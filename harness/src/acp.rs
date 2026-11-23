@@ -175,17 +175,16 @@ pub async fn run_stdio(runtime: Arc<Runtime>) -> Result<()> {
 }
 
 /// The two model pickers, with entries grouped by CLI.
-/// The two model pickers. Zed's buttons show only the selected option's
-/// name, so each option carries its role and CLI ("Fast: Haiku (Claude Code)").
+/// The two model pickers. Zed's buttons show only the selected option's name
+/// (the picker's name and description appear on hover), so each option names
+/// its CLI: pi and Codex offer the same model names.
 fn model_options(choices: &ModelChoices) -> Vec<SessionConfigOption> {
-    let grouped = |role: &str| -> Vec<SessionConfigSelectGroup> {
+    let grouped = || -> Vec<SessionConfigSelectGroup> {
         let mut groups: Vec<(&str, Vec<SessionConfigSelectOption>)> = Vec::new();
         for entry in &choices.catalog {
             let cli = entry.backend.label();
-            let option = SessionConfigSelectOption::new(
-                entry.id.clone(),
-                option_label(role, &entry.label, cli),
-            );
+            let option =
+                SessionConfigSelectOption::new(entry.id.clone(), option_label(&entry.label, cli));
             match groups.iter_mut().find(|(g, _)| *g == cli) {
                 Some((_, options)) => options.push(option),
                 None => groups.push((cli, vec![option])),
@@ -197,27 +196,17 @@ fn model_options(choices: &ModelChoices) -> Vec<SessionConfigOption> {
             .collect()
     };
     vec![
-        SessionConfigOption::select(
-            "system1",
-            "Fast model",
-            choices.system1.clone(),
-            grouped("Fast"),
-        )
-        .description("System 1: onboarding and log replies".to_string())
-        .category(SessionConfigOptionCategory::ModelConfig),
-        SessionConfigOption::select(
-            "system2",
-            "Main model",
-            choices.system2.clone(),
-            grouped("Main"),
-        )
-        .description("System 2: map, candidates, judgment and agent work".to_string())
-        .category(SessionConfigOptionCategory::Model),
+        SessionConfigOption::select("system1", "Fast model", choices.system1.clone(), grouped())
+            .description("System 1: onboarding and log replies".to_string())
+            .category(SessionConfigOptionCategory::ModelConfig),
+        SessionConfigOption::select("system2", "Main model", choices.system2.clone(), grouped())
+            .description("System 2: map, candidates, judgment and agent work".to_string())
+            .category(SessionConfigOptionCategory::Model),
     ]
 }
 
-fn option_label(role: &str, model: &str, cli: &str) -> String {
-    format!("{role}: {model} ({cli})")
+fn option_label(model: &str, cli: &str) -> String {
+    format!("{model} ({cli})")
 }
 
 fn make_stream_sink(cx: ConnectionTo<Client>, session_id: SessionId) -> StreamSink {
@@ -428,7 +417,7 @@ mod tests {
     use crate::config::{Backend, ModelEntry};
 
     #[test]
-    fn picker_options_name_role_and_cli() {
+    fn picker_options_name_the_cli() {
         let entry = |id: &str, backend| ModelEntry {
             id: id.into(),
             label: "GPT-6 Luna".into(),
@@ -452,10 +441,10 @@ mod tests {
             .flat_map(|g| g["options"].as_array().unwrap())
             .map(|o| o["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names, ["Fast: GPT-6 Luna (pi)", "Fast: GPT-6 Luna (Codex)"]);
+        assert_eq!(names, ["GPT-6 Luna (pi)", "GPT-6 Luna (Codex)"]);
         assert_eq!(
             json[1]["options"][1]["options"][0]["name"],
-            "Main: GPT-6 Luna (Codex)"
+            "GPT-6 Luna (Codex)"
         );
     }
 }
