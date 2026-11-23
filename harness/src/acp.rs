@@ -175,32 +175,49 @@ pub async fn run_stdio(runtime: Arc<Runtime>) -> Result<()> {
 }
 
 /// The two model pickers, with entries grouped by CLI.
+/// The two model pickers. Zed's buttons show only the selected option's
+/// name, so each option carries its role and CLI ("Fast: Haiku (Claude Code)").
 fn model_options(choices: &ModelChoices) -> Vec<SessionConfigOption> {
-    let mut groups: Vec<(String, Vec<SessionConfigSelectOption>)> = Vec::new();
-    for entry in &choices.catalog {
-        let group = entry.backend.label().to_string();
-        let option = SessionConfigSelectOption::new(entry.id.clone(), entry.label.clone());
-        match groups.iter_mut().find(|(g, _)| *g == group) {
-            Some((_, options)) => options.push(option),
-            None => groups.push((group, vec![option])),
+    let grouped = |role: &str| -> Vec<SessionConfigSelectGroup> {
+        let mut groups: Vec<(&str, Vec<SessionConfigSelectOption>)> = Vec::new();
+        for entry in &choices.catalog {
+            let cli = entry.backend.label();
+            let option = SessionConfigSelectOption::new(
+                entry.id.clone(),
+                option_label(role, &entry.label, cli),
+            );
+            match groups.iter_mut().find(|(g, _)| *g == cli) {
+                Some((_, options)) => options.push(option),
+                None => groups.push((cli, vec![option])),
+            }
         }
-    }
-    let grouped = || -> Vec<SessionConfigSelectGroup> {
         groups
-            .iter()
-            .map(|(g, options)| {
-                SessionConfigSelectGroup::new(g.clone(), g.clone(), options.clone())
-            })
+            .into_iter()
+            .map(|(g, options)| SessionConfigSelectGroup::new(g, g, options))
             .collect()
     };
     vec![
-        SessionConfigOption::select("system2", "Model", choices.system2.clone(), grouped())
-            .description("System 2: map, candidates, judgment and agent work".to_string())
-            .category(SessionConfigOptionCategory::Model),
-        SessionConfigOption::select("system1", "Fast model", choices.system1.clone(), grouped())
-            .description("System 1: onboarding and log replies".to_string())
-            .category(SessionConfigOptionCategory::ModelConfig),
+        SessionConfigOption::select(
+            "system1",
+            "Fast model",
+            choices.system1.clone(),
+            grouped("Fast"),
+        )
+        .description("System 1: onboarding and log replies".to_string())
+        .category(SessionConfigOptionCategory::ModelConfig),
+        SessionConfigOption::select(
+            "system2",
+            "Main model",
+            choices.system2.clone(),
+            grouped("Main"),
+        )
+        .description("System 2: map, candidates, judgment and agent work".to_string())
+        .category(SessionConfigOptionCategory::Model),
     ]
+}
+
+fn option_label(role: &str, model: &str, cli: &str) -> String {
+    format!("{role}: {model} ({cli})")
 }
 
 fn make_stream_sink(cx: ConnectionTo<Client>, session_id: SessionId) -> StreamSink {
@@ -402,5 +419,43 @@ fn hex_val(b: u8) -> Option<u8> {
         b'a'..=b'f' => Some(b - b'a' + 10),
         b'A'..=b'F' => Some(b - b'A' + 10),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Backend, ModelEntry};
+
+    #[test]
+    fn picker_options_name_role_and_cli() {
+        let entry = |id: &str, backend| ModelEntry {
+            id: id.into(),
+            label: "GPT-6 Luna".into(),
+            backend,
+            model: String::new(),
+            effort: None,
+        };
+        let choices = ModelChoices {
+            catalog: vec![
+                entry("pi-luna", Backend::Pi),
+                entry("codex-luna", Backend::Codex),
+            ],
+            system1: "pi-luna".into(),
+            system2: "codex-luna".into(),
+        };
+        let json = serde_json::to_value(model_options(&choices)).unwrap();
+        let names: Vec<&str> = json[0]["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|g| g["options"].as_array().unwrap())
+            .map(|o| o["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["Fast: GPT-6 Luna (pi)", "Fast: GPT-6 Luna (Codex)"]);
+        assert_eq!(
+            json[1]["options"][1]["options"][0]["name"],
+            "Main: GPT-6 Luna (Codex)"
+        );
     }
 }
