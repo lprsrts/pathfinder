@@ -1,5 +1,4 @@
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
@@ -13,6 +12,7 @@ use crate::engine::{
     Engine, EngineRequest, EngineTier, StreamEvent, StreamSink, ToolAccess, run_gated,
 };
 use crate::store::Store;
+use crate::workspace::WorkspaceSnapshot;
 
 const ESCALATE_AFTER_TURNS: u32 = 4;
 
@@ -132,7 +132,8 @@ impl Runtime {
     ) -> Result<TurnOutput> {
         session.push_turn("user", text);
 
-        let folder_summary = summarize_folder(&session.cwd);
+        let workspace = WorkspaceSnapshot::scan(&session.cwd);
+        let folder_summary = workspace.render();
         let history = format_history(session);
         let concepts_summary = session.render_concepts();
 
@@ -156,7 +157,7 @@ impl Runtime {
             "onboarding",
             &req,
             sink.clone(),
-            |d: &OnboardingDecision| check_onboarding(d, &session_snapshot),
+            |d: &OnboardingDecision| check_onboarding(d, &session_snapshot, &workspace.stack),
         )
         .await?;
 
@@ -192,7 +193,7 @@ impl Runtime {
         files: &[PathBuf],
         sink: StreamSink,
     ) -> Result<TurnOutput> {
-        let folder_summary = summarize_folder(&session.cwd);
+        let folder_summary = WorkspaceSnapshot::scan(&session.cwd).render();
         let history = format_history(session);
         let concepts_summary = session.render_concepts();
         let goal = session
@@ -784,34 +785,6 @@ fn render_active_prompt(item: &PathItem) -> String {
     blocks.join("\n\n")
 }
 
-fn summarize_folder(cwd: &Path) -> String {
-    let Ok(entries) = fs::read_dir(cwd) else {
-        return "(unreadable folder)".to_string();
-    };
-    let mut names: Vec<String> = entries
-        .filter_map(|e| e.ok())
-        .filter_map(|e| {
-            let name = e.file_name().to_string_lossy().to_string();
-            if name.starts_with('.') {
-                return None;
-            }
-            let suffix = if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                "/"
-            } else {
-                ""
-            };
-            Some(format!("{name}{suffix}"))
-        })
-        .collect();
-    names.sort();
-    names.truncate(40);
-    if names.is_empty() {
-        "(empty folder)".to_string()
-    } else {
-        names.join(", ")
-    }
-}
-
 fn format_history(session: &Session) -> String {
     if session.history.is_empty() {
         return "(none)".to_string();
@@ -831,8 +804,13 @@ fn format_history(session: &Session) -> String {
 
 const ONBOARDING_SYSTEM: &str = r#"You are a calm, direct human-in-the-loop pathfinder doing short onboarding.
 Your job: establish TWO things before planning:
-1. The concrete goal (and preferred medium/tools if relevant).
+1. The concrete goal.
 2. What the user already knows vs. does not know on the key prerequisite concepts or skills.
+
+You are given a workspace snapshot (file tree, detected stack, excerpts of README/manifests) and a `read` tool for opening files. Look before you ask:
+- Never ask what the workspace already answers: language, framework, build tool, project layout, or what existing code does. Read the relevant files instead.
+- Ask only what files cannot tell you: the user's intent, constraints, and their own understanding.
+- When useful, ground the question in what you found (e.g. name the file or function the change would touch).
 
 Strict rules (enforced mechanically by critics):
 - Flat, calm tone. NEVER open with cheerleading or filler ("Great goal!", "Awesome!", "Sure!", "Let's dive in!").

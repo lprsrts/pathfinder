@@ -166,10 +166,44 @@ fn count_sentences(text: &str) -> usize {
     count.max(usize::from(!text.trim().is_empty()))
 }
 
-pub fn check_onboarding(decision: &OnboardingDecision, session: &Session) -> Vec<Violation> {
+const STACK_QUESTION_MARKERS: &[&str] = &[
+    "which language",
+    "what language",
+    "programming language",
+    "which framework",
+    "what framework",
+    "tech stack",
+    "which tools",
+    "what tools",
+    "preferred tools",
+    "preferred language",
+];
+
+/// Flags a question about the stack when the workspace already shows it.
+fn asks_known_stack(reply: &str, known_stack: &[String]) -> Option<Violation> {
+    if known_stack.is_empty() || !reply.contains('?') {
+        return None;
+    }
+    let lower = reply.to_lowercase();
+    let marker = STACK_QUESTION_MARKERS.iter().find(|m| lower.contains(*m))?;
+    Some(Violation::new(
+        "asks_known_stack",
+        format!(
+            "reply asks about `{marker}`, but the workspace already shows: {}. Read the files and ask about intent or understanding instead.",
+            known_stack.join("; ")
+        ),
+    ))
+}
+
+pub fn check_onboarding(
+    decision: &OnboardingDecision,
+    session: &Session,
+    known_stack: &[String],
+) -> Vec<Violation> {
     let mut out = Vec::new();
     out.extend(check_tone_and_format(&decision.reply, "reply"));
     out.extend(check_length(&decision.reply, "reply", 70, 3));
+    out.extend(asks_known_stack(&decision.reply, known_stack));
 
     for c in &decision.observed_concepts {
         if c.status == ConceptStatus::Proven {
@@ -384,7 +418,7 @@ mod tests {
             starting_point: None,
             observed_concepts: vec![],
         };
-        let v = check_onboarding(&d, &session);
+        let v = check_onboarding(&d, &session, &[]);
         assert!(v.iter().any(|x| x.code == "unprobed_background"));
     }
 
@@ -402,8 +436,26 @@ mod tests {
                 status: ConceptStatus::Unknown,
             }],
         };
-        let v = check_onboarding(&d, &session);
+        let v = check_onboarding(&d, &session, &[]);
         assert!(v.is_empty(), "unexpected violations: {v:?}");
+    }
+
+    #[test]
+    fn blocks_asking_for_stack_the_workspace_already_shows() {
+        let session = Session::new("s1".into(), PathBuf::from("."));
+        let d = OnboardingDecision {
+            reply: "What should `/status` report, and which language do you want to use?".into(),
+            ready_to_plan: false,
+            goal_summary: None,
+            starting_point: None,
+            observed_concepts: vec![],
+        };
+        let stack = vec!["Rust (Cargo) in harness/".to_string()];
+        let v = check_onboarding(&d, &session, &stack);
+        assert!(v.iter().any(|x| x.code == "asks_known_stack"));
+
+        // Same question is fine in an empty folder.
+        assert!(check_onboarding(&d, &session, &[]).is_empty());
     }
 
     #[test]

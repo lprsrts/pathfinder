@@ -5,6 +5,7 @@ mod domain;
 mod engine;
 mod runtime;
 mod store;
+mod workspace;
 
 use std::env;
 use std::sync::Arc;
