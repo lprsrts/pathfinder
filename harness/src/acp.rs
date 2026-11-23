@@ -74,9 +74,8 @@ pub async fn run_stdio(runtime: Arc<Runtime>) -> Result<()> {
                     },
                     Err(err) => {
                         error!("load_session failed: {err:#}");
-                        return responder.respond_with_error(
-                            AcpError::internal_error().data(err.to_string()),
-                        );
+                        return responder
+                            .respond_with_error(AcpError::internal_error().data(err.to_string()));
                     }
                 };
                 responder.respond(LoadSessionResponse::new())?;
@@ -181,21 +180,30 @@ fn send_commands(cx: &ConnectionTo<Client>, session_id: SessionId) -> Result<(),
             )),
         ),
         AvailableCommand::new("next", "Move to the next ready part after passing /check"),
-        AvailableCommand::new("handoff", "Let the agent finish remaining labor after /check").input(
-            AvailableCommandInput::Unstructured(UnstructuredCommandInput::new(
-                "Optional instructions for the handed-off work",
-            )),
-        ),
-        AvailableCommand::new("skip", "Skip learning this part and let the agent handle it").input(
-            AvailableCommandInput::Unstructured(UnstructuredCommandInput::new(
+        AvailableCommand::new(
+            "handoff",
+            "Let the agent finish remaining labor after /check",
+        )
+        .input(AvailableCommandInput::Unstructured(
+            UnstructuredCommandInput::new("Optional instructions for the handed-off work"),
+        )),
+        AvailableCommand::new(
+            "skip",
+            "Skip learning this part and let the agent handle it",
+        )
+        .input(AvailableCommandInput::Unstructured(
+            UnstructuredCommandInput::new(
                 "Optional instructions, or `none` to skip without agent edits",
-            )),
-        ),
+            ),
+        )),
         AvailableCommand::new("replan", "Update the remaining path based on new findings").input(
             AvailableCommandInput::Unstructured(UnstructuredCommandInput::new("What changed?")),
         ),
         AvailableCommand::new("map", "Show the dependency map and current status"),
-        AvailableCommand::new("concepts", "Show tracked concept states (unknown/claimed/proven/skipped)"),
+        AvailableCommand::new(
+            "concepts",
+            "Show tracked concept states (unknown/claimed/proven/skipped)",
+        ),
         AvailableCommand::new("focus", "Switch focus to another ready part by ID").input(
             AvailableCommandInput::Unstructured(UnstructuredCommandInput::new("item id")),
         ),

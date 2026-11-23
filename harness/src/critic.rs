@@ -59,7 +59,10 @@ pub fn check_tone_and_format(text: &str, field: &str) -> Vec<Violation> {
     let mut out = Vec::new();
     let trimmed = text.trim();
     if trimmed.is_empty() {
-        out.push(Violation::new("empty_text", format!("{field} must not be empty")));
+        out.push(Violation::new(
+            "empty_text",
+            format!("{field} must not be empty"),
+        ));
         return out;
     }
 
@@ -105,8 +108,8 @@ fn has_unescaped_math_underscores(text: &str) -> bool {
             let prev = chars[i - 1];
             let next = chars[i + 1];
             // Pattern like w_1, x_i, a_2 where a single letter precedes `_` and digit/single letter follows
-            let prev_is_single_var = prev.is_ascii_alphabetic()
-                && (i < 2 || !chars[i - 2].is_ascii_alphanumeric());
+            let prev_is_single_var =
+                prev.is_ascii_alphabetic() && (i < 2 || !chars[i - 2].is_ascii_alphanumeric());
             let next_is_sub = next.is_ascii_digit()
                 || (next.is_ascii_alphabetic()
                     && (i + 2 >= chars.len() || !chars[i + 2].is_ascii_alphanumeric()));
@@ -232,13 +235,32 @@ pub fn check_plan_proposal(
 
     let mut merged = existing_resolved.to_vec();
     for item in &proposal.items {
-        out.extend(check_tone_and_format(&item.title, &format!("{}.title", item.id)));
-        out.extend(check_tone_and_format(&item.user_task, &format!("{}.user_task", item.id)));
-        out.extend(check_length(&item.user_task, &format!("{}.user_task", item.id), 75, 3));
+        out.extend(check_tone_and_format(
+            &item.title,
+            &format!("{}.title", item.id),
+        ));
+        out.extend(check_tone_and_format(
+            &item.user_task,
+            &format!("{}.user_task", item.id),
+        ));
+        out.extend(check_length(
+            &item.user_task,
+            &format!("{}.user_task", item.id),
+            75,
+            3,
+        ));
 
         if !item.introduces.is_empty() {
-            out.extend(check_tone_and_format(&item.framing, &format!("{}.framing", item.id)));
-            out.extend(check_length(&item.framing, &format!("{}.framing", item.id), 85, 3));
+            out.extend(check_tone_and_format(
+                &item.framing,
+                &format!("{}.framing", item.id),
+            ));
+            out.extend(check_length(
+                &item.framing,
+                &format!("{}.framing", item.id),
+                85,
+                3,
+            ));
             if item.framing.split_whitespace().count() < 8 {
                 out.push(Violation::new(
                     "thin_framing",
@@ -250,8 +272,16 @@ pub fn check_plan_proposal(
                 ));
             }
         } else if !item.framing.trim().is_empty() {
-            out.extend(check_tone_and_format(&item.framing, &format!("{}.framing", item.id)));
-            out.extend(check_length(&item.framing, &format!("{}.framing", item.id), 85, 3));
+            out.extend(check_tone_and_format(
+                &item.framing,
+                &format!("{}.framing", item.id),
+            ));
+            out.extend(check_length(
+                &item.framing,
+                &format!("{}.framing", item.id),
+                85,
+                3,
+            ));
         }
 
         merged.push(PathItem {

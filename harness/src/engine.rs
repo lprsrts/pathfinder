@@ -363,7 +363,11 @@ where
     req.stream_text = false;
 
     let attempts: Vec<EngineTier> = match base_req.tier {
-        EngineTier::System1 => vec![EngineTier::System1, EngineTier::System2, EngineTier::System2],
+        EngineTier::System1 => vec![
+            EngineTier::System1,
+            EngineTier::System2,
+            EngineTier::System2,
+        ],
         EngineTier::System2 => vec![EngineTier::System2, EngineTier::System2],
     };
 
@@ -371,7 +375,8 @@ where
 
     for (idx, tier) in attempts.iter().copied().enumerate() {
         req.tier = tier;
-        let is_escalation = idx > 0 && base_req.tier == EngineTier::System1 && tier == EngineTier::System2;
+        let is_escalation =
+            idx > 0 && base_req.tier == EngineTier::System1 && tier == EngineTier::System2;
 
         if idx == 0 {
             sink(StreamEvent::Thought(format!(

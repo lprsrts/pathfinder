@@ -179,7 +179,13 @@ mod tests {
         assert_eq!(loaded.goal.as_deref(), Some("Understand FFT"));
 
         store
-            .record_outcome("s-1", "n1", "Complex roots", ItemStatus::Understood, Some("solid"))
+            .record_outcome(
+                "s-1",
+                "n1",
+                "Complex roots",
+                ItemStatus::Understood,
+                Some("solid"),
+            )
             .unwrap();
         store
             .record_critic_event(

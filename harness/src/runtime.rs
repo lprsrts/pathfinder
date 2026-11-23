@@ -610,7 +610,10 @@ impl Runtime {
         };
 
         let reply = if streamed {
-            format!("\n\nMarked **{}** skipped (not yet understood).{tail}", active.title)
+            format!(
+                "\n\nMarked **{}** skipped (not yet understood).{tail}",
+                active.title
+            )
         } else {
             format!("{report}{tail}")
         };
@@ -1075,7 +1078,10 @@ mod tests {
             .await
             .unwrap();
         assert!(out.plan_changed);
-        assert!(out.reply.contains("A lexer scans input one character at a time"));
+        assert!(
+            out.reply
+                .contains("A lexer scans input one character at a time")
+        );
         assert!(out.reply.contains("Try this:"));
 
         // Coaching stays read-only on S1

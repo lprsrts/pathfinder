@@ -117,7 +117,9 @@ pub enum GraphError {
     SelfDependency(String),
     #[error("plan contains a dependency cycle")]
     Cycle,
-    #[error("item `{item}` requires concept `{concept}` which is neither already proven/skipped nor introduced by an ancestor")]
+    #[error(
+        "item `{item}` requires concept `{concept}` which is neither already proven/skipped nor introduced by an ancestor"
+    )]
     UnsatisfiedPrerequisite { item: String, concept: String },
     #[error("item `{0}` introduces new concepts but has no framing explanation")]
     MissingFraming(String),
@@ -285,7 +287,10 @@ impl PlanGraph {
             } else {
                 format!("  (+{})", item.introduces.join(", "))
             };
-            lines.push(format!("- `{}` {} {}{}{}", item.id, marker, item.title, deps, intro));
+            lines.push(format!(
+                "- `{}` {} {}{}{}",
+                item.id, marker, item.title, deps, intro
+            ));
         }
         lines.join("\n")
     }
@@ -295,7 +300,13 @@ pub fn normalize_id(raw: &str) -> String {
     raw.trim()
         .to_lowercase()
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect::<String>()
         .trim_matches('_')
         .to_string()
@@ -360,15 +371,18 @@ impl Session {
         if key.is_empty() {
             return;
         }
-        let entry = self.concepts.entry(key.clone()).or_insert_with(|| ConceptRecord {
-            id: key.clone(),
-            label: label
-                .filter(|l| !l.trim().is_empty())
-                .map(str::to_string)
-                .unwrap_or_else(|| key.replace('_', " ")),
-            status,
-            evidence: None,
-        });
+        let entry = self
+            .concepts
+            .entry(key.clone())
+            .or_insert_with(|| ConceptRecord {
+                id: key.clone(),
+                label: label
+                    .filter(|l| !l.trim().is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| key.replace('_', " ")),
+                status,
+                evidence: None,
+            });
         if let Some(lbl) = label {
             if !lbl.trim().is_empty() {
                 entry.label = lbl.to_string();
