@@ -2,14 +2,16 @@
 
 Human-in-the-loop pathfinder over ACP (built for Zed, backed by `pi` + SQLite).
 
-## Build
+## Build and install
+
+The harness is developed with itself, so Zed runs an installed copy rather than `target/`. Work-in-progress builds never replace the tool you are using; install a build only once it passes:
 
 ```bash
 cd harness
-cargo build --release
+cargo test --release && cargo install --path . --root ~/.local --locked
 ```
 
-Binary path: `harness/target/release/harness`
+Installed binary: `~/.local/bin/harness`. Start a new Pathfinder thread in Zed to pick up a new install.
 
 ## Connect in Zed
 
@@ -19,7 +21,7 @@ Add to `~/.config/zed/settings.json`:
 {
   "agent_servers": {
     "Pathfinder": {
-      "command": "/Users/alper/dev/personal/pathfinder/harness/target/release/harness",
+      "command": "/Users/alper/.local/bin/harness",
       "args": ["acp"]
     }
   }
