@@ -195,6 +195,61 @@ fn asks_known_stack(reply: &str, known_stack: &[String]) -> Option<Violation> {
     ))
 }
 
+const PROMISE_PREFIXES: &[&str] = &[
+    "i'll ",
+    "i will ",
+    "let me ",
+    "i'm going to ",
+    "i am going to ",
+    "first i'll ",
+];
+
+const PROMISE_VERBS: &[&str] = &[
+    "check",
+    "look",
+    "inspect",
+    "read",
+    "review",
+    "examine",
+    "explore",
+    "scan",
+    "open",
+    "search",
+    "investigate",
+    "dig",
+    "take a look",
+    "go through",
+];
+
+/// A single-shot reply is the model's last word for the turn, so announcing
+/// a future action ("I'll check the code") is always an empty promise.
+fn promises_action(reply: &str, field: &str) -> Option<Violation> {
+    let lower = reply.to_lowercase().replace(['\u{2019}', '\u{2018}'], "'");
+    for prefix in PROMISE_PREFIXES {
+        for (idx, _) in lower.match_indices(prefix) {
+            let at_word_start = idx == 0
+                || !lower[..idx]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_alphanumeric());
+            if !at_word_start {
+                continue;
+            }
+            let rest = &lower[idx + prefix.len()..];
+            if let Some(verb) = PROMISE_VERBS.iter().find(|v| rest.starts_with(*v)) {
+                return Some(Violation::new(
+                    "promised_action",
+                    format!(
+                        "{field} announces `{}{verb}`, but this reply ends the turn and nothing will follow. Use the read tool before answering and state what you found, or just ask.",
+                        prefix.trim_end()
+                    ),
+                ));
+            }
+        }
+    }
+    None
+}
+
 pub fn check_onboarding(
     decision: &OnboardingDecision,
     session: &Session,
@@ -204,6 +259,7 @@ pub fn check_onboarding(
     out.extend(check_tone_and_format(&decision.reply, "reply"));
     out.extend(check_length(&decision.reply, "reply", 70, 3));
     out.extend(asks_known_stack(&decision.reply, known_stack));
+    out.extend(promises_action(&decision.reply, "reply"));
 
     for c in &decision.observed_concepts {
         if c.status == ConceptStatus::Proven {
@@ -344,6 +400,7 @@ pub fn check_coach(decision: &CoachDecision) -> Vec<Violation> {
     let mut out = Vec::new();
     out.extend(check_tone_and_format(&decision.reply, "reply"));
     out.extend(check_length(&decision.reply, "reply", 85, 4));
+    out.extend(promises_action(&decision.reply, "reply"));
 
     if has_large_code_block(&decision.reply, 6) {
         out.push(Violation::new(
@@ -456,6 +513,33 @@ mod tests {
 
         // Same question is fine in an empty folder.
         assert!(check_onboarding(&d, &session, &[]).is_empty());
+    }
+
+    #[test]
+    fn blocks_promised_actions_but_not_plain_questions() {
+        let promised = [
+            "I\u{2019}ll check how commands are currently handled. What should `/status` show?",
+            "Let me look at runtime.rs first. What do you expect?",
+            "First, I will inspect the store. Which fields matter?",
+        ];
+        for reply in promised {
+            assert!(
+                promises_action(reply, "reply").is_some(),
+                "missed promise: {reply}"
+            );
+        }
+
+        let fine = [
+            "Commands live in `acp.rs` and `runtime.rs`. What should `/status` show?",
+            "Would you check the output yourself, or should the harness?",
+            "Should it read from the store? I'll leave that choice to you.",
+        ];
+        for reply in fine {
+            assert!(
+                promises_action(reply, "reply").is_none(),
+                "false positive: {reply}"
+            );
+        }
     }
 
     #[test]

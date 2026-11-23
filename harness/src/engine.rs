@@ -31,6 +31,8 @@ impl EngineTier {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolAccess {
+    /// No tools: used to reformat an answer without re-doing the work.
+    None,
     ReadOnly,
     Full,
 }
@@ -121,6 +123,9 @@ impl Engine for PiEngine {
             }
 
             match req.tools {
+                ToolAccess::None => {
+                    cmd.arg("--no-tools");
+                }
                 ToolAccess::ReadOnly => {
                     cmd.args(["--tools", "read"]);
                 }
@@ -404,7 +409,36 @@ where
         }
 
         let raw = engine.run_text(&req, sink.clone()).await?;
-        match evaluate_proposal::<T, _>(&raw, &critic) {
+        let mut outcome = evaluate_proposal::<T, _>(&raw, &critic);
+
+        // Weak models often answer well but drop the JSON envelope after a
+        // tool call. Ask the same tier to re-wrap its own answer (no tools)
+        // before treating it as a quality failure and escalating.
+        if is_only_invalid_json(&outcome) && !raw.trim().is_empty() {
+            let _ = store.record_critic_event(
+                session_id,
+                kind,
+                tier.label(),
+                false,
+                false,
+                outcome.as_ref().err().map(Vec::as_slice).unwrap_or(&[]),
+            );
+            sink(StreamEvent::Thought(
+                "Answer was not JSON — reformatting...\n".to_string(),
+            ));
+            let mut repair = req.clone();
+            repair.tools = ToolAccess::None;
+            repair.files.clear();
+            repair.prompt = format!(
+                "{}\n\nYour previous answer was not valid JSON:\n<<<\n{}\n>>>\n\nKeep its content (do not redo the work and do not call tools) and return it as ONLY one valid JSON object matching the schema.",
+                base_req.prompt,
+                raw.trim()
+            );
+            let repaired = engine.run_text(&repair, sink.clone()).await?;
+            outcome = evaluate_proposal::<T, _>(&repaired, &critic);
+        }
+
+        match outcome {
             Ok(val) => {
                 let _ = store.record_critic_event(
                     session_id,
@@ -441,6 +475,10 @@ where
         "{kind} proposal rejected by critic after retries:\n{}",
         format_violations(&last_violations)
     )
+}
+
+fn is_only_invalid_json<T>(outcome: &std::result::Result<T, Vec<Violation>>) -> bool {
+    matches!(outcome, Err(v) if v.len() == 1 && v[0].code == "invalid_json")
 }
 
 fn evaluate_proposal<T, C>(raw: &str, critic: &C) -> std::result::Result<T, Vec<Violation>>

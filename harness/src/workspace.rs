@@ -8,7 +8,8 @@ use std::path::Path;
 const MAX_DEPTH: usize = 3;
 const MAX_TREE_ENTRIES: usize = 150;
 const MAX_EXCERPT_LINES: usize = 40;
-const MAX_EXCERPT_BYTES: usize = 3_000;
+const MAX_EXCERPT_BYTES: usize = 4_000;
+const MAX_SECTION_LINES: usize = 14;
 const MAX_KEY_FILES: usize = 6;
 
 const SKIP_DIRS: &[&str] = &[
@@ -173,6 +174,20 @@ fn walk(
 
 fn excerpt(path: &Path) -> Option<String> {
     let raw = fs::read_to_string(path).ok()?;
+    let is_markdown = path
+        .extension()
+        .map(|e| e.eq_ignore_ascii_case("md"))
+        .unwrap_or(false);
+    let out = if is_markdown {
+        markdown_excerpt(&raw)
+    } else {
+        head_excerpt(&raw)
+    };
+    let out = out.trim_end().to_string();
+    (!out.is_empty()).then_some(out)
+}
+
+fn head_excerpt(raw: &str) -> String {
     let mut out = String::new();
     for (i, line) in raw.lines().enumerate() {
         if i >= MAX_EXCERPT_LINES || out.len() + line.len() > MAX_EXCERPT_BYTES {
@@ -182,8 +197,64 @@ fn excerpt(path: &Path) -> Option<String> {
         out.push_str(line);
         out.push('\n');
     }
-    let out = out.trim_end().to_string();
-    (!out.is_empty()).then_some(out)
+    out
+}
+
+/// Keeps every heading and the first lines under each, so a late section
+/// (e.g. a command list) is never cut off by a long early one.
+fn markdown_excerpt(raw: &str) -> String {
+    let mut out = String::new();
+    let mut in_fence = false;
+    let mut printed_open_fence = false;
+    let mut section_lines = 0usize;
+    let mut elided = false;
+
+    for line in raw.lines() {
+        let is_fence = line.trim_start().starts_with("```");
+
+        if !in_fence && line.starts_with('#') {
+            section_lines = 0;
+            elided = false;
+            if out.len() + line.len() > MAX_EXCERPT_BYTES {
+                out.push_str("...\n");
+                break;
+            }
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+
+        if is_fence {
+            in_fence = !in_fence;
+            // Always close a fence whose opening line was printed.
+            if !in_fence && printed_open_fence {
+                if elided {
+                    out.push_str("...\n");
+                }
+                out.push_str(line);
+                out.push('\n');
+                printed_open_fence = false;
+                elided = true;
+                continue;
+            }
+        }
+
+        if section_lines >= MAX_SECTION_LINES || out.len() + line.len() > MAX_EXCERPT_BYTES {
+            if !elided && !printed_open_fence {
+                out.push_str("...\n");
+            }
+            elided = true;
+            continue;
+        }
+
+        out.push_str(line);
+        out.push('\n');
+        section_lines += 1;
+        if is_fence && in_fence {
+            printed_open_fence = true;
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -231,6 +302,31 @@ mod tests {
         assert!(rendered.contains("Pathfinder over ACP."));
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn markdown_excerpt_keeps_late_sections() {
+        let mut readme = String::from("# tool\n\n## Long section\n");
+        for i in 0..60 {
+            readme.push_str(&format!("filler line {i}\n"));
+        }
+        readme.push_str("\n## Slash commands\n\n- `/check` verify\n- `/map` show map\n");
+        let out = markdown_excerpt(&readme);
+        assert!(out.contains("## Slash commands"));
+        assert!(out.contains("- `/map` show map"));
+        assert!(!out.contains("filler line 30"));
+    }
+
+    #[test]
+    fn markdown_excerpt_closes_cut_code_fences() {
+        let mut readme = String::from("## Build\n```bash\n");
+        for i in 0..30 {
+            readme.push_str(&format!("step {i}\n"));
+        }
+        readme.push_str("```\n## Next\ntext\n");
+        let out = markdown_excerpt(&readme);
+        assert_eq!(out.matches("```").count(), 2, "unbalanced fences:\n{out}");
+        assert!(out.contains("## Next\ntext"));
     }
 
     #[test]

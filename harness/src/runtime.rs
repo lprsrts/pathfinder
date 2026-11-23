@@ -143,7 +143,7 @@ impl Runtime {
             cwd: session.cwd.clone(),
             system_prompt: ONBOARDING_SYSTEM.to_string(),
             prompt: format!(
-                "Workspace folder snapshot:\n{folder_summary}\n\nKnown concept state so far:\n{concepts_summary}\n\nConversation so far:\n{history}\n\nRespond with JSON only."
+                "Workspace folder snapshot:\n{folder_summary}\n\nKnown concept state so far:\n{concepts_summary}\n\nConversation so far:\n{history}\n\nRead any files you need first, then respond with JSON only."
             ),
             files: files.to_vec(),
             stream_text: false,
@@ -349,7 +349,7 @@ impl Runtime {
             cwd: session.cwd.clone(),
             system_prompt: COACH_SYSTEM.to_string(),
             prompt: format!(
-                "Goal: {}\nCurrent focus: {} (`{}`)\nFraming given: {}\nUser task: {}\nCriteria for understanding: {}\n\nConcept state:\n{concepts}\n\nRecent conversation:\n{history}\n\nRespond with JSON only.",
+                "Goal: {}\nCurrent focus: {} (`{}`)\nFraming given: {}\nUser task: {}\nCriteria for understanding: {}\n\nConcept state:\n{concepts}\n\nRecent conversation:\n{history}\n\nRead any files you need first, then respond with JSON only.",
                 session.goal.as_deref().unwrap_or("(session goal)"),
                 active.title,
                 active.id,
@@ -811,6 +811,8 @@ You are given a workspace snapshot (file tree, detected stack, excerpts of READM
 - Never ask what the workspace already answers: language, framework, build tool, project layout, or what existing code does. Read the relevant files instead.
 - Ask only what files cannot tell you: the user's intent, constraints, and their own understanding.
 - When useful, ground the question in what you found (e.g. name the file or function the change would touch).
+- If a file matters to your question and is not fully shown in the snapshot, call `read` on it BEFORE writing the JSON.
+- `reply` is your final message for this turn; nothing runs after it. State what you found, never what you are about to do ("I'll check...", "Let me look...").
 
 Strict rules (enforced mechanically by critics):
 - Flat, calm tone. NEVER open with cheerleading or filler ("Great goal!", "Awesome!", "Sure!", "Let's dive in!").
@@ -871,6 +873,7 @@ Strict rules (enforced mechanically by critics):
 - Keep `reply` to 1-3 short sentences (under 80 words). Never dump walls of text or large code blocks (>6 lines).
 - Wrap math formulas in inline code backticks, never bare underscore subscripts.
 - Stay strictly on the current item and do not spoil the answer.
+- Use the `read` tool before answering if you need a file. `reply` ends your turn: never announce actions you are about to take ("I'll check...", "Let me look...").
 - Choose `action`:
   - "keep_going": normal short nudge or clarifying question
   - "suggest_check": user appears ready to verify with /check
@@ -972,6 +975,48 @@ mod tests {
                 Ok(reply)
             })
         }
+    }
+
+    #[tokio::test]
+    async fn non_json_answer_is_reformatted_on_same_tier_before_escalating() {
+        let store = Store::open_in_memory().unwrap();
+        let engine = FakeEngine::new(vec![
+            // S1 reads files, then answers in prose instead of JSON.
+            (
+                ToolAccess::ReadOnly,
+                EngineTier::System1,
+                "Commands live in `acp.rs`. What should `/status` show?",
+            ),
+            // Same tier, no tools: re-wraps the same content as JSON.
+            (
+                ToolAccess::None,
+                EngineTier::System1,
+                r#"{"reply":"Commands live in `acp.rs`. What should `/status` show?","ready_to_plan":false}"#,
+            ),
+        ]);
+        let req = EngineRequest {
+            tier: EngineTier::System1,
+            tools: ToolAccess::ReadOnly,
+            cwd: PathBuf::from("."),
+            system_prompt: String::new(),
+            prompt: "onboard".into(),
+            files: vec![],
+            stream_text: false,
+        };
+        let session = Session::new("s-json".into(), PathBuf::from("."));
+        let d: OnboardingDecision = run_gated(
+            &engine,
+            &store,
+            "s-json",
+            "onboarding",
+            &req,
+            noop_sink(),
+            |d: &OnboardingDecision| check_onboarding(d, &session, &[]),
+        )
+        .await
+        .unwrap();
+        assert!(d.reply.starts_with("Commands live in"));
+        assert!(engine.replies.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
