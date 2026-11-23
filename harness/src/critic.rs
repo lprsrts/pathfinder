@@ -250,6 +250,64 @@ fn promises_action(reply: &str, field: &str) -> Option<Violation> {
     None
 }
 
+const QUESTION_STARTERS: &[&str] = &[
+    "what", "how", "which", "why", "when", "where", "who", "do", "does", "did", "are", "is",
+    "have", "has", "can", "could", "should", "would", "will",
+];
+
+const QUESTION_JOINERS: &[&str] = &[", and ", "; and ", ", or ", "; ", " and also "];
+
+/// Counts questions, including a second one chained onto the first
+/// ("What should it show, and how familiar are you with X?").
+/// Inline code spans are ignored so `a?b` in code does not count.
+fn count_questions(text: &str) -> usize {
+    let mut plain = String::with_capacity(text.len());
+    let mut in_code = false;
+    for c in text.chars() {
+        if c == '`' {
+            in_code = !in_code;
+            plain.push(' ');
+        } else if !in_code {
+            plain.push(c);
+        }
+    }
+    let lower = plain.to_lowercase();
+
+    let mut count = 0;
+    let mut start = 0;
+    for (idx, c) in lower.char_indices() {
+        if matches!(c, '.' | '!' | '\n') {
+            start = idx + c.len_utf8();
+        } else if c == '?' {
+            let sentence = &lower[start..idx];
+            count += 1;
+            for joiner in QUESTION_JOINERS {
+                for (pos, _) in sentence.match_indices(joiner) {
+                    let next = sentence[pos + joiner.len()..]
+                        .split(|ch: char| !ch.is_alphanumeric())
+                        .next()
+                        .unwrap_or("");
+                    if QUESTION_STARTERS.contains(&next) {
+                        count += 1;
+                    }
+                }
+            }
+            start = idx + 1;
+        }
+    }
+    count
+}
+
+fn check_single_question(reply: &str) -> Option<Violation> {
+    let n = count_questions(reply);
+    (n > 1).then(|| {
+        Violation::new(
+            "multiple_questions",
+            format!("reply asks {n} questions; ask only the single most important one this turn."),
+        )
+    })
+}
+
 pub fn check_onboarding(
     decision: &OnboardingDecision,
     session: &Session,
@@ -260,6 +318,7 @@ pub fn check_onboarding(
     out.extend(check_length(&decision.reply, "reply", 70, 3));
     out.extend(asks_known_stack(&decision.reply, known_stack));
     out.extend(promises_action(&decision.reply, "reply"));
+    out.extend(check_single_question(&decision.reply));
 
     for c in &decision.observed_concepts {
         if c.status == ConceptStatus::Proven {
@@ -501,7 +560,7 @@ mod tests {
     fn blocks_asking_for_stack_the_workspace_already_shows() {
         let session = Session::new("s1".into(), PathBuf::from("."));
         let d = OnboardingDecision {
-            reply: "What should `/status` report, and which language do you want to use?".into(),
+            reply: "Which language do you want to use for `/status`?".into(),
             ready_to_plan: false,
             goal_summary: None,
             starting_point: None,
@@ -537,6 +596,36 @@ mod tests {
         for reply in fine {
             assert!(
                 promises_action(reply, "reply").is_none(),
+                "false positive: {reply}"
+            );
+        }
+    }
+
+    #[test]
+    fn counts_chained_and_separate_questions() {
+        let multi = [
+            "What should `/status` show, and how familiar are you with slash commands?",
+            "What should `/status` show that `/map` does not, and how familiar are you with adding a command in Rust?",
+            "What should it show? Do you know where commands are routed?",
+            "Which file holds it; do you want tests?",
+        ];
+        for reply in multi {
+            assert!(
+                check_single_question(reply).is_some(),
+                "missed multiple questions: {reply}"
+            );
+        }
+
+        let single = [
+            "What should `/status` show that `/map` does not?",
+            "Should it read from the store, or from memory?",
+            "Commands live in `acp.rs` and `runtime.rs`. What should `/status` show?",
+            "Is `a?b` valid here?",
+            "Building the path now.",
+        ];
+        for reply in single {
+            assert!(
+                check_single_question(reply).is_none(),
                 "false positive: {reply}"
             );
         }
