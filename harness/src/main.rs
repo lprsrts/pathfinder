@@ -14,7 +14,7 @@ use anyhow::Result;
 use tracing_subscriber::EnvFilter;
 
 use crate::config::Config;
-use crate::engine::PiEngine;
+use crate::engine::CliEngine;
 use crate::runtime::Runtime;
 use crate::store::Store;
 
@@ -33,7 +33,7 @@ async fn main() -> Result<()> {
         Some("acp") => {
             let cfg = Config::load();
             let store = Arc::new(Store::open(&cfg.db_path)?);
-            let engine = Arc::new(PiEngine::new(cfg));
+            let engine = Arc::new(CliEngine::new(cfg));
             let runtime = Arc::new(Runtime::new(store, engine));
             acp::run_stdio(runtime).await
         }

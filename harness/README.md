@@ -28,21 +28,27 @@ Add to `~/.config/zed/settings.json`:
 }
 ```
 
-## Configure System 1 and System 2 models
+## Models and CLIs
 
-Optional `~/.config/harness/config.json` (defaults to your `pi` default model with `low` vs `high` thinking):
+Pathfinder runs models through `pi`, Claude Code (`claude`) or Codex (`codex`), so each can use the logins and subscriptions of its own CLI. It uses a fast model (System 1: onboarding, log replies) and a stronger one (System 2: map, candidates, judgment, agent work).
+
+List the models in `~/.config/harness/config.json`. They appear, grouped by CLI, in the two model pickers of Zed's agent panel; `system1`/`system2` are the defaults for new sessions. The file is re-read on every turn, so edits apply without restarting Zed.
 
 ```json
 {
-  "pi_bin": "pi",
-  "system1_model": "anthropic/claude-haiku-4-5",
-  "system1_thinking": "low",
-  "system2_model": "anthropic/claude-sonnet-4-6",
-  "system2_thinking": "high"
+  "models": [
+    { "id": "claude-haiku", "label": "Haiku", "backend": "claude", "model": "haiku", "effort": "low" },
+    { "id": "codex-sol", "label": "GPT-6.1 Sol", "backend": "codex", "model": "gpt-6.1-sol", "effort": "high" },
+    { "id": "pi-luna", "label": "GPT-6 Luna", "backend": "pi", "model": "openai/gpt-6-luna", "effort": "low" }
+  ],
+  "system1": "claude-haiku",
+  "system2": "codex-sol"
 }
 ```
 
-Or via env vars: `HARNESS_S1_MODEL`, `HARNESS_S2_MODEL`, `HARNESS_S1_THINKING`, `HARNESS_S2_THINKING`, `HARNESS_PI_BIN`, `HARNESS_DB_PATH`.
+- `backend`: `pi`, `claude` or `codex`. `model` is passed to that CLI (empty uses its default); `effort` maps to pi's `--thinking`, Claude Code's `--effort` and Codex's `model_reasoning_effort`.
+- Agent work (`/handoff`, `/delegate`) may edit files and run shell commands in the workspace: Codex in its `workspace-write` sandbox, Claude Code with its sandbox enabled.
+- Binaries: `pi_bin`, `claude_bin`, `codex_bin` (or `HARNESS_PI_BIN`, `HARNESS_CLAUDE_BIN`, `HARNESS_CODEX_BIN`). `HARNESS_DB_PATH` moves the session database.
 
 ## How a session goes
 

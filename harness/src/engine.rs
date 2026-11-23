@@ -7,10 +7,10 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
-use crate::config::Config;
+use crate::config::{Backend, Config, ModelEntry};
 use crate::store::Store;
 use crate::validate::{Violation, format_violations};
 
@@ -50,6 +50,13 @@ pub fn noop_sink() -> StreamSink {
     Arc::new(|_| {})
 }
 
+/// The models a request may use. Escalation moves from System 1 to System 2.
+#[derive(Debug, Clone)]
+pub struct TierModels {
+    pub system1: ModelEntry,
+    pub system2: ModelEntry,
+}
+
 #[derive(Debug, Clone)]
 pub struct EngineRequest {
     pub tier: EngineTier,
@@ -59,6 +66,35 @@ pub struct EngineRequest {
     pub prompt: String,
     pub files: Vec<PathBuf>,
     pub stream_text: bool,
+    pub models: TierModels,
+}
+
+impl EngineRequest {
+    pub fn model(&self) -> &ModelEntry {
+        match self.tier {
+            EngineTier::System1 => &self.models.system1,
+            EngineTier::System2 => &self.models.system2,
+        }
+    }
+
+    /// Prompt plus attached file paths, for CLIs without `@file` arguments.
+    fn prompt_with_files(&self) -> String {
+        let files: Vec<String> = self
+            .files
+            .iter()
+            .filter(|f| f.exists())
+            .map(|f| format!("- {}", f.display()))
+            .collect();
+        if files.is_empty() {
+            self.prompt.clone()
+        } else {
+            format!(
+                "{}\n\nAttached files (read them as needed):\n{}",
+                self.prompt,
+                files.join("\n")
+            )
+        }
+    }
 }
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -71,146 +107,387 @@ pub trait Engine: Send + Sync {
     ) -> BoxFuture<'a, Result<String>>;
 }
 
-pub struct PiEngine {
+/// Runs models through pi, Claude Code or Codex, per the request's model.
+pub struct CliEngine {
     config: Config,
 }
 
-impl PiEngine {
+impl CliEngine {
     pub fn new(config: Config) -> Self {
         Self { config }
     }
 }
 
-impl Engine for PiEngine {
+impl Engine for CliEngine {
     fn run_text<'a>(
         &'a self,
         req: &'a EngineRequest,
         sink: StreamSink,
     ) -> BoxFuture<'a, Result<String>> {
         Box::pin(async move {
-            let mut cmd = Command::new(&self.config.pi_bin);
-            cmd.current_dir(&req.cwd)
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .args([
-                    "--mode",
-                    "json",
-                    "--print",
-                    "--no-extensions",
-                    "--no-mcp",
-                    "--no-skills",
-                    "--no-context-files",
-                    "--no-session",
-                ]);
-
-            let (model, thinking) = match req.tier {
-                EngineTier::System1 => (
-                    self.config.system1_model.as_deref(),
-                    self.config.system1_thinking.as_str(),
-                ),
-                EngineTier::System2 => (
-                    self.config.system2_model.as_deref(),
-                    self.config.system2_thinking.as_str(),
-                ),
-            };
-
-            if let Some(m) = model {
-                cmd.args(["--model", m]);
-            }
-            if !thinking.is_empty() {
-                cmd.args(["--thinking", thinking]);
-            }
-
-            match req.tools {
-                ToolAccess::None => {
-                    cmd.arg("--no-tools");
+            let model = req.model();
+            sink(StreamEvent::Thought(format!(
+                "{} via {}{}...\n",
+                req.tier.label(),
+                model.backend.label(),
+                if model.model.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", model.model)
                 }
-                ToolAccess::ReadOnly => {
-                    cmd.args(["--tools", "read"]);
-                }
-                ToolAccess::Full => {}
+            )));
+            match model.backend {
+                Backend::Pi => self.run_pi(req, sink).await,
+                Backend::Claude => self.run_claude(req, sink).await,
+                Backend::Codex => self.run_codex(req, sink).await,
             }
-
-            cmd.args(["--system-prompt", &req.system_prompt]);
-            cmd.arg("--");
-
-            for file in &req.files {
-                if file.exists() {
-                    cmd.arg(format!("@{}", file.display()));
-                }
-            }
-            cmd.arg(&req.prompt);
-
-            let mut child = cmd
-                .spawn()
-                .with_context(|| format!("spawn `{}`", self.config.pi_bin))?;
-
-            let stdout = child
-                .stdout
-                .take()
-                .ok_or_else(|| anyhow!("pi stdout pipe unavailable"))?;
-            let mut stderr = child
-                .stderr
-                .take()
-                .ok_or_else(|| anyhow!("pi stderr pipe unavailable"))?;
-
-            let stderr_task = tokio::spawn(async move {
-                let mut buf = String::new();
-                let _ = stderr.read_to_string(&mut buf).await;
-                buf
-            });
-
-            let mut reader = BufReader::new(stdout);
-            let mut line = String::new();
-            let mut final_text: Option<String> = None;
-            let mut delta_buf = String::new();
-            let mut last_error: Option<String> = None;
-
-            loop {
-                line.clear();
-                let n = reader.read_line(&mut line).await?;
-                if n == 0 {
-                    break;
-                }
-                let trimmed = line.trim_end_matches(['\r', '\n']).trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                let Ok(val) = serde_json::from_str::<Value>(trimmed) else {
-                    continue;
-                };
-                process_pi_event(
-                    &val,
-                    req.stream_text,
-                    &sink,
-                    &mut final_text,
-                    &mut delta_buf,
-                    &mut last_error,
-                );
-            }
-
-            let status = child.wait().await?;
-            let stderr_text = stderr_task.await.unwrap_or_default();
-
-            if !status.success() {
-                bail!("pi exited with {status}: {}", stderr_text.trim());
-            }
-
-            if let Some(text) = final_text {
-                return Ok(text);
-            }
-            if !delta_buf.trim().is_empty() {
-                return Ok(delta_buf);
-            }
-            if let Some(err) = last_error {
-                bail!("model error: {err}");
-            }
-            Err(anyhow!(
-                "no assistant text found in pi json stream (stderr: {})",
-                stderr_text.trim()
-            ))
         })
+    }
+}
+
+/// Spawns `cmd`, optionally writes `stdin_text`, and hands each JSON line of
+/// stdout to `on_event`. Returns the exit status and stderr.
+async fn run_jsonl(
+    mut cmd: Command,
+    bin: &str,
+    stdin_text: Option<String>,
+    mut on_event: impl FnMut(&Value),
+) -> Result<(std::process::ExitStatus, String)> {
+    cmd.stdin(if stdin_text.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    })
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+    let mut child = cmd.spawn().with_context(|| format!("spawn `{bin}`"))?;
+
+    if let Some(text) = stdin_text {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("{bin} stdin pipe unavailable"))?;
+        stdin.write_all(text.as_bytes()).await?;
+        drop(stdin);
+    }
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("{bin} stdout pipe unavailable"))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("{bin} stderr pipe unavailable"))?;
+    let stderr_task = tokio::spawn(async move {
+        let mut buf = String::new();
+        let _ = stderr.read_to_string(&mut buf).await;
+        buf
+    });
+
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line).await? == 0 {
+            break;
+        }
+        if let Ok(val) = serde_json::from_str::<Value>(line.trim()) {
+            on_event(&val);
+        }
+    }
+    let status = child.wait().await?;
+    let stderr_text = stderr_task.await.unwrap_or_default();
+    Ok((status, stderr_text))
+}
+
+impl CliEngine {
+    async fn run_pi(&self, req: &EngineRequest, sink: StreamSink) -> Result<String> {
+        let model = req.model();
+        let mut cmd = Command::new(&self.config.pi_bin);
+        cmd.current_dir(&req.cwd).args([
+            "--mode",
+            "json",
+            "--print",
+            "--no-extensions",
+            "--no-mcp",
+            "--no-skills",
+            "--no-context-files",
+            "--no-session",
+        ]);
+        if !model.model.is_empty() {
+            cmd.args(["--model", &model.model]);
+        }
+        if let Some(effort) = model.effort.as_deref().filter(|e| !e.is_empty()) {
+            cmd.args(["--thinking", effort]);
+        }
+        match req.tools {
+            ToolAccess::None => {
+                cmd.arg("--no-tools");
+            }
+            ToolAccess::ReadOnly => {
+                cmd.args(["--tools", "read"]);
+            }
+            ToolAccess::Full => {}
+        }
+        cmd.args(["--system-prompt", &req.system_prompt]);
+        cmd.arg("--");
+        for file in &req.files {
+            if file.exists() {
+                cmd.arg(format!("@{}", file.display()));
+            }
+        }
+        cmd.arg(&req.prompt);
+
+        let mut final_text: Option<String> = None;
+        let mut delta_buf = String::new();
+        let mut last_error: Option<String> = None;
+        let (status, stderr) = run_jsonl(cmd, &self.config.pi_bin, None, |val| {
+            process_pi_event(
+                val,
+                req.stream_text,
+                &sink,
+                &mut final_text,
+                &mut delta_buf,
+                &mut last_error,
+            )
+        })
+        .await?;
+
+        if !status.success() {
+            bail!("pi exited with {status}: {}", stderr.trim());
+        }
+        if let Some(text) = final_text {
+            return Ok(text);
+        }
+        if !delta_buf.trim().is_empty() {
+            return Ok(delta_buf);
+        }
+        if let Some(err) = last_error {
+            bail!("model error: {err}");
+        }
+        Err(anyhow!(
+            "no assistant text found in pi json stream (stderr: {})",
+            stderr.trim()
+        ))
+    }
+
+    async fn run_claude(&self, req: &EngineRequest, sink: StreamSink) -> Result<String> {
+        let model = req.model();
+        let mut cmd = Command::new(&self.config.claude_bin);
+        cmd.current_dir(&req.cwd).args([
+            "-p",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--no-session-persistence",
+            "--strict-mcp-config",
+        ]);
+        if !model.model.is_empty() {
+            cmd.args(["--model", &model.model]);
+        }
+        if let Some(effort) = model.effort.as_deref().filter(|e| !e.is_empty()) {
+            cmd.args(["--effort", effort]);
+        }
+        cmd.args(["--system-prompt", &req.system_prompt]);
+        match req.tools {
+            ToolAccess::None => {
+                cmd.args(["--tools", ""]);
+            }
+            ToolAccess::ReadOnly => {
+                cmd.args(["--tools", "Read,Glob,Grep"]);
+            }
+            ToolAccess::Full => {
+                cmd.args([
+                    "--tools",
+                    "Read,Glob,Grep,Edit,Write,Bash",
+                    "--permission-mode",
+                    "acceptEdits",
+                    "--allowedTools",
+                    "Bash",
+                    "--settings",
+                    r#"{"sandbox":{"enabled":true,"autoAllowBashIfSandboxed":true}}"#,
+                ]);
+            }
+        }
+
+        let mut result: Option<(bool, String)> = None;
+        let (status, stderr) = run_jsonl(
+            cmd,
+            &self.config.claude_bin,
+            Some(req.prompt_with_files()),
+            |val| process_claude_event(val, req.stream_text, &sink, &mut result),
+        )
+        .await?;
+
+        match result {
+            Some((false, text)) => Ok(text),
+            Some((true, err)) => bail!("model error: {err}"),
+            None => bail!(
+                "claude exited with {status} without a result: {}",
+                stderr.trim()
+            ),
+        }
+    }
+
+    async fn run_codex(&self, req: &EngineRequest, sink: StreamSink) -> Result<String> {
+        let model = req.model();
+        let mut cmd = Command::new(&self.config.codex_bin);
+        cmd.arg("exec")
+            .args([
+                "--json",
+                "--ignore-user-config",
+                "--skip-git-repo-check",
+                "--ephemeral",
+            ])
+            .arg("-C")
+            .arg(&req.cwd)
+            .args([
+                "-s",
+                match req.tools {
+                    ToolAccess::Full => "workspace-write",
+                    ToolAccess::ReadOnly | ToolAccess::None => "read-only",
+                },
+            ]);
+        if !model.model.is_empty() {
+            cmd.args(["-m", &model.model]);
+        }
+        if let Some(effort) = model.effort.as_deref().filter(|e| !e.is_empty()) {
+            cmd.args(["-c", &format!("model_reasoning_effort=\"{effort}\"")]);
+        }
+        // Codex has no system-prompt flag; the instructions lead the prompt.
+        let mut prompt = format!("<instructions>\n{}\n</instructions>\n\n", req.system_prompt);
+        if req.tools == ToolAccess::None {
+            prompt.push_str("Do not run any commands or read any files for this answer.\n\n");
+        }
+        prompt.push_str(&req.prompt_with_files());
+
+        let mut last_message: Option<String> = None;
+        let mut last_error: Option<String> = None;
+        let (status, stderr) = run_jsonl(cmd, &self.config.codex_bin, Some(prompt), |val| {
+            process_codex_event(
+                val,
+                req.stream_text,
+                &sink,
+                &mut last_message,
+                &mut last_error,
+            )
+        })
+        .await?;
+
+        if let Some(text) = last_message {
+            return Ok(text);
+        }
+        if let Some(err) = last_error {
+            bail!("model error: {err}");
+        }
+        bail!(
+            "codex exited with {status} without a message: {}",
+            stderr.trim()
+        )
+    }
+}
+
+fn process_claude_event(
+    val: &Value,
+    stream_text: bool,
+    sink: &StreamSink,
+    result: &mut Option<(bool, String)>,
+) {
+    match val.get("type").and_then(Value::as_str) {
+        Some("assistant") => {
+            let content = val
+                .pointer("/message/content")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            for item in content {
+                match item.get("type").and_then(Value::as_str) {
+                    Some("text") if stream_text => {
+                        if let Some(t) = item.get("text").and_then(Value::as_str) {
+                            sink(StreamEvent::TextDelta(format!("{t}\n\n")));
+                        }
+                    }
+                    Some("thinking") => {
+                        if let Some(t) = item.get("thinking").and_then(Value::as_str) {
+                            if !t.is_empty() {
+                                sink(StreamEvent::Thought(t.to_string()));
+                            }
+                        }
+                    }
+                    Some("tool_use") => {
+                        if let Some(name) = item.get("name").and_then(Value::as_str) {
+                            sink(StreamEvent::Thought(format!("Using `{name}`...\n")));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Some("result") => {
+            let is_error = val
+                .get("is_error")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let text = val
+                .get("result")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            *result = Some((is_error, text));
+        }
+        _ => {}
+    }
+}
+
+fn process_codex_event(
+    val: &Value,
+    stream_text: bool,
+    sink: &StreamSink,
+    last_message: &mut Option<String>,
+    last_error: &mut Option<String>,
+) {
+    let item = val.get("item");
+    let item_type = item
+        .and_then(|i| i.get("type"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let text = || {
+        item.and_then(|i| i.get("text"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    match (val.get("type").and_then(Value::as_str), item_type) {
+        (Some("item.started"), "command_execution") => {
+            let command = item
+                .and_then(|i| i.get("command"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            sink(StreamEvent::Thought(format!("Running `{command}`...\n")));
+        }
+        (Some("item.completed"), "reasoning") => {
+            let t = text();
+            if !t.is_empty() {
+                sink(StreamEvent::Thought(t));
+            }
+        }
+        (Some("item.completed"), "agent_message") => {
+            let t = text();
+            if stream_text {
+                sink(StreamEvent::TextDelta(format!("{t}\n\n")));
+            }
+            *last_message = Some(t);
+        }
+        (Some("error"), _) | (Some("turn.failed"), _) => {
+            let msg = val
+                .get("message")
+                .or_else(|| val.pointer("/error/message"))
+                .and_then(Value::as_str)
+                .unwrap_or("unknown error");
+            *last_error = Some(msg.to_string());
+        }
+        _ => {}
     }
 }
 
@@ -513,6 +790,47 @@ mod tests {
 {"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"{\"reply\":\"ok\"}"}]}}
 {"type":"agent_settled","aborted":false}"#;
         assert_eq!(parse_pi_jsonl(stream).unwrap(), r#"{"reply":"ok"}"#);
+    }
+
+    #[test]
+    fn claude_result_event_is_the_answer() {
+        let sink = noop_sink();
+        let mut result = None;
+        for line in [
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{}}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"{\"a\":1}"}]}}"#,
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"{\"a\":1}"}"#,
+        ] {
+            process_claude_event(
+                &serde_json::from_str(line).unwrap(),
+                false,
+                &sink,
+                &mut result,
+            );
+        }
+        assert_eq!(result, Some((false, r#"{"a":1}"#.to_string())));
+    }
+
+    #[test]
+    fn codex_last_agent_message_is_the_answer() {
+        let sink = noop_sink();
+        let (mut last, mut err) = (None, None);
+        for line in [
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"Checking."}}"#,
+            r#"{"type":"item.started","item":{"type":"command_execution","command":"rg name"}}"#,
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"{\"a\":1}"}}"#,
+            r#"{"type":"turn.completed"}"#,
+        ] {
+            process_codex_event(
+                &serde_json::from_str(line).unwrap(),
+                false,
+                &sink,
+                &mut last,
+                &mut err,
+            );
+        }
+        assert_eq!(last.as_deref(), Some(r#"{"a":1}"#));
+        assert!(err.is_none());
     }
 
     #[test]

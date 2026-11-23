@@ -7,8 +7,11 @@ use agent_client_protocol::v1::schema::{
     CancelNotification, ContentBlock, ContentChunk, EmbeddedResourceResource, Implementation,
     InitializeRequest, InitializeResponse, LoadSessionRequest, LoadSessionResponse,
     NewSessionRequest, NewSessionResponse, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus,
-    PromptCapabilities, PromptRequest, PromptResponse, SessionId, SessionNotification,
-    SessionUpdate, StopReason, UnstructuredCommandInput,
+    PromptCapabilities, PromptRequest, PromptResponse, SessionConfigOption,
+    SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigSelectGroup,
+    SessionConfigSelectOption, SessionId, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason,
+    UnstructuredCommandInput,
 };
 use agent_client_protocol::{Agent, Client, Error as AcpError, Stdio};
 use anyhow::Result;
@@ -17,12 +20,13 @@ use uuid::Uuid;
 
 use crate::domain::{PartStatus, Session};
 use crate::engine::{StreamEvent, StreamSink};
-use crate::runtime::{Runtime, TurnInput};
+use crate::runtime::{ModelChoices, Runtime, TurnInput};
 
 pub async fn run_stdio(runtime: Arc<Runtime>) -> Result<()> {
     let rt_new = runtime.clone();
     let rt_load = runtime.clone();
     let rt_prompt = runtime.clone();
+    let rt_config = runtime.clone();
 
     Agent
         .v1()
@@ -43,9 +47,12 @@ pub async fn run_stdio(runtime: Arc<Runtime>) -> Result<()> {
             async move |req: NewSessionRequest, responder, cx| {
                 let id = Uuid::new_v4().to_string();
                 match rt_new.create_session(id.clone(), req.cwd) {
-                    Ok(_) => {
+                    Ok(session) => {
                         let sid = SessionId::new(id);
-                        responder.respond(NewSessionResponse::new(sid.clone()))?;
+                        let options = model_options(&rt_new.model_choices(&session));
+                        responder.respond(
+                            NewSessionResponse::new(sid.clone()).config_options(options),
+                        )?;
                         let _ = send_commands(&cx, sid);
                         Ok(())
                     }
@@ -78,12 +85,41 @@ pub async fn run_stdio(runtime: Arc<Runtime>) -> Result<()> {
                             .respond_with_error(AcpError::internal_error().data(err.to_string()));
                     }
                 };
-                responder.respond(LoadSessionResponse::new())?;
+                let options = model_options(&rt_load.model_choices(&loaded));
+                responder.respond(LoadSessionResponse::new().config_options(options))?;
                 let _ = send_commands(&cx, req.session_id.clone());
                 if !loaded.map.parts.is_empty() {
                     let _ = send_plan(&cx, req.session_id, &loaded);
                 }
                 Ok(())
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |req: SetSessionConfigOptionRequest, responder, _cx| {
+                let id = req.session_id.0.to_string();
+                let system2 = match req.config_id.0.as_ref() {
+                    "system1" => false,
+                    "system2" => true,
+                    other => {
+                        return responder.respond_with_error(
+                            AcpError::invalid_params().data(format!("unknown option `{other}`")),
+                        );
+                    }
+                };
+                let SessionConfigOptionValue::ValueId { value } = &req.value else {
+                    return responder.respond_with_error(
+                        AcpError::invalid_params().data("expected a model id"),
+                    );
+                };
+                match rt_config.set_model(&id, system2, &value.0) {
+                    Ok(session) => {
+                        let options = model_options(&rt_config.model_choices(&session));
+                        responder.respond(SetSessionConfigOptionResponse::new(options))
+                    }
+                    Err(err) => responder
+                        .respond_with_error(AcpError::invalid_params().data(err.to_string())),
+                }
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -136,6 +172,35 @@ pub async fn run_stdio(runtime: Arc<Runtime>) -> Result<()> {
 
     info!("acp stdio connection closed");
     Ok(())
+}
+
+/// The two model pickers, with entries grouped by CLI.
+fn model_options(choices: &ModelChoices) -> Vec<SessionConfigOption> {
+    let mut groups: Vec<(String, Vec<SessionConfigSelectOption>)> = Vec::new();
+    for entry in &choices.catalog {
+        let group = entry.backend.label().to_string();
+        let option = SessionConfigSelectOption::new(entry.id.clone(), entry.label.clone());
+        match groups.iter_mut().find(|(g, _)| *g == group) {
+            Some((_, options)) => options.push(option),
+            None => groups.push((group, vec![option])),
+        }
+    }
+    let grouped = || -> Vec<SessionConfigSelectGroup> {
+        groups
+            .iter()
+            .map(|(g, options)| {
+                SessionConfigSelectGroup::new(g.clone(), g.clone(), options.clone())
+            })
+            .collect()
+    };
+    vec![
+        SessionConfigOption::select("system2", "Model", choices.system2.clone(), grouped())
+            .description("System 2: map, candidates, judgment and agent work".to_string())
+            .category(SessionConfigOptionCategory::Model),
+        SessionConfigOption::select("system1", "Fast model", choices.system1.clone(), grouped())
+            .description("System 1: onboarding and log replies".to_string())
+            .category(SessionConfigOptionCategory::ModelConfig),
+    ]
 }
 
 fn make_stream_sink(cx: ConnectionTo<Client>, session_id: SessionId) -> StreamSink {

@@ -299,6 +299,11 @@ pub struct Session {
     /// A map change the model proposed, waiting for your OK (§3).
     #[serde(default)]
     pub pending_change: Option<MapChange>,
+    /// Model picks (config entry ids); None follows the config default.
+    #[serde(default)]
+    pub system1: Option<String>,
+    #[serde(default)]
+    pub system2: Option<String>,
     pub history: Vec<TurnRecord>,
 }
 
@@ -313,6 +318,8 @@ impl Session {
             active: None,
             pending_candidate: None,
             pending_change: None,
+            system1: None,
+            system2: None,
             history: Vec::new(),
         }
     }

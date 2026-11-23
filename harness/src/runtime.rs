@@ -5,11 +5,14 @@ use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
 
+use crate::config::{Config, ModelEntry};
 use crate::domain::{
     CandidateProposal, JudgmentVerdict, LogReply, MapChange, MapProposal, OnboardingDecision, Part,
     PartStatus, PendingCandidate, Session, SessionMode,
 };
-use crate::engine::{Engine, EngineRequest, EngineTier, StreamSink, ToolAccess, run_gated};
+use crate::engine::{
+    Engine, EngineRequest, EngineTier, StreamSink, TierModels, ToolAccess, run_gated,
+};
 use crate::store::Store;
 use crate::validate::{
     check_candidate, check_change, check_log_reply, check_map, check_onboarding, check_verdict,
@@ -53,6 +56,15 @@ pub struct Runtime {
     store: Arc<Store>,
     engine: Arc<dyn Engine>,
     flaw_coin: fn() -> bool,
+    /// Read on every use, so config edits apply without a restart.
+    config: fn() -> Config,
+}
+
+/// The model pickers' state for one session.
+pub struct ModelChoices {
+    pub catalog: Vec<ModelEntry>,
+    pub system1: String,
+    pub system2: String,
 }
 
 impl Runtime {
@@ -61,7 +73,44 @@ impl Runtime {
             store,
             engine,
             flaw_coin: random_flaw,
+            config: Config::load,
         }
+    }
+
+    fn models(&self, session: &Session) -> TierModels {
+        let config = (self.config)();
+        TierModels {
+            system1: config.pick(session.system1.as_deref(), false),
+            system2: config.pick(session.system2.as_deref(), true),
+        }
+    }
+
+    pub fn model_choices(&self, session: &Session) -> ModelChoices {
+        let models = self.models(session);
+        ModelChoices {
+            catalog: (self.config)().catalog(),
+            system1: models.system1.id,
+            system2: models.system2.id,
+        }
+    }
+
+    /// Sets a session's System 1 or System 2 model from the picker.
+    pub fn set_model(&self, session_id: &str, system2: bool, entry_id: &str) -> Result<Session> {
+        let mut session = self
+            .store
+            .load_session(session_id)?
+            .ok_or_else(|| anyhow!("unknown session `{session_id}`"))?;
+        if (self.config)().entry(entry_id).is_none() {
+            return Err(anyhow!("unknown model `{entry_id}`"));
+        }
+        let slot = if system2 {
+            &mut session.system2
+        } else {
+            &mut session.system1
+        };
+        *slot = Some(entry_id.to_string());
+        self.store.save_session(&session)?;
+        Ok(session)
     }
 
     pub fn create_session(&self, id: String, cwd: PathBuf) -> Result<Session> {
@@ -169,6 +218,7 @@ impl Runtime {
             ),
             files: files.to_vec(),
             stream_text: false,
+            models: self.models(session),
         };
         let decision: OnboardingDecision = run_gated(
             self.engine.as_ref(),
@@ -217,6 +267,7 @@ impl Runtime {
             ),
             files: files.to_vec(),
             stream_text: false,
+            models: self.models(session),
         };
         let proposal: MapProposal = run_gated(
             self.engine.as_ref(),
@@ -277,6 +328,7 @@ impl Runtime {
             ),
             files: files.to_vec(),
             stream_text: false,
+            models: self.models(session),
         };
         let current = session.map.clone();
         let change: MapChange = run_gated(
@@ -383,6 +435,7 @@ impl Runtime {
             ),
             files: files.to_vec(),
             stream_text: false,
+            models: self.models(session),
         };
         let current = session.map.clone();
         let decision: LogReply = run_gated(
@@ -457,6 +510,7 @@ impl Runtime {
             ),
             files: files.to_vec(),
             stream_text: false,
+            models: self.models(session),
         };
         let proposal: CandidateProposal = run_gated(
             self.engine.as_ref(),
@@ -516,6 +570,7 @@ impl Runtime {
             ),
             files: files.to_vec(),
             stream_text: false,
+            models: self.models(session),
         };
         let verdict: JudgmentVerdict = run_gated(
             self.engine.as_ref(),
@@ -725,6 +780,7 @@ impl Runtime {
             prompt,
             files: files.to_vec(),
             stream_text: true,
+            models: self.models(session),
         };
         self.engine.run_text(&req, sink).await
     }
@@ -951,6 +1007,31 @@ mod tests {
     }
 
     use EngineTier::{System1 as S1, System2 as S2};
+
+    fn test_models() -> TierModels {
+        let config = Config::default();
+        TierModels {
+            system1: config.pick(None, false),
+            system2: config.pick(None, true),
+        }
+    }
+
+    #[test]
+    fn set_model_stores_pick_and_rejects_unknown_ids() {
+        let mut rt = Runtime::new(
+            Arc::new(Store::open_in_memory().unwrap()),
+            Arc::new(FakeEngine::new(vec![])),
+        );
+        rt.config = Config::default;
+        rt.create_session("s".into(), PathBuf::from(".")).unwrap();
+        assert!(rt.set_model("s", true, "nope").is_err());
+        let s = rt.set_model("s", false, "pi-system2").unwrap();
+        assert_eq!(s.system1.as_deref(), Some("pi-system2"));
+        let choices = rt.model_choices(&s);
+        assert_eq!(choices.system1, "pi-system2");
+        assert_eq!(choices.system2, "pi-system2");
+        assert_eq!(choices.catalog.len(), 2);
+    }
     use ToolAccess::{Full, ReadOnly};
 
     const ONBOARD_READY: &str =
@@ -963,6 +1044,7 @@ mod tests {
         let engine = Arc::new(engine);
         let mut rt = Runtime::new(Arc::new(Store::open_in_memory().unwrap()), engine.clone());
         rt.flaw_coin = if flawed { || true } else { || false };
+        rt.config = Config::default;
         rt.create_session("s".into(), PathBuf::from(".")).unwrap();
         (rt, engine)
     }
@@ -1083,6 +1165,7 @@ mod tests {
             prompt: "onboard".into(),
             files: vec![],
             stream_text: false,
+            models: test_models(),
         };
         let d: OnboardingDecision = run_gated(
             &engine,
