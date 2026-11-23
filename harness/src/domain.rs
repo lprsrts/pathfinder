@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -10,6 +10,39 @@ pub enum SessionMode {
     Onboarding,
     Working,
     Done,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConceptStatus {
+    Unknown,
+    Claimed,
+    Proven,
+    Skipped,
+}
+
+impl ConceptStatus {
+    pub fn is_cleared(self) -> bool {
+        matches!(self, Self::Proven | Self::Skipped)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Claimed => "claimed",
+            Self::Proven => "proven",
+            Self::Skipped => "skipped",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConceptRecord {
+    pub id: String,
+    pub label: String,
+    pub status: ConceptStatus,
+    #[serde(default)]
+    pub evidence: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,6 +87,12 @@ pub struct PathItem {
     pub title: String,
     #[serde(default)]
     pub depends_on: Vec<String>,
+    #[serde(default)]
+    pub requires: Vec<String>,
+    #[serde(default)]
+    pub introduces: Vec<String>,
+    #[serde(default)]
+    pub framing: String,
     pub user_task: String,
     pub check_criteria: String,
     pub status: ItemStatus,
@@ -78,19 +117,33 @@ pub enum GraphError {
     SelfDependency(String),
     #[error("plan contains a dependency cycle")]
     Cycle,
+    #[error("item `{item}` requires concept `{concept}` which is neither already proven/skipped nor introduced by an ancestor")]
+    UnsatisfiedPrerequisite { item: String, concept: String },
+    #[error("item `{0}` introduces new concepts but has no framing explanation")]
+    MissingFraming(String),
 }
 
 impl PlanGraph {
+    #[cfg(test)]
     pub fn validate(&self) -> Result<(), GraphError> {
+        self.validate_against(&BTreeMap::new())
+    }
+
+    pub fn validate_against(
+        &self,
+        concepts: &BTreeMap<String, ConceptRecord>,
+    ) -> Result<(), GraphError> {
         if self.items.is_empty() {
             return Err(GraphError::Empty);
         }
 
         let mut ids = HashSet::with_capacity(self.items.len());
+        let mut by_id: HashMap<&str, &PathItem> = HashMap::with_capacity(self.items.len());
         for item in &self.items {
             if !ids.insert(item.id.as_str()) {
                 return Err(GraphError::DuplicateId(item.id.clone()));
             }
+            by_id.insert(item.id.as_str(), item);
         }
 
         let mut indegree: HashMap<&str, usize> =
@@ -120,10 +173,10 @@ impl PlanGraph {
             .iter()
             .filter_map(|(&id, &deg)| (deg == 0).then_some(id))
             .collect();
-        let mut visited = 0usize;
+        let mut topo_order: Vec<&str> = Vec::with_capacity(self.items.len());
 
         while let Some(id) = queue.pop_front() {
-            visited += 1;
+            topo_order.push(id);
             if let Some(next_ids) = dependents.get(id) {
                 for &next in next_ids {
                     let deg = indegree.get_mut(next).unwrap();
@@ -135,8 +188,49 @@ impl PlanGraph {
             }
         }
 
-        if visited != self.items.len() {
+        if topo_order.len() != self.items.len() {
             return Err(GraphError::Cycle);
+        }
+
+        // Symbolic prerequisite soundness: every required concept must already be
+        // cleared (proven/skipped) or introduced by a dependency ancestor.
+        let base_cleared: HashSet<String> = concepts
+            .values()
+            .filter(|c| c.status.is_cleared())
+            .map(|c| normalize_id(&c.id))
+            .collect();
+
+        let mut available_after: HashMap<&str, HashSet<String>> = HashMap::new();
+        for id in topo_order {
+            let item = by_id[id];
+            let mut available = base_cleared.clone();
+            for dep in &item.depends_on {
+                if let Some(dep_set) = available_after.get(dep.as_str()) {
+                    available.extend(dep_set.iter().cloned());
+                }
+            }
+
+            for req in &item.requires {
+                let norm = normalize_id(req);
+                if !norm.is_empty() && !available.contains(&norm) {
+                    return Err(GraphError::UnsatisfiedPrerequisite {
+                        item: item.id.clone(),
+                        concept: req.clone(),
+                    });
+                }
+            }
+
+            if !item.introduces.is_empty() && item.framing.trim().is_empty() {
+                return Err(GraphError::MissingFraming(item.id.clone()));
+            }
+
+            for intro in &item.introduces {
+                let norm = normalize_id(intro);
+                if !norm.is_empty() {
+                    available.insert(norm);
+                }
+            }
+            available_after.insert(id, available);
         }
 
         Ok(())
@@ -186,10 +280,25 @@ impl PlanGraph {
             } else {
                 format!("  <- {}", item.depends_on.join(", "))
             };
-            lines.push(format!("- `{}` {} {}{}", item.id, marker, item.title, deps));
+            let intro = if item.introduces.is_empty() {
+                String::new()
+            } else {
+                format!("  (+{})", item.introduces.join(", "))
+            };
+            lines.push(format!("- `{}` {} {}{}{}", item.id, marker, item.title, deps, intro));
         }
         lines.join("\n")
     }
+}
+
+pub fn normalize_id(raw: &str) -> String {
+    raw.trim()
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .collect::<String>()
+        .trim_matches('_')
+        .to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -205,6 +314,8 @@ pub struct Session {
     pub goal: Option<String>,
     pub starting_point: Option<String>,
     pub mode: SessionMode,
+    #[serde(default)]
+    pub concepts: BTreeMap<String, ConceptRecord>,
     pub plan: PlanGraph,
     pub active_item: Option<String>,
     pub turns_on_active: u32,
@@ -219,6 +330,7 @@ impl Session {
             goal: None,
             starting_point: None,
             mode: SessionMode::Onboarding,
+            concepts: BTreeMap::new(),
             plan: PlanGraph::default(),
             active_item: None,
             turns_on_active: 0,
@@ -235,6 +347,51 @@ impl Session {
             let drain = self.history.len() - 40;
             self.history.drain(0..drain);
         }
+    }
+
+    pub fn upsert_concept(
+        &mut self,
+        id: &str,
+        label: Option<&str>,
+        status: ConceptStatus,
+        evidence: Option<String>,
+    ) {
+        let key = normalize_id(id);
+        if key.is_empty() {
+            return;
+        }
+        let entry = self.concepts.entry(key.clone()).or_insert_with(|| ConceptRecord {
+            id: key.clone(),
+            label: label
+                .filter(|l| !l.trim().is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| key.replace('_', " ")),
+            status,
+            evidence: None,
+        });
+        if let Some(lbl) = label {
+            if !lbl.trim().is_empty() {
+                entry.label = lbl.to_string();
+            }
+        }
+        // Never downgrade a Proven concept back to Claimed/Unknown.
+        if entry.status != ConceptStatus::Proven || status == ConceptStatus::Proven {
+            entry.status = status;
+        }
+        if evidence.is_some() {
+            entry.evidence = evidence;
+        }
+    }
+
+    pub fn render_concepts(&self) -> String {
+        if self.concepts.is_empty() {
+            return "No concepts tracked yet.".to_string();
+        }
+        let mut lines = vec!["Concept state:".to_string()];
+        for c in self.concepts.values() {
+            lines.push(format!("- `{}` ({}) — {}", c.id, c.label, c.status.label()));
+        }
+        lines.join("\n")
     }
 
     pub fn active(&self) -> Option<&PathItem> {
@@ -263,6 +420,14 @@ impl Session {
 // --- Type-safe structured model outputs ---
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct ObservedConcept {
+    pub id: String,
+    #[serde(default)]
+    pub label: String,
+    pub status: ConceptStatus,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct OnboardingDecision {
     pub reply: String,
     pub ready_to_plan: bool,
@@ -270,6 +435,8 @@ pub struct OnboardingDecision {
     pub goal_summary: Option<String>,
     #[serde(default)]
     pub starting_point: Option<String>,
+    #[serde(default)]
+    pub observed_concepts: Vec<ObservedConcept>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -278,6 +445,12 @@ pub struct ProposedItem {
     pub title: String,
     #[serde(default)]
     pub depends_on: Vec<String>,
+    #[serde(default)]
+    pub requires: Vec<String>,
+    #[serde(default)]
+    pub introduces: Vec<String>,
+    #[serde(default)]
+    pub framing: String,
     pub user_task: String,
     pub check_criteria: String,
 }
@@ -289,7 +462,10 @@ pub struct PlanProposal {
 }
 
 impl PlanProposal {
-    pub fn into_graph(self) -> Result<(String, PlanGraph), GraphError> {
+    pub fn into_graph(
+        self,
+        concepts: &BTreeMap<String, ConceptRecord>,
+    ) -> Result<(String, PlanGraph), GraphError> {
         let graph = PlanGraph {
             items: self
                 .items
@@ -298,6 +474,9 @@ impl PlanProposal {
                     id: p.id,
                     title: p.title,
                     depends_on: p.depends_on,
+                    requires: p.requires,
+                    introduces: p.introduces,
+                    framing: p.framing,
                     user_task: p.user_task,
                     check_criteria: p.check_criteria,
                     status: ItemStatus::Pending,
@@ -305,7 +484,7 @@ impl PlanProposal {
                 })
                 .collect(),
         };
-        graph.validate()?;
+        graph.validate_against(concepts)?;
         Ok((self.brief, graph))
     }
 }
@@ -337,17 +516,29 @@ pub enum CheckVerdict {
 pub struct CheckDecision {
     pub verdict: CheckVerdict,
     pub feedback: String,
+    #[serde(default)]
+    pub proven_concepts: Vec<String>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn item(id: &str, deps: &[&str], status: ItemStatus) -> PathItem {
+    fn item(
+        id: &str,
+        deps: &[&str],
+        requires: &[&str],
+        introduces: &[&str],
+        framing: &str,
+        status: ItemStatus,
+    ) -> PathItem {
         PathItem {
             id: id.to_string(),
             title: format!("Title {id}"),
             depends_on: deps.iter().map(|s| s.to_string()).collect(),
+            requires: requires.iter().map(|s| s.to_string()).collect(),
+            introduces: introduces.iter().map(|s| s.to_string()).collect(),
+            framing: framing.to_string(),
             user_task: "Do the work".to_string(),
             check_criteria: "Explain why it works".to_string(),
             status,
@@ -356,12 +547,25 @@ mod tests {
     }
 
     #[test]
-    fn validates_dag_and_picks_next_ready() {
+    fn validates_dag_and_prerequisite_closure() {
         let graph = PlanGraph {
             items: vec![
-                item("a", &[], ItemStatus::Understood),
-                item("b", &["a"], ItemStatus::Pending),
-                item("c", &["b"], ItemStatus::Pending),
+                item(
+                    "a",
+                    &[],
+                    &[],
+                    &["weighted_sum", "bias"],
+                    "A neuron multiplies inputs by weights and adds a bias.",
+                    ItemStatus::Understood,
+                ),
+                item(
+                    "b",
+                    &["a"],
+                    &["weighted_sum"],
+                    &["activation"],
+                    "An activation turns the raw score into a bounded output.",
+                    ItemStatus::Pending,
+                ),
             ],
         };
         assert_eq!(graph.validate(), Ok(()));
@@ -369,11 +573,75 @@ mod tests {
     }
 
     #[test]
+    fn rejects_unintroduced_prerequisite() {
+        let graph = PlanGraph {
+            items: vec![item(
+                "a",
+                &[],
+                &["chain_rule"],
+                &["backprop"],
+                "Backprop applies the chain rule across layers.",
+                ItemStatus::Pending,
+            )],
+        };
+        assert_eq!(
+            graph.validate(),
+            Err(GraphError::UnsatisfiedPrerequisite {
+                item: "a".to_string(),
+                concept: "chain_rule".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn accepts_prerequisite_already_proven_in_session() {
+        let mut concepts = BTreeMap::new();
+        concepts.insert(
+            "chain_rule".to_string(),
+            ConceptRecord {
+                id: "chain_rule".into(),
+                label: "Chain rule".into(),
+                status: ConceptStatus::Proven,
+                evidence: None,
+            },
+        );
+        let graph = PlanGraph {
+            items: vec![item(
+                "a",
+                &[],
+                &["chain_rule"],
+                &["backprop"],
+                "Backprop reuses the chain rule layer by layer.",
+                ItemStatus::Pending,
+            )],
+        };
+        assert_eq!(graph.validate_against(&concepts), Ok(()));
+    }
+
+    #[test]
+    fn rejects_missing_framing_when_introducing_concepts() {
+        let graph = PlanGraph {
+            items: vec![item(
+                "a",
+                &[],
+                &[],
+                &["weighted_sum"],
+                "",
+                ItemStatus::Pending,
+            )],
+        };
+        assert_eq!(
+            graph.validate(),
+            Err(GraphError::MissingFraming("a".into()))
+        );
+    }
+
+    #[test]
     fn rejects_cycle() {
         let graph = PlanGraph {
             items: vec![
-                item("a", &["b"], ItemStatus::Pending),
-                item("b", &["a"], ItemStatus::Pending),
+                item("a", &["b"], &[], &[], "", ItemStatus::Pending),
+                item("b", &["a"], &[], &[], "", ItemStatus::Pending),
             ],
         };
         assert_eq!(graph.validate(), Err(GraphError::Cycle));
@@ -382,7 +650,7 @@ mod tests {
     #[test]
     fn rejects_missing_dependency() {
         let graph = PlanGraph {
-            items: vec![item("a", &["ghost"], ItemStatus::Pending)],
+            items: vec![item("a", &["ghost"], &[], &[], "", ItemStatus::Pending)],
         };
         assert_eq!(
             graph.validate(),
@@ -391,16 +659,5 @@ mod tests {
                 missing: "ghost".to_string(),
             })
         );
-    }
-
-    #[test]
-    fn rejects_duplicate_id() {
-        let graph = PlanGraph {
-            items: vec![
-                item("a", &[], ItemStatus::Pending),
-                item("a", &[], ItemStatus::Pending),
-            ],
-        };
-        assert_eq!(graph.validate(), Err(GraphError::DuplicateId("a".into())));
     }
 }

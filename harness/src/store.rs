@@ -5,6 +5,7 @@ use std::sync::Mutex;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 
+use crate::critic::Violation;
 use crate::domain::{ItemStatus, Session};
 
 pub struct Store {
@@ -58,6 +59,17 @@ impl Store {
                 recorded_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
             CREATE INDEX IF NOT EXISTS idx_outcomes_session ON outcomes(session_id);
+            CREATE TABLE IF NOT EXISTS critic_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                tier TEXT NOT NULL,
+                accepted INTEGER NOT NULL,
+                escalated INTEGER NOT NULL,
+                violations_json TEXT NOT NULL,
+                recorded_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_critic_session ON critic_events(session_id);
             "#,
         )?;
         Ok(())
@@ -119,6 +131,34 @@ impl Store {
         )?;
         Ok(())
     }
+
+    pub fn record_critic_event(
+        &self,
+        session_id: &str,
+        kind: &str,
+        tier: &str,
+        accepted: bool,
+        escalated: bool,
+        violations: &[Violation],
+    ) -> Result<()> {
+        let json = serde_json::to_string(violations)?;
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            r#"
+            INSERT INTO critic_events (session_id, kind, tier, accepted, escalated, violations_json)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "#,
+            params![
+                session_id,
+                kind,
+                tier,
+                i32::from(accepted),
+                i32::from(escalated),
+                json,
+            ],
+        )?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -128,7 +168,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn round_trips_session_and_outcomes() {
+    fn round_trips_session_outcomes_and_critic_events() {
         let store = Store::open_in_memory().unwrap();
         let mut s = Session::new("s-1".into(), PathBuf::from("/tmp"));
         s.goal = Some("Understand FFT".into());
@@ -140,6 +180,16 @@ mod tests {
 
         store
             .record_outcome("s-1", "n1", "Complex roots", ItemStatus::Understood, Some("solid"))
+            .unwrap();
+        store
+            .record_critic_event(
+                "s-1",
+                "onboarding",
+                "system1",
+                false,
+                true,
+                &[Violation::new("fluff_opener", "started with filler")],
+            )
             .unwrap();
     }
 }

@@ -2,13 +2,17 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::Stdio;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
 
 use crate::config::Config;
+use crate::critic::{Violation, format_violations};
+use crate::store::Store;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EngineTier {
@@ -16,10 +20,32 @@ pub enum EngineTier {
     System2,
 }
 
+impl EngineTier {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::System1 => "system1",
+            Self::System2 => "system2",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolAccess {
     ReadOnly,
     Full,
+}
+
+#[derive(Debug, Clone)]
+pub enum StreamEvent {
+    Thought(String),
+    TextDelta(String),
+}
+
+pub type StreamSink = Arc<dyn Fn(StreamEvent) + Send + Sync>;
+
+#[cfg(test)]
+pub fn noop_sink() -> StreamSink {
+    Arc::new(|_| {})
 }
 
 #[derive(Debug, Clone)]
@@ -30,12 +56,17 @@ pub struct EngineRequest {
     pub system_prompt: String,
     pub prompt: String,
     pub files: Vec<PathBuf>,
+    pub stream_text: bool,
 }
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 pub trait Engine: Send + Sync {
-    fn run_text<'a>(&'a self, req: &'a EngineRequest) -> BoxFuture<'a, Result<String>>;
+    fn run_text<'a>(
+        &'a self,
+        req: &'a EngineRequest,
+        sink: StreamSink,
+    ) -> BoxFuture<'a, Result<String>>;
 }
 
 pub struct PiEngine {
@@ -49,7 +80,11 @@ impl PiEngine {
 }
 
 impl Engine for PiEngine {
-    fn run_text<'a>(&'a self, req: &'a EngineRequest) -> BoxFuture<'a, Result<String>> {
+    fn run_text<'a>(
+        &'a self,
+        req: &'a EngineRequest,
+        sink: StreamSink,
+    ) -> BoxFuture<'a, Result<String>> {
         Box::pin(async move {
             let mut cmd = Command::new(&self.config.pi_bin);
             cmd.current_dir(&req.cwd)
@@ -102,36 +137,140 @@ impl Engine for PiEngine {
             }
             cmd.arg(&req.prompt);
 
-            let output = cmd
-                .output()
-                .await
+            let mut child = cmd
+                .spawn()
                 .with_context(|| format!("spawn `{}`", self.config.pi_bin))?;
 
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = child
+                .stdout
+                .take()
+                .ok_or_else(|| anyhow!("pi stdout pipe unavailable"))?;
+            let mut stderr = child
+                .stderr
+                .take()
+                .ok_or_else(|| anyhow!("pi stderr pipe unavailable"))?;
 
-            if !output.status.success() {
-                bail!(
-                    "pi exited with {}: {}",
-                    output.status,
-                    stderr.trim()
+            let stderr_task = tokio::spawn(async move {
+                let mut buf = String::new();
+                let _ = stderr.read_to_string(&mut buf).await;
+                buf
+            });
+
+            let mut reader = BufReader::new(stdout);
+            let mut line = String::new();
+            let mut final_text: Option<String> = None;
+            let mut delta_buf = String::new();
+            let mut last_error: Option<String> = None;
+
+            loop {
+                line.clear();
+                let n = reader.read_line(&mut line).await?;
+                if n == 0 {
+                    break;
+                }
+                let trimmed = line.trim_end_matches(['\r', '\n']).trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let Ok(val) = serde_json::from_str::<Value>(trimmed) else {
+                    continue;
+                };
+                process_pi_event(
+                    &val,
+                    req.stream_text,
+                    &sink,
+                    &mut final_text,
+                    &mut delta_buf,
+                    &mut last_error,
                 );
             }
 
-            parse_pi_jsonl(&stdout).with_context(|| {
-                format!(
-                    "failed to extract assistant reply from pi output (stderr: {})",
-                    stderr.trim()
-                )
-            })
+            let status = child.wait().await?;
+            let stderr_text = stderr_task.await.unwrap_or_default();
+
+            if !status.success() {
+                bail!("pi exited with {status}: {}", stderr_text.trim());
+            }
+
+            if let Some(text) = final_text {
+                return Ok(text);
+            }
+            if !delta_buf.trim().is_empty() {
+                return Ok(delta_buf);
+            }
+            if let Some(err) = last_error {
+                bail!("model error: {err}");
+            }
+            Err(anyhow!(
+                "no assistant text found in pi json stream (stderr: {})",
+                stderr_text.trim()
+            ))
         })
     }
 }
 
+fn process_pi_event(
+    val: &Value,
+    stream_text: bool,
+    sink: &StreamSink,
+    final_text: &mut Option<String>,
+    delta_buf: &mut String,
+    last_error: &mut Option<String>,
+) {
+    match val.get("type").and_then(Value::as_str) {
+        Some("message_end") => {
+            if let Some(msg) = val.get("message") {
+                if msg.get("role").and_then(Value::as_str) == Some("assistant") {
+                    let text = extract_content_text(msg.get("content"));
+                    if !text.is_empty() {
+                        *final_text = Some(text);
+                    }
+                    if let Some(err) = msg.get("errorMessage").and_then(Value::as_str) {
+                        *last_error = Some(err.to_string());
+                    }
+                }
+            }
+        }
+        Some("message_update") => {
+            if let Some(ev) = val.get("assistantMessageEvent") {
+                match ev.get("type").and_then(Value::as_str) {
+                    Some("text_delta") => {
+                        if let Some(d) = ev.get("delta").and_then(Value::as_str) {
+                            delta_buf.push_str(d);
+                            if stream_text {
+                                sink(StreamEvent::TextDelta(d.to_string()));
+                            }
+                        }
+                    }
+                    Some("thinking_delta") => {
+                        if let Some(d) = ev.get("delta").and_then(Value::as_str) {
+                            sink(StreamEvent::Thought(d.to_string()));
+                        }
+                    }
+                    Some("error") => {
+                        if let Some(err) = ev.get("error").and_then(Value::as_str) {
+                            *last_error = Some(err.to_string());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Some("tool_execution_start") => {
+            if let Some(name) = val.get("toolName").and_then(Value::as_str) {
+                sink(StreamEvent::Thought(format!("Using `{name}`...\n")));
+            }
+        }
+        _ => {}
+    }
+}
+
+#[cfg(test)]
 pub fn parse_pi_jsonl(stdout: &str) -> Result<String> {
-    let mut final_text: Option<String> = None;
+    let sink = noop_sink();
+    let mut final_text = None;
     let mut delta_buf = String::new();
-    let mut last_error: Option<String> = None;
+    let mut last_error = None;
 
     for raw_line in stdout.split('\n') {
         let line = raw_line.trim_end_matches('\r').trim();
@@ -141,39 +280,14 @@ pub fn parse_pi_jsonl(stdout: &str) -> Result<String> {
         let Ok(val) = serde_json::from_str::<Value>(line) else {
             continue;
         };
-        match val.get("type").and_then(Value::as_str) {
-            Some("message_end") => {
-                if let Some(msg) = val.get("message") {
-                    if msg.get("role").and_then(Value::as_str) == Some("assistant") {
-                        let text = extract_content_text(msg.get("content"));
-                        if !text.is_empty() {
-                            final_text = Some(text);
-                        }
-                        if let Some(err) = msg.get("errorMessage").and_then(Value::as_str) {
-                            last_error = Some(err.to_string());
-                        }
-                    }
-                }
-            }
-            Some("message_update") => {
-                if let Some(ev) = val.get("assistantMessageEvent") {
-                    match ev.get("type").and_then(Value::as_str) {
-                        Some("text_delta") => {
-                            if let Some(d) = ev.get("delta").and_then(Value::as_str) {
-                                delta_buf.push_str(d);
-                            }
-                        }
-                        Some("error") => {
-                            if let Some(err) = ev.get("error").and_then(Value::as_str) {
-                                last_error = Some(err.to_string());
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            _ => {}
-        }
+        process_pi_event(
+            &val,
+            false,
+            &sink,
+            &mut final_text,
+            &mut delta_buf,
+            &mut last_error,
+        );
     }
 
     if let Some(text) = final_text {
@@ -229,42 +343,119 @@ pub fn extract_json_object(raw: &str) -> &str {
     trimmed
 }
 
-pub async fn run_structured<T, V>(
+/// Runs a structured proposal through deterministic Rust critics.
+/// When starting on System 1, any parse error or critic rejection automatically
+/// escalates to System 2 with exact machine-readable violation feedback.
+pub async fn run_gated<T, C>(
     engine: &dyn Engine,
+    store: &Store,
+    session_id: &str,
+    kind: &str,
     base_req: &EngineRequest,
-    validate: V,
+    sink: StreamSink,
+    critic: C,
 ) -> Result<T>
 where
     T: DeserializeOwned,
-    V: Fn(&T) -> Result<()>,
+    C: Fn(&T) -> Vec<Violation>,
 {
-    let first = engine.run_text(base_req).await?;
-    match parse_and_validate::<T, _>(&first, &validate) {
-        Ok(val) => Ok(val),
-        Err(first_err) => {
-            let mut retry_req = base_req.clone();
-            retry_req.prompt = format!(
-                "{}\n\nYour previous reply did not match the required JSON shape ({first_err}). Return ONLY a single valid JSON object matching the schema with no extra text.",
-                base_req.prompt
-            );
-            let second = engine.run_text(&retry_req).await?;
-            parse_and_validate::<T, _>(&second, &validate).with_context(|| {
-                format!("structured output failed after retry (first error: {first_err})")
-            })
+    let mut req = base_req.clone();
+    req.stream_text = false;
+
+    let attempts: Vec<EngineTier> = match base_req.tier {
+        EngineTier::System1 => vec![EngineTier::System1, EngineTier::System2, EngineTier::System2],
+        EngineTier::System2 => vec![EngineTier::System2, EngineTier::System2],
+    };
+
+    let mut last_violations: Vec<Violation> = Vec::new();
+
+    for (idx, tier) in attempts.iter().copied().enumerate() {
+        req.tier = tier;
+        let is_escalation = idx > 0 && base_req.tier == EngineTier::System1 && tier == EngineTier::System2;
+
+        if idx == 0 {
+            sink(StreamEvent::Thought(format!(
+                "Drafting {kind} ({})...\n",
+                tier.label()
+            )));
+        } else if is_escalation && idx == 1 {
+            let codes = last_violations
+                .iter()
+                .map(|v| v.code)
+                .collect::<Vec<_>>()
+                .join(", ");
+            sink(StreamEvent::Thought(format!(
+                "Critic rejected System 1 ({codes}) — escalating to System 2...\n"
+            )));
+        } else {
+            let codes = last_violations
+                .iter()
+                .map(|v| v.code)
+                .collect::<Vec<_>>()
+                .join(", ");
+            sink(StreamEvent::Thought(format!(
+                "Critic requested revision ({codes})...\n"
+            )));
+        }
+
+        let raw = engine.run_text(&req, sink.clone()).await?;
+        match evaluate_proposal::<T, _>(&raw, &critic) {
+            Ok(val) => {
+                let _ = store.record_critic_event(
+                    session_id,
+                    kind,
+                    tier.label(),
+                    true,
+                    is_escalation,
+                    &[],
+                );
+                return Ok(val);
+            }
+            Err(violations) => {
+                let will_escalate = tier == EngineTier::System1
+                    && attempts.get(idx + 1) == Some(&EngineTier::System2);
+                let _ = store.record_critic_event(
+                    session_id,
+                    kind,
+                    tier.label(),
+                    false,
+                    will_escalate,
+                    &violations,
+                );
+                last_violations = violations;
+                let report = format_violations(&last_violations);
+                req.prompt = format!(
+                    "{}\n\nYour previous proposal was rejected by the deterministic critic for:\n{report}\n\nFix every violation above and return ONLY one valid JSON object matching the schema.",
+                    base_req.prompt
+                );
+            }
         }
     }
+
+    bail!(
+        "{kind} proposal rejected by critic after retries:\n{}",
+        format_violations(&last_violations)
+    )
 }
 
-fn parse_and_validate<T, V>(raw: &str, validate: &V) -> Result<T>
+fn evaluate_proposal<T, C>(raw: &str, critic: &C) -> std::result::Result<T, Vec<Violation>>
 where
     T: DeserializeOwned,
-    V: Fn(&T) -> Result<()>,
+    C: Fn(&T) -> Vec<Violation>,
 {
     let candidate = extract_json_object(raw);
-    let parsed: T = serde_json::from_str(candidate)
-        .with_context(|| format!("invalid JSON: {candidate}"))?;
-    validate(&parsed)?;
-    Ok(parsed)
+    let parsed: T = serde_json::from_str(candidate).map_err(|err| {
+        vec![Violation::new(
+            "invalid_json",
+            format!("could not parse JSON: {err}"),
+        )]
+    })?;
+    let violations = critic(&parsed);
+    if violations.is_empty() {
+        Ok(parsed)
+    } else {
+        Err(violations)
+    }
 }
 
 #[cfg(test)]

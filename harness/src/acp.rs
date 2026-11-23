@@ -16,6 +16,7 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::domain::{ItemStatus, Session};
+use crate::engine::{StreamEvent, StreamSink};
 use crate::runtime::{Runtime, TurnInput};
 
 pub async fn run_stdio(runtime: Arc<Runtime>) -> Result<()> {
@@ -50,7 +51,8 @@ pub async fn run_stdio(runtime: Arc<Runtime>) -> Result<()> {
                     }
                     Err(err) => {
                         error!("create_session failed: {err:#}");
-                        responder.respond_with_error(AcpError::internal_error().data(err.to_string()))
+                        responder
+                            .respond_with_error(AcpError::internal_error().data(err.to_string()))
                     }
                 }
             },
@@ -95,14 +97,17 @@ pub async fn run_stdio(runtime: Arc<Runtime>) -> Result<()> {
                 let cx_task = cx.clone();
                 cx.spawn(async move {
                     let id_str = sid.0.to_string();
-                    match rt.handle_turn(&id_str, input).await {
+                    let sink = make_stream_sink(cx_task.clone(), sid.clone());
+                    match rt.handle_turn(&id_str, input, sink).await {
                         Ok(out) => {
                             if out.plan_changed {
                                 if let Ok(Some(session)) = rt.load_session(&id_str) {
                                     let _ = send_plan(&cx_task, sid.clone(), &session);
                                 }
                             }
-                            let _ = send_text(&cx_task, sid.clone(), out.reply);
+                            if !out.reply.is_empty() {
+                                let _ = send_text(&cx_task, sid.clone(), out.reply);
+                            }
                             let _ = responder.respond(PromptResponse::new(StopReason::EndTurn));
                         }
                         Err(err) => {
@@ -134,10 +139,36 @@ pub async fn run_stdio(runtime: Arc<Runtime>) -> Result<()> {
     Ok(())
 }
 
-fn send_text(cx: &ConnectionTo<Client>, session_id: SessionId, text: String) -> Result<(), AcpError> {
+fn make_stream_sink(cx: ConnectionTo<Client>, session_id: SessionId) -> StreamSink {
+    Arc::new(move |ev: StreamEvent| match ev {
+        StreamEvent::Thought(text) => {
+            let _ = send_thought(&cx, session_id.clone(), text);
+        }
+        StreamEvent::TextDelta(text) => {
+            let _ = send_text(&cx, session_id.clone(), text);
+        }
+    })
+}
+
+fn send_text(
+    cx: &ConnectionTo<Client>,
+    session_id: SessionId,
+    text: String,
+) -> Result<(), AcpError> {
     cx.send_notification(SessionNotification::new(
         session_id,
         SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::from(text))),
+    ))
+}
+
+fn send_thought(
+    cx: &ConnectionTo<Client>,
+    session_id: SessionId,
+    text: String,
+) -> Result<(), AcpError> {
+    cx.send_notification(SessionNotification::new(
+        session_id,
+        SessionUpdate::AgentThoughtChunk(ContentChunk::new(ContentBlock::from(text))),
     ))
 }
 
@@ -161,11 +192,10 @@ fn send_commands(cx: &ConnectionTo<Client>, session_id: SessionId) -> Result<(),
             )),
         ),
         AvailableCommand::new("replan", "Update the remaining path based on new findings").input(
-            AvailableCommandInput::Unstructured(UnstructuredCommandInput::new(
-                "What changed?",
-            )),
+            AvailableCommandInput::Unstructured(UnstructuredCommandInput::new("What changed?")),
         ),
         AvailableCommand::new("map", "Show the dependency map and current status"),
+        AvailableCommand::new("concepts", "Show tracked concept states (unknown/claimed/proven/skipped)"),
         AvailableCommand::new("focus", "Switch focus to another ready part by ID").input(
             AvailableCommandInput::Unstructured(UnstructuredCommandInput::new("item id")),
         ),

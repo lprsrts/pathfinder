@@ -51,4 +51,5 @@ Or via env vars: `HARNESS_S1_MODEL`, `HARNESS_S2_MODEL`, `HARNESS_S1_THINKING`, 
 - `/skip [notes]` — skip learning this part and let System 2 handle it (`none` to skip without edits)
 - `/replan [what changed]` — update the remaining path mid-session
 - `/map` — show the dependency map and current status
+- `/concepts` — show tracked concept states (`unknown`, `claimed`, `proven`, `skipped`)
 - `/focus <id>` — jump to any ready part

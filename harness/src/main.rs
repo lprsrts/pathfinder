@@ -1,5 +1,6 @@
 mod acp;
 mod config;
+mod critic;
 mod domain;
 mod engine;
 mod runtime;
