@@ -10,8 +10,9 @@ use agent_client_protocol::v1::schema::{
     PromptCapabilities, PromptRequest, PromptResponse, SessionConfigOption,
     SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigSelectGroup,
     SessionConfigSelectOption, SessionId, SessionNotification, SessionUpdate,
-    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason,
-    UnstructuredCommandInput,
+    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason, ToolCall,
+    ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+    ToolKind as AcpToolKind, UnstructuredCommandInput,
 };
 use agent_client_protocol::{Agent, Client, Error as AcpError, Stdio};
 use anyhow::Result;
@@ -21,6 +22,7 @@ use uuid::Uuid;
 use crate::domain::{PartStatus, Session};
 use crate::engine::{StreamEvent, StreamSink};
 use crate::runtime::{ModelChoices, Runtime, TurnInput};
+use crate::stream::ToolKind;
 
 pub async fn run_stdio(runtime: Arc<Runtime>) -> Result<()> {
     let rt_new = runtime.clone();
@@ -196,12 +198,13 @@ fn model_options(choices: &ModelChoices) -> Vec<SessionConfigOption> {
             .collect()
     };
     vec![
-        SessionConfigOption::select("system1", "Fast model", choices.system1.clone(), grouped())
-            .description("System 1: onboarding and log replies".to_string())
-            .category(SessionConfigOptionCategory::ModelConfig),
+        // Zed lists these right to left: Main first puts Fast on the left.
         SessionConfigOption::select("system2", "Main model", choices.system2.clone(), grouped())
             .description("System 2: map, candidates, judgment and agent work".to_string())
             .category(SessionConfigOptionCategory::Model),
+        SessionConfigOption::select("system1", "Fast model", choices.system1.clone(), grouped())
+            .description("System 1: onboarding and log replies".to_string())
+            .category(SessionConfigOptionCategory::ModelConfig),
     ]
 }
 
@@ -210,13 +213,41 @@ fn option_label(model: &str, cli: &str) -> String {
 }
 
 fn make_stream_sink(cx: ConnectionTo<Client>, session_id: SessionId) -> StreamSink {
-    Arc::new(move |ev: StreamEvent| match ev {
-        StreamEvent::Thought(text) => {
-            let _ = send_thought(&cx, session_id.clone(), text);
-        }
-        StreamEvent::TextDelta(text) => {
-            let _ = send_text(&cx, session_id.clone(), text);
-        }
+    Arc::new(move |ev: StreamEvent| {
+        let update = match ev {
+            StreamEvent::Thought(text) => {
+                SessionUpdate::AgentThoughtChunk(ContentChunk::new(ContentBlock::from(text)))
+            }
+            StreamEvent::TextDelta(text) => {
+                SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::from(text)))
+            }
+            StreamEvent::ToolStart(tool) => {
+                let kind = match tool.kind {
+                    ToolKind::Read => AcpToolKind::Read,
+                    ToolKind::Edit => AcpToolKind::Edit,
+                    ToolKind::Search => AcpToolKind::Search,
+                    ToolKind::Execute => AcpToolKind::Execute,
+                    ToolKind::Fetch => AcpToolKind::Fetch,
+                    ToolKind::Other => AcpToolKind::Other,
+                };
+                let locations = tool.path.map(ToolCallLocation::new).into_iter().collect();
+                SessionUpdate::ToolCall(
+                    ToolCall::new(tool.id, tool.title)
+                        .kind(kind)
+                        .status(ToolCallStatus::InProgress)
+                        .locations(locations),
+                )
+            }
+            StreamEvent::ToolEnd { id, ok } => SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                id,
+                ToolCallUpdateFields::new().status(if ok {
+                    ToolCallStatus::Completed
+                } else {
+                    ToolCallStatus::Failed
+                }),
+            )),
+        };
+        let _ = cx.send_notification(SessionNotification::new(session_id.clone(), update));
     })
 }
 
@@ -228,17 +259,6 @@ fn send_text(
     cx.send_notification(SessionNotification::new(
         session_id,
         SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::from(text))),
-    ))
-}
-
-fn send_thought(
-    cx: &ConnectionTo<Client>,
-    session_id: SessionId,
-    text: String,
-) -> Result<(), AcpError> {
-    cx.send_notification(SessionNotification::new(
-        session_id,
-        SessionUpdate::AgentThoughtChunk(ContentChunk::new(ContentBlock::from(text))),
     ))
 }
 
@@ -434,7 +454,7 @@ mod tests {
             system2: "codex-luna".into(),
         };
         let json = serde_json::to_value(model_options(&choices)).unwrap();
-        let names: Vec<&str> = json[0]["options"]
+        let names: Vec<&str> = json[1]["options"]
             .as_array()
             .unwrap()
             .iter()

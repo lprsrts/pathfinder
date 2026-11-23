@@ -11,7 +11,8 @@ use crate::domain::{
     PartStatus, PendingCandidate, Session, SessionMode,
 };
 use crate::engine::{
-    Engine, EngineRequest, EngineTier, StreamSink, TierModels, ToolAccess, run_gated,
+    Engine, EngineRequest, EngineTier, StreamEvent, StreamSink, TierModels, ToolAccess, run_gated,
+    run_gated_streamed,
 };
 use crate::store::Store;
 use crate::validate::{
@@ -220,7 +221,7 @@ impl Runtime {
             stream_text: false,
             models: self.models(session),
         };
-        let decision: OnboardingDecision = run_gated(
+        let (decision, shown): (OnboardingDecision, _) = run_gated_streamed(
             self.engine.as_ref(),
             self.store.as_ref(),
             &session.id,
@@ -228,21 +229,20 @@ impl Runtime {
             &req,
             sink.clone(),
             check_onboarding,
+            Some("reply"),
         )
         .await?;
+        flush(&sink, &decision.reply, &shown);
 
         if let Some(goal) = decision.goal.filter(|g| !g.trim().is_empty()) {
             session.goal = Some(goal);
         }
         session.push_turn("assistant", &decision.reply);
         if decision.ready_to_map {
-            let map = self.build_map(session, files, sink).await?;
-            return Ok(TurnOutput::changed(format!(
-                "{}\n\n{}",
-                decision.reply, map.reply
-            )));
+            sink(StreamEvent::TextDelta("\n\n".to_string()));
+            return self.build_map(session, files, sink).await;
         }
-        Ok(TurnOutput::text(decision.reply))
+        Ok(TurnOutput::text(String::new()))
     }
 
     async fn build_map(
@@ -269,16 +269,18 @@ impl Runtime {
             stream_text: false,
             models: self.models(session),
         };
-        let proposal: MapProposal = run_gated(
+        let (proposal, shown): (MapProposal, _) = run_gated_streamed(
             self.engine.as_ref(),
             self.store.as_ref(),
             &session.id,
             "map",
             &req,
-            sink,
+            sink.clone(),
             check_map,
+            Some("brief"),
         )
         .await?;
+        flush(&sink, &proposal.brief, &shown);
 
         session.map = proposal.to_map();
         session.active = None;
@@ -286,17 +288,13 @@ impl Runtime {
         session.pending_candidate = None;
         session.advance();
 
-        let mut reply = format!(
-            "{}\n\n{}",
-            proposal.brief,
-            session.map.render(session.active.as_deref())
-        );
+        let mut rest = session.map.render(session.active.as_deref());
         if let Some(part) = session.active_part() {
-            reply.push_str("\n\n");
-            reply.push_str(&render_part(part));
+            rest.push_str("\n\n");
+            rest.push_str(&render_part(part));
         }
-        session.push_turn("assistant", &reply);
-        Ok(TurnOutput::changed(reply))
+        session.push_turn("assistant", format!("{}\n\n{rest}", proposal.brief));
+        Ok(TurnOutput::changed(format!("\n\n{rest}")))
     }
 
     /// §3: the model proposes map changes; you accept or reject them.
@@ -438,25 +436,29 @@ impl Runtime {
             models: self.models(session),
         };
         let current = session.map.clone();
-        let decision: LogReply = run_gated(
+        let (decision, shown): (LogReply, _) = run_gated_streamed(
             self.engine.as_ref(),
             self.store.as_ref(),
             &session.id,
             "log",
             &req,
-            sink,
+            sink.clone(),
             |r: &LogReply| check_log_reply(r, &current),
+            Some("reply"),
         )
         .await?;
+        flush(&sink, &decision.reply, &shown);
 
-        let mut reply = decision.reply;
+        let mut visible = String::new();
+        let mut full = decision.reply;
         if let Some(change) = decision.map_change {
-            reply.push_str("\n\n");
-            reply.push_str(&render_change(&change));
+            let rendered = format!("\n\n{}", render_change(&change));
+            visible.push_str(&rendered);
+            full.push_str(&rendered);
             session.pending_change = Some(change);
         }
-        session.push_turn("assistant", &reply);
-        Ok(TurnOutput::text(reply))
+        session.push_turn("assistant", &full);
+        Ok(TurnOutput::text(visible))
     }
 
     async fn handle_summary(
@@ -512,21 +514,24 @@ impl Runtime {
             stream_text: false,
             models: self.models(session),
         };
-        let proposal: CandidateProposal = run_gated(
+        let header = format!("Candidate for **{}**:\n\n", part.title);
+        sink(StreamEvent::TextDelta(header.clone()));
+        let (proposal, shown): (CandidateProposal, _) = run_gated_streamed(
             self.engine.as_ref(),
             self.store.as_ref(),
             &session.id,
             "candidate",
             &req,
-            sink,
+            sink.clone(),
             check_candidate,
+            Some("candidate"),
         )
         .await?;
+        flush(&sink, &proposal.candidate, &shown);
 
-        let reply = format!(
-            "Candidate for **{}**:\n\n{}\n\nIs it right? Say why.",
-            part.title, proposal.candidate
-        );
+        const ASK: &str = "\n\nIs it right? Say why.";
+        let visible = ASK.to_string();
+        let reply = format!("{header}{}{ASK}", proposal.candidate);
         session.pending_candidate = Some(PendingCandidate {
             part_id: part.id,
             candidate: proposal.candidate,
@@ -534,7 +539,7 @@ impl Runtime {
             key_reason: proposal.key_reason,
         });
         session.push_turn("assistant", &reply);
-        Ok(TurnOutput::text(reply))
+        Ok(TurnOutput::text(visible))
     }
 
     async fn handle_judgment(
@@ -572,31 +577,30 @@ impl Runtime {
             stream_text: false,
             models: self.models(session),
         };
-        let verdict: JudgmentVerdict = run_gated(
+        let (verdict, shown): (JudgmentVerdict, _) = run_gated_streamed(
             self.engine.as_ref(),
             self.store.as_ref(),
             &session.id,
             "judgment",
             &req,
-            sink,
+            sink.clone(),
             check_verdict,
+            Some("feedback"),
         )
         .await?;
+        flush(&sink, &verdict.feedback, &shown);
 
-        let reply = if verdict.pass {
+        let next = if verdict.pass {
             self.set_status(session, &part.id, PartStatus::Understood, &verdict.feedback)?;
             format!(
-                "{}\n\n**{}** understood. `/handoff` gives the work to the agent; or keep it yourself and `/next`.",
-                verdict.feedback, part.title
+                "\n\n**{}** understood. `/handoff` gives the work to the agent; or keep it yourself and `/next`.",
+                part.title
             )
         } else {
-            format!(
-                "{}\n\nKeep logging, then `/summary` again for a new candidate.",
-                verdict.feedback
-            )
+            "\n\nKeep logging, then `/summary` again for a new candidate.".to_string()
         };
-        session.push_turn("assistant", &reply);
-        Ok(TurnOutput::changed(reply))
+        session.push_turn("assistant", format!("{}{next}", verdict.feedback));
+        Ok(TurnOutput::changed(next))
     }
 
     // --- §6 Skips ---
@@ -828,6 +832,14 @@ impl Runtime {
 const REVIEW_PROMPT: &str =
     "\n\nReview the result: `/approve`, or `/object <what's wrong and why>` to send it back.";
 
+/// Makes sure the user has seen `full`: if streaming didn't show it, send it
+/// now, so it stays ahead of anything that follows.
+fn flush(sink: &StreamSink, full: &str, shown: &str) {
+    if shown.is_empty() || shown.trim() != full.trim() {
+        sink(StreamEvent::TextDelta(full.to_string()));
+    }
+}
+
 fn render_part(part: &Part) -> String {
     let mut out = format!("**{}** (`{}`)", part.title, part.id);
     if !part.note.trim().is_empty() {
@@ -1001,6 +1013,15 @@ mod tests {
                     .expect("unexpected engine call");
                 assert_eq!(req.tools, tools, "tool access mismatch");
                 assert_eq!(req.tier, tier, "engine tier mismatch");
+                // Stream raw text in small chunks, as the CLIs do.
+                if req.stream_text {
+                    let chars: Vec<char> = reply.chars().collect();
+                    for chunk in chars.chunks(3) {
+                        _sink(crate::engine::StreamEvent::TextDelta(
+                            chunk.iter().collect(),
+                        ));
+                    }
+                }
                 Ok(reply)
             })
         }
@@ -1180,6 +1201,41 @@ mod tests {
         .unwrap();
         assert!(d.reply.starts_with("Commands live in"));
         assert!(engine.replies.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn streamed_reply_is_shown_once_and_decoded() {
+        let (rt, _) = runtime(
+            FakeEngine::new(vec![(
+                ReadOnly,
+                S1,
+                r#"{"reply":"What do you want \"status\" to show?","ready_to_map":false}"#,
+            )]),
+            false,
+        );
+        let seen = Arc::new(Mutex::new(String::new()));
+        let record = seen.clone();
+        let sink: StreamSink = Arc::new(move |ev| {
+            if let crate::engine::StreamEvent::TextDelta(t) = ev {
+                record.lock().unwrap().push_str(&t);
+            }
+        });
+        let out = rt
+            .handle_turn(
+                "s",
+                TurnInput {
+                    text: "add /status".into(),
+                    files: vec![],
+                },
+                sink,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            r#"What do you want "status" to show?"#
+        );
+        assert_eq!(out.reply, "");
     }
 
     #[tokio::test]

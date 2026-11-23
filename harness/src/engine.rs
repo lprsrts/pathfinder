@@ -1,8 +1,8 @@
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::de::DeserializeOwned;
@@ -12,6 +12,7 @@ use tokio::process::Command;
 
 use crate::config::{Backend, Config, ModelEntry};
 use crate::store::Store;
+use crate::stream::{FieldStreamer, ToolKind, ToolStart, describe_tool, strip_shell_wrapper};
 use crate::validate::{Violation, format_violations};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,6 +42,8 @@ pub enum ToolAccess {
 pub enum StreamEvent {
     Thought(String),
     TextDelta(String),
+    ToolStart(ToolStart),
+    ToolEnd { id: String, ok: bool },
 }
 
 pub type StreamSink = Arc<dyn Fn(StreamEvent) + Send + Sync>;
@@ -136,10 +139,12 @@ impl Engine for CliEngine {
                     format!(" ({})", model.model)
                 }
             )));
+            // Tool call ids must be unique per thread; CLI ids repeat across runs.
+            let run = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
             match model.backend {
-                Backend::Pi => self.run_pi(req, sink).await,
-                Backend::Claude => self.run_claude(req, sink).await,
-                Backend::Codex => self.run_codex(req, sink).await,
+                Backend::Pi => self.run_pi(req, sink, &run).await,
+                Backend::Claude => self.run_claude(req, sink, &run).await,
+                Backend::Codex => self.run_codex(req, sink, &run).await,
             }
         })
     }
@@ -202,7 +207,7 @@ async fn run_jsonl(
 }
 
 impl CliEngine {
-    async fn run_pi(&self, req: &EngineRequest, sink: StreamSink) -> Result<String> {
+    async fn run_pi(&self, req: &EngineRequest, sink: StreamSink, run: &str) -> Result<String> {
         let model = req.model();
         let mut cmd = Command::new(&self.config.pi_bin);
         cmd.current_dir(&req.cwd).args([
@@ -245,8 +250,12 @@ impl CliEngine {
         let (status, stderr) = run_jsonl(cmd, &self.config.pi_bin, None, |val| {
             process_pi_event(
                 val,
-                req.stream_text,
-                &sink,
+                &PiCtx {
+                    stream_text: req.stream_text,
+                    sink: &sink,
+                    run,
+                    cwd: &req.cwd,
+                },
                 &mut final_text,
                 &mut delta_buf,
                 &mut last_error,
@@ -272,7 +281,7 @@ impl CliEngine {
         ))
     }
 
-    async fn run_claude(&self, req: &EngineRequest, sink: StreamSink) -> Result<String> {
+    async fn run_claude(&self, req: &EngineRequest, sink: StreamSink, run: &str) -> Result<String> {
         let model = req.model();
         let mut cmd = Command::new(&self.config.claude_bin);
         cmd.current_dir(&req.cwd).args([
@@ -280,6 +289,7 @@ impl CliEngine {
             "--output-format",
             "stream-json",
             "--verbose",
+            "--include-partial-messages",
             "--no-session-persistence",
             "--strict-mcp-config",
         ]);
@@ -312,11 +322,22 @@ impl CliEngine {
         }
 
         let mut result: Option<(bool, String)> = None;
+        let mut text_started = false;
         let (status, stderr) = run_jsonl(
             cmd,
             &self.config.claude_bin,
             Some(req.prompt_with_files()),
-            |val| process_claude_event(val, req.stream_text, &sink, &mut result),
+            |val| {
+                process_claude_event(
+                    val,
+                    req.stream_text,
+                    &sink,
+                    run,
+                    &req.cwd,
+                    &mut text_started,
+                    &mut result,
+                )
+            },
         )
         .await?;
 
@@ -330,7 +351,7 @@ impl CliEngine {
         }
     }
 
-    async fn run_codex(&self, req: &EngineRequest, sink: StreamSink) -> Result<String> {
+    async fn run_codex(&self, req: &EngineRequest, sink: StreamSink, run: &str) -> Result<String> {
         let model = req.model();
         let mut cmd = Command::new(&self.config.codex_bin);
         cmd.arg("exec")
@@ -339,6 +360,16 @@ impl CliEngine {
                 "--ignore-user-config",
                 "--skip-git-repo-check",
                 "--ephemeral",
+                // No MCP servers, account apps (ChatGPT connectors), plugins
+                // or hooks: Pathfinder runs see only the workspace.
+                "-c",
+                "mcp_servers={}",
+                "--disable",
+                "apps",
+                "--disable",
+                "plugins",
+                "--disable",
+                "hooks",
             ])
             .arg("-C")
             .arg(&req.cwd)
@@ -369,6 +400,8 @@ impl CliEngine {
                 val,
                 req.stream_text,
                 &sink,
+                run,
+                &req.cwd,
                 &mut last_message,
                 &mut last_error,
             )
@@ -388,13 +421,37 @@ impl CliEngine {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn process_claude_event(
     val: &Value,
     stream_text: bool,
     sink: &StreamSink,
+    run: &str,
+    cwd: &Path,
+    text_started: &mut bool,
     result: &mut Option<(bool, String)>,
 ) {
     match val.get("type").and_then(Value::as_str) {
+        // Token-level text, from --include-partial-messages.
+        Some("stream_event") if stream_text => {
+            let event = &val["event"];
+            match event.get("type").and_then(Value::as_str) {
+                Some("content_block_start")
+                    if event.pointer("/content_block/type").and_then(Value::as_str)
+                        == Some("text")
+                        && *text_started =>
+                {
+                    sink(StreamEvent::TextDelta("\n\n".to_string()));
+                }
+                Some("content_block_delta") => {
+                    if let Some(t) = event.pointer("/delta/text").and_then(Value::as_str) {
+                        *text_started = true;
+                        sink(StreamEvent::TextDelta(t.to_string()));
+                    }
+                }
+                _ => {}
+            }
+        }
         Some("assistant") => {
             let content = val
                 .pointer("/message/content")
@@ -403,11 +460,6 @@ fn process_claude_event(
                 .unwrap_or_default();
             for item in content {
                 match item.get("type").and_then(Value::as_str) {
-                    Some("text") if stream_text => {
-                        if let Some(t) = item.get("text").and_then(Value::as_str) {
-                            sink(StreamEvent::TextDelta(format!("{t}\n\n")));
-                        }
-                    }
                     Some("thinking") => {
                         if let Some(t) = item.get("thinking").and_then(Value::as_str) {
                             if !t.is_empty() {
@@ -416,11 +468,39 @@ fn process_claude_event(
                         }
                     }
                     Some("tool_use") => {
-                        if let Some(name) = item.get("name").and_then(Value::as_str) {
-                            sink(StreamEvent::Thought(format!("Using `{name}`...\n")));
-                        }
+                        let id = item.get("id").and_then(Value::as_str).unwrap_or_default();
+                        let name = item.get("name").and_then(Value::as_str).unwrap_or("tool");
+                        sink(StreamEvent::ToolStart(describe_tool(
+                            format!("{run}-{id}"),
+                            name,
+                            item.get("input").unwrap_or(&Value::Null),
+                            cwd,
+                        )));
                     }
                     _ => {}
+                }
+            }
+        }
+        Some("user") => {
+            let content = val
+                .pointer("/message/content")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            for item in content {
+                if item.get("type").and_then(Value::as_str) == Some("tool_result") {
+                    let id = item
+                        .get("tool_use_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let ok = !item
+                        .get("is_error")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    sink(StreamEvent::ToolEnd {
+                        id: format!("{run}-{id}"),
+                        ok,
+                    });
                 }
             }
         }
@@ -440,31 +520,97 @@ fn process_claude_event(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn process_codex_event(
     val: &Value,
     stream_text: bool,
     sink: &StreamSink,
+    run: &str,
+    cwd: &Path,
     last_message: &mut Option<String>,
     last_error: &mut Option<String>,
 ) {
-    let item = val.get("item");
-    let item_type = item
-        .and_then(|i| i.get("type"))
-        .and_then(Value::as_str)
-        .unwrap_or_default();
+    let item = val.get("item").cloned().unwrap_or(Value::Null);
+    let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
+    let id = format!(
+        "{run}-{}",
+        item.get("id").and_then(Value::as_str).unwrap_or_default()
+    );
     let text = || {
-        item.and_then(|i| i.get("text"))
+        item.get("text")
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string()
     };
+    let started = |title: String, kind: ToolKind, path: Option<PathBuf>| {
+        sink(StreamEvent::ToolStart(ToolStart {
+            id: id.clone(),
+            title,
+            kind,
+            path,
+        }))
+    };
+    let ended = |ok: bool| sink(StreamEvent::ToolEnd { id: id.clone(), ok });
+    let status_ok = || {
+        let status = item
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("completed");
+        let exit_ok = item
+            .get("exit_code")
+            .and_then(Value::as_i64)
+            .is_none_or(|c| c == 0);
+        status != "failed" && exit_ok
+    };
+
     match (val.get("type").and_then(Value::as_str), item_type) {
         (Some("item.started"), "command_execution") => {
             let command = item
-                .and_then(|i| i.get("command"))
+                .get("command")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            sink(StreamEvent::Thought(format!("Running `{command}`...\n")));
+            started(
+                format!("Run `{}`", strip_shell_wrapper(command)),
+                ToolKind::Execute,
+                None,
+            );
+        }
+        (Some("item.completed"), "command_execution") => ended(status_ok()),
+        (Some("item.started"), "mcp_tool_call") => {
+            let tool = item.get("tool").and_then(Value::as_str).unwrap_or("tool");
+            started(tool.to_string(), ToolKind::Other, None);
+        }
+        (Some("item.completed"), "mcp_tool_call") => ended(status_ok()),
+        (Some("item.started"), "web_search") => {
+            let query = item
+                .get("query")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            started(format!("Search the web `{query}`"), ToolKind::Fetch, None);
+        }
+        (Some("item.completed"), "web_search") => ended(true),
+        (Some("item.completed"), "file_change") => {
+            let paths: Vec<PathBuf> = item
+                .get("changes")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|c| c.get("path").and_then(Value::as_str))
+                .map(|p| {
+                    let p = PathBuf::from(p);
+                    if p.is_absolute() { p } else { cwd.join(p) }
+                })
+                .collect();
+            let shown: Vec<String> = paths
+                .iter()
+                .map(|p| p.strip_prefix(cwd).unwrap_or(p).display().to_string())
+                .collect();
+            started(
+                format!("Edit {}", shown.join(", ")),
+                ToolKind::Edit,
+                paths.first().cloned(),
+            );
+            ended(status_ok());
         }
         (Some("item.completed"), "reasoning") => {
             let t = text();
@@ -491,14 +637,21 @@ fn process_codex_event(
     }
 }
 
+struct PiCtx<'a> {
+    stream_text: bool,
+    sink: &'a StreamSink,
+    run: &'a str,
+    cwd: &'a Path,
+}
+
 fn process_pi_event(
     val: &Value,
-    stream_text: bool,
-    sink: &StreamSink,
+    ctx: &PiCtx<'_>,
     final_text: &mut Option<String>,
     delta_buf: &mut String,
     last_error: &mut Option<String>,
 ) {
+    let sink = ctx.sink;
     match val.get("type").and_then(Value::as_str) {
         Some("message_end") => {
             if let Some(msg) = val.get("message") {
@@ -519,7 +672,7 @@ fn process_pi_event(
                     Some("text_delta") => {
                         if let Some(d) = ev.get("delta").and_then(Value::as_str) {
                             delta_buf.push_str(d);
-                            if stream_text {
+                            if ctx.stream_text {
                                 sink(StreamEvent::TextDelta(d.to_string()));
                             }
                         }
@@ -539,9 +692,31 @@ fn process_pi_event(
             }
         }
         Some("tool_execution_start") => {
-            if let Some(name) = val.get("toolName").and_then(Value::as_str) {
-                sink(StreamEvent::Thought(format!("Using `{name}`...\n")));
-            }
+            let id = val
+                .get("toolCallId")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let name = val
+                .get("toolName")
+                .and_then(Value::as_str)
+                .unwrap_or("tool");
+            sink(StreamEvent::ToolStart(describe_tool(
+                format!("{}-{id}", ctx.run),
+                name,
+                val.get("args").unwrap_or(&Value::Null),
+                ctx.cwd,
+            )));
+        }
+        Some("tool_execution_end") => {
+            let id = val
+                .get("toolCallId")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let ok = !val.get("isError").and_then(Value::as_bool).unwrap_or(false);
+            sink(StreamEvent::ToolEnd {
+                id: format!("{}-{id}", ctx.run),
+                ok,
+            });
         }
         _ => {}
     }
@@ -564,8 +739,12 @@ pub fn parse_pi_jsonl(stdout: &str) -> Result<String> {
         };
         process_pi_event(
             &val,
-            false,
-            &sink,
+            &PiCtx {
+                stream_text: false,
+                sink: &sink,
+                run: "t",
+                cwd: Path::new("."),
+            },
             &mut final_text,
             &mut delta_buf,
             &mut last_error,
@@ -641,8 +820,60 @@ where
     T: DeserializeOwned,
     C: Fn(&T) -> Vec<Violation>,
 {
+    run_gated_streamed(engine, store, session_id, kind, base_req, sink, check, None)
+        .await
+        .map(|(value, _)| value)
+}
+
+/// Like `run_gated`, but streams the JSON string `field` (e.g. `"reply"`) to
+/// the user as it is generated. Returns the value and the text shown for the
+/// accepted attempt, so callers don't send it twice.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_gated_streamed<T, C>(
+    engine: &dyn Engine,
+    store: &Store,
+    session_id: &str,
+    kind: &str,
+    base_req: &EngineRequest,
+    sink: StreamSink,
+    check: C,
+    field: Option<&str>,
+) -> Result<(T, String)>
+where
+    T: DeserializeOwned,
+    C: Fn(&T) -> Vec<Violation>,
+{
     let mut req = base_req.clone();
-    req.stream_text = false;
+    req.stream_text = field.is_some();
+    let mut shown_any = false;
+    // Wraps the sink so raw JSON never reaches the user, only the decoded
+    // `field`. Returns the wrapped sink and a record of what it showed.
+    let field_sink = |shown_any: bool| -> (StreamSink, Arc<Mutex<String>>) {
+        let shown = Arc::new(Mutex::new(String::new()));
+        let Some(field) = field else {
+            return (sink.clone(), shown);
+        };
+        let streamer = Mutex::new(FieldStreamer::new(field));
+        let separator_due = Mutex::new(shown_any);
+        let inner = sink.clone();
+        let record = shown.clone();
+        let wrapped: StreamSink = Arc::new(move |ev| match ev {
+            StreamEvent::TextDelta(t) => {
+                let out = streamer.lock().unwrap().push(&t);
+                if out.is_empty() {
+                    return;
+                }
+                // A retry after visible text starts a new paragraph.
+                if std::mem::take(&mut *separator_due.lock().unwrap()) {
+                    inner(StreamEvent::TextDelta("\n\n".to_string()));
+                }
+                record.lock().unwrap().push_str(&out);
+                inner(StreamEvent::TextDelta(out));
+            }
+            other => inner(other),
+        });
+        (wrapped, shown)
+    };
 
     let attempts: Vec<EngineTier> = match base_req.tier {
         EngineTier::System1 => vec![
@@ -685,7 +916,9 @@ where
             )));
         }
 
-        let raw = engine.run_text(&req, sink.clone()).await?;
+        let (attempt_sink, mut shown) = field_sink(shown_any);
+        let raw = engine.run_text(&req, attempt_sink).await?;
+        shown_any |= !shown.lock().unwrap().is_empty();
         let mut outcome = evaluate_proposal::<T, _>(&raw, &check);
 
         // Weak models often answer well but drop the JSON envelope after a
@@ -711,7 +944,10 @@ where
                 base_req.prompt,
                 raw.trim()
             );
-            let repaired = engine.run_text(&repair, sink.clone()).await?;
+            let (repair_sink, repair_shown) = field_sink(shown_any);
+            let repaired = engine.run_text(&repair, repair_sink).await?;
+            shown_any |= !repair_shown.lock().unwrap().is_empty();
+            shown = repair_shown;
             outcome = evaluate_proposal::<T, _>(&repaired, &check);
         }
 
@@ -725,7 +961,8 @@ where
                     is_escalation,
                     &[],
                 );
-                return Ok(val);
+                let shown = shown.lock().unwrap().clone();
+                return Ok((val, shown));
             }
             Err(violations) => {
                 let will_escalate = tier == EngineTier::System1
@@ -792,45 +1029,82 @@ mod tests {
         assert_eq!(parse_pi_jsonl(stream).unwrap(), r#"{"reply":"ok"}"#);
     }
 
+    fn recording_sink() -> (StreamSink, Arc<Mutex<Vec<String>>>) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let record = events.clone();
+        let sink: StreamSink = Arc::new(move |ev| {
+            let line = match ev {
+                StreamEvent::Thought(t) => format!("thought {t}"),
+                StreamEvent::TextDelta(t) => format!("text {t}"),
+                StreamEvent::ToolStart(t) => format!("start {} {}", t.id, t.title),
+                StreamEvent::ToolEnd { id, ok } => format!("end {id} {ok}"),
+            };
+            record.lock().unwrap().push(line);
+        });
+        (sink, events)
+    }
+
     #[test]
-    fn claude_result_event_is_the_answer() {
-        let sink = noop_sink();
-        let mut result = None;
+    fn claude_streams_text_and_tool_calls() {
+        let (sink, events) = recording_sink();
+        let (mut result, mut text_started) = (None, false);
         for line in [
-            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{}}]}}"#,
-            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"{\"a\":1}"}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu1","name":"Read","input":{"file_path":"/w/a.rs"}}]}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tu1","content":"..."}]}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_start","content_block":{"type":"text","text":""}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"{\"a\""}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":":1}"}}}"#,
             r#"{"type":"result","subtype":"success","is_error":false,"result":"{\"a\":1}"}"#,
         ] {
             process_claude_event(
                 &serde_json::from_str(line).unwrap(),
-                false,
+                true,
                 &sink,
+                "r",
+                Path::new("/w"),
+                &mut text_started,
                 &mut result,
             );
         }
         assert_eq!(result, Some((false, r#"{"a":1}"#.to_string())));
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                "start r-tu1 Read a.rs",
+                "end r-tu1 true",
+                r#"text {"a""#,
+                "text :1}"
+            ]
+        );
     }
 
     #[test]
-    fn codex_last_agent_message_is_the_answer() {
-        let sink = noop_sink();
+    fn codex_tool_calls_and_last_agent_message() {
+        let (sink, events) = recording_sink();
         let (mut last, mut err) = (None, None);
         for line in [
-            r#"{"type":"item.completed","item":{"type":"agent_message","text":"Checking."}}"#,
-            r#"{"type":"item.started","item":{"type":"command_execution","command":"rg name"}}"#,
-            r#"{"type":"item.completed","item":{"type":"agent_message","text":"{\"a\":1}"}}"#,
+            r#"{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"Checking."}}"#,
+            r#"{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"/bin/zsh -lc \"rg name\""}}"#,
+            r#"{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"x","exit_code":1,"status":"failed"}}"#,
+            r#"{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"{\"a\":1}"}}"#,
             r#"{"type":"turn.completed"}"#,
         ] {
             process_codex_event(
                 &serde_json::from_str(line).unwrap(),
                 false,
                 &sink,
+                "r",
+                Path::new("/w"),
                 &mut last,
                 &mut err,
             );
         }
         assert_eq!(last.as_deref(), Some(r#"{"a":1}"#));
         assert!(err.is_none());
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["start r-item_1 Run `rg name`", "end r-item_1 false"]
+        );
     }
 
     #[test]
