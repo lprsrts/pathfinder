@@ -1,4 +1,6 @@
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+//! Session state. Section numbers refer to `docs/theory.md`.
+
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -12,162 +14,151 @@ pub enum SessionMode {
     Done,
 }
 
+/// Where a part stands. The understanding behind it (§8) is `record()`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ConceptStatus {
-    Unknown,
-    Claimed,
-    Proven,
-    Skipped,
-}
-
-impl ConceptStatus {
-    pub fn is_cleared(self) -> bool {
-        matches!(self, Self::Proven | Self::Skipped)
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Unknown => "unknown",
-            Self::Claimed => "claimed",
-            Self::Proven => "proven",
-            Self::Skipped => "skipped",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ConceptRecord {
-    pub id: String,
-    pub label: String,
-    pub status: ConceptStatus,
-    #[serde(default)]
-    pub evidence: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ItemStatus {
-    Pending,
-    Working,
+pub enum PartStatus {
+    /// Nothing decided yet.
+    Open,
+    /// Understanding shown through log, summary and candidate (§5).
     Understood,
-    HandedOff,
-    Skipped,
+    /// Understood and handed off; the agent's result awaits your review (§7).
+    InReview,
+    /// Understood and finished: you approved the agent's result (§7).
+    Done,
+    /// Skipped as already known, on your word (§6).
+    Known,
+    /// Skipped and handed off without understanding (§6).
+    Delegated,
 }
 
-impl ItemStatus {
+impl PartStatus {
     pub fn is_resolved(self) -> bool {
-        matches!(self, Self::Understood | Self::HandedOff | Self::Skipped)
+        matches!(
+            self,
+            Self::Understood | Self::Done | Self::Known | Self::Delegated
+        )
     }
 
-    pub fn symbol(self) -> &'static str {
+    /// The §8 record this status falls under.
+    pub fn record(self) -> Option<&'static str> {
         match self {
-            Self::Pending => "[ ]",
-            Self::Working => "[>]",
-            Self::Understood => "[x]",
-            Self::HandedOff => "[~]",
-            Self::Skipped => "[-]",
+            Self::Open => None,
+            Self::Understood | Self::InReview | Self::Done => Some("understood"),
+            Self::Known => Some("claimed_known"),
+            Self::Delegated => Some("handed_off_without_understanding"),
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Pending => "pending",
-            Self::Working => "working",
+            Self::Open => "open",
             Self::Understood => "understood",
-            Self::HandedOff => "handed_off",
-            Self::Skipped => "skipped",
+            Self::InReview => "in review",
+            Self::Done => "understood, done",
+            Self::Known => "claimed as known",
+            Self::Delegated => "handed off without understanding",
         }
     }
 }
 
+/// Something the task depends on (§3).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct PathItem {
+pub struct Part {
     pub id: String,
     pub title: String,
     #[serde(default)]
+    pub note: String,
+    #[serde(default)]
     pub depends_on: Vec<String>,
+    pub status: PartStatus,
+    /// Your thinking and reasons while working (§5.1).
     #[serde(default)]
-    pub requires: Vec<String>,
+    pub log: Vec<String>,
+    /// Your summary of the part (§5.2).
     #[serde(default)]
-    pub introduces: Vec<String>,
+    pub summary: Option<String>,
+    /// The agent's latest result (§7).
     #[serde(default)]
-    pub framing: String,
-    pub user_task: String,
-    pub check_criteria: String,
-    pub status: ItemStatus,
+    pub result: Option<String>,
+    /// Objections you sent back to the agent (§7).
     #[serde(default)]
-    pub notes: Option<String>,
+    pub objections: Vec<String>,
 }
 
+impl Part {
+    pub fn new(id: String, title: String, note: String, depends_on: Vec<String>) -> Self {
+        Self {
+            id,
+            title,
+            note,
+            depends_on,
+            status: PartStatus::Open,
+            log: Vec::new(),
+            summary: None,
+            result: None,
+            objections: Vec::new(),
+        }
+    }
+}
+
+/// The rough map of what the task depends on (§3). No size limit.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct PlanGraph {
-    pub items: Vec<PathItem>,
+pub struct Map {
+    pub parts: Vec<Part>,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
-pub enum GraphError {
-    #[error("plan must contain at least one item")]
+pub enum MapError {
+    #[error("the map must contain at least one part")]
     Empty,
-    #[error("duplicate item id `{0}`")]
+    #[error("part id must not be empty")]
+    EmptyId,
+    #[error("duplicate part id `{0}`")]
     DuplicateId(String),
-    #[error("item `{item}` depends on unknown id `{missing}`")]
-    MissingDependency { item: String, missing: String },
-    #[error("item `{0}` cannot depend on itself")]
+    #[error("part `{part}` depends on unknown part `{missing}`")]
+    MissingDependency { part: String, missing: String },
+    #[error("part `{0}` cannot depend on itself")]
     SelfDependency(String),
-    #[error("plan contains a dependency cycle")]
+    #[error("the map contains a dependency cycle")]
     Cycle,
-    #[error(
-        "item `{item}` requires concept `{concept}` which is neither already proven/skipped nor introduced by an ancestor"
-    )]
-    UnsatisfiedPrerequisite { item: String, concept: String },
-    #[error("item `{0}` introduces new concepts but has no framing explanation")]
-    MissingFraming(String),
 }
 
-impl PlanGraph {
-    #[cfg(test)]
-    pub fn validate(&self) -> Result<(), GraphError> {
-        self.validate_against(&BTreeMap::new())
-    }
-
-    pub fn validate_against(
-        &self,
-        concepts: &BTreeMap<String, ConceptRecord>,
-    ) -> Result<(), GraphError> {
-        if self.items.is_empty() {
-            return Err(GraphError::Empty);
+impl Map {
+    pub fn validate(&self) -> Result<(), MapError> {
+        if self.parts.is_empty() {
+            return Err(MapError::Empty);
         }
 
-        let mut ids = HashSet::with_capacity(self.items.len());
-        let mut by_id: HashMap<&str, &PathItem> = HashMap::with_capacity(self.items.len());
-        for item in &self.items {
-            if !ids.insert(item.id.as_str()) {
-                return Err(GraphError::DuplicateId(item.id.clone()));
+        let mut ids = HashSet::with_capacity(self.parts.len());
+        for part in &self.parts {
+            if part.id.trim().is_empty() {
+                return Err(MapError::EmptyId);
             }
-            by_id.insert(item.id.as_str(), item);
+            if !ids.insert(part.id.as_str()) {
+                return Err(MapError::DuplicateId(part.id.clone()));
+            }
         }
 
         let mut indegree: HashMap<&str, usize> =
-            self.items.iter().map(|i| (i.id.as_str(), 0)).collect();
+            self.parts.iter().map(|p| (p.id.as_str(), 0)).collect();
         let mut dependents: HashMap<&str, Vec<&str>> = HashMap::new();
-
-        for item in &self.items {
-            for dep in &item.depends_on {
-                if dep == &item.id {
-                    return Err(GraphError::SelfDependency(item.id.clone()));
+        for part in &self.parts {
+            for dep in &part.depends_on {
+                if dep == &part.id {
+                    return Err(MapError::SelfDependency(part.id.clone()));
                 }
                 if !ids.contains(dep.as_str()) {
-                    return Err(GraphError::MissingDependency {
-                        item: item.id.clone(),
+                    return Err(MapError::MissingDependency {
+                        part: part.id.clone(),
                         missing: dep.clone(),
                     });
                 }
-                *indegree.get_mut(item.id.as_str()).unwrap() += 1;
+                *indegree.get_mut(part.id.as_str()).unwrap() += 1;
                 dependents
                     .entry(dep.as_str())
                     .or_default()
-                    .push(item.id.as_str());
+                    .push(part.id.as_str());
             }
         }
 
@@ -175,141 +166,117 @@ impl PlanGraph {
             .iter()
             .filter_map(|(&id, &deg)| (deg == 0).then_some(id))
             .collect();
-        let mut topo_order: Vec<&str> = Vec::with_capacity(self.items.len());
-
+        let mut seen = 0;
         while let Some(id) = queue.pop_front() {
-            topo_order.push(id);
-            if let Some(next_ids) = dependents.get(id) {
-                for &next in next_ids {
-                    let deg = indegree.get_mut(next).unwrap();
-                    *deg -= 1;
-                    if *deg == 0 {
-                        queue.push_back(next);
-                    }
+            seen += 1;
+            for &next in dependents.get(id).into_iter().flatten() {
+                let deg = indegree.get_mut(next).unwrap();
+                *deg -= 1;
+                if *deg == 0 {
+                    queue.push_back(next);
                 }
             }
         }
-
-        if topo_order.len() != self.items.len() {
-            return Err(GraphError::Cycle);
+        if seen != self.parts.len() {
+            return Err(MapError::Cycle);
         }
-
-        // Symbolic prerequisite soundness: every required concept must already be
-        // cleared (proven/skipped) or introduced by a dependency ancestor.
-        let base_cleared: HashSet<String> = concepts
-            .values()
-            .filter(|c| c.status.is_cleared())
-            .map(|c| normalize_id(&c.id))
-            .collect();
-
-        let mut available_after: HashMap<&str, HashSet<String>> = HashMap::new();
-        for id in topo_order {
-            let item = by_id[id];
-            let mut available = base_cleared.clone();
-            for dep in &item.depends_on {
-                if let Some(dep_set) = available_after.get(dep.as_str()) {
-                    available.extend(dep_set.iter().cloned());
-                }
-            }
-
-            for req in &item.requires {
-                let norm = normalize_id(req);
-                if !norm.is_empty() && !available.contains(&norm) {
-                    return Err(GraphError::UnsatisfiedPrerequisite {
-                        item: item.id.clone(),
-                        concept: req.clone(),
-                    });
-                }
-            }
-
-            if !item.introduces.is_empty() && item.framing.trim().is_empty() {
-                return Err(GraphError::MissingFraming(item.id.clone()));
-            }
-
-            for intro in &item.introduces {
-                let norm = normalize_id(intro);
-                if !norm.is_empty() {
-                    available.insert(norm);
-                }
-            }
-            available_after.insert(id, available);
-        }
-
         Ok(())
     }
 
-    pub fn get(&self, id: &str) -> Option<&PathItem> {
-        self.items.iter().find(|i| i.id == id)
+    pub fn get(&self, id: &str) -> Option<&Part> {
+        self.parts.iter().find(|p| p.id == id)
     }
 
-    pub fn get_mut(&mut self, id: &str) -> Option<&mut PathItem> {
-        self.items.iter_mut().find(|i| i.id == id)
+    pub fn get_mut(&mut self, id: &str) -> Option<&mut Part> {
+        self.parts.iter_mut().find(|p| p.id == id)
     }
 
-    pub fn deps_satisfied(&self, item: &PathItem) -> bool {
-        item.depends_on.iter().all(|dep| {
-            self.get(dep)
-                .map(|d| d.status.is_resolved())
-                .unwrap_or(false)
-        })
-    }
-
-    pub fn next_ready_id(&self) -> Option<String> {
-        self.items
+    fn deps_resolved(&self, part: &Part) -> bool {
+        part.depends_on
             .iter()
-            .find(|item| !item.status.is_resolved() && self.deps_satisfied(item))
-            .map(|item| item.id.clone())
+            .all(|d| self.get(d).is_some_and(|p| p.status.is_resolved()))
+    }
+
+    /// Next unresolved part other than `skip`, preferring one whose
+    /// dependencies are resolved. Order is a suggestion; you can focus any part.
+    pub fn next_open(&self, skip: Option<&str>) -> Option<String> {
+        let candidates = || {
+            self.parts
+                .iter()
+                .filter(|p| !p.status.is_resolved() && Some(p.id.as_str()) != skip)
+        };
+        candidates()
+            .find(|p| self.deps_resolved(p))
+            .or_else(|| candidates().next())
+            .map(|p| p.id.clone())
     }
 
     pub fn all_resolved(&self) -> bool {
-        !self.items.is_empty() && self.items.iter().all(|i| i.status.is_resolved())
+        !self.parts.is_empty() && self.parts.iter().all(|p| p.status.is_resolved())
     }
 
-    pub fn render_map(&self, active_id: Option<&str>) -> String {
-        if self.items.is_empty() {
-            return "No path built yet.".to_string();
+    pub fn render(&self, active: Option<&str>) -> String {
+        if self.parts.is_empty() {
+            return "No map yet.".to_string();
         }
-        let mut lines = Vec::with_capacity(self.items.len() + 2);
-        lines.push("Path map (`[x]` understood, `[>]` active, `[~]` handed off, `[-]` skipped, `[ ]` pending):".to_string());
-        for item in &self.items {
-            let marker = if Some(item.id.as_str()) == active_id && !item.status.is_resolved() {
-                "[>]"
+        let mut lines = vec!["Map:".to_string()];
+        for part in &self.parts {
+            let marker = if Some(part.id.as_str()) == active {
+                "▶"
             } else {
-                item.status.symbol()
+                "-"
             };
-            let deps = if item.depends_on.is_empty() {
+            let deps = if part.depends_on.is_empty() {
                 String::new()
             } else {
-                format!("  <- {}", item.depends_on.join(", "))
-            };
-            let intro = if item.introduces.is_empty() {
-                String::new()
-            } else {
-                format!("  (+{})", item.introduces.join(", "))
+                format!(" (needs {})", part.depends_on.join(", "))
             };
             lines.push(format!(
-                "- `{}` {} {}{}{}",
-                item.id, marker, item.title, deps, intro
+                "{marker} `{}` {} [{}]{deps}",
+                part.id,
+                part.title,
+                part.status.label()
             ));
         }
         lines.join("\n")
     }
+
+    /// Applies a proposed change (§3) and validates the result.
+    pub fn with_change(&self, change: &MapChange) -> Result<Map, String> {
+        let mut map = self.clone();
+        for id in &change.remove {
+            let Some(part) = map.get(id) else {
+                return Err(format!("cannot remove unknown part `{id}`"));
+            };
+            if part.status != PartStatus::Open || !part.log.is_empty() {
+                return Err(format!(
+                    "cannot remove part `{id}`: it already has work or an outcome"
+                ));
+            }
+            map.parts.retain(|p| &p.id != id);
+        }
+        for proposed in &change.parts {
+            match map.get_mut(&proposed.id) {
+                Some(existing) => {
+                    existing.title = proposed.title.clone();
+                    existing.note = proposed.note.clone();
+                    existing.depends_on = proposed.depends_on.clone();
+                }
+                None => map.parts.push(proposed.clone().into_part()),
+            }
+        }
+        map.validate().map_err(|e| e.to_string())?;
+        Ok(map)
+    }
 }
 
-pub fn normalize_id(raw: &str) -> String {
-    raw.trim()
-        .to_lowercase()
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>()
-        .trim_matches('_')
-        .to_string()
+/// A candidate you judge (§5.3). The key stays hidden until you've judged.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PendingCandidate {
+    pub part_id: String,
+    pub candidate: String,
+    pub key_correct: bool,
+    pub key_reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -323,13 +290,15 @@ pub struct Session {
     pub id: String,
     pub cwd: PathBuf,
     pub goal: Option<String>,
-    pub starting_point: Option<String>,
     pub mode: SessionMode,
     #[serde(default)]
-    pub concepts: BTreeMap<String, ConceptRecord>,
-    pub plan: PlanGraph,
-    pub active_item: Option<String>,
-    pub turns_on_active: u32,
+    pub map: Map,
+    pub active: Option<String>,
+    #[serde(default)]
+    pub pending_candidate: Option<PendingCandidate>,
+    /// A map change the model proposed, waiting for your OK (§3).
+    #[serde(default)]
+    pub pending_change: Option<MapChange>,
     pub history: Vec<TurnRecord>,
 }
 
@@ -339,12 +308,11 @@ impl Session {
             id,
             cwd,
             goal: None,
-            starting_point: None,
             mode: SessionMode::Onboarding,
-            concepts: BTreeMap::new(),
-            plan: PlanGraph::default(),
-            active_item: None,
-            turns_on_active: 0,
+            map: Map::default(),
+            active: None,
+            pending_candidate: None,
+            pending_change: None,
             history: Vec::new(),
         }
     }
@@ -354,324 +322,229 @@ impl Session {
             role: role.to_string(),
             content: content.into(),
         });
-        if self.history.len() > 40 {
-            let drain = self.history.len() - 40;
-            self.history.drain(0..drain);
-        }
     }
 
-    pub fn upsert_concept(
-        &mut self,
-        id: &str,
-        label: Option<&str>,
-        status: ConceptStatus,
-        evidence: Option<String>,
-    ) {
-        let key = normalize_id(id);
-        if key.is_empty() {
-            return;
-        }
-        let entry = self
-            .concepts
-            .entry(key.clone())
-            .or_insert_with(|| ConceptRecord {
-                id: key.clone(),
-                label: label
-                    .filter(|l| !l.trim().is_empty())
-                    .map(str::to_string)
-                    .unwrap_or_else(|| key.replace('_', " ")),
-                status,
-                evidence: None,
-            });
-        if let Some(lbl) = label {
-            if !lbl.trim().is_empty() {
-                entry.label = lbl.to_string();
-            }
-        }
-        // Never downgrade a Proven concept back to Claimed/Unknown.
-        if entry.status != ConceptStatus::Proven || status == ConceptStatus::Proven {
-            entry.status = status;
-        }
-        if evidence.is_some() {
-            entry.evidence = evidence;
-        }
+    pub fn active_part(&self) -> Option<&Part> {
+        self.map.get(self.active.as_deref()?)
     }
 
-    pub fn render_concepts(&self) -> String {
-        if self.concepts.is_empty() {
-            return "No concepts tracked yet.".to_string();
-        }
-        let mut lines = vec!["Concept state:".to_string()];
-        for c in self.concepts.values() {
-            lines.push(format!("- `{}` ({}) — {}", c.id, c.label, c.status.label()));
-        }
-        lines.join("\n")
+    pub fn active_part_mut(&mut self) -> Option<&mut Part> {
+        let id = self.active.clone()?;
+        self.map.get_mut(&id)
     }
 
-    pub fn active(&self) -> Option<&PathItem> {
-        let id = self.active_item.as_deref()?;
-        self.plan.get(id)
-    }
-
-    pub fn advance_active(&mut self) -> Option<String> {
-        let next = self.plan.next_ready_id();
-        self.active_item = next.clone();
-        self.turns_on_active = 0;
-        if let Some(ref id) = next {
-            if let Some(item) = self.plan.get_mut(id) {
-                if item.status == ItemStatus::Pending {
-                    item.status = ItemStatus::Working;
-                }
-            }
+    /// Moves to the next unresolved part, or to Done when none is left.
+    pub fn advance(&mut self) -> Option<String> {
+        let next = self.map.next_open(self.active.as_deref());
+        if next.is_some() {
+            self.active = next.clone();
             self.mode = SessionMode::Working;
-        } else if self.plan.all_resolved() {
+        } else if self.map.all_resolved() {
+            self.active = None;
             self.mode = SessionMode::Done;
         }
         next
     }
 }
 
-// --- Type-safe structured model outputs ---
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ObservedConcept {
-    pub id: String,
-    #[serde(default)]
-    pub label: String,
-    pub status: ConceptStatus,
-}
+// --- Model outputs ---
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct OnboardingDecision {
     pub reply: String,
-    pub ready_to_plan: bool,
     #[serde(default)]
-    pub goal_summary: Option<String>,
+    pub ready_to_map: bool,
     #[serde(default)]
-    pub starting_point: Option<String>,
-    #[serde(default)]
-    pub observed_concepts: Vec<ObservedConcept>,
+    pub goal: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct ProposedItem {
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProposedPart {
     pub id: String,
     pub title: String,
     #[serde(default)]
+    pub note: String,
+    #[serde(default)]
     pub depends_on: Vec<String>,
-    #[serde(default)]
-    pub requires: Vec<String>,
-    #[serde(default)]
-    pub introduces: Vec<String>,
-    #[serde(default)]
-    pub framing: String,
-    pub user_task: String,
-    pub check_criteria: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct PlanProposal {
-    pub brief: String,
-    pub items: Vec<ProposedItem>,
-}
-
-impl PlanProposal {
-    pub fn into_graph(
-        self,
-        concepts: &BTreeMap<String, ConceptRecord>,
-    ) -> Result<(String, PlanGraph), GraphError> {
-        let graph = PlanGraph {
-            items: self
-                .items
-                .into_iter()
-                .map(|p| PathItem {
-                    id: p.id,
-                    title: p.title,
-                    depends_on: p.depends_on,
-                    requires: p.requires,
-                    introduces: p.introduces,
-                    framing: p.framing,
-                    user_task: p.user_task,
-                    check_criteria: p.check_criteria,
-                    status: ItemStatus::Pending,
-                    notes: None,
-                })
-                .collect(),
-        };
-        graph.validate_against(concepts)?;
-        Ok((self.brief, graph))
+impl ProposedPart {
+    pub fn into_part(self) -> Part {
+        Part::new(self.id, self.title, self.note, self.depends_on)
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CoachAction {
-    KeepGoing,
-    SuggestCheck,
-    Escalate,
-    NeedReplan,
-}
-
 #[derive(Debug, Clone, Deserialize)]
-pub struct CoachDecision {
-    pub reply: String,
-    pub action: CoachAction,
+pub struct MapProposal {
+    pub brief: String,
+    pub parts: Vec<ProposedPart>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CheckVerdict {
-    Pass,
-    Close,
-    NotYet,
+impl MapProposal {
+    pub fn to_map(&self) -> Map {
+        Map {
+            parts: self
+                .parts
+                .iter()
+                .cloned()
+                .map(ProposedPart::into_part)
+                .collect(),
+        }
+    }
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct CheckDecision {
-    pub verdict: CheckVerdict,
-    pub feedback: String,
+/// Parts to add or update, and open parts to remove.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MapChange {
+    pub brief: String,
     #[serde(default)]
-    pub proven_concepts: Vec<String>,
+    pub parts: Vec<ProposedPart>,
+    #[serde(default)]
+    pub remove: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LogReply {
+    pub reply: String,
+    #[serde(default)]
+    pub map_change: Option<MapChange>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CandidateProposal {
+    pub candidate: String,
+    pub key_reason: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct JudgmentVerdict {
+    pub pass: bool,
+    pub feedback: String,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn item(
-        id: &str,
-        deps: &[&str],
-        requires: &[&str],
-        introduces: &[&str],
-        framing: &str,
-        status: ItemStatus,
-    ) -> PathItem {
-        PathItem {
-            id: id.to_string(),
-            title: format!("Title {id}"),
-            depends_on: deps.iter().map(|s| s.to_string()).collect(),
-            requires: requires.iter().map(|s| s.to_string()).collect(),
-            introduces: introduces.iter().map(|s| s.to_string()).collect(),
-            framing: framing.to_string(),
-            user_task: "Do the work".to_string(),
-            check_criteria: "Explain why it works".to_string(),
-            status,
-            notes: None,
-        }
+    fn part(id: &str, deps: &[&str], status: PartStatus) -> Part {
+        let mut p = Part::new(
+            id.into(),
+            format!("Part {id}"),
+            String::new(),
+            deps.iter().map(|s| s.to_string()).collect(),
+        );
+        p.status = status;
+        p
+    }
+
+    fn map(parts: Vec<Part>) -> Map {
+        Map { parts }
     }
 
     #[test]
-    fn validates_dag_and_prerequisite_closure() {
-        let graph = PlanGraph {
-            items: vec![
-                item(
-                    "a",
-                    &[],
-                    &[],
-                    &["weighted_sum", "bias"],
-                    "A neuron multiplies inputs by weights and adds a bias.",
-                    ItemStatus::Understood,
-                ),
-                item(
-                    "b",
-                    &["a"],
-                    &["weighted_sum"],
-                    &["activation"],
-                    "An activation turns the raw score into a bounded output.",
-                    ItemStatus::Pending,
-                ),
+    fn validates_structure_only() {
+        assert_eq!(map(vec![]).validate(), Err(MapError::Empty));
+        assert_eq!(
+            map(vec![
+                part("a", &[], PartStatus::Open),
+                part("a", &[], PartStatus::Open)
+            ])
+            .validate(),
+            Err(MapError::DuplicateId("a".into()))
+        );
+        assert!(matches!(
+            map(vec![part("a", &["zz"], PartStatus::Open)]).validate(),
+            Err(MapError::MissingDependency { .. })
+        ));
+        assert_eq!(
+            map(vec![part("a", &["a"], PartStatus::Open)]).validate(),
+            Err(MapError::SelfDependency("a".into()))
+        );
+        assert_eq!(
+            map(vec![
+                part("a", &["b"], PartStatus::Open),
+                part("b", &["a"], PartStatus::Open)
+            ])
+            .validate(),
+            Err(MapError::Cycle)
+        );
+        // No size limit.
+        let many: Vec<Part> = (0..40)
+            .map(|i| part(&format!("p{i}"), &[], PartStatus::Open))
+            .collect();
+        assert!(map(many).validate().is_ok());
+    }
+
+    #[test]
+    fn records_keep_the_three_outcomes_apart() {
+        assert_eq!(PartStatus::Open.record(), None);
+        assert_eq!(PartStatus::Understood.record(), Some("understood"));
+        assert_eq!(PartStatus::InReview.record(), Some("understood"));
+        assert_eq!(PartStatus::Done.record(), Some("understood"));
+        assert_eq!(PartStatus::Known.record(), Some("claimed_known"));
+        assert_eq!(
+            PartStatus::Delegated.record(),
+            Some("handed_off_without_understanding")
+        );
+        assert!(!PartStatus::InReview.is_resolved());
+    }
+
+    #[test]
+    fn next_open_prefers_ready_parts_but_never_blocks() {
+        let m = map(vec![
+            part("a", &[], PartStatus::Known),
+            part("b", &["c"], PartStatus::Open),
+            part("c", &[], PartStatus::Open),
+        ]);
+        assert_eq!(m.next_open(None).as_deref(), Some("c"));
+        assert_eq!(m.next_open(Some("c")).as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn map_change_adds_updates_and_guards_removal() {
+        let mut worked = part("b", &[], PartStatus::Open);
+        worked.log.push("tried something".into());
+        let m = map(vec![part("a", &[], PartStatus::Open), worked]);
+
+        let change = MapChange {
+            brief: "x".into(),
+            parts: vec![
+                ProposedPart {
+                    id: "c".into(),
+                    title: "New".into(),
+                    note: String::new(),
+                    depends_on: vec!["a".into()],
+                },
+                ProposedPart {
+                    id: "a".into(),
+                    title: "Renamed".into(),
+                    note: String::new(),
+                    depends_on: vec![],
+                },
             ],
+            remove: vec![],
         };
-        assert_eq!(graph.validate(), Ok(()));
-        assert_eq!(graph.next_ready_id().as_deref(), Some("b"));
-    }
+        let next = m.with_change(&change).unwrap();
+        assert_eq!(next.parts.len(), 3);
+        assert_eq!(next.get("a").unwrap().title, "Renamed");
 
-    #[test]
-    fn rejects_unintroduced_prerequisite() {
-        let graph = PlanGraph {
-            items: vec![item(
-                "a",
-                &[],
-                &["chain_rule"],
-                &["backprop"],
-                "Backprop applies the chain rule across layers.",
-                ItemStatus::Pending,
-            )],
+        let remove_worked = MapChange {
+            brief: "x".into(),
+            parts: vec![],
+            remove: vec!["b".into()],
         };
-        assert_eq!(
-            graph.validate(),
-            Err(GraphError::UnsatisfiedPrerequisite {
-                item: "a".to_string(),
-                concept: "chain_rule".to_string(),
-            })
-        );
-    }
+        assert!(m.with_change(&remove_worked).is_err());
 
-    #[test]
-    fn accepts_prerequisite_already_proven_in_session() {
-        let mut concepts = BTreeMap::new();
-        concepts.insert(
-            "chain_rule".to_string(),
-            ConceptRecord {
-                id: "chain_rule".into(),
-                label: "Chain rule".into(),
-                status: ConceptStatus::Proven,
-                evidence: None,
-            },
-        );
-        let graph = PlanGraph {
-            items: vec![item(
-                "a",
-                &[],
-                &["chain_rule"],
-                &["backprop"],
-                "Backprop reuses the chain rule layer by layer.",
-                ItemStatus::Pending,
-            )],
+        let cycle = MapChange {
+            brief: "x".into(),
+            parts: vec![ProposedPart {
+                id: "a".into(),
+                title: "A".into(),
+                note: String::new(),
+                depends_on: vec!["a".into()],
+            }],
+            remove: vec![],
         };
-        assert_eq!(graph.validate_against(&concepts), Ok(()));
-    }
-
-    #[test]
-    fn rejects_missing_framing_when_introducing_concepts() {
-        let graph = PlanGraph {
-            items: vec![item(
-                "a",
-                &[],
-                &[],
-                &["weighted_sum"],
-                "",
-                ItemStatus::Pending,
-            )],
-        };
-        assert_eq!(
-            graph.validate(),
-            Err(GraphError::MissingFraming("a".into()))
-        );
-    }
-
-    #[test]
-    fn rejects_cycle() {
-        let graph = PlanGraph {
-            items: vec![
-                item("a", &["b"], &[], &[], "", ItemStatus::Pending),
-                item("b", &["a"], &[], &[], "", ItemStatus::Pending),
-            ],
-        };
-        assert_eq!(graph.validate(), Err(GraphError::Cycle));
-    }
-
-    #[test]
-    fn rejects_missing_dependency() {
-        let graph = PlanGraph {
-            items: vec![item("a", &["ghost"], &[], &[], "", ItemStatus::Pending)],
-        };
-        assert_eq!(
-            graph.validate(),
-            Err(GraphError::MissingDependency {
-                item: "a".to_string(),
-                missing: "ghost".to_string(),
-            })
-        );
+        assert!(m.with_change(&cycle).is_err());
     }
 }

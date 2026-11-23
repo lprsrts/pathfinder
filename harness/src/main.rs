@@ -1,10 +1,10 @@
 mod acp;
 mod config;
-mod critic;
 mod domain;
 mod engine;
 mod runtime;
 mod store;
+mod validate;
 mod workspace;
 
 use std::env;

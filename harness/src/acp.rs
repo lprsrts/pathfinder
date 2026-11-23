@@ -15,7 +15,7 @@ use anyhow::Result;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use crate::domain::{ItemStatus, Session};
+use crate::domain::{PartStatus, Session};
 use crate::engine::{StreamEvent, StreamSink};
 use crate::runtime::{Runtime, TurnInput};
 
@@ -80,7 +80,7 @@ pub async fn run_stdio(runtime: Arc<Runtime>) -> Result<()> {
                 };
                 responder.respond(LoadSessionResponse::new())?;
                 let _ = send_commands(&cx, req.session_id.clone());
-                if !loaded.plan.items.is_empty() {
+                if !loaded.map.parts.is_empty() {
                     let _ = send_plan(&cx, req.session_id, &loaded);
                 }
                 Ok(())
@@ -173,40 +173,43 @@ fn send_thought(
 
 fn send_commands(cx: &ConnectionTo<Client>, session_id: SessionId) -> Result<(), AcpError> {
     let cmds = vec![
-        AvailableCommand::new("plan", "Build the path now from what we discussed"),
-        AvailableCommand::new("check", "Verify you understand the current part").input(
-            AvailableCommandInput::Unstructured(UnstructuredCommandInput::new(
-                "Explain what you did or understood (optional if in files)",
-            )),
-        ),
-        AvailableCommand::new("next", "Move to the next ready part after passing /check"),
+        AvailableCommand::new("plan", "Build the map now from what we discussed"),
+        AvailableCommand::new(
+            "summary",
+            "Explain the current part; you then judge a candidate",
+        )
+        .input(AvailableCommandInput::Unstructured(
+            UnstructuredCommandInput::new("Your explanation of the part"),
+        )),
         AvailableCommand::new(
             "handoff",
-            "Let the agent finish remaining labor after /check",
+            "Give an understood part to the agent; you review the result",
         )
         .input(AvailableCommandInput::Unstructured(
-            UnstructuredCommandInput::new("Optional instructions for the handed-off work"),
+            UnstructuredCommandInput::new("Optional instructions"),
         )),
-        AvailableCommand::new(
-            "skip",
-            "Skip learning this part and let the agent handle it",
-        )
-        .input(AvailableCommandInput::Unstructured(
-            UnstructuredCommandInput::new(
-                "Optional instructions, or `none` to skip without agent edits",
-            ),
-        )),
-        AvailableCommand::new("replan", "Update the remaining path based on new findings").input(
+        AvailableCommand::new("approve", "Approve the agent's result for this part"),
+        AvailableCommand::new("object", "Send the agent's result back with your reason").input(
+            AvailableCommandInput::Unstructured(UnstructuredCommandInput::new(
+                "What's wrong and why",
+            )),
+        ),
+        AvailableCommand::new("known", "Skip this part as already known"),
+        AvailableCommand::new("delegate", "Hand this part off without understanding it").input(
+            AvailableCommandInput::Unstructured(UnstructuredCommandInput::new(
+                "Optional instructions",
+            )),
+        ),
+        AvailableCommand::new("accept", "Accept the proposed map change"),
+        AvailableCommand::new("reject", "Reject the proposed map change"),
+        AvailableCommand::new("replan", "Ask for a map change").input(
             AvailableCommandInput::Unstructured(UnstructuredCommandInput::new("What changed?")),
         ),
-        AvailableCommand::new("map", "Show the dependency map and current status"),
-        AvailableCommand::new(
-            "concepts",
-            "Show tracked concept states (unknown/claimed/proven/skipped)",
+        AvailableCommand::new("next", "Move to the next unresolved part"),
+        AvailableCommand::new("focus", "Switch to a part by id").input(
+            AvailableCommandInput::Unstructured(UnstructuredCommandInput::new("part id")),
         ),
-        AvailableCommand::new("focus", "Switch focus to another ready part by ID").input(
-            AvailableCommandInput::Unstructured(UnstructuredCommandInput::new("item id")),
-        ),
+        AvailableCommand::new("map", "Show the map"),
     ];
     cx.send_notification(SessionNotification::new(
         session_id,
@@ -220,31 +223,34 @@ fn send_plan(
     session: &Session,
 ) -> Result<(), AcpError> {
     let entries: Vec<PlanEntry> = session
-        .plan
-        .items
+        .map
+        .parts
         .iter()
-        .map(|item| {
-            let is_active = session.active_item.as_deref() == Some(item.id.as_str());
-            let status = match item.status {
-                ItemStatus::Pending => PlanEntryStatus::Pending,
-                ItemStatus::Working => PlanEntryStatus::InProgress,
-                ItemStatus::Understood | ItemStatus::HandedOff | ItemStatus::Skipped => {
-                    PlanEntryStatus::Completed
-                }
+        .map(|part| {
+            let is_active = session.active.as_deref() == Some(part.id.as_str());
+            let status = match part.status {
+                PartStatus::Open if is_active => PlanEntryStatus::InProgress,
+                PartStatus::Open => PlanEntryStatus::Pending,
+                PartStatus::InReview => PlanEntryStatus::InProgress,
+                PartStatus::Understood
+                | PartStatus::Done
+                | PartStatus::Known
+                | PartStatus::Delegated => PlanEntryStatus::Completed,
             };
             let priority = if is_active {
                 PlanEntryPriority::High
             } else {
                 PlanEntryPriority::Medium
             };
-            let tag = match item.status {
-                ItemStatus::HandedOff => " [handed off]",
-                ItemStatus::Skipped => " [skipped]",
-                ItemStatus::Understood => " [understood]",
-                ItemStatus::Working | ItemStatus::Pending => "",
+            let tag = match part.status {
+                PartStatus::Open => String::new(),
+                other => format!(" [{}]", other.label()),
             };
-            let content = format!("[{}] {}{}", item.id, item.title, tag);
-            PlanEntry::new(content, priority, status)
+            PlanEntry::new(
+                format!("[{}] {}{tag}", part.id, part.title),
+                priority,
+                status,
+            )
         })
         .collect();
 

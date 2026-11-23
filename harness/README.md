@@ -44,14 +44,24 @@ Optional `~/.config/harness/config.json` (defaults to your `pi` default model wi
 
 Or via env vars: `HARNESS_S1_MODEL`, `HARNESS_S2_MODEL`, `HARNESS_S1_THINKING`, `HARNESS_S2_THINKING`, `HARNESS_PI_BIN`, `HARNESS_DB_PATH`.
 
+## How a session goes
+
+1. Say what you want done. Onboarding settles the goal, then sketches a map of what the task depends on (no size limit).
+2. Work on a part. Every message is a log entry: your thinking and the reasons behind your steps. The model replies briefly and may propose map changes.
+3. `/summary` explains the part; you're then shown a candidate (an approach or result, right or with one real flaw) and say whether it's right and why. That decides whether the part is understood.
+4. You decide what to give the agent: `/handoff` an understood part and review the result, `/known` to skip a part you already know, or `/delegate` to hand it off without understanding it.
+
 ## Slash commands in Zed
 
-- `/plan` — build the path right away from onboarding
-- `/check [answer]` — System 2 verifies you understand the current part
-- `/handoff [notes]` — unlocked after `/check`; System 2 finishes the remaining labor
-- `/next` — move to the next ready part after passing `/check`
-- `/skip [notes]` — skip learning this part and let System 2 handle it (`none` to skip without edits)
-- `/replan [what changed]` — update the remaining path mid-session
-- `/map` — show the dependency map and current status
-- `/concepts` — show tracked concept states (`unknown`, `claimed`, `proven`, `skipped`)
-- `/focus <id>` — jump to any ready part
+- `/plan` — build the map now from onboarding
+- `/summary <text>` — explain the current part; a candidate to judge follows
+- `/handoff [notes]` — give an understood part to the agent; you review the result
+- `/approve` — accept the agent's result
+- `/object <reason>` — send the result back to the agent with your reason
+- `/known` — skip the part as already known (recorded as your claim)
+- `/delegate [notes]` — hand the part off without understanding it (not reviewed)
+- `/accept`, `/reject` — settle a proposed map change
+- `/replan [what changed]` — ask for a map change
+- `/next` — move to the next unresolved part
+- `/focus <id>` — switch to any part
+- `/map` — show the map

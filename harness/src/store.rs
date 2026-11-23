@@ -5,8 +5,8 @@ use std::sync::Mutex;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::critic::Violation;
-use crate::domain::{ItemStatus, Session};
+use crate::domain::Session;
+use crate::validate::Violation;
 
 pub struct Store {
     conn: Mutex<Connection>,
@@ -72,6 +72,13 @@ impl Store {
             CREATE INDEX IF NOT EXISTS idx_critic_session ON critic_events(session_id);
             "#,
         )?;
+        // Outcomes gained a `status` column next to the §8 record in `outcome`.
+        let has_status: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('outcomes') WHERE name = 'status'")?
+            .exists([])?;
+        if !has_status {
+            conn.execute("ALTER TABLE outcomes ADD COLUMN status TEXT", [])?;
+        }
         Ok(())
     }
 
@@ -108,7 +115,15 @@ impl Store {
             )
             .optional()?;
         match raw {
-            Some(json) => Ok(Some(serde_json::from_str(&json)?)),
+            Some(json) => match serde_json::from_str(&json) {
+                Ok(session) => Ok(Some(session)),
+                // Sessions saved by an older state format can't be resumed;
+                // treat them as new rather than failing the thread.
+                Err(err) => {
+                    tracing::warn!("discarding unreadable session `{id}`: {err}");
+                    Ok(None)
+                }
+            },
             None => Ok(None),
         }
     }
@@ -118,16 +133,17 @@ impl Store {
         session_id: &str,
         item_id: &str,
         title: &str,
-        status: ItemStatus,
+        record: &str,
+        status: &str,
         notes: Option<&str>,
     ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             r#"
-            INSERT INTO outcomes (session_id, item_id, title, outcome, notes)
-            VALUES (?1, ?2, ?3, ?4, ?5)
+            INSERT INTO outcomes (session_id, item_id, title, outcome, status, notes)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
             "#,
-            params![session_id, item_id, title, status.label(), notes],
+            params![session_id, item_id, title, record, status, notes],
         )?;
         Ok(())
     }
@@ -183,7 +199,8 @@ mod tests {
                 "s-1",
                 "n1",
                 "Complex roots",
-                ItemStatus::Understood,
+                "understood",
+                "understood",
                 Some("solid"),
             )
             .unwrap();
@@ -194,7 +211,7 @@ mod tests {
                 "system1",
                 false,
                 true,
-                &[Violation::new("fluff_opener", "started with filler")],
+                &[Violation::new("empty_field", "`reply` must not be empty")],
             )
             .unwrap();
     }

@@ -11,8 +11,8 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
 
 use crate::config::Config;
-use crate::critic::{Violation, format_violations};
 use crate::store::Store;
+use crate::validate::{Violation, format_violations};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EngineTier {
@@ -348,8 +348,8 @@ pub fn extract_json_object(raw: &str) -> &str {
     trimmed
 }
 
-/// Runs a structured proposal through deterministic Rust critics.
-/// When starting on System 1, any parse error or critic rejection automatically
+/// Runs a structured proposal through its shape check (see validate.rs).
+/// When starting on System 1, any parse error or failed check automatically
 /// escalates to System 2 with exact machine-readable violation feedback.
 pub async fn run_gated<T, C>(
     engine: &dyn Engine,
@@ -358,7 +358,7 @@ pub async fn run_gated<T, C>(
     kind: &str,
     base_req: &EngineRequest,
     sink: StreamSink,
-    critic: C,
+    check: C,
 ) -> Result<T>
 where
     T: DeserializeOwned,
@@ -395,7 +395,7 @@ where
                 .collect::<Vec<_>>()
                 .join(", ");
             sink(StreamEvent::Thought(format!(
-                "Critic rejected System 1 ({codes}) — escalating to System 2...\n"
+                "System 1 output failed the shape check ({codes}) — escalating to System 2...\n"
             )));
         } else {
             let codes = last_violations
@@ -404,12 +404,12 @@ where
                 .collect::<Vec<_>>()
                 .join(", ");
             sink(StreamEvent::Thought(format!(
-                "Critic requested revision ({codes})...\n"
+                "Output failed the shape check ({codes}) — retrying...\n"
             )));
         }
 
         let raw = engine.run_text(&req, sink.clone()).await?;
-        let mut outcome = evaluate_proposal::<T, _>(&raw, &critic);
+        let mut outcome = evaluate_proposal::<T, _>(&raw, &check);
 
         // Weak models often answer well but drop the JSON envelope after a
         // tool call. Ask the same tier to re-wrap its own answer (no tools)
@@ -435,7 +435,7 @@ where
                 raw.trim()
             );
             let repaired = engine.run_text(&repair, sink.clone()).await?;
-            outcome = evaluate_proposal::<T, _>(&repaired, &critic);
+            outcome = evaluate_proposal::<T, _>(&repaired, &check);
         }
 
         match outcome {
@@ -464,7 +464,7 @@ where
                 last_violations = violations;
                 let report = format_violations(&last_violations);
                 req.prompt = format!(
-                    "{}\n\nYour previous proposal was rejected by the deterministic critic for:\n{report}\n\nFix every violation above and return ONLY one valid JSON object matching the schema.",
+                    "{}\n\nYour previous output failed the shape check:\n{report}\n\nFix every violation above and return ONLY one valid JSON object matching the schema.",
                     base_req.prompt
                 );
             }
@@ -472,7 +472,7 @@ where
     }
 
     bail!(
-        "{kind} proposal rejected by critic after retries:\n{}",
+        "{kind} output failed the shape check after retries:\n{}",
         format_violations(&last_violations)
     )
 }
@@ -481,7 +481,7 @@ fn is_only_invalid_json<T>(outcome: &std::result::Result<T, Vec<Violation>>) -> 
     matches!(outcome, Err(v) if v.len() == 1 && v[0].code == "invalid_json")
 }
 
-fn evaluate_proposal<T, C>(raw: &str, critic: &C) -> std::result::Result<T, Vec<Violation>>
+fn evaluate_proposal<T, C>(raw: &str, check: &C) -> std::result::Result<T, Vec<Violation>>
 where
     T: DeserializeOwned,
     C: Fn(&T) -> Vec<Violation>,
@@ -493,7 +493,7 @@ where
             format!("could not parse JSON: {err}"),
         )]
     })?;
-    let violations = critic(&parsed);
+    let violations = check(&parsed);
     if violations.is_empty() {
         Ok(parsed)
     } else {

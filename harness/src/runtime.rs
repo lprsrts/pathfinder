@@ -1,20 +1,20 @@
+//! The loop from `docs/theory.md`. Section numbers refer to that document.
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
 
-use crate::critic::{check_coach, check_onboarding, check_plan_proposal, check_verdict};
 use crate::domain::{
-    CheckDecision, CheckVerdict, CoachAction, CoachDecision, ConceptStatus, ItemStatus,
-    OnboardingDecision, PathItem, PlanGraph, PlanProposal, Session, SessionMode,
+    CandidateProposal, JudgmentVerdict, LogReply, MapChange, MapProposal, OnboardingDecision, Part,
+    PartStatus, PendingCandidate, Session, SessionMode,
 };
-use crate::engine::{
-    Engine, EngineRequest, EngineTier, StreamEvent, StreamSink, ToolAccess, run_gated,
-};
+use crate::engine::{Engine, EngineRequest, EngineTier, StreamSink, ToolAccess, run_gated};
 use crate::store::Store;
+use crate::validate::{
+    check_candidate, check_change, check_log_reply, check_map, check_onboarding, check_verdict,
+};
 use crate::workspace::WorkspaceSnapshot;
-
-const ESCALATE_AFTER_TURNS: u32 = 4;
 
 pub struct TurnInput {
     pub text: String,
@@ -26,14 +26,42 @@ pub struct TurnOutput {
     pub plan_changed: bool,
 }
 
+impl TurnOutput {
+    fn text(reply: impl Into<String>) -> Self {
+        Self {
+            reply: reply.into(),
+            plan_changed: false,
+        }
+    }
+
+    fn changed(reply: impl Into<String>) -> Self {
+        Self {
+            reply: reply.into(),
+            plan_changed: true,
+        }
+    }
+}
+
+pub const COMMANDS_HELP: &str = "Commands: `/plan`, `/summary <text>`, `/handoff [notes]`, `/approve`, `/object <reason>`, `/known`, `/delegate [notes]`, `/accept`, `/reject`, `/replan [what changed]`, `/next`, `/focus <id>`, `/map`.";
+
+/// Decides whether the next candidate is flawed (§5.3).
+fn random_flaw() -> bool {
+    uuid::Uuid::new_v4().as_bytes()[0] & 1 == 1
+}
+
 pub struct Runtime {
     store: Arc<Store>,
     engine: Arc<dyn Engine>,
+    flaw_coin: fn() -> bool,
 }
 
 impl Runtime {
     pub fn new(store: Arc<Store>, engine: Arc<dyn Engine>) -> Self {
-        Self { store, engine }
+        Self {
+            store,
+            engine,
+            flaw_coin: random_flaw,
+        }
     }
 
     pub fn create_session(&self, id: String, cwd: PathBuf) -> Result<Session> {
@@ -57,25 +85,24 @@ impl Runtime {
             .load_session(session_id)?
             .ok_or_else(|| anyhow!("unknown session `{session_id}`"))?;
 
-        let trimmed = input.text.trim();
-        let output = if trimmed.starts_with('/') {
-            self.handle_command(&mut session, trimmed, &input.files, sink)
-                .await?
+        let text = input.text.trim();
+        let files = &input.files;
+        let output = if text.starts_with('/') {
+            self.handle_command(&mut session, text, files, sink).await?
         } else {
             match session.mode {
                 SessionMode::Onboarding => {
-                    self.handle_onboarding(&mut session, trimmed, &input.files, sink)
+                    self.handle_onboarding(&mut session, text, files, sink)
                         .await?
                 }
-                SessionMode::Working => {
-                    self.handle_working(&mut session, trimmed, &input.files, sink)
+                SessionMode::Working if session.pending_candidate.is_some() => {
+                    self.handle_judgment(&mut session, text, files, sink)
                         .await?
                 }
-                SessionMode::Done => TurnOutput {
-                    reply: "Everything on this path is resolved. Run `/replan <new goal>` to extend it or start a new session."
-                        .to_string(),
-                    plan_changed: false,
-                },
+                SessionMode::Working => self.handle_log(&mut session, text, files, sink).await?,
+                SessionMode::Done => TurnOutput::text(
+                    "Every part is resolved. `/replan <what changed>` to extend the map, or start a new session.",
+                ),
             }
         };
 
@@ -90,38 +117,37 @@ impl Runtime {
         files: &[PathBuf],
         sink: StreamSink,
     ) -> Result<TurnOutput> {
-        let mut parts = raw.splitn(2, char::is_whitespace);
-        let cmd = parts.next().unwrap_or("");
-        let arg = parts.next().unwrap_or("").trim();
+        let mut words = raw.splitn(2, char::is_whitespace);
+        let cmd = words.next().unwrap_or("");
+        let arg = words.next().unwrap_or("").trim();
 
         match cmd {
-            "/map" => Ok(TurnOutput {
-                reply: session.plan.render_map(session.active_item.as_deref()),
-                plan_changed: false,
-            }),
-            "/concepts" => Ok(TurnOutput {
-                reply: session.render_concepts(),
-                plan_changed: false,
-            }),
+            "/map" => Ok(TurnOutput::text(render_map_and_pending(session))),
             "/plan" => {
                 if !arg.is_empty() {
                     session.push_turn("user", arg);
                 }
-                self.build_initial_plan(session, files, sink).await
+                self.build_map(session, files, sink).await
             }
-            "/check" => self.handle_check(session, arg, files, sink).await,
-            "/next" => self.handle_next(session),
+            "/summary" => self.handle_summary(session, arg, files, sink).await,
             "/handoff" => self.handle_handoff(session, arg, files, sink).await,
-            "/skip" => self.handle_skip(session, arg, files, sink).await,
-            "/replan" => self.handle_replan(session, arg, files, sink).await,
-            "/focus" => self.handle_focus(session, arg),
-            _ => Ok(TurnOutput {
-                reply: "Commands: `/plan`, `/check [answer]`, `/next`, `/handoff [notes]`, `/skip [notes]`, `/replan [what changed]`, `/map`, `/concepts`, `/focus <id>`."
-                    .to_string(),
-                plan_changed: false,
+            "/object" => self.handle_object(session, arg, files, sink).await,
+            "/approve" => self.handle_approve(session),
+            "/known" => self.handle_known(session),
+            "/delegate" => self.handle_delegate(session, arg, files, sink).await,
+            "/accept" => self.handle_accept(session),
+            "/reject" => Ok(match session.pending_change.take() {
+                Some(_) => TurnOutput::text("Map change rejected."),
+                None => TurnOutput::text("No map change is waiting."),
             }),
+            "/replan" => self.handle_replan(session, arg, files, sink).await,
+            "/next" => Ok(self.handle_next(session)),
+            "/focus" => Ok(self.handle_focus(session, arg)),
+            _ => Ok(TurnOutput::text(COMMANDS_HELP)),
         }
     }
+
+    // --- §3 Onboarding and the map ---
 
     async fn handle_onboarding(
         &self,
@@ -131,25 +157,19 @@ impl Runtime {
         sink: StreamSink,
     ) -> Result<TurnOutput> {
         session.push_turn("user", text);
-
-        let workspace = WorkspaceSnapshot::scan(&session.cwd);
-        let folder_summary = workspace.render();
-        let history = format_history(session);
-        let concepts_summary = session.render_concepts();
-
+        let snapshot = WorkspaceSnapshot::scan(&session.cwd).render();
         let req = EngineRequest {
             tier: EngineTier::System1,
             tools: ToolAccess::ReadOnly,
             cwd: session.cwd.clone(),
             system_prompt: ONBOARDING_SYSTEM.to_string(),
             prompt: format!(
-                "Workspace folder snapshot:\n{folder_summary}\n\nKnown concept state so far:\n{concepts_summary}\n\nConversation so far:\n{history}\n\nRead any files you need first, then respond with JSON only."
+                "Workspace snapshot:\n{snapshot}\n\nConversation so far:\n{}\n\nRead any files you need first, then respond with JSON only.",
+                format_history(session)
             ),
             files: files.to_vec(),
             stream_text: false,
         };
-
-        let session_snapshot = session.clone();
         let decision: OnboardingDecision = run_gated(
             self.engine.as_ref(),
             self.store.as_ref(),
@@ -157,362 +177,437 @@ impl Runtime {
             "onboarding",
             &req,
             sink.clone(),
-            |d: &OnboardingDecision| check_onboarding(d, &session_snapshot, &workspace.stack),
+            check_onboarding,
         )
         .await?;
 
-        if let Some(goal) = decision.goal_summary {
-            if !goal.trim().is_empty() {
-                session.goal = Some(goal);
-            }
+        if let Some(goal) = decision.goal.filter(|g| !g.trim().is_empty()) {
+            session.goal = Some(goal);
         }
-        if let Some(start) = decision.starting_point {
-            if !start.trim().is_empty() {
-                session.starting_point = Some(start);
-            }
-        }
-        for c in &decision.observed_concepts {
-            session.upsert_concept(&c.id, Some(&c.label), c.status, None);
-        }
-
-        if decision.ready_to_plan {
-            session.push_turn("assistant", &decision.reply);
-            return self.build_initial_plan(session, files, sink).await;
-        }
-
         session.push_turn("assistant", &decision.reply);
-        Ok(TurnOutput {
-            reply: decision.reply,
-            plan_changed: false,
-        })
+        if decision.ready_to_map {
+            let map = self.build_map(session, files, sink).await?;
+            return Ok(TurnOutput::changed(format!(
+                "{}\n\n{}",
+                decision.reply, map.reply
+            )));
+        }
+        Ok(TurnOutput::text(decision.reply))
     }
 
-    async fn build_initial_plan(
+    async fn build_map(
         &self,
         session: &mut Session,
         files: &[PathBuf],
         sink: StreamSink,
     ) -> Result<TurnOutput> {
-        let folder_summary = WorkspaceSnapshot::scan(&session.cwd).render();
-        let history = format_history(session);
-        let concepts_summary = session.render_concepts();
-        let goal = session
-            .goal
-            .as_deref()
-            .unwrap_or("(infer from conversation)");
-        let starting = session
-            .starting_point
-            .as_deref()
-            .unwrap_or("(infer from conversation and folder)");
-
+        let snapshot = WorkspaceSnapshot::scan(&session.cwd).render();
         let req = EngineRequest {
             tier: EngineTier::System2,
             tools: ToolAccess::ReadOnly,
             cwd: session.cwd.clone(),
-            system_prompt: PLANNER_SYSTEM.to_string(),
+            system_prompt: MAP_SYSTEM.to_string(),
             prompt: format!(
-                "Goal: {goal}\nStarting point: {starting}\n\nTracked concept state:\n{concepts_summary}\n\nWorkspace folder snapshot:\n{folder_summary}\n\nOnboarding conversation:\n{history}\n\nBuild a sound dependency graph as JSON only."
+                "Goal: {}\n\nWorkspace snapshot:\n{snapshot}\n\nOnboarding conversation:\n{}\n\nRead any files you need first, then respond with JSON only.",
+                session
+                    .goal
+                    .as_deref()
+                    .unwrap_or("(infer from the conversation)"),
+                format_history(session)
             ),
             files: files.to_vec(),
             stream_text: false,
         };
-
-        let concepts_snapshot = session.concepts.clone();
-        let proposal: PlanProposal = run_gated(
+        let proposal: MapProposal = run_gated(
             self.engine.as_ref(),
             self.store.as_ref(),
             &session.id,
-            "plan",
+            "map",
             &req,
             sink,
-            |p: &PlanProposal| check_plan_proposal(p, &[], &concepts_snapshot),
+            check_map,
         )
         .await?;
 
-        let (brief, graph) = proposal
-            .into_graph(&session.concepts)
-            .map_err(|e| anyhow!(e))?;
+        session.map = proposal.to_map();
+        session.active = None;
+        session.pending_change = None;
+        session.pending_candidate = None;
+        session.advance();
 
-        for item in &graph.items {
-            for cid in &item.introduces {
-                if !session.concepts.contains_key(cid) {
-                    session.upsert_concept(cid, None, ConceptStatus::Unknown, None);
-                }
-            }
+        let mut reply = format!(
+            "{}\n\n{}",
+            proposal.brief,
+            session.map.render(session.active.as_deref())
+        );
+        if let Some(part) = session.active_part() {
+            reply.push_str("\n\n");
+            reply.push_str(&render_part(part));
         }
-
-        session.plan = graph;
-        let active_id = session.advance_active();
-
-        let reply = match active_id.as_deref().and_then(|id| session.plan.get(id)) {
-            Some(first) => format!("{brief}\n\n{}", render_active_prompt(first)),
-            None => brief,
-        };
-
         session.push_turn("assistant", &reply);
-        Ok(TurnOutput {
-            reply,
-            plan_changed: true,
-        })
+        Ok(TurnOutput::changed(reply))
     }
 
-    async fn handle_working(
+    /// §3: the model proposes map changes; you accept or reject them.
+    async fn handle_replan(
+        &self,
+        session: &mut Session,
+        reason: &str,
+        files: &[PathBuf],
+        sink: StreamSink,
+    ) -> Result<TurnOutput> {
+        if session.map.parts.is_empty() {
+            return Ok(TurnOutput::text("No map yet. `/plan` builds one."));
+        }
+        let req = EngineRequest {
+            tier: EngineTier::System2,
+            tools: ToolAccess::ReadOnly,
+            cwd: session.cwd.clone(),
+            system_prompt: CHANGE_SYSTEM.to_string(),
+            prompt: format!(
+                "Goal: {}\nWhat changed: {}\n\nCurrent map:\n{}\n\nRecent conversation:\n{}\n\nRead any files you need first, then respond with JSON only.",
+                session.goal.as_deref().unwrap_or("(session goal)"),
+                if reason.is_empty() {
+                    "(infer from the conversation)"
+                } else {
+                    reason
+                },
+                session.map.render(session.active.as_deref()),
+                format_history(session)
+            ),
+            files: files.to_vec(),
+            stream_text: false,
+        };
+        let current = session.map.clone();
+        let change: MapChange = run_gated(
+            self.engine.as_ref(),
+            self.store.as_ref(),
+            &session.id,
+            "map_change",
+            &req,
+            sink,
+            |c: &MapChange| check_change(c, &current),
+        )
+        .await?;
+        let reply = render_change(&change);
+        session.pending_change = Some(change);
+        Ok(TurnOutput::text(reply))
+    }
+
+    fn handle_accept(&self, session: &mut Session) -> Result<TurnOutput> {
+        let Some(change) = session.pending_change.take() else {
+            return Ok(TurnOutput::text("No map change is waiting."));
+        };
+        match session.map.with_change(&change) {
+            Ok(map) => {
+                session.map = map;
+                if session
+                    .active
+                    .as_deref()
+                    .is_none_or(|id| session.map.get(id).is_none())
+                {
+                    session.active = None;
+                    session.advance();
+                } else if session.mode == SessionMode::Done && !session.map.all_resolved() {
+                    session.advance();
+                }
+                Ok(TurnOutput::changed(format!(
+                    "Map updated.\n\n{}",
+                    session.map.render(session.active.as_deref())
+                )))
+            }
+            Err(e) => Ok(TurnOutput::text(format!(
+                "That change no longer fits the map ({e}). Dropped it."
+            ))),
+        }
+    }
+
+    fn handle_next(&self, session: &mut Session) -> TurnOutput {
+        let current = session.active.clone();
+        match session.map.next_open(current.as_deref()) {
+            Some(id) => {
+                session.active = Some(id);
+                session.mode = SessionMode::Working;
+                session.pending_candidate = None;
+                TurnOutput::changed(render_part(session.active_part().unwrap()))
+            }
+            None if session.map.all_resolved() => {
+                session.advance();
+                TurnOutput::changed("Every part is resolved.")
+            }
+            None => TurnOutput::text("No other unresolved part."),
+        }
+    }
+
+    fn handle_focus(&self, session: &mut Session, id: &str) -> TurnOutput {
+        if id.is_empty() {
+            return TurnOutput::text("Usage: `/focus <id>`. `/map` shows the ids.");
+        }
+        if session.map.get(id).is_none() {
+            return TurnOutput::text(format!("No part `{id}` on the map."));
+        }
+        session.active = Some(id.to_string());
+        session.mode = SessionMode::Working;
+        session.pending_candidate = None;
+        TurnOutput::changed(render_part(session.active_part().unwrap()))
+    }
+
+    // --- §5 Evidence: log, summary, candidate ---
+
+    async fn handle_log(
         &self,
         session: &mut Session,
         text: &str,
         files: &[PathBuf],
         sink: StreamSink,
     ) -> Result<TurnOutput> {
-        let Some(active) = session.active().cloned() else {
-            let next = session.advance_active();
-            return Ok(TurnOutput {
-                reply: match next.and_then(|id| session.plan.get(&id).cloned()) {
-                    Some(item) => render_active_prompt(&item),
-                    None => "Everything on this path is resolved.".to_string(),
-                },
-                plan_changed: true,
-            });
-        };
-
-        if active.status == ItemStatus::Understood {
-            return Ok(TurnOutput {
-                reply: format!(
-                    "You already passed **{}**. Run `/handoff` to let me finish remaining labor on it, or `/next` to move on.",
-                    active.title
-                ),
-                plan_changed: false,
-            });
-        }
-
-        session.push_turn("user", text);
-        session.turns_on_active += 1;
-
-        let force_s2 = session.turns_on_active >= ESCALATE_AFTER_TURNS;
-        let tier = if force_s2 {
-            EngineTier::System2
-        } else {
-            EngineTier::System1
-        };
-
-        let decision = self
-            .run_coach_turn(session, &active, tier, files, sink.clone())
-            .await?;
-
-        if !force_s2 && decision.action == CoachAction::Escalate {
-            sink(StreamEvent::Thought(
-                "System 1 escalated coaching to System 2...\n".to_string(),
+        let Some(part) = session.active_part_mut() else {
+            return Ok(TurnOutput::text(
+                "No part is active. `/focus <id>` picks one; `/map` shows them.",
             ));
-            let escalated = self
-                .run_coach_turn(session, &active, EngineTier::System2, files, sink)
-                .await?;
-            session.turns_on_active = 0;
-            session.push_turn("assistant", &escalated.reply);
-            return Ok(TurnOutput {
-                reply: escalated.reply,
-                plan_changed: false,
-            });
-        }
+        };
+        part.log.push(text.to_string());
+        let part = part.clone();
+        session.push_turn("user", text);
 
-        if decision.action == CoachAction::NeedReplan {
-            return self.handle_replan(session, text, files, sink).await;
-        }
-
-        if force_s2 {
-            session.turns_on_active = 0;
-        }
-
-        let mut reply = decision.reply;
-        if decision.action == CoachAction::SuggestCheck {
-            reply.push_str("\n\nReady to verify? Run `/check` with your answer or edits.");
-        }
-
-        session.push_turn("assistant", &reply);
-        Ok(TurnOutput {
-            reply,
-            plan_changed: false,
-        })
-    }
-
-    async fn run_coach_turn(
-        &self,
-        session: &Session,
-        active: &PathItem,
-        tier: EngineTier,
-        files: &[PathBuf],
-        sink: StreamSink,
-    ) -> Result<CoachDecision> {
-        let history = format_history(session);
-        let concepts = session.render_concepts();
         let req = EngineRequest {
-            tier,
+            tier: EngineTier::System1,
             tools: ToolAccess::ReadOnly,
             cwd: session.cwd.clone(),
-            system_prompt: COACH_SYSTEM.to_string(),
+            system_prompt: LOG_SYSTEM.to_string(),
             prompt: format!(
-                "Goal: {}\nCurrent focus: {} (`{}`)\nFraming given: {}\nUser task: {}\nCriteria for understanding: {}\n\nConcept state:\n{concepts}\n\nRecent conversation:\n{history}\n\nRead any files you need first, then respond with JSON only.",
+                "Goal: {}\n\n{}\n\nMap:\n{}\n\nLatest log entry: {text}\n\nRead any files you need first, then respond with JSON only.",
                 session.goal.as_deref().unwrap_or("(session goal)"),
-                active.title,
-                active.id,
-                active.framing,
-                active.user_task,
-                active.check_criteria
+                describe_part(&part),
+                session.map.render(session.active.as_deref()),
             ),
             files: files.to_vec(),
             stream_text: false,
         };
-
-        run_gated(
+        let current = session.map.clone();
+        let decision: LogReply = run_gated(
             self.engine.as_ref(),
             self.store.as_ref(),
             &session.id,
-            "coach",
+            "log",
             &req,
             sink,
-            check_coach,
+            |r: &LogReply| check_log_reply(r, &current),
         )
-        .await
+        .await?;
+
+        let mut reply = decision.reply;
+        if let Some(change) = decision.map_change {
+            reply.push_str("\n\n");
+            reply.push_str(&render_change(&change));
+            session.pending_change = Some(change);
+        }
+        session.push_turn("assistant", &reply);
+        Ok(TurnOutput::text(reply))
     }
 
-    async fn handle_check(
+    async fn handle_summary(
         &self,
         session: &mut Session,
-        answer: &str,
+        summary: &str,
         files: &[PathBuf],
         sink: StreamSink,
     ) -> Result<TurnOutput> {
-        let Some(active) = session.active().cloned() else {
-            return Ok(TurnOutput {
-                reply: "No active item to check yet.".to_string(),
-                plan_changed: false,
-            });
+        let Some(part) = session.active_part_mut() else {
+            return Ok(TurnOutput::text(
+                "No part is active. `/focus <id>` picks one.",
+            ));
         };
-
-        if !answer.is_empty() {
-            session.push_turn("user", format!("/check {answer}"));
+        if part.status != PartStatus::Open {
+            return Ok(TurnOutput::text(format!(
+                "**{}** is already {}.",
+                part.title,
+                part.status.label()
+            )));
         }
+        if summary.is_empty() {
+            return Ok(TurnOutput::text(
+                "Usage: `/summary <your explanation of the part>`.",
+            ));
+        }
+        if part.log.is_empty() {
+            return Ok(TurnOutput::text(
+                "The evidence starts with your log: write your thinking and reasons as you work on this part first, then `/summary`.",
+            ));
+        }
+        part.summary = Some(summary.to_string());
+        let part = part.clone();
+        session.push_turn("user", format!("/summary {summary}"));
 
-        let history = format_history(session);
+        let flawed = (self.flaw_coin)();
         let req = EngineRequest {
             tier: EngineTier::System2,
             tools: ToolAccess::ReadOnly,
             cwd: session.cwd.clone(),
-            system_prompt: CHECK_SYSTEM.to_string(),
+            system_prompt: CANDIDATE_SYSTEM.to_string(),
             prompt: format!(
-                "Checking item: {} (`{}`)\nIntroduces concepts: {}\nUser task: {}\nCriteria for understanding: {}\nUser submission: {}\n\nRecent conversation:\n{history}\n\nInspect workspace files if relevant, then return JSON only.",
-                active.title,
-                active.id,
-                active.introduces.join(", "),
-                active.user_task,
-                active.check_criteria,
-                if answer.is_empty() {
-                    "(check recent conversation and workspace files)"
+                "Goal: {}\n\n{}\n\nMake this candidate {}.\n\nRead any files you need first, then respond with JSON only.",
+                session.goal.as_deref().unwrap_or("(session goal)"),
+                describe_part(&part),
+                if flawed {
+                    "FLAWED: exactly one real flaw"
                 } else {
-                    answer
+                    "CORRECT"
                 }
             ),
             files: files.to_vec(),
             stream_text: false,
         };
-
-        let check: CheckDecision = run_gated(
+        let proposal: CandidateProposal = run_gated(
             self.engine.as_ref(),
             self.store.as_ref(),
             &session.id,
-            "check",
+            "candidate",
+            &req,
+            sink,
+            check_candidate,
+        )
+        .await?;
+
+        let reply = format!(
+            "Candidate for **{}**:\n\n{}\n\nIs it right? Say why.",
+            part.title, proposal.candidate
+        );
+        session.pending_candidate = Some(PendingCandidate {
+            part_id: part.id,
+            candidate: proposal.candidate,
+            key_correct: !flawed,
+            key_reason: proposal.key_reason,
+        });
+        session.push_turn("assistant", &reply);
+        Ok(TurnOutput::text(reply))
+    }
+
+    async fn handle_judgment(
+        &self,
+        session: &mut Session,
+        judgment: &str,
+        files: &[PathBuf],
+        sink: StreamSink,
+    ) -> Result<TurnOutput> {
+        let pending = session.pending_candidate.take().unwrap();
+        let Some(part) = session.map.get(&pending.part_id).cloned() else {
+            return Ok(TurnOutput::text(
+                "That candidate's part is no longer on the map.",
+            ));
+        };
+        session.push_turn("user", judgment);
+
+        let req = EngineRequest {
+            tier: EngineTier::System2,
+            tools: ToolAccess::ReadOnly,
+            cwd: session.cwd.clone(),
+            system_prompt: JUDGE_SYSTEM.to_string(),
+            prompt: format!(
+                "Part: {}\n\nCandidate:\n{}\n\nHidden key: the candidate is {}. {}\n\nUser's judgment: {judgment}\n\nRespond with JSON only.",
+                part.title,
+                pending.candidate,
+                if pending.key_correct {
+                    "CORRECT"
+                } else {
+                    "FLAWED"
+                },
+                pending.key_reason,
+            ),
+            files: files.to_vec(),
+            stream_text: false,
+        };
+        let verdict: JudgmentVerdict = run_gated(
+            self.engine.as_ref(),
+            self.store.as_ref(),
+            &session.id,
+            "judgment",
             &req,
             sink,
             check_verdict,
         )
         .await?;
 
-        let mut plan_changed = false;
-        let reply = match check.verdict {
-            CheckVerdict::Pass => {
-                if let Some(item) = session.plan.get_mut(&active.id) {
-                    item.status = ItemStatus::Understood;
-                    item.notes = Some(check.feedback.clone());
-                }
-                for cid in &active.introduces {
-                    session.upsert_concept(
-                        cid,
-                        None,
-                        ConceptStatus::Proven,
-                        Some(check.feedback.clone()),
-                    );
-                }
-                for cid in &check.proven_concepts {
-                    session.upsert_concept(
-                        cid,
-                        None,
-                        ConceptStatus::Proven,
-                        Some(check.feedback.clone()),
-                    );
-                }
-                self.store.record_outcome(
-                    &session.id,
-                    &active.id,
-                    &active.title,
-                    ItemStatus::Understood,
-                    Some(&check.feedback),
-                )?;
-                plan_changed = true;
-
-                let next_hint = session
-                    .plan
-                    .next_ready_id()
-                    .and_then(|id| session.plan.get(&id).map(|i| i.title.clone()));
-
-                match next_hint {
-                    Some(next_title) => format!(
-                        "{}\n\nMarked **{}** understood. Run `/handoff` if you want me to finish remaining labor on it, or `/next` to move on to **{}**.",
-                        check.feedback, active.title, next_title
-                    ),
-                    None => format!(
-                        "{}\n\nMarked **{}** understood. Run `/handoff` for any remaining labor, or `/next` to wrap up.",
-                        check.feedback, active.title
-                    ),
-                }
-            }
-            CheckVerdict::Close | CheckVerdict::NotYet => {
-                format!(
-                    "{}\n\nAdjust and run `/check` again, or `/skip` to hand this part off.",
-                    check.feedback
-                )
-            }
+        let reply = if verdict.pass {
+            self.set_status(session, &part.id, PartStatus::Understood, &verdict.feedback)?;
+            format!(
+                "{}\n\n**{}** understood. `/handoff` gives the work to the agent; or keep it yourself and `/next`.",
+                verdict.feedback, part.title
+            )
+        } else {
+            format!(
+                "{}\n\nKeep logging, then `/summary` again for a new candidate.",
+                verdict.feedback
+            )
         };
-
         session.push_turn("assistant", &reply);
-        Ok(TurnOutput {
-            reply,
-            plan_changed,
-        })
+        Ok(TurnOutput::changed(reply))
     }
 
-    fn handle_next(&self, session: &mut Session) -> Result<TurnOutput> {
-        if let Some(active) = session.active() {
-            if !active.status.is_resolved() {
-                return Ok(TurnOutput {
-                    reply: format!(
-                        "**{}** isn't resolved yet. Run `/check` when you've got it, or `/skip` to hand it off.",
-                        active.title
-                    ),
-                    plan_changed: false,
-                });
+    // --- §6 Skips ---
+
+    fn handle_known(&self, session: &mut Session) -> Result<TurnOutput> {
+        let Some(part) = session.active_part().cloned() else {
+            return Ok(TurnOutput::text("No part is active."));
+        };
+        if part.status != PartStatus::Open {
+            return Ok(TurnOutput::text(format!(
+                "**{}** is already {}.",
+                part.title,
+                part.status.label()
+            )));
+        }
+        session.pending_candidate = None;
+        self.set_status(session, &part.id, PartStatus::Known, "claimed by the user")?;
+        Ok(self.after_resolution(
+            session,
+            format!("**{}** recorded as already known.", part.title),
+        ))
+    }
+
+    async fn handle_delegate(
+        &self,
+        session: &mut Session,
+        instructions: &str,
+        files: &[PathBuf],
+        sink: StreamSink,
+    ) -> Result<TurnOutput> {
+        let Some(part) = session.active_part().cloned() else {
+            return Ok(TurnOutput::text("No part is active."));
+        };
+        match part.status {
+            PartStatus::Open => {}
+            PartStatus::Understood => {
+                return Ok(TurnOutput::text(
+                    "You understood this part, so `/handoff` it: you'll review the result.",
+                ));
+            }
+            other => {
+                return Ok(TurnOutput::text(format!(
+                    "**{}** is already {}.",
+                    part.title,
+                    other.label()
+                )));
             }
         }
-
-        let next = session.advance_active();
-        let reply = match next.as_deref().and_then(|id| session.plan.get(id)) {
-            Some(item) => render_active_prompt(item),
-            None => "All items on the path are done.".to_string(),
-        };
-
-        session.push_turn("assistant", &reply);
-        Ok(TurnOutput {
-            reply,
-            plan_changed: true,
-        })
+        session.pending_candidate = None;
+        let result = self
+            .run_agent(session, &part, false, instructions, files, sink)
+            .await?;
+        if let Some(p) = session.map.get_mut(&part.id) {
+            p.result = Some(result.clone());
+        }
+        self.set_status(session, &part.id, PartStatus::Delegated, &result)?;
+        Ok(self.after_resolution(
+            session,
+            format!(
+                "\n\n**{}** handed off without understanding; not reviewed.",
+                part.title
+            ),
+        ))
     }
+
+    // --- §7 Handoff and review ---
 
     async fn handle_handoff(
         &self,
@@ -521,416 +616,294 @@ impl Runtime {
         files: &[PathBuf],
         sink: StreamSink,
     ) -> Result<TurnOutput> {
-        let Some(active) = session.active().cloned() else {
-            return Ok(TurnOutput {
-                reply: "No active item to hand off.".to_string(),
-                plan_changed: false,
-            });
+        let Some(part) = session.active_part().cloned() else {
+            return Ok(TurnOutput::text("No part is active."));
         };
-
-        if active.status != ItemStatus::Understood {
-            return Ok(TurnOutput {
-                reply: format!(
-                    "Handoff unlocks after passing `/check` on **{}**. To skip learning this part and let me handle it now, run `/skip`.",
-                    active.title
-                ),
-                plan_changed: false,
-            });
+        match part.status {
+            PartStatus::Understood => {}
+            PartStatus::Open => {
+                return Ok(TurnOutput::text(
+                    "Handoff comes after understanding: log, `/summary`, then judge the candidate. To hand it off without understanding, `/delegate`.",
+                ));
+            }
+            other => {
+                return Ok(TurnOutput::text(format!(
+                    "**{}** is already {}.",
+                    part.title,
+                    other.label()
+                )));
+            }
         }
-
-        let report = self
-            .run_labor(session, &active, instructions, files, sink)
+        let result = self
+            .run_agent(session, &part, true, instructions, files, sink)
             .await?;
-
-        if let Some(item) = session.plan.get_mut(&active.id) {
-            item.status = ItemStatus::HandedOff;
-            item.notes = Some(report.clone());
+        if let Some(p) = session.map.get_mut(&part.id) {
+            p.result = Some(result);
+            p.status = PartStatus::InReview;
         }
-        self.store.record_outcome(
-            &session.id,
-            &active.id,
-            &active.title,
-            ItemStatus::HandedOff,
-            Some(&report),
-        )?;
-
-        let next = session.advance_active();
-        let tail = match next.as_deref().and_then(|id| session.plan.get(id)) {
-            Some(item) => format!("\n\n{}", render_active_prompt(item)),
-            None => "\n\nEverything on this path is resolved.".to_string(),
-        };
-
-        session.push_turn("assistant", format!("{report}{tail}"));
-        Ok(TurnOutput {
-            reply: tail,
-            plan_changed: true,
-        })
+        Ok(TurnOutput::changed(REVIEW_PROMPT))
     }
 
-    async fn handle_skip(
-        &self,
-        session: &mut Session,
-        instructions: &str,
-        files: &[PathBuf],
-        sink: StreamSink,
-    ) -> Result<TurnOutput> {
-        let Some(active) = session.active().cloned() else {
-            return Ok(TurnOutput {
-                reply: "No active item to skip.".to_string(),
-                plan_changed: false,
-            });
-        };
-
-        let streamed = !instructions.eq_ignore_ascii_case("none");
-        let report = if streamed {
-            self.run_labor(session, &active, instructions, files, sink)
-                .await?
-        } else {
-            format!("Skipped **{}** (no agent work requested).", active.title)
-        };
-
-        if let Some(item) = session.plan.get_mut(&active.id) {
-            item.status = ItemStatus::Skipped;
-            item.notes = Some(report.clone());
-        }
-        for cid in &active.introduces {
-            session.upsert_concept(cid, None, ConceptStatus::Skipped, None);
-        }
-        self.store.record_outcome(
-            &session.id,
-            &active.id,
-            &active.title,
-            ItemStatus::Skipped,
-            Some(&report),
-        )?;
-
-        let next = session.advance_active();
-        let tail = match next.as_deref().and_then(|id| session.plan.get(id)) {
-            Some(item) => format!("\n\n{}", render_active_prompt(item)),
-            None => "\n\nEverything on this path is resolved.".to_string(),
-        };
-
-        let reply = if streamed {
-            format!(
-                "\n\nMarked **{}** skipped (not yet understood).{tail}",
-                active.title
-            )
-        } else {
-            format!("{report}{tail}")
-        };
-        session.push_turn("assistant", format!("{report}{tail}"));
-        Ok(TurnOutput {
-            reply,
-            plan_changed: true,
-        })
-    }
-
-    async fn run_labor(
-        &self,
-        session: &Session,
-        item: &PathItem,
-        instructions: &str,
-        files: &[PathBuf],
-        sink: StreamSink,
-    ) -> Result<String> {
-        let req = EngineRequest {
-            tier: EngineTier::System2,
-            tools: ToolAccess::Full,
-            cwd: session.cwd.clone(),
-            system_prompt: LABOR_SYSTEM.to_string(),
-            prompt: format!(
-                "Goal: {}\nItem to execute: {} (`{}`)\nTask scope: {}\nExtra user instructions: {}\n\nComplete the needed labor cleanly in the workspace (or provide a concise summary if purely conceptual). Keep your final report brief and concrete.",
-                session.goal.as_deref().unwrap_or("(session goal)"),
-                item.title,
-                item.id,
-                item.user_task,
-                if instructions.is_empty() {
-                    "(none)"
-                } else {
-                    instructions
-                }
-            ),
-            files: files.to_vec(),
-            stream_text: true,
-        };
-
-        self.engine.run_text(&req, sink).await
-    }
-
-    async fn handle_replan(
+    async fn handle_object(
         &self,
         session: &mut Session,
         reason: &str,
         files: &[PathBuf],
         sink: StreamSink,
     ) -> Result<TurnOutput> {
-        let resolved: Vec<PathItem> = session
-            .plan
-            .items
-            .iter()
-            .filter(|i| i.status.is_resolved())
-            .cloned()
-            .collect();
-        let current_map = session.plan.render_map(session.active_item.as_deref());
-        let concepts_summary = session.render_concepts();
-        let history = format_history(session);
-
-        let req = EngineRequest {
-            tier: EngineTier::System2,
-            tools: ToolAccess::ReadOnly,
-            cwd: session.cwd.clone(),
-            system_prompt: REPLAN_SYSTEM.to_string(),
-            prompt: format!(
-                "Goal: {}\nWhat changed: {}\n\nTracked concept state:\n{concepts_summary}\n\nCurrent path:\n{current_map}\n\nRecent conversation:\n{history}\n\nReturn ONLY JSON for the updated remaining items (do not reuse already-resolved item IDs; new items may depend on resolved IDs).",
-                session.goal.as_deref().unwrap_or("(session goal)"),
-                if reason.is_empty() {
-                    "(infer from conversation)"
-                } else {
-                    reason
-                }
-            ),
-            files: files.to_vec(),
-            stream_text: false,
+        let Some(part) = session.active_part().cloned() else {
+            return Ok(TurnOutput::text("No part is active."));
         };
-
-        let resolved_snapshot = resolved.clone();
-        let concepts_snapshot = session.concepts.clone();
-        let proposal: PlanProposal = run_gated(
-            self.engine.as_ref(),
-            self.store.as_ref(),
-            &session.id,
-            "replan",
-            &req,
-            sink,
-            |p: &PlanProposal| check_plan_proposal(p, &resolved_snapshot, &concepts_snapshot),
-        )
-        .await?;
-
-        let mut merged = resolved;
-        for prop in proposal.items {
-            for cid in &prop.introduces {
-                if !session.concepts.contains_key(cid) {
-                    session.upsert_concept(cid, None, ConceptStatus::Unknown, None);
-                }
-            }
-            merged.push(PathItem {
-                id: prop.id,
-                title: prop.title,
-                depends_on: prop.depends_on,
-                requires: prop.requires,
-                introduces: prop.introduces,
-                framing: prop.framing,
-                user_task: prop.user_task,
-                check_criteria: prop.check_criteria,
-                status: ItemStatus::Pending,
-                notes: None,
-            });
+        if part.status != PartStatus::InReview {
+            return Ok(TurnOutput::text(
+                "Nothing is waiting for your review on this part.",
+            ));
         }
-        session.plan = PlanGraph { items: merged };
-        let active_id = session.advance_active();
-
-        let reply = match active_id.as_deref().and_then(|id| session.plan.get(id)) {
-            Some(item) => format!("{}\n\n{}", proposal.brief, render_active_prompt(item)),
-            None => proposal.brief,
-        };
-
-        session.push_turn("assistant", &reply);
-        Ok(TurnOutput {
-            reply,
-            plan_changed: true,
-        })
+        if reason.is_empty() {
+            return Ok(TurnOutput::text("Usage: `/object <what's wrong and why>`."));
+        }
+        if let Some(p) = session.map.get_mut(&part.id) {
+            p.objections.push(reason.to_string());
+        }
+        let part = session.map.get(&part.id).cloned().unwrap();
+        let result = self
+            .run_agent(session, &part, true, "", files, sink)
+            .await?;
+        if let Some(p) = session.map.get_mut(&part.id) {
+            p.result = Some(result);
+        }
+        Ok(TurnOutput::text(REVIEW_PROMPT))
     }
 
-    fn handle_focus(&self, session: &mut Session, id: &str) -> Result<TurnOutput> {
-        if id.is_empty() {
-            return Ok(TurnOutput {
-                reply: "Usage: `/focus <id>`. Run `/map` to see item IDs.".to_string(),
-                plan_changed: false,
-            });
-        }
-        let Some(item) = session.plan.get(id).cloned() else {
-            return Ok(TurnOutput {
-                reply: format!("No item `{id}` on the current path."),
-                plan_changed: false,
-            });
+    fn handle_approve(&self, session: &mut Session) -> Result<TurnOutput> {
+        let Some(part) = session.active_part().cloned() else {
+            return Ok(TurnOutput::text("No part is active."));
         };
-        if !session.plan.deps_satisfied(&item) {
-            return Ok(TurnOutput {
-                reply: format!("`{id}` depends on {} first.", item.depends_on.join(", ")),
-                plan_changed: false,
-            });
+        if part.status != PartStatus::InReview {
+            return Ok(TurnOutput::text(
+                "Nothing is waiting for your review on this part.",
+            ));
         }
-        session.active_item = Some(item.id.clone());
-        session.turns_on_active = 0;
-        if let Some(m) = session.plan.get_mut(&item.id) {
-            if m.status == ItemStatus::Pending {
-                m.status = ItemStatus::Working;
+        self.set_status(session, &part.id, PartStatus::Done, "result approved")?;
+        Ok(self.after_resolution(session, format!("**{}** done.", part.title)))
+    }
+
+    async fn run_agent(
+        &self,
+        session: &Session,
+        part: &Part,
+        understood: bool,
+        instructions: &str,
+        files: &[PathBuf],
+        sink: StreamSink,
+    ) -> Result<String> {
+        let mut prompt = format!(
+            "Goal: {}\n\n{}\n\n{}",
+            session.goal.as_deref().unwrap_or("(session goal)"),
+            describe_part(part),
+            if understood {
+                "The user understands this part and will review your result."
+            } else {
+                "The user handed this part off without understanding it."
             }
+        );
+        if !part.objections.is_empty() {
+            prompt.push_str(&format!(
+                "\n\nYour previous result:\n{}\n\nThe user objected:\n- {}\n\nAddress every objection.",
+                part.result.as_deref().unwrap_or("(none)"),
+                part.objections.join("\n- ")
+            ));
         }
-        session.mode = SessionMode::Working;
-        Ok(TurnOutput {
-            reply: render_active_prompt(&item),
-            plan_changed: true,
-        })
+        if !instructions.is_empty() {
+            prompt.push_str(&format!("\n\nUser instructions: {instructions}"));
+        }
+        let req = EngineRequest {
+            tier: EngineTier::System2,
+            tools: ToolAccess::Full,
+            cwd: session.cwd.clone(),
+            system_prompt: AGENT_SYSTEM.to_string(),
+            prompt,
+            files: files.to_vec(),
+            stream_text: true,
+        };
+        self.engine.run_text(&req, sink).await
+    }
+
+    // --- §8 Record ---
+
+    fn set_status(
+        &self,
+        session: &mut Session,
+        part_id: &str,
+        status: PartStatus,
+        notes: &str,
+    ) -> Result<()> {
+        let Some(part) = session.map.get_mut(part_id) else {
+            return Ok(());
+        };
+        part.status = status;
+        let title = part.title.clone();
+        if let Some(record) = status.record() {
+            self.store.record_outcome(
+                &session.id,
+                part_id,
+                &title,
+                record,
+                status.label(),
+                Some(notes),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn after_resolution(&self, session: &mut Session, lead: String) -> TurnOutput {
+        let reply = match session.advance() {
+            Some(_) => format!("{lead}\n\n{}", render_part(session.active_part().unwrap())),
+            None if session.mode == SessionMode::Done => {
+                format!("{lead}\n\nEvery part is resolved.")
+            }
+            None => lead,
+        };
+        session.push_turn("assistant", &reply);
+        TurnOutput::changed(reply)
     }
 }
 
-fn render_active_prompt(item: &PathItem) -> String {
-    let mut blocks = vec![format!("**{}** (`{}`)", item.title, item.id)];
-    if !item.framing.trim().is_empty() {
-        blocks.push(item.framing.trim().to_string());
+const REVIEW_PROMPT: &str =
+    "\n\nReview the result: `/approve`, or `/object <what's wrong and why>` to send it back.";
+
+fn render_part(part: &Part) -> String {
+    let mut out = format!("**{}** (`{}`)", part.title, part.id);
+    if !part.note.trim().is_empty() {
+        out.push_str(&format!("\n{}", part.note.trim()));
     }
-    blocks.push(format!("Try this: {}", item.user_task.trim()));
-    blocks.push("Run `/check` when you have it, or `/skip` to hand it off.".to_string());
-    blocks.join("\n\n")
+    out.push_str(&format!("\nStatus: {}.", part.status.label()));
+    if part.status == PartStatus::Open {
+        out.push_str(
+            "\n\nLog your thinking and reasons as you work. `/summary <text>` when you can explain it; `/known` if you already know it; `/delegate` to hand it off without understanding it.",
+        );
+    }
+    out
+}
+
+fn describe_part(part: &Part) -> String {
+    let mut out = format!("Part: {} (`{}`)", part.title, part.id);
+    if !part.note.trim().is_empty() {
+        out.push_str(&format!("\nNote: {}", part.note.trim()));
+    }
+    if !part.log.is_empty() {
+        out.push_str(&format!("\nUser's log:\n- {}", part.log.join("\n- ")));
+    }
+    if let Some(summary) = &part.summary {
+        out.push_str(&format!("\nUser's summary: {summary}"));
+    }
+    out
+}
+
+fn render_change(change: &MapChange) -> String {
+    let mut lines = vec![format!("Proposed map change: {}", change.brief)];
+    for p in &change.parts {
+        let deps = if p.depends_on.is_empty() {
+            String::new()
+        } else {
+            format!(" (needs {})", p.depends_on.join(", "))
+        };
+        lines.push(format!("+ `{}` {}{deps}", p.id, p.title));
+    }
+    for id in &change.remove {
+        lines.push(format!("- remove `{id}`"));
+    }
+    lines.push("`/accept` or `/reject`.".to_string());
+    lines.join("\n")
+}
+
+fn render_map_and_pending(session: &Session) -> String {
+    let mut out = session.map.render(session.active.as_deref());
+    if let Some(change) = &session.pending_change {
+        out.push_str("\n\n");
+        out.push_str(&render_change(change));
+    }
+    out
 }
 
 fn format_history(session: &Session) -> String {
     if session.history.is_empty() {
         return "(none)".to_string();
     }
-    session
-        .history
+    let start = session.history.len().saturating_sub(12);
+    session.history[start..]
         .iter()
-        .rev()
-        .take(12)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
         .map(|t| format!("{}: {}", t.role, t.content))
         .collect::<Vec<_>>()
         .join("\n")
 }
 
-const ONBOARDING_SYSTEM: &str = r#"You are a calm, direct human-in-the-loop pathfinder doing short onboarding.
-Your job: establish TWO things before planning:
-1. The concrete goal.
-2. What the user already knows vs. does not know on the key prerequisite concepts or skills.
+const ONBOARDING_SYSTEM: &str = r#"You run onboarding for Pathfinder, a harness that makes sure the user understands a task before the work is handed to an agent.
 
-You are given a workspace snapshot (file tree, detected stack, excerpts of README/manifests) and a `read` tool for opening files. Look before you ask:
-- Never ask what the workspace already answers: language, framework, build tool, project layout, or what existing code does. Read the relevant files instead.
-- Ask only what files cannot tell you: the user's intent, constraints, and their own understanding.
-- When useful, ground the question in what you found (e.g. name the file or function the change would touch).
-- If a file matters to your question and is not fully shown in the snapshot, call `read` on it BEFORE writing the JSON.
-- `reply` is your final message for this turn; nothing runs after it. State what you found, never what you are about to do ("I'll check...", "Let me look...").
+Onboarding sets the goal: what the user wants done, concretely enough to sketch what the task depends on. Do not plan, teach or do the task here.
 
-Strict rules (enforced mechanically by critics):
-- Flat, calm tone. NEVER open with cheerleading or filler ("Great goal!", "Awesome!", "Sure!", "Let's dive in!").
-- Keep `reply` to 1-2 short sentences (under 60 words). Ask exactly ONE focused question; never chain a second one on with "and how/what/do you...". Ask the next question in a later turn.
-- Wrap math formulas in inline code backticks (e.g. `z = w1*x1 + w2*x2 + b`), never bare subscripts with underscores.
-- Do NOT set `ready_to_plan` to true until you have actually probed the user's prior background AND populated `goal_summary`, `starting_point`, and at least one entry in `observed_concepts`.
-- In `observed_concepts`, status must be `"unknown"` or `"claimed"` (never `"proven"` before a check).
-- Never solve the task during onboarding.
+You get a workspace snapshot and a `read` tool. Read files instead of asking what they already answer. Call `read` before writing your JSON: `reply` ends your turn and nothing runs after it.
+
+When the goal is clear, set `ready_to_map` to true and fill `goal`.
 
 Return ONLY a JSON object:
-{
-  "reply": "1-2 calm sentences with a single focused question",
-  "ready_to_plan": false,
-  "goal_summary": "concise goal or null",
-  "starting_point": "concise summary of user background + folder state or null",
-  "observed_concepts": [
-    {"id": "lowercase_id", "label": "Readable name", "status": "unknown"}
-  ]
-}"#;
+{"reply": "...", "ready_to_map": false, "goal": null}"#;
 
-const PLANNER_SYSTEM: &str = r#"You are the deep planning engine of a neurosymbolic human-in-the-loop pathfinder.
-Build a sound dependency graph (DAG) of 3-6 concrete items so the human builds real understanding by doing each part themselves before handing off repetitive labor.
+const MAP_SYSTEM: &str = r#"You sketch the map for Pathfinder: what the task depends on.
 
-Strict rules (enforced mechanically by critics):
-- Calm, flat, plain language. No filler openers, no cheerleading, no exclamation spam.
-- Wrap math expressions in inline code backticks (e.g. `z = w1*x1 + w2*x2 + b`), never bare underscore subscripts outside backticks.
-- `brief`: 1-3 plain sentences summarizing the path (under 75 words).
-- Every item has:
-  - `id`: short lowercase id ("p1", "p2", ...)
-  - `title`: crisp plain title
-  - `depends_on`: valid earlier item IDs (no cycles)
-  - `requires`: lowercase concept IDs that MUST already be `proven`/`skipped` in tracked concept state OR be listed in `introduces` of an item in `depends_on` (transitively). Do NOT put unintroduced concepts in `requires`.
-  - `introduces`: lowercase concept IDs newly introduced by this item.
-  - `framing`: MANDATORY whenever `introduces` is non-empty (1-3 crisp sentences, 12-80 words). Plainly explain the newly introduced idea BEFORE asking the user to act, so the user is never hit cold with unexplained terms or formulas.
-  - `user_task`: 1-2 concrete sentences (under 70 words) telling the user what to try, compute, inspect, or write.
-  - `check_criteria`: what proves real understanding.
+- A part is something the task depends on: a piece of the work, or of the understanding needed to judge the work. It is not a lesson and not an assignment: the user decides during the work which parts they do themselves and which go to an agent.
+- No size limit. Use as many parts as the task needs and no more; a small task can be a single part.
+- `depends_on` lists parts that must be understood or done before this one makes sense. No cycles.
+- `id`: short lowercase id. `note`: one line on what the part covers. `brief`: what the map covers.
 
 Return ONLY a JSON object:
-{
-  "brief": "short plain summary",
-  "items": [
-    {
-      "id": "p1",
-      "title": "Short title",
-      "depends_on": [],
-      "requires": [],
-      "introduces": ["weighted_sum", "bias"],
-      "framing": "1-3 plain sentences introducing the concept clearly before the task.",
-      "user_task": "Concrete action for the human.",
-      "check_criteria": "What proves they got it."
-    }
-  ]
-}"#;
+{"brief": "...", "parts": [{"id": "p1", "title": "...", "note": "...", "depends_on": []}]}"#;
 
-const COACH_SYSTEM: &str = r#"You are a calm, direct partner guiding the human while they work on the current item.
-Strict rules (enforced mechanically by critics):
-- Flat, plain tone. Never use cheerleading or filler openers ("Great!", "Awesome!", "Sure!").
-- Keep `reply` to 1-3 short sentences (under 80 words). Never dump walls of text or large code blocks (>6 lines).
-- Wrap math formulas in inline code backticks, never bare underscore subscripts.
-- Stay strictly on the current item and do not spoil the answer.
-- Use the `read` tool before answering if you need a file. `reply` ends your turn: never announce actions you are about to take ("I'll check...", "Let me look...").
-- Choose `action`:
-  - "keep_going": normal short nudge or clarifying question
-  - "suggest_check": user appears ready to verify with /check
-  - "escalate": user is deeply stuck or has a subtle misconception needing deeper diagnosis
-  - "need_replan": new evidence shows the path needs to change
+const CHANGE_SYSTEM: &str = r#"You propose a change to Pathfinder's map of what the task depends on, because something changed. The user accepts or rejects it.
+
+- `parts`: parts to add, or existing parts to update (same id), each with id, title, note, depends_on.
+- `remove`: ids of parts to drop. Only parts with no work or outcome can be removed.
+- No size limit. No cycles.
 
 Return ONLY a JSON object:
-{
-  "reply": "1-3 calm sentences",
-  "action": "keep_going"
-}"#;
+{"brief": "what changed", "parts": [], "remove": []}"#;
 
-const CHECK_SYSTEM: &str = r#"You are the careful judge of a human-in-the-loop pathfinder.
-Evaluate whether the user genuinely understands the current item based on their explanation, work, and workspace files.
-Strict rules (enforced mechanically by critics):
-- Calm, direct tone. No filler openers or cheerleading.
-- Do not rubber-stamp vague or hand-wavy answers.
-- Keep `feedback` to 1-3 sentences (under 90 words), specific about what landed or what is missing.
-- Wrap math formulas in inline code backticks.
-- `verdict` must be `"pass"`, `"close"`, or `"not_yet"`.
-- `proven_concepts`: list of lowercase concept IDs genuinely demonstrated in this check (empty if not passed).
+const LOG_SYSTEM: &str = r#"The user is working on one part of a task and logging their thinking and the reasons behind their steps and choices. The log is evidence of their understanding.
+
+Reply briefly to the latest entry: answer what they ask, or point out what the entry reveals. Do not do the work for them and do not give away the part's answer.
+
+The user decides which parts they do themselves and which go to an agent. Never raise that.
+
+If the entry reveals the map is wrong (a missing dependency, a part that doesn't belong, a wrong edge), propose a change in `map_change`; the user accepts or rejects it. Otherwise set it to null. A change has `brief`, `parts` (to add, or update by id: id, title, note, depends_on) and `remove` (ids of parts with no work yet).
+
+Call `read` before writing your JSON if a file matters: `reply` ends your turn.
 
 Return ONLY a JSON object:
-{
-  "verdict": "pass",
-  "feedback": "short specific feedback",
-  "proven_concepts": ["weighted_sum"]
-}"#;
+{"reply": "...", "map_change": null}"#;
 
-const LABOR_SYSTEM: &str = r#"You are executing handed-off or skipped labor inside a human-in-the-loop pathfinder.
-Complete the requested work cleanly using available tools.
-Calm, direct tone. Keep your final summary brief (3-6 sentences or short bullets) reporting what you changed or found."#;
+const CANDIDATE_SYSTEM: &str = r#"You make a candidate for the user to judge. Their judgment decides whether they understand the part well enough to direct an agent and tell whether its result is right.
 
-const REPLAN_SYSTEM: &str = r#"You are updating the remaining path of a neurosymbolic human-in-the-loop pathfinder because reality changed mid-session.
-Strict rules (enforced mechanically by critics):
-- Calm, flat tone. Wrap math formulas in inline code backticks.
-- `brief`: 1-2 plain sentences explaining what changed.
-- Return ONLY the new/updated remaining items; do not reuse already-resolved item IDs.
-- Every `requires` concept must already be proven/skipped or introduced by a dependency ancestor.
-- Every item introducing new concepts must include a clear 1-3 sentence `framing` before `user_task`.
+A candidate is a concrete approach or result for this part, as an agent might produce it. Pick whichever fits the part.
+
+You are told whether to make it correct or flawed. A flawed candidate contains exactly one real flaw that matters for the goal and that someone who understands the part would catch. It must look plausible: never hint at the flaw.
+
+`key_reason` is hidden from the user: for a correct candidate, why it is right; for a flawed one, what the flaw is and why it matters.
 
 Return ONLY a JSON object:
-{
-  "brief": "what changed",
-  "items": [
-    {
-      "id": "p_new_1",
-      "title": "Short title",
-      "depends_on": [],
-      "requires": [],
-      "introduces": ["concept_id"],
-      "framing": "1-3 plain sentences explaining the new idea before the task.",
-      "user_task": "Concrete action for the human.",
-      "check_criteria": "What proves they got it."
-    }
-  ]
-}"#;
+{"candidate": "...", "key_reason": "..."}"#;
+
+const JUDGE_SYSTEM: &str = r#"Decide whether the user's judgment of a candidate shows they could judge an agent's work on this part.
+
+You have the candidate, the hidden key (correct or flawed, and why) and the user's judgment.
+
+`pass` is true only if their verdict matches the key and their reason does too: for a flawed candidate they name the actual flaw, not a different one; for a correct one they say why it holds, not just that it looks fine.
+
+`feedback`: reveal the key and say what their judgment got right or missed.
+
+Return ONLY a JSON object:
+{"pass": false, "feedback": "..."}"#;
+
+const AGENT_SYSTEM: &str = r#"You do the work for one part of a task in the user's workspace, using the tools available. End with a report of what you changed or found, concrete enough for the user to review."#;
 
 #[cfg(test)]
 mod tests {
@@ -950,7 +923,7 @@ mod tests {
                 replies: Mutex::new(
                     items
                         .into_iter()
-                        .map(|(ta, tier, s)| (ta, tier, s.to_string()))
+                        .map(|(t, tier, s)| (t, tier, s.to_string()))
                         .collect(),
                 ),
             }
@@ -964,17 +937,125 @@ mod tests {
             _sink: StreamSink,
         ) -> BoxFuture<'a, Result<String>> {
             Box::pin(async move {
-                let (expected_tools, expected_tier, reply) = self
+                let (tools, tier, reply) = self
                     .replies
                     .lock()
                     .unwrap()
                     .pop_front()
                     .expect("unexpected engine call");
-                assert_eq!(req.tools, expected_tools, "tool access mismatch");
-                assert_eq!(req.tier, expected_tier, "engine tier mismatch");
+                assert_eq!(req.tools, tools, "tool access mismatch");
+                assert_eq!(req.tier, tier, "engine tier mismatch");
                 Ok(reply)
             })
         }
+    }
+
+    use EngineTier::{System1 as S1, System2 as S2};
+    use ToolAccess::{Full, ReadOnly};
+
+    const ONBOARD_READY: &str =
+        r#"{"reply":"Got it.","ready_to_map":true,"goal":"Add a /status command"}"#;
+    const MAP: &str = r#"{"brief":"Two parts.","parts":[
+        {"id":"route","title":"Command routing","note":"Where commands dispatch","depends_on":[]},
+        {"id":"report","title":"What status reports","depends_on":["route"]}]}"#;
+
+    fn runtime(engine: FakeEngine, flawed: bool) -> (Runtime, Arc<FakeEngine>) {
+        let engine = Arc::new(engine);
+        let mut rt = Runtime::new(Arc::new(Store::open_in_memory().unwrap()), engine.clone());
+        rt.flaw_coin = if flawed { || true } else { || false };
+        rt.create_session("s".into(), PathBuf::from(".")).unwrap();
+        (rt, engine)
+    }
+
+    async fn turn(rt: &Runtime, text: &str) -> TurnOutput {
+        rt.handle_turn(
+            "s",
+            TurnInput {
+                text: text.into(),
+                files: vec![],
+            },
+            noop_sink(),
+        )
+        .await
+        .unwrap()
+    }
+
+    fn status(rt: &Runtime, id: &str) -> PartStatus {
+        rt.load_session("s")
+            .unwrap()
+            .unwrap()
+            .map
+            .get(id)
+            .unwrap()
+            .status
+    }
+
+    #[tokio::test]
+    async fn understood_part_is_handed_off_reviewed_objected_and_approved() {
+        let (rt, engine) = runtime(
+            FakeEngine::new(vec![
+                (ReadOnly, S1, ONBOARD_READY),
+                (ReadOnly, S2, MAP),
+                (
+                    ReadOnly,
+                    S1,
+                    r#"{"reply":"Right, acp.rs lists them.","map_change":null}"#,
+                ),
+                (
+                    ReadOnly,
+                    S2,
+                    r#"{"candidate":"Add it only in runtime.rs.","key_reason":"Zed never sees it unless acp.rs advertises it."}"#,
+                ),
+                (
+                    ReadOnly,
+                    S2,
+                    r#"{"pass":true,"feedback":"Yes: it must be advertised in acp.rs."}"#,
+                ),
+                (Full, S2, "Added /status."),
+                (Full, S2, "Advertised it too."),
+            ]),
+            true,
+        );
+
+        let out = turn(&rt, "add a /status command").await;
+        assert!(out.reply.contains("Command routing"));
+        assert_eq!(
+            rt.load_session("s").unwrap().unwrap().active.as_deref(),
+            Some("route")
+        );
+
+        // §5: summary before any log is refused.
+        assert!(turn(&rt, "/summary it routes").await.reply.contains("log"));
+        // §7: handoff before understanding is refused.
+        assert!(turn(&rt, "/handoff").await.reply.contains("/delegate"));
+
+        turn(
+            &rt,
+            "commands are advertised in acp.rs and dispatched in runtime.rs",
+        )
+        .await;
+        let cand = turn(&rt, "/summary two places: advertise and dispatch").await;
+        assert!(cand.reply.contains("Is it right?"));
+        let s = rt.load_session("s").unwrap().unwrap();
+        assert!(!s.pending_candidate.as_ref().unwrap().key_correct);
+
+        turn(&rt, "Wrong: acp.rs must advertise it or Zed won't show it").await;
+        assert_eq!(status(&rt, "route"), PartStatus::Understood);
+
+        turn(&rt, "/handoff").await;
+        assert_eq!(status(&rt, "route"), PartStatus::InReview);
+        turn(&rt, "/object it isn't advertised").await;
+        let s = rt.load_session("s").unwrap().unwrap();
+        assert_eq!(s.map.get("route").unwrap().objections.len(), 1);
+        assert_eq!(
+            s.map.get("route").unwrap().result.as_deref(),
+            Some("Advertised it too.")
+        );
+
+        let out = turn(&rt, "/approve").await;
+        assert_eq!(status(&rt, "route"), PartStatus::Done);
+        assert!(out.reply.contains("What status reports"));
+        assert!(engine.replies.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -983,35 +1064,34 @@ mod tests {
         let engine = FakeEngine::new(vec![
             // S1 reads files, then answers in prose instead of JSON.
             (
-                ToolAccess::ReadOnly,
-                EngineTier::System1,
+                ReadOnly,
+                S1,
                 "Commands live in `acp.rs`. What should `/status` show?",
             ),
             // Same tier, no tools: re-wraps the same content as JSON.
             (
                 ToolAccess::None,
-                EngineTier::System1,
-                r#"{"reply":"Commands live in `acp.rs`. What should `/status` show?","ready_to_plan":false}"#,
+                S1,
+                r#"{"reply":"Commands live in `acp.rs`. What should `/status` show?","ready_to_map":false}"#,
             ),
         ]);
         let req = EngineRequest {
-            tier: EngineTier::System1,
-            tools: ToolAccess::ReadOnly,
+            tier: S1,
+            tools: ReadOnly,
             cwd: PathBuf::from("."),
             system_prompt: String::new(),
             prompt: "onboard".into(),
             files: vec![],
             stream_text: false,
         };
-        let session = Session::new("s-json".into(), PathBuf::from("."));
         let d: OnboardingDecision = run_gated(
             &engine,
             &store,
-            "s-json",
+            "s",
             "onboarding",
             &req,
             noop_sink(),
-            |d: &OnboardingDecision| check_onboarding(d, &session, &[]),
+            check_onboarding,
         )
         .await
         .unwrap();
@@ -1020,154 +1100,82 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn critic_rejects_fluff_on_s1_and_escalates_to_s2() {
-        let store = Arc::new(Store::open_in_memory().unwrap());
-        let engine = Arc::new(FakeEngine::new(vec![
-            // System 1 violates tone ("Great goal!") -> critic rejects & escalates to System 2
-            (
-                ToolAccess::ReadOnly,
-                EngineTier::System1,
-                r#"{"reply":"Great goal! Do you know algebra?","ready_to_plan":false,"observed_concepts":[]}"#,
-            ),
-            // System 2 fixes the violation -> accepted
-            (
-                ToolAccess::ReadOnly,
-                EngineTier::System2,
-                r#"{"reply":"Before we map this out, how comfortable are you with linear combinations and basic derivatives?","ready_to_plan":false,"goal_summary":"Learn neuron mechanics","observed_concepts":[]}"#,
-            ),
-        ]));
-
-        let rt = Runtime::new(store, engine);
-        rt.create_session("s1".into(), PathBuf::from(".")).unwrap();
-
-        let out = rt
-            .handle_turn(
-                "s1",
-                TurnInput {
-                    text: "I want to learn neuron mechanics".into(),
-                    files: vec![],
-                },
-                noop_sink(),
-            )
-            .await
-            .unwrap();
-        assert!(!out.plan_changed);
-        assert!(out.reply.contains("linear combinations"));
+    async fn failed_judgment_keeps_part_open() {
+        let (rt, _) = runtime(
+            FakeEngine::new(vec![
+                (ReadOnly, S1, ONBOARD_READY),
+                (ReadOnly, S2, MAP),
+                (ReadOnly, S1, r#"{"reply":"Ok.","map_change":null}"#),
+                (ReadOnly, S2, r#"{"candidate":"c","key_reason":"r"}"#),
+                (
+                    ReadOnly,
+                    S2,
+                    r#"{"pass":false,"feedback":"It was correct."}"#,
+                ),
+            ]),
+            false,
+        );
+        turn(&rt, "goal").await;
+        turn(&rt, "thinking").await;
+        turn(&rt, "/summary s").await;
+        let out = turn(&rt, "looks wrong").await;
+        assert!(out.reply.contains("/summary"));
+        let s = rt.load_session("s").unwrap().unwrap();
+        assert_eq!(s.map.get("route").unwrap().status, PartStatus::Open);
+        assert!(s.pending_candidate.is_none());
     }
 
     #[tokio::test]
-    async fn enforces_framing_concepts_and_tool_gating_end_to_end() {
-        let store = Arc::new(Store::open_in_memory().unwrap());
-        let engine = Arc::new(FakeEngine::new(vec![
-            (
-                ToolAccess::ReadOnly,
-                EngineTier::System1,
-                r#"{"reply":"Building a short path from scratch.","ready_to_plan":true,"goal_summary":"Fix parser","starting_point":"Knows Rust, new to lexers","observed_concepts":[{"id":"rust_basics","label":"Rust basics","status":"claimed"},{"id":"lexer_state","label":"Lexer state","status":"unknown"}]}"#,
-            ),
-            (
-                ToolAccess::ReadOnly,
-                EngineTier::System2,
-                r#"{"brief":"Two-part path covering the tokenizer and the remaining cases.","items":[{"id":"p1","title":"Trace tokenizer","depends_on":[],"requires":[],"introduces":["lexer_state"],"framing":"A lexer scans input one character at a time and skips whitespace before reading a token.","user_task":"Check line 10 and trace what happens on a tab character.","check_criteria":"Explain why tabs slip past whitespace handling."},{"id":"p2","title":"Fix remaining rules","depends_on":["p1"],"requires":["lexer_state"],"introduces":[],"framing":"","user_task":"Apply the same whitespace check to the remaining branches.","check_criteria":"Tests pass."}]}"#,
-            ),
-            (
-                ToolAccess::ReadOnly,
-                EngineTier::System1,
-                r#"{"reply":"Look closely at which characters the whitespace helper matches.","action":"keep_going"}"#,
-            ),
-            (
-                ToolAccess::ReadOnly,
-                EngineTier::System2,
-                r#"{"verdict":"pass","feedback":"Exact diagnosis: tabs were missing from the whitespace branch.","proven_concepts":["lexer_state"]}"#,
-            ),
-            (
-                ToolAccess::Full,
-                EngineTier::System2,
-                "Updated the remaining tokenizer cases and all tests pass.",
-            ),
-        ]));
+    async fn two_kinds_of_skip() {
+        let (rt, engine) = runtime(
+            FakeEngine::new(vec![
+                (ReadOnly, S1, ONBOARD_READY),
+                (ReadOnly, S2, MAP),
+                (Full, S2, "Wrote the report."),
+            ]),
+            false,
+        );
+        turn(&rt, "goal").await;
+        turn(&rt, "/known").await;
+        assert_eq!(status(&rt, "route"), PartStatus::Known);
+        let out = turn(&rt, "/delegate").await;
+        assert!(out.reply.contains("without understanding"));
+        assert_eq!(status(&rt, "report"), PartStatus::Delegated);
+        // No review for delegated parts.
+        let s = rt.load_session("s").unwrap().unwrap();
+        assert_eq!(s.mode, SessionMode::Done);
+        assert!(engine.replies.lock().unwrap().is_empty());
+    }
 
-        let rt = Runtime::new(store.clone(), engine);
-        rt.create_session("s1".into(), PathBuf::from(".")).unwrap();
-
-        let out = rt
-            .handle_turn(
-                "s1",
-                TurnInput {
-                    text: "Fix parser bug; I know Rust but never wrote a lexer".into(),
-                    files: vec![],
-                },
-                noop_sink(),
-            )
-            .await
-            .unwrap();
-        assert!(out.plan_changed);
+    #[tokio::test]
+    async fn map_change_waits_for_your_ok() {
+        let (rt, _) = runtime(
+            FakeEngine::new(vec![
+                (ReadOnly, S1, ONBOARD_READY),
+                (ReadOnly, S2, MAP),
+                (
+                    ReadOnly,
+                    S1,
+                    r#"{"reply":"That needs the store.","map_change":{"brief":"Status reads the store","parts":[{"id":"store","title":"Session store","depends_on":[]}],"remove":[]}}"#,
+                ),
+            ]),
+            false,
+        );
+        turn(&rt, "goal").await;
+        let out = turn(&rt, "status should show saved sessions").await;
+        assert!(out.reply.contains("/accept"));
         assert!(
-            out.reply
-                .contains("A lexer scans input one character at a time")
-        );
-        assert!(out.reply.contains("Try this:"));
-
-        // Coaching stays read-only on S1
-        let out = rt
-            .handle_turn(
-                "s1",
-                TurnInput {
-                    text: "Why does it fail on tabs?".into(),
-                    files: vec![],
-                },
-                noop_sink(),
-            )
-            .await
-            .unwrap();
-        assert!(!out.plan_changed);
-        assert!(out.reply.contains("whitespace helper"));
-
-        // Handoff blocked before /check passes
-        let blocked = rt
-            .handle_turn(
-                "s1",
-                TurnInput {
-                    text: "/handoff".into(),
-                    files: vec![],
-                },
-                noop_sink(),
-            )
-            .await
-            .unwrap();
-        assert!(blocked.reply.contains("unlocks after passing `/check`"));
-
-        // /check passes on S2 (read-only) and marks `lexer_state` proven
-        let checked = rt
-            .handle_turn(
-                "s1",
-                TurnInput {
-                    text: "/check Tabs were not in the whitespace match".into(),
-                    files: vec![],
-                },
-                noop_sink(),
-            )
-            .await
-            .unwrap();
-        assert!(checked.plan_changed);
-        let session = rt.load_session("s1").unwrap().unwrap();
-        assert_eq!(
-            session.concepts.get("lexer_state").unwrap().status,
-            ConceptStatus::Proven
+            rt.load_session("s")
+                .unwrap()
+                .unwrap()
+                .map
+                .get("store")
+                .is_none()
         );
 
-        // /handoff unlocks Full tools on S2 and advances to p2
-        let handoff = rt
-            .handle_turn(
-                "s1",
-                TurnInput {
-                    text: "/handoff".into(),
-                    files: vec![],
-                },
-                noop_sink(),
-            )
-            .await
-            .unwrap();
-        assert!(handoff.plan_changed);
-        assert!(handoff.reply.contains("Fix remaining rules"));
+        turn(&rt, "/accept").await;
+        let s = rt.load_session("s").unwrap().unwrap();
+        assert!(s.map.get("store").is_some());
+        assert!(s.pending_change.is_none());
     }
 }
