@@ -19,7 +19,7 @@ Add to `~/.config/zed/settings.json`:
 {
   "agent_servers": {
     "Pathfinder": {
-      "command": "/Users/alper/dev/personal/waylit/harness/target/release/harness",
+      "command": "/Users/alper/dev/personal/pathfinder/harness/target/release/harness",
       "args": ["acp"]
     }
   }
