@@ -34,12 +34,23 @@ Pathfinder uses a fast model (System 1: onboarding, log replies) and a stronger 
 
 | Route | What runs it | Credentials |
 |---|---|---|
+| `chatgpt` | Pathfinder's own agent, OpenAI Responses API | Sign in with ChatGPT (your Plus/Pro plan) |
 | `anthropic` | Pathfinder's own agent, Anthropic Messages API | API key (see below) |
 | `openai` | Pathfinder's own agent, OpenAI Responses API | API key (see below) |
 | `claude` | Claude Code CLI (`claude -p`) | the CLI's own login |
 | `codex` | Codex CLI (`codex exec`) | the CLI's own login |
 
 On the API routes Pathfinder runs its own tool loop (read, list, find, search in the workspace) and streams the model's thinking and tool calls into Zed. Agent work (`/handoff`, `/delegate`) currently needs a `claude` or `codex` main model; it comes to the API routes next.
+
+### Sign in with ChatGPT
+
+```bash
+harness auth login chatgpt
+```
+
+Opens your browser to sign in with your ChatGPT account; model usage then counts against your ChatGPT plan (Plus users share one five-hour limit across all connected apps; see chatgpt.com/settings/usage). This is OpenAI's official flow for open-source apps: Pathfinder registers itself once, keeps the tokens in your keychain, and refreshes them as needed. In Zed, the **Sign in with ChatGPT** button runs the same command. `harness auth logout chatgpt` signs out and revokes the token (`--forget` also drops the registration, to switch accounts). Set `HARNESS_NO_BROWSER=1` to print the sign-in URL instead of opening a browser.
+
+Claude and Gemini subscriptions can't be used this way: their providers don't allow third-party apps to. Use an API key, or the `claude` route for your Claude Code login.
 
 ### API keys
 

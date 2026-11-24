@@ -16,12 +16,13 @@ use anyhow::{Result, anyhow, bail};
 use futures_util::future::join_all;
 
 use crate::auth::Credentials;
+use crate::auth::chatgpt::ChatGptError;
 use crate::config::{ModelEntry, Route};
 use crate::engine::{
     BoxFuture, Engine, EngineRequest, EngineTier, StreamEvent, StreamSink, ToolAccess,
 };
 use crate::llm::anthropic::Anthropic;
-use crate::llm::responses::Responses;
+use crate::llm::responses::{Bearer, Responses};
 use crate::llm::{Llm, LlmError, LlmEvent, LlmRequest, Message, Part, ToolResult, text_of};
 use crate::stream::describe_tool;
 use tools::ToolEnv;
@@ -44,13 +45,25 @@ impl ApiEngine {
         Self { factory }
     }
 
-    /// Clients authenticated with keys from env vars or the keychain.
+    /// Clients authenticated with keys from env vars or the keychain, or
+    /// with the Sign in with ChatGPT session.
     pub fn with_credentials(creds: Arc<Credentials>) -> Self {
         let http = reqwest::Client::new();
         Self::new(Arc::new(
             move |entry: &ModelEntry| -> Result<Arc<dyn Llm>> {
-                let key = creds.api_key(entry.route)?;
                 let base = |var: &str| env::var(var).ok().filter(|v| !v.trim().is_empty());
+                if entry.route == Route::Chatgpt {
+                    let session = creds.chatgpt();
+                    if !session.signed_in() {
+                        return Err(ChatGptError::NotSignedIn.into());
+                    }
+                    return Ok(Arc::new(Responses::with_bearer(
+                        http.clone(),
+                        Bearer::ChatGpt(session),
+                        base("HARNESS_OPENAI_BASE_URL"),
+                    )));
+                }
+                let key = creds.api_key(entry.route)?;
                 Ok(match entry.route {
                     Route::Anthropic => Arc::new(Anthropic::new(
                         http.clone(),

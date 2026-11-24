@@ -136,6 +136,7 @@ fn error_message(body: &str) -> String {
         .and_then(|v| {
             v.pointer("/error/message")
                 .or_else(|| v.get("message"))
+                .or_else(|| v.get("detail"))
                 .and_then(Value::as_str)
                 .map(str::to_string)
         })
@@ -150,7 +151,17 @@ async fn status_error(resp: Response) -> LlmError {
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.trim().parse::<f64>().ok())
         .map(Duration::from_secs_f64);
-    let message = error_message(&resp.text().await.unwrap_or_default());
+    let body = resp.text().await.unwrap_or_default();
+    let message = error_message(&body);
+    // Structured codes (e.g. ChatGPT plan limits) say more than the status.
+    if let Ok(v) = serde_json::from_str::<Value>(&body) {
+        if v.pointer("/error/code")
+            .and_then(Value::as_str)
+            .is_some_and(|c| c.starts_with("subscription_sharing"))
+        {
+            return responses::failure(&v);
+        }
+    }
     match status {
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => LlmError::Auth(message),
         StatusCode::TOO_MANY_REQUESTS => LlmError::RateLimited {

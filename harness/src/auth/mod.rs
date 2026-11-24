@@ -5,6 +5,7 @@
 //! `<provider>-api-key` keychain item for the current user, which is only
 //! ever read, never changed.
 
+pub mod chatgpt;
 pub mod secrets;
 
 use std::collections::HashMap;
@@ -15,6 +16,7 @@ use anyhow::Result;
 use thiserror::Error;
 
 use crate::config::Route;
+use chatgpt::ChatGpt;
 use secrets::SecretStore;
 
 pub const SERVICE: &str = "pathfinder";
@@ -61,6 +63,7 @@ impl MissingCredentials {
 
 pub struct Credentials {
     store: Arc<dyn SecretStore>,
+    chatgpt: Arc<ChatGpt>,
     user: String,
     use_env: bool,
     /// Successful lookups only, so a key added later is found on the next try.
@@ -78,6 +81,7 @@ fn shared_service(route: Route) -> String {
 impl Credentials {
     pub fn new(store: Arc<dyn SecretStore>) -> Self {
         Self {
+            chatgpt: Arc::new(ChatGpt::new(store.clone())),
             store,
             user: env::var("USER").unwrap_or_default(),
             use_env: true,
@@ -93,11 +97,17 @@ impl Credentials {
     #[cfg(test)]
     pub fn for_tests(store: Arc<dyn SecretStore>, user: &str) -> Self {
         Self {
+            chatgpt: Arc::new(ChatGpt::new(store.clone())),
             store,
             user: user.to_string(),
             use_env: false,
             cache: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// The Sign in with ChatGPT session.
+    pub fn chatgpt(&self) -> Arc<ChatGpt> {
+        self.chatgpt.clone()
     }
 
     /// Finds a key and where it came from, without caching.

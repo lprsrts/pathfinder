@@ -72,7 +72,7 @@ impl ModelCache {
 
     /// Picker entries, ids like `anthropic:claude-sonnet-5-5`.
     pub fn entries(&self) -> Vec<ModelEntry> {
-        Route::API
+        Route::DISCOVERED
             .into_iter()
             .flat_map(|route| {
                 self.providers
@@ -114,7 +114,7 @@ pub async fn list_models(
             .header("anthropic-version", "2026-10-21"),
             "display_name",
         ),
-        Route::Openai => (
+        Route::Openai | Route::Chatgpt => (
             http.get(format!(
                 "{}/models",
                 base_url("HARNESS_OPENAI_BASE_URL", "https://api.openai.com/v1")
@@ -137,6 +137,20 @@ pub async fn list_models(
         bail!("{} model list failed ({status})", route.provider_name());
     }
     let body: Value = resp.json().await.context("reading model list")?;
+    if route == Route::Chatgpt {
+        // Plan models: `models[]`, listable ones only, server order kept.
+        return Ok(body["models"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|m| m["visibility"].as_str() == Some("list"))
+            .filter_map(|m| {
+                let id = m["slug"].as_str()?.to_string();
+                let label = m["display_name"].as_str().unwrap_or(&id).to_string();
+                Some(CachedModel { id, label })
+            })
+            .collect());
+    }
     let mut listed: Vec<(i64, CachedModel)> = body["data"]
         .as_array()
         .into_iter()
@@ -211,8 +225,24 @@ fn keep(route: Route, id: &str) -> bool {
 /// keep their previous list.
 pub async fn refresh(creds: &Credentials, http: &reqwest::Client) -> ModelCache {
     let mut cache = ModelCache::load();
-    for route in Route::API {
-        let Some((key, _)) = creds.lookup(route) else {
+    for route in Route::DISCOVERED {
+        let key = if route == Route::Chatgpt {
+            let session = creds.chatgpt();
+            if session.signed_in() {
+                match session.access_token().await {
+                    Ok(token) => Some(token),
+                    Err(e) => {
+                        tracing::warn!("{e}");
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            creds.lookup(route).map(|(key, _)| key)
+        };
+        let Some(key) = key else {
             cache.providers.remove(route.provider_id());
             continue;
         };

@@ -17,6 +17,8 @@ pub enum Route {
     Anthropic,
     /// OpenAI Responses API with an API key.
     Openai,
+    /// OpenAI Responses API through Sign in with ChatGPT (plan usage).
+    Chatgpt,
 }
 
 impl Route {
@@ -27,6 +29,7 @@ impl Route {
             Self::Codex => "Codex",
             Self::Anthropic => "Anthropic API",
             Self::Openai => "OpenAI API",
+            Self::Chatgpt => "ChatGPT",
         }
     }
 
@@ -34,8 +37,11 @@ impl Route {
         matches!(self, Self::Claude | Self::Codex)
     }
 
-    /// API routes Pathfinder calls itself, in display order.
+    /// Routes that use API keys.
     pub const API: [Route; 2] = [Route::Anthropic, Route::Openai];
+
+    /// Routes whose models Pathfinder discovers, in picker order.
+    pub const DISCOVERED: [Route; 3] = [Route::Chatgpt, Route::Anthropic, Route::Openai];
 
     /// Provider id used in commands and keychain entries.
     pub fn provider_id(self) -> &'static str {
@@ -44,6 +50,7 @@ impl Route {
             Self::Codex => "codex",
             Self::Anthropic => "anthropic",
             Self::Openai => "openai",
+            Self::Chatgpt => "chatgpt",
         }
     }
 
@@ -58,6 +65,7 @@ impl Route {
             Self::Codex => "Codex",
             Self::Anthropic => "Anthropic",
             Self::Openai => "OpenAI",
+            Self::Chatgpt => "ChatGPT",
         }
     }
 
@@ -66,7 +74,7 @@ impl Route {
         match self {
             Self::Anthropic => Some("ANTHROPIC_API_KEY"),
             Self::Openai => Some("OPENAI_API_KEY"),
-            Self::Claude | Self::Codex => None,
+            Self::Claude | Self::Codex | Self::Chatgpt => None,
         }
     }
 }

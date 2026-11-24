@@ -10,6 +10,8 @@ use crate::catalog::{self, ModelCache};
 use crate::config::Route;
 
 const AUTH_USAGE: &str = "Usage:
+  harness auth login chatgpt                      Sign in with ChatGPT (uses your plan)
+  harness auth logout chatgpt [--forget]          Sign out; --forget also drops the registration
   harness auth set [anthropic|openai] [--stdin]   Store an API key in your keychain
   harness auth remove <provider>                  Remove Pathfinder's stored key
   harness auth import <provider>                  Copy an existing <provider>-api-key keychain item
@@ -24,6 +26,28 @@ pub async fn auth(args: &[String]) -> Result<()> {
         .filter(|a| !a.starts_with("--"))
         .collect();
     match positional.first().copied() {
+        Some("login") => match positional.get(1).copied() {
+            Some("chatgpt") | None => login_chatgpt(&creds).await,
+            Some(other) => {
+                bail!("`login` is for ChatGPT; for {other} use `harness auth set {other}`")
+            }
+        },
+        Some("logout") => match positional.get(1).copied() {
+            Some("chatgpt") | None => {
+                let revoked = creds.chatgpt().logout(flag("--forget")).await?;
+                println!(
+                    "Signed out of ChatGPT.{}",
+                    if revoked {
+                        ""
+                    } else {
+                        " The token couldn't be revoked with OpenAI, but it was deleted here."
+                    }
+                );
+                refresh(&creds).await;
+                Ok(())
+            }
+            Some(other) => bail!("to remove a {other} key use `harness auth remove {other}`"),
+        },
         Some("set") => set(&creds, positional.get(1).copied(), flag("--stdin")).await,
         Some("remove") => {
             let route = provider(positional.get(1).copied())?;
@@ -125,11 +149,68 @@ async fn set(creds: &Credentials, name: Option<&str>, from_stdin: bool) -> Resul
     Ok(())
 }
 
+async fn login_chatgpt(creds: &Credentials) -> Result<()> {
+    let session = creds.chatgpt();
+    println!("Opening your browser to sign in with ChatGPT...");
+    let registration = session
+        .login(|url| {
+            println!("If the browser doesn't open, visit:\n{url}\n");
+            open_browser(url);
+        })
+        .await?;
+    println!(
+        "Signed in with ChatGPT{}. Model usage counts against your ChatGPT plan.",
+        registration
+            .email
+            .map(|e| format!(" as {e}"))
+            .unwrap_or_default()
+    );
+    refresh(creds).await;
+    let count = ModelCache::load()
+        .providers
+        .get("chatgpt")
+        .map_or(0, Vec::len);
+    println!("{count} ChatGPT models available. Start a new Pathfinder thread to use them.");
+    Ok(())
+}
+
+/// Opens a URL in the default browser, unless HARNESS_NO_BROWSER is set
+/// (e.g. over SSH), in which case the printed URL is used instead.
+pub fn open_browser(url: &str) {
+    if std::env::var_os("HARNESS_NO_BROWSER").is_some() {
+        return;
+    }
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else if cfg!(target_os = "windows") {
+        "explorer"
+    } else {
+        "xdg-open"
+    };
+    let _ = std::process::Command::new(opener)
+        .arg(url)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
 async fn refresh(creds: &Credentials) {
     catalog::refresh(creds, &reqwest::Client::new()).await;
 }
 
 fn status(creds: &Credentials) -> Result<()> {
+    let session = creds.chatgpt();
+    match (session.signed_in(), session.registration()) {
+        (true, Some(reg)) => println!(
+            "{:<10} signed in{}",
+            "ChatGPT",
+            reg.email.map(|e| format!(" as {e}")).unwrap_or_default()
+        ),
+        _ => println!(
+            "{:<10} not signed in (`harness auth login chatgpt`)",
+            "ChatGPT"
+        ),
+    }
     for route in Route::API {
         match creds.lookup(route) {
             Some((key, source)) => {

@@ -53,7 +53,20 @@ pub async fn run_stdio(runtime: Arc<Runtime>, creds: Arc<Credentials>) -> Result
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_request(
-            async move |_req: AuthenticateRequest, responder, _cx| {
+            async move |req: AuthenticateRequest, responder, _cx| {
+                if req.method_id.0.as_ref() == "chatgpt" {
+                    // stdout carries the protocol, so the URL goes to the log.
+                    let session = creds_auth.chatgpt();
+                    let login = session.login(|url| {
+                        info!("ChatGPT sign-in: {url}");
+                        crate::cli::open_browser(url);
+                    });
+                    if let Err(e) = login.await {
+                        warn!("ChatGPT sign-in failed: {e:#}");
+                        return responder.respond_with_error(AcpError::auth_required());
+                    }
+                    catalog::refresh(&creds_auth, &reqwest::Client::new()).await;
+                }
                 if ensure_models(&creds_auth).await {
                     responder.respond(AuthenticateResponse::new())
                 } else {
@@ -202,18 +215,34 @@ pub async fn run_stdio(runtime: Arc<Runtime>, creds: Arc<Credentials>) -> Result
 /// Sign-in options shown when no model is usable. Terminal methods make Zed
 /// re-run this binary with the given arguments in a terminal.
 fn auth_methods(terminal: bool) -> Vec<AuthMethod> {
-    let description = "Store an Anthropic or OpenAI API key in your keychain. Claude Code and Codex models use their own CLI logins instead (see the README).";
+    let chatgpt = "Use your ChatGPT Plus or Pro plan. Opens your browser.";
+    let api_key = "Store an Anthropic or OpenAI API key in your keychain. Claude Code and Codex models use their own CLI logins instead (see the README).";
     if terminal {
-        vec![AuthMethod::Terminal(
-            AuthMethodTerminal::new("api-key", "Add an API key")
-                .args(vec!["auth".into(), "set".into()])
-                .description(description.to_string()),
-        )]
+        vec![
+            AuthMethod::Terminal(
+                AuthMethodTerminal::new("chatgpt", "Sign in with ChatGPT")
+                    .args(vec!["auth".into(), "login".into(), "chatgpt".into()])
+                    .description(chatgpt.to_string()),
+            ),
+            AuthMethod::Terminal(
+                AuthMethodTerminal::new("api-key", "Add an API key")
+                    .args(vec!["auth".into(), "set".into()])
+                    .description(api_key.to_string()),
+            ),
+        ]
     } else {
-        vec![AuthMethod::Agent(
-            AuthMethodAgent::new("api-key", "Add an API key")
-                .description("Run `harness auth set` in a terminal, then try again.".to_string()),
-        )]
+        vec![
+            // Without terminal support the agent runs the browser sign-in itself.
+            AuthMethod::Agent(
+                AuthMethodAgent::new("chatgpt", "Sign in with ChatGPT")
+                    .description(chatgpt.to_string()),
+            ),
+            AuthMethod::Agent(
+                AuthMethodAgent::new("api-key", "Add an API key").description(
+                    "Run `harness auth set` in a terminal, then try again.".to_string(),
+                ),
+            ),
+        ]
     }
 }
 
