@@ -44,6 +44,16 @@ pub fn confine(
     {
         return Err("writing inside .git is not allowed".to_string());
     }
+    if write
+        && resolved
+            .strip_prefix(&root)
+            .is_ok_and(|rel| rel.starts_with(".pathfinder"))
+    {
+        return Err(
+            "writing inside .pathfinder is not allowed: it holds the record of your understanding"
+                .to_string(),
+        );
+    }
     Ok(resolved)
 }
 

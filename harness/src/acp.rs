@@ -886,6 +886,10 @@ fn send_commands(cx: &ConnectionTo<Client>, session_id: SessionId) -> Result<(),
         ),
         AvailableCommand::new("map", "Show the map"),
         AvailableCommand::new("why", "Show what this part's status rests on"),
+        AvailableCommand::new(
+            "coverage",
+            "Show how much of the agent's work you can vouch for",
+        ),
     ];
     cx.send_notification(SessionNotification::new(
         session_id,

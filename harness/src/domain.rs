@@ -87,6 +87,9 @@ pub struct Part {
     /// The 1–4 core concepts the part rests on (§10, A4).
     #[serde(default)]
     pub concepts: Vec<String>,
+    /// Ledger change entries from the agent's latest run, awaiting review.
+    #[serde(default)]
+    pub unreviewed: Vec<String>,
 }
 
 impl Part {
@@ -102,6 +105,7 @@ impl Part {
             result: None,
             objections: Vec::new(),
             concepts: Vec::new(),
+            unreviewed: Vec::new(),
         }
     }
 }

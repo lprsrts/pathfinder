@@ -123,6 +123,19 @@ impl Store {
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
             CREATE INDEX IF NOT EXISTS idx_secrets_session ON secrets(session_id, status);
+            -- Provenance (theory A7): hash-chained per workspace, append-only.
+            CREATE TABLE IF NOT EXISTS ledger (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                workspace TEXT NOT NULL,
+                id TEXT NOT NULL UNIQUE,
+                entry_json TEXT NOT NULL,
+                hash TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_ledger_workspace ON ledger(workspace, seq);
+            CREATE TRIGGER IF NOT EXISTS ledger_append_only_update BEFORE UPDATE ON ledger
+                BEGIN SELECT RAISE(ABORT, 'the ledger is append-only'); END;
+            CREATE TRIGGER IF NOT EXISTS ledger_append_only_delete BEFORE DELETE ON ledger
+                BEGIN SELECT RAISE(ABORT, 'the ledger is append-only'); END;
             CREATE TABLE IF NOT EXISTS misconceptions (
                 id TEXT PRIMARY KEY,
                 workspace TEXT NOT NULL,
@@ -419,6 +432,50 @@ impl Store {
             }
         }
         out.sort_by_key(|e| e.id);
+        Ok(out)
+    }
+
+    // --- The ledger (theory A7) ---
+
+    /// Chains `entry` onto the workspace's ledger and appends it.
+    pub fn append_ledger(
+        &self,
+        workspace: &str,
+        mut entry: crate::ledger::Entry,
+    ) -> Result<crate::ledger::Entry> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let prev: Option<String> = tx
+            .query_row(
+                "SELECT hash FROM ledger WHERE workspace = ?1 ORDER BY seq DESC LIMIT 1",
+                params![workspace],
+                |row| row.get(0),
+            )
+            .optional()?;
+        entry.prev_hash = prev.unwrap_or_else(|| crate::ledger::GENESIS.to_string());
+        entry.hash = entry.compute_hash();
+        tx.execute(
+            "INSERT INTO ledger (workspace, id, entry_json, hash) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                workspace,
+                entry.id,
+                serde_json::to_string(&entry)?,
+                entry.hash
+            ],
+        )?;
+        tx.commit()?;
+        Ok(entry)
+    }
+
+    pub fn ledger(&self, workspace: &str) -> Result<Vec<crate::ledger::Entry>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT entry_json FROM ledger WHERE workspace = ?1 ORDER BY seq")?;
+        let rows = stmt.query_map(params![workspace], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(serde_json::from_str(&row?)?);
+        }
         Ok(out)
     }
 

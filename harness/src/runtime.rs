@@ -25,6 +25,7 @@ use crate::workspace::WorkspaceSnapshot;
 
 mod concepts;
 mod gate;
+mod provenance;
 
 pub struct TurnInput {
     pub text: String,
@@ -52,7 +53,7 @@ impl TurnOutput {
     }
 }
 
-pub const COMMANDS_HELP: &str = "Commands: `/plan`, `/summary <text>`, `/handoff [notes]`, `/approve`, `/object <reason>`, `/known`, `/delegate [notes]`, `/accept`, `/reject`, `/replan [what changed]`, `/next`, `/focus <id|number|prefix>`, `/map`, `/why`.";
+pub const COMMANDS_HELP: &str = "Commands: `/plan`, `/summary <text>`, `/handoff [notes]`, `/approve`, `/object <reason>`, `/known`, `/delegate [notes]`, `/accept`, `/reject`, `/replan [what changed]`, `/next`, `/focus <id|number|prefix>`, `/map`, `/why`, `/coverage`.";
 
 /// No decision model: the LLM decides each message's step itself.
 struct NoDecider;
@@ -308,6 +309,7 @@ impl Runtime {
             "/delegate" => self.handle_delegate(session, arg, files, sink).await,
             "/accept" => self.handle_accept(session).await,
             "/why" => Ok(TurnOutput::text(self.why(session))),
+            "/coverage" => Ok(TurnOutput::text(self.coverage_report(session))),
             "/reject" => Ok(match session.pending_change.take() {
                 Some(_) => TurnOutput::text("Map change rejected."),
                 None => TurnOutput::text("No map change is waiting."),
@@ -1209,9 +1211,12 @@ impl Runtime {
             }
         }
         session.pending_candidate = None;
+        let before = self.snapshot_before(session);
         let result = self
             .run_agent(session, &part, false, instructions, files, sink)
             .await?;
+        self.record_changes(session, &part, before, true, instructions)
+            .await;
         if let Some(p) = session.map.get_mut(&part.id) {
             p.result = Some(result.clone());
         }
@@ -1253,12 +1258,17 @@ impl Runtime {
                 )));
             }
         }
+        let before = self.snapshot_before(session);
         let result = self
             .run_agent(session, &part, true, instructions, files, sink)
             .await?;
+        let changes = self
+            .record_changes(session, &part, before, false, instructions)
+            .await;
         if let Some(p) = session.map.get_mut(&part.id) {
             p.result = Some(result);
             p.status = PartStatus::InReview;
+            p.unreviewed = changes;
         }
         Ok(TurnOutput::changed(REVIEW_PROMPT))
     }
@@ -1281,15 +1291,26 @@ impl Runtime {
         if reason.is_empty() {
             return Ok(TurnOutput::text("Usage: `/object <what's wrong and why>`."));
         }
+        self.record_review(
+            session,
+            &part.id,
+            &part.unreviewed,
+            "objected",
+            Some(reason),
+        );
         if let Some(p) = session.map.get_mut(&part.id) {
             p.objections.push(reason.to_string());
+            p.unreviewed.clear();
         }
         let part = session.map.get(&part.id).cloned().unwrap();
+        let before = self.snapshot_before(session);
         let result = self
             .run_agent(session, &part, true, "", files, sink)
             .await?;
+        let changes = self.record_changes(session, &part, before, false, "").await;
         if let Some(p) = session.map.get_mut(&part.id) {
             p.result = Some(result);
+            p.unreviewed = changes;
         }
         Ok(TurnOutput::text(REVIEW_PROMPT))
     }
@@ -1302,6 +1323,10 @@ impl Runtime {
             return Ok(TurnOutput::text(
                 "Nothing is waiting for your review on this part.",
             ));
+        }
+        self.record_review(session, &part.id, &part.unreviewed, "approved", None);
+        if let Some(p) = session.map.get_mut(&part.id) {
+            p.unreviewed.clear();
         }
         self.set_status(session, &part.id, PartStatus::Done, "result approved")?;
         Ok(self.after_resolution(session, format!("**{}** done.", part.title)))

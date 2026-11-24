@@ -7,6 +7,7 @@ mod config;
 mod decide;
 mod domain;
 mod engine;
+mod ledger;
 mod llm;
 mod runtime;
 mod secrets;
@@ -64,13 +65,14 @@ async fn main() -> Result<()> {
         }
         Some("auth") => cli::auth(&args[1..]).await,
         Some("models") => cli::models(&args[1..]).await,
+        Some("coverage") => cli::coverage(&args[1..]),
         Some("--version") | Some("-V") => {
             println!("harness {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
         _ => {
             eprintln!(
-                "harness {} — human-in-the-loop pathfinder over ACP\n\nUsage:\n  harness acp                Run the ACP server over stdio (for Zed)\n  harness auth [status|set|remove|import]   Manage API keys\n  harness models [--refresh] List discovered models\n  harness --version          Print version",
+                "harness {} — human-in-the-loop pathfinder over ACP\n\nUsage:\n  harness acp                Run the ACP server over stdio (for Zed)\n  harness auth [status|set|remove|import]   Manage API keys\n  harness models [--refresh] List discovered models\n  harness coverage [--export] [path]   Understanding coverage of the agent's changes\n  harness --version          Print version",
                 env!("CARGO_PKG_VERSION")
             );
             Ok(())

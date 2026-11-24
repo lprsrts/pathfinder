@@ -313,3 +313,31 @@ fn status(creds: &Credentials) -> Result<()> {
     println!("\n{} models discovered.", cache.entries().len());
     Ok(())
 }
+
+/// `harness coverage [--export] [path]`: understanding coverage of the
+/// agent's changes in the repository at `path` (default: here).
+pub fn coverage(args: &[String]) -> Result<()> {
+    let export = args.iter().any(|a| a == "--export");
+    let dir = args
+        .iter()
+        .find(|a| !a.starts_with("--"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or(std::env::current_dir()?);
+    let Some(root) = crate::ledger::repo_root(&dir) else {
+        bail!("{} is not in a git repository", dir.display());
+    };
+    let store = crate::store::Store::open(&crate::config::Config::load().db_path)?;
+    let entries = store.ledger(&root.to_string_lossy())?;
+    let report = crate::ledger::coverage(&root, &entries);
+    println!("{}", crate::ledger::render(&report));
+    if export {
+        let out = root.join(".pathfinder").join("coverage.json");
+        std::fs::create_dir_all(out.parent().unwrap())?;
+        std::fs::write(&out, serde_json::to_string_pretty(&report)?)?;
+        println!("\nWrote {}", out.display());
+    }
+    if !report.chain_ok {
+        bail!("the ledger chain does not verify");
+    }
+    Ok(())
+}

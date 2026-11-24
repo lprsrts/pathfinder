@@ -133,6 +133,28 @@ Before an LLM sees a chat message, a decision model can say which step it is (a 
 
 In a thread, the **Decisions** switch turns it on or off and the **Decision model** picker (shown when more than one service has a key) chooses the service; otherwise the first one with a key is used, in that order. `HARNESS_DECISION=openai|gemini|typesafe|off` sets the default for every thread (`off` wins). Each decision shows in the thinking panel with its probability.
 
+## Understanding coverage
+
+In a git repository, Pathfinder records every change the agent makes:
+
+- **Snapshots:** it snapshots the workspace before and after each run, through a scratch index so your own index is never touched. This works on every route.
+- **Tagging:** each hunk is tagged with the part's core concepts it relies on. One decision request covers each hunk, with a question per concept plus "something else"; a concept is tagged at p ≥ 0.6.
+- **Labels,** set by your understanding at that moment:
+  - **reviewable:** every tagged concept has evidence;
+  - **claimed:** the rest rest only on your claim;
+  - **delegated:** anything else. Untagged hunks, hunks with no decision service, and everything from `/delegate` count as delegated.
+- **The ledger:** each entry holds the hunk, path-scoped hashes of its new lines, the concepts, your part summary and the evidence with the time it was computed. Entries are hash-chained in the session database and can't be edited or deleted. `/approve` and `/object` add review entries later.
+
+`/coverage`, or `harness coverage [--export] [path]` from a terminal, counts the current lines of the files the agent changed:
+
+- vouched: reviewable and approved;
+- reviewable but unreviewed;
+- claimed;
+- delegated;
+- not from Pathfinder.
+
+`--export` writes `.pathfinder/coverage.json` with the chain head. A broken chain vouches for nothing. A line that has been reformatted since falls back to "not from Pathfinder", never higher. The agent can't write under `.pathfinder/`. Coverage measures understanding, not correctness, so run your tests separately.
+
 ## Thread toolbar
 
 Main model, Effort (main model reasoning: default, low, medium, high), Fast model, the Decisions switch and the Decision model picker. Each thread keeps its own settings. Zed draws Decisions as a switch where it supports on/off options, and as an On/Off dropdown otherwise.
@@ -155,3 +177,4 @@ Shortcuts for the same steps, and the only way to run the agent:
 - `/focus <id>` — switch to any part; also takes its number in the plan (`/focus 3`) or the start of its id (`/focus fwd`)
 - `/map` — show the map
 - `/why` — what the current part's status rests on: each concept's state, checks and open misconceptions
+- `/coverage` — how much of the agent's work in this repository you can vouch for
