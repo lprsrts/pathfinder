@@ -43,7 +43,7 @@ impl Route {
     /// Routes whose models Pathfinder discovers, in picker order.
     pub const DISCOVERED: [Route; 3] = [Route::Chatgpt, Route::Anthropic, Route::Openai];
 
-    /// Provider id used in commands and keychain entries.
+    /// Provider id used in commands and auth file entries.
     pub fn provider_id(self) -> &'static str {
         match self {
             Self::Claude => "claude",

@@ -1,9 +1,9 @@
-//! API keys for the provider routes.
+//! API keys for the provider routes and the ChatGPT session.
 //!
-//! Lookup order: environment variable, then Pathfinder's own keychain entry
-//! (service `pathfinder`, account `api-key:<provider>`), then an existing
-//! `<provider>-api-key` keychain item for the current user, which is only
-//! ever read, never changed.
+//! Lookup order: environment variable, then Pathfinder's auth file
+//! (`~/.config/harness/auth.json`, mode 0600). `harness auth import` copies
+//! an existing `<provider>-api-key` macOS keychain item into the file once;
+//! nothing else touches the keychain, so there are no prompts.
 
 pub mod chatgpt;
 pub mod secrets;
@@ -12,29 +12,24 @@ use std::collections::HashMap;
 use std::env;
 use std::sync::{Arc, Mutex};
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use thiserror::Error;
 
 use crate::config::Route;
 use chatgpt::ChatGpt;
-use secrets::SecretStore;
-
-pub const SERVICE: &str = "pathfinder";
+use secrets::{FileStore, SecretStore};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeySource {
     Env(&'static str),
-    Keychain,
-    /// An existing `<provider>-api-key` item made by another tool.
-    Shared,
+    File,
 }
 
 impl KeySource {
     pub fn describe(self) -> String {
         match self {
             Self::Env(var) => format!("environment variable {var}"),
-            Self::Keychain => "Pathfinder's keychain entry".to_string(),
-            Self::Shared => "shared keychain item".to_string(),
+            Self::File => "Pathfinder's auth file".to_string(),
         }
     }
 }
@@ -61,45 +56,62 @@ impl MissingCredentials {
     }
 }
 
+/// Reads a generic-password item by service name, for `auth import` only.
+type KeychainReader = Arc<dyn Fn(&str) -> Result<Option<String>> + Send + Sync>;
+
 pub struct Credentials {
     store: Arc<dyn SecretStore>,
     chatgpt: Arc<ChatGpt>,
-    user: String,
+    keychain: KeychainReader,
     use_env: bool,
     /// Successful lookups only, so a key added later is found on the next try.
     cache: Mutex<HashMap<Route, String>>,
 }
 
-fn own_account(route: Route) -> String {
-    format!("api-key:{}", route.provider_id())
-}
-
-fn shared_service(route: Route) -> String {
+/// The entry name in the auth file, also the keychain service `auth import`
+/// reads: `anthropic-api-key`, `openai-api-key`.
+fn key_name(route: Route) -> String {
     format!("{}-api-key", route.provider_id())
 }
 
+/// `security find-generic-password -s <service> -w`, as in your own scripts.
+fn read_macos_keychain(service: &str) -> Result<Option<String>> {
+    if !cfg!(target_os = "macos") {
+        bail!("`auth import` reads the macOS keychain; use `harness auth set` instead");
+    }
+    let out = std::process::Command::new("security")
+        .args(["find-generic-password", "-s", service, "-w"])
+        .output()?;
+    match out.status.code() {
+        Some(0) => Ok(Some(
+            String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        )),
+        // errSecItemNotFound
+        Some(44) => Ok(None),
+        _ => bail!("keychain: {}", String::from_utf8_lossy(&out.stderr).trim()),
+    }
+}
+
 impl Credentials {
-    pub fn new(store: Arc<dyn SecretStore>) -> Self {
+    /// `~/.config/harness/auth.json`.
+    pub fn system() -> Self {
+        let store: Arc<dyn SecretStore> =
+            Arc::new(FileStore::new(chatgpt::config_dir().join("auth.json")));
         Self {
             chatgpt: Arc::new(ChatGpt::new(store.clone())),
             store,
-            user: env::var("USER").unwrap_or_default(),
+            keychain: Arc::new(read_macos_keychain),
             use_env: true,
             cache: Mutex::new(HashMap::new()),
         }
     }
 
-    /// The system keychain.
-    pub fn system() -> Self {
-        Self::new(Arc::new(secrets::KeyringStore))
-    }
-
     #[cfg(test)]
-    pub fn for_tests(store: Arc<dyn SecretStore>, user: &str) -> Self {
+    pub fn for_tests(store: Arc<dyn SecretStore>, keychain: KeychainReader) -> Self {
         Self {
             chatgpt: Arc::new(ChatGpt::new(store.clone())),
             store,
-            user: user.to_string(),
+            keychain,
             use_env: false,
             cache: Mutex::new(HashMap::new()),
         }
@@ -112,17 +124,6 @@ impl Credentials {
 
     /// Finds a key and where it came from, without caching.
     pub fn lookup(&self, route: Route) -> Option<(String, KeySource)> {
-        self.find(route, true)
-    }
-
-    /// Like `lookup`, but never reads shared `<provider>-api-key` items:
-    /// macOS asks before another tool's item is read, so background work
-    /// (model discovery) must not touch them.
-    pub fn lookup_own(&self, route: Route) -> Option<(String, KeySource)> {
-        self.find(route, false)
-    }
-
-    fn find(&self, route: Route, include_shared: bool) -> Option<(String, KeySource)> {
         if self.use_env {
             if let Some(var) = route.key_env() {
                 if let Ok(v) = env::var(var) {
@@ -132,22 +133,15 @@ impl Credentials {
                 }
             }
         }
-        let read = |service: &str, account: &str| match self.store.get(service, account) {
-            Ok(v) => v.filter(|v| !v.trim().is_empty()),
+        match self.store.get(&key_name(route)) {
+            Ok(v) => v
+                .filter(|v| !v.trim().is_empty())
+                .map(|v| (v, KeySource::File)),
             Err(e) => {
-                tracing::warn!("reading {service}/{account}: {e}");
+                tracing::warn!("{e:#}");
                 None
             }
-        };
-        if let Some(key) = read(SERVICE, &own_account(route)) {
-            return Some((key, KeySource::Keychain));
         }
-        if include_shared && !self.user.is_empty() {
-            if let Some(key) = read(&shared_service(route), &self.user) {
-                return Some((key.trim().to_string(), KeySource::Shared));
-            }
-        }
-        None
     }
 
     /// The key for an API route, cached once found.
@@ -163,20 +157,19 @@ impl Credentials {
     }
 
     pub fn set_key(&self, route: Route, key: &str) -> Result<()> {
-        self.store.set(SERVICE, &own_account(route), key)?;
+        self.store.set(&key_name(route), key)?;
         self.cache.lock().unwrap().remove(&route);
         Ok(())
     }
 
-    /// Removes Pathfinder's own entry; shared items are left alone.
     pub fn remove_key(&self, route: Route) -> Result<bool> {
         self.cache.lock().unwrap().remove(&route);
-        self.store.delete(SERVICE, &own_account(route))
+        self.store.delete(&key_name(route))
     }
 
-    /// Copies a shared `<provider>-api-key` item into Pathfinder's own entry.
-    pub fn import_shared(&self, route: Route) -> Result<bool> {
-        match self.store.get(&shared_service(route), &self.user)? {
+    /// Copies a `<provider>-api-key` keychain item into the auth file.
+    pub fn import_keychain(&self, route: Route) -> Result<bool> {
+        match (self.keychain)(&key_name(route))? {
             Some(key) if !key.trim().is_empty() => {
                 self.set_key(route, key.trim())?;
                 Ok(true)
@@ -216,24 +209,18 @@ mod tests {
     use super::secrets::MemoryStore;
     use super::*;
 
+    fn no_keychain() -> KeychainReader {
+        Arc::new(|_| Ok(None))
+    }
+
     #[test]
-    fn own_entry_wins_over_shared_and_shared_is_never_changed() {
+    fn keys_round_trip_through_the_store() {
         let store = Arc::new(MemoryStore::default());
-        store
-            .set("anthropic-api-key", "alper", "sk-ant-shared-0000000000")
-            .unwrap();
-        let creds = Credentials::for_tests(store.clone(), "alper");
-
-        let (key, source) = creds.lookup(Route::Anthropic).unwrap();
-        assert_eq!(
-            (key.as_str(), source),
-            ("sk-ant-shared-0000000000", KeySource::Shared)
-        );
+        let creds = Credentials::for_tests(store.clone(), no_keychain());
         assert!(
-            creds.lookup_own(Route::Anthropic).is_none(),
-            "discovery must not read shared items"
+            creds.api_key(Route::Openai).is_err(),
+            "misses aren't cached"
         );
-
         creds
             .set_key(Route::Anthropic, "sk-ant-own-111111111111")
             .unwrap();
@@ -241,39 +228,34 @@ mod tests {
             creds.api_key(Route::Anthropic).unwrap(),
             "sk-ant-own-111111111111"
         );
+        assert_eq!(creds.lookup(Route::Anthropic).unwrap().1, KeySource::File);
         assert_eq!(
-            creds.lookup(Route::Anthropic).unwrap().1,
-            KeySource::Keychain
+            store.get("anthropic-api-key").unwrap().as_deref(),
+            Some("sk-ant-own-111111111111")
         );
-
         assert!(creds.remove_key(Route::Anthropic).unwrap());
         assert!(!creds.remove_key(Route::Anthropic).unwrap());
-        assert_eq!(
-            store.get("anthropic-api-key", "alper").unwrap().as_deref(),
-            Some("sk-ant-shared-0000000000")
-        );
-        assert!(creds.lookup(Route::Openai).is_none());
         let err = creds.api_key(Route::Openai).unwrap_err().to_string();
         assert!(err.contains("harness auth set openai"));
         assert!(err.contains("OPENAI_API_KEY"));
     }
 
     #[test]
-    fn missing_keys_are_not_cached_and_import_copies() {
+    fn import_copies_the_keychain_item() {
         let store = Arc::new(MemoryStore::default());
-        let creds = Credentials::for_tests(store.clone(), "alper");
-        assert!(creds.api_key(Route::Openai).is_err());
-        store
-            .set("openai-api-key", "alper", "sk-proj-abcdefghijklmnop")
-            .unwrap();
+        let keychain: KeychainReader = Arc::new(|service| {
+            Ok((service == "openai-api-key").then(|| "sk-proj-abcdefghijklmnop\n".to_string()))
+        });
+        let creds = Credentials::for_tests(store, keychain);
+        assert!(
+            creds.lookup(Route::Openai).is_none(),
+            "keychain is never read on lookup"
+        );
+        assert!(creds.import_keychain(Route::Openai).unwrap());
+        assert!(!creds.import_keychain(Route::Anthropic).unwrap());
         assert_eq!(
             creds.api_key(Route::Openai).unwrap(),
             "sk-proj-abcdefghijklmnop"
-        );
-        assert!(creds.import_shared(Route::Openai).unwrap());
-        assert_eq!(
-            store.get(SERVICE, "api-key:openai").unwrap().as_deref(),
-            Some("sk-proj-abcdefghijklmnop")
         );
         assert_eq!(mask("sk-proj-abcdefghijklmnop"), "sk-…mnop");
         assert!(check_key_shape("short").is_err());

@@ -48,7 +48,7 @@ On the API routes Pathfinder runs its own tool loop (read, list, find, search in
 harness auth login chatgpt
 ```
 
-Opens your browser to sign in with your ChatGPT account; model usage then counts against your ChatGPT plan (Plus users share one five-hour limit across all connected apps; see chatgpt.com/settings/usage). This is OpenAI's official flow for open-source apps: Pathfinder registers itself once, keeps the tokens in your keychain, and refreshes them as needed. In Zed, the **Sign in with ChatGPT** button runs the same command. `harness auth logout chatgpt` signs out and revokes the token (`--forget` also drops the registration, to switch accounts). Set `HARNESS_NO_BROWSER=1` to print the sign-in URL instead of opening a browser.
+Opens your browser to sign in with your ChatGPT account; model usage then counts against your ChatGPT plan (Plus users share one five-hour limit across all connected apps; see chatgpt.com/settings/usage). This is OpenAI's official flow for open-source apps: Pathfinder registers itself once, keeps the tokens in its auth file, and refreshes them as needed. In Zed, the **Sign in with ChatGPT** button runs the same command. `harness auth logout chatgpt` signs out and revokes the token (`--forget` also drops the registration, to switch accounts). Set `HARNESS_NO_BROWSER=1` to print the sign-in URL instead of opening a browser.
 
 Claude and Gemini subscriptions can't be used this way: their providers don't allow third-party apps to. Use an API key, or the `claude` route for your Claude Code login.
 
@@ -58,13 +58,13 @@ Claude and Gemini subscriptions can't be used this way: their providers don't al
 harness auth set anthropic     # or: harness auth set openai
 ```
 
-The key is checked with the provider, then stored in your OS keychain (macOS Keychain, Windows Credential Manager, Linux Secret Service). When no model is available, Zed shows an **Add an API key** button that runs the same command in a terminal. Other commands:
+The key is checked with the provider, then stored in `~/.config/harness/auth.json`, a file only you can read (mode 0600), the same way Codex and other CLIs keep credentials. When no model is available, Zed shows an **Add an API key** button that runs the same command in a terminal. Other commands:
 
 - `harness auth status` shows which keys are available and where they come from.
 - `harness auth remove <provider>` deletes Pathfinder's stored key.
-- `harness auth import <provider>` copies an existing `<provider>-api-key` keychain item (e.g. one your scripts already use) into Pathfinder's own entry. Pathfinder can read such items directly too when it runs a model, but macOS asks you to allow that, so importing once is quieter. Model discovery never reads them: it lists models only for providers with an environment variable or Pathfinder's own entry.
+- `harness auth import <provider>` copies an existing `<provider>-api-key` macOS keychain item (e.g. one your scripts already use) into the auth file. This is the only time Pathfinder reads the keychain.
 
-Keys are looked up in this order: `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`, Pathfinder's keychain entry, then a `<provider>-api-key` keychain item.
+Keys are looked up in this order: `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`, then the auth file. The file holds secrets in plain text, protected by file permissions; use the environment variables if you'd rather keep keys elsewhere.
 
 ### Choosing models
 

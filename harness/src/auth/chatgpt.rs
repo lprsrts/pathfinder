@@ -20,7 +20,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 
-use super::SERVICE;
 use super::secrets::SecretStore;
 
 pub const RESOURCE: &str = "https://api.openai.com/v1";
@@ -33,7 +32,7 @@ const APP_NAME: &str = "Pathfinder";
 const REFRESH_MARGIN: u64 = 5 * 60;
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
-/// Keychain accounts under the `pathfinder` service, kept small and separate.
+/// Entries in the auth file.
 const REGISTRATION: &str = "chatgpt";
 const ID_TOKEN: &str = "chatgpt-id-token";
 const REFRESH: &str = "chatgpt-refresh";
@@ -143,7 +142,7 @@ fn pkce_challenge(verifier: &str) -> String {
     URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
 }
 
-fn config_dir() -> PathBuf {
+pub(crate) fn config_dir() -> PathBuf {
     env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
@@ -224,11 +223,11 @@ impl ChatGpt {
     }
 
     fn get(&self, account: &str) -> Option<String> {
-        self.store.get(SERVICE, account).ok().flatten()
+        self.store.get(account).ok().flatten()
     }
 
     fn put(&self, account: &str, value: &str) -> Result<()> {
-        self.store.set(SERVICE, account, value)
+        self.store.set(account, value)
     }
 
     pub fn registration(&self) -> Option<Registration> {
@@ -297,8 +296,8 @@ impl ChatGpt {
                 .or_else(|| body.pointer("/error/code").and_then(Value::as_str))
                 .unwrap_or_default();
             if TERMINAL_REFRESH.contains(&code) {
-                let _ = self.store.delete(SERVICE, REFRESH);
-                let _ = self.store.delete(SERVICE, ACCESS);
+                let _ = self.store.delete(REFRESH);
+                let _ = self.store.delete(ACCESS);
                 *cached = None;
                 return Err(ChatGptError::Expired);
             }
@@ -517,11 +516,11 @@ impl ChatGpt {
                 });
         }
         for account in [REFRESH, ACCESS] {
-            let _ = self.store.delete(SERVICE, account);
+            let _ = self.store.delete(account);
         }
         if forget {
             for account in [REGISTRATION, ID_TOKEN] {
-                let _ = self.store.delete(SERVICE, account);
+                let _ = self.store.delete(account);
             }
         }
         *self.access.lock().await = None;
@@ -801,10 +800,7 @@ mod tests {
 
         // Forced refresh rotates the refresh token.
         assert_eq!(gpt.force_refresh().await.unwrap(), "at-2");
-        assert_eq!(
-            store.get(SERVICE, REFRESH).unwrap().as_deref(),
-            Some("rt-2")
-        );
+        assert_eq!(store.get(REFRESH).unwrap().as_deref(), Some("rt-2"));
 
         // A rejected refresh ends the session.
         assert!(matches!(
@@ -814,7 +810,7 @@ mod tests {
         assert!(!gpt.signed_in());
         assert!(gpt.registration().is_some());
 
-        store.set(SERVICE, REFRESH, "rt-x").unwrap();
+        store.set(REFRESH, "rt-x").unwrap();
         assert!(gpt.logout(false).await.unwrap());
         assert!(!gpt.signed_in());
         assert!(gpt.registration().is_some(), "registration kept for reuse");

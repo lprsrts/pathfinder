@@ -216,7 +216,7 @@ pub async fn run_stdio(runtime: Arc<Runtime>, creds: Arc<Credentials>) -> Result
 /// re-run this binary with the given arguments in a terminal.
 fn auth_methods(terminal: bool) -> Vec<AuthMethod> {
     let chatgpt = "Use your ChatGPT Plus or Pro plan. Opens your browser.";
-    let api_key = "Store an Anthropic or OpenAI API key in your keychain. Claude Code and Codex models use their own CLI logins instead (see the README).";
+    let api_key = "Store an Anthropic or OpenAI API key for Pathfinder. Claude Code and Codex models use their own CLI logins instead (see the README).";
     if terminal {
         vec![
             AuthMethod::Terminal(

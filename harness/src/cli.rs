@@ -5,16 +5,16 @@ use std::io::{self, BufRead, IsTerminal, Write};
 
 use anyhow::{Context, Result, bail};
 
-use crate::auth::{Credentials, KeySource, check_key_shape, mask};
+use crate::auth::{Credentials, check_key_shape, mask};
 use crate::catalog::{self, ModelCache};
 use crate::config::Route;
 
 const AUTH_USAGE: &str = "Usage:
   harness auth login chatgpt                      Sign in with ChatGPT (uses your plan)
   harness auth logout chatgpt [--forget]          Sign out; --forget also drops the registration
-  harness auth set [anthropic|openai] [--stdin]   Store an API key in your keychain
+  harness auth set [anthropic|openai] [--stdin]   Store an API key in Pathfinder's auth file
   harness auth remove <provider>                  Remove Pathfinder's stored key
-  harness auth import <provider>                  Copy an existing <provider>-api-key keychain item
+  harness auth import <provider>                  Copy a <provider>-api-key macOS keychain item
   harness auth status                             Show which keys are available";
 
 pub async fn auth(args: &[String]) -> Result<()> {
@@ -61,9 +61,9 @@ pub async fn auth(args: &[String]) -> Result<()> {
         }
         Some("import") => {
             let route = provider(positional.get(1).copied())?;
-            if creds.import_shared(route)? {
+            if creds.import_keychain(route)? {
                 println!(
-                    "Copied {}-api-key into Pathfinder's keychain entry.",
+                    "Copied the {}-api-key keychain item into Pathfinder's auth file.",
                     route.provider_id()
                 );
                 refresh(&creds, route).await;
@@ -149,7 +149,7 @@ async fn set(creds: &Credentials, name: Option<&str>, from_stdin: bool) -> Resul
         Err(e) => bail!("{e:#}. The key was not saved."),
     }
     creds.set_key(route, key)?;
-    println!("Saved to your keychain. Start a new Pathfinder thread to use it.");
+    println!("Saved to Pathfinder's auth file. Start a new Pathfinder thread to use it.");
     refresh(creds, route).await;
     Ok(())
 }
@@ -220,15 +220,8 @@ fn status(creds: &Credentials) -> Result<()> {
     for route in Route::API {
         match creds.lookup(route) {
             Some((key, source)) => {
-                let note = match source {
-                    KeySource::Shared => format!(
-                        " (run `harness auth import {}` to give Pathfinder its own copy)",
-                        route.provider_id()
-                    ),
-                    _ => String::new(),
-                };
                 println!(
-                    "{:<10} {} from {}{note}",
+                    "{:<10} {} from {}",
                     route.provider_name(),
                     mask(&key),
                     source.describe()

@@ -45,7 +45,7 @@ impl ApiEngine {
         Self { factory }
     }
 
-    /// Clients authenticated with keys from env vars or the keychain, or
+    /// Clients authenticated with keys from env vars or the auth file, or
     /// with the Sign in with ChatGPT session.
     pub fn with_credentials(creds: Arc<Credentials>) -> Self {
         let http = reqwest::Client::new();
