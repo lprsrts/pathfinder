@@ -5,7 +5,8 @@
 use serde::Serialize;
 
 use crate::domain::{
-    CandidateProposal, JudgmentVerdict, LogReply, Map, MapChange, MapProposal, OnboardingDecision,
+    CandidateProposal, Intent, JudgmentVerdict, LogReply, Map, MapChange, MapProposal,
+    OnboardingDecision,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -105,9 +106,19 @@ pub fn check_change(change: &MapChange, current: &Map) -> Vec<Violation> {
     out
 }
 
-pub fn check_log_reply(r: &LogReply, current: &Map) -> Vec<Violation> {
+/// `change_waiting`: whether a map change is waiting for the user's OK, the
+/// only time `accept` or `reject` makes sense.
+pub fn check_log_reply(r: &LogReply, current: &Map, change_waiting: bool) -> Vec<Violation> {
     let mut out = Vec::new();
-    require_text(&mut out, &r.reply, "reply");
+    if matches!(r.intent, Intent::Accept | Intent::Reject) && !change_waiting {
+        out.push(Violation::new(
+            "no_change_waiting",
+            "no map change is waiting, so the intent can't be accept or reject; it's probably log",
+        ));
+    }
+    if r.intent == Intent::Log {
+        require_text(&mut out, &r.reply, "reply");
+    }
     if let Some(change) = &r.map_change {
         out.extend(check_change(change, current));
     }
@@ -123,7 +134,9 @@ pub fn check_candidate(c: &CandidateProposal) -> Vec<Violation> {
 
 pub fn check_verdict(v: &JudgmentVerdict) -> Vec<Violation> {
     let mut out = Vec::new();
-    require_text(&mut out, &v.feedback, "feedback");
+    if v.is_judgment {
+        require_text(&mut out, &v.feedback, "feedback");
+    }
     out
 }
 
@@ -182,12 +195,30 @@ mod tests {
     }
 
     #[test]
+    fn accept_needs_a_waiting_change() {
+        let reply = LogReply {
+            intent: Intent::Accept,
+            part: None,
+            reply: String::new(),
+            map_change: None,
+        };
+        let map = Map { parts: vec![] };
+        assert_eq!(
+            check_log_reply(&reply, &map, false)[0].code,
+            "no_change_waiting"
+        );
+        assert!(check_log_reply(&reply, &map, true).is_empty());
+    }
+
+    #[test]
     fn log_reply_change_must_apply_to_current_map() {
         let mut current = Map {
             parts: vec![proposed("a", &[]).into_part()],
         };
         current.parts[0].status = PartStatus::Understood;
         let bad = LogReply {
+            intent: Intent::Log,
+            part: None,
             reply: "Noted.".into(),
             map_change: Some(MapChange {
                 goal: None,
@@ -196,9 +227,14 @@ mod tests {
                 remove: vec!["a".into()],
             }),
         };
-        assert_eq!(check_log_reply(&bad, &current)[0].code, "invalid_change");
+        assert_eq!(
+            check_log_reply(&bad, &current, false)[0].code,
+            "invalid_change"
+        );
 
         let good = LogReply {
+            intent: Intent::Log,
+            part: None,
             reply: "Noted.".into(),
             map_change: Some(MapChange {
                 goal: None,
@@ -207,6 +243,6 @@ mod tests {
                 remove: vec![],
             }),
         };
-        assert!(check_log_reply(&good, &current).is_empty());
+        assert!(check_log_reply(&good, &current, false).is_empty());
     }
 }

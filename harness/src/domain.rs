@@ -446,8 +446,33 @@ pub struct MapChange {
     pub remove: Vec<String>,
 }
 
+/// What a chat message in a working session means, so plain chat drives the
+/// loop and commands are shortcuts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Intent {
+    /// A log entry: the user's thinking or a question (§5).
+    #[default]
+    Log,
+    /// Their explanation of the whole part, as `/summary`.
+    Summary,
+    /// They already know this part, as `/known` (§6).
+    Known,
+    /// Go to the next part, or to `part`, as `/next` or `/focus`.
+    Move,
+    /// Accept or reject the waiting map change.
+    Accept,
+    Reject,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct LogReply {
+    #[serde(default)]
+    pub intent: Intent,
+    /// For `move`: the part to go to, if they named one.
+    #[serde(default)]
+    pub part: Option<String>,
+    #[serde(default)]
     pub reply: String,
     #[serde(default)]
     pub map_change: Option<MapChange>,
@@ -461,8 +486,18 @@ pub struct CandidateProposal {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct JudgmentVerdict {
+    /// False when the message isn't a verdict on the candidate at all (a
+    /// question, a log entry, a request to move on); it is then routed as chat.
+    #[serde(default = "yes")]
+    pub is_judgment: bool,
+    #[serde(default)]
     pub pass: bool,
+    #[serde(default)]
     pub feedback: String,
+}
+
+fn yes() -> bool {
+    true
 }
 
 #[cfg(test)]

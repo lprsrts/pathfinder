@@ -90,11 +90,14 @@ With a key in place, Pathfinder lists the provider's current models in Zed's pic
 ## How a session goes
 
 1. Say what you want done. Onboarding settles the goal, then sketches a map of what the task depends on (no size limit).
-2. Work on a part. Every message is a log entry: your thinking and the reasons behind your steps. The model replies briefly and may propose map changes.
-3. `/summary` explains the part; you're then shown a candidate (an approach or result, right or with one real flaw) and say whether it's right and why. That decides whether the part is understood.
-4. You decide what to give the agent: `/handoff` an understood part and review the result, `/known` to skip a part you already know, or `/delegate` to hand it off without understanding it.
+2. Work on a part by chatting. Your thinking and the reasons behind your steps are the log; the model replies briefly and may propose map changes. Pathfinder reads what each message means, so plain words drive the loop: "I think I get it: …" explains the part, "I already know this" skips it, "let's move on" goes to the next part, "yes, add it" accepts a map change.
+3. When you explain the part, you're shown a candidate (an approach or result, right or with one real flaw) and say whether it's right and why. That decides whether the part is understood. While it waits you can still ask questions; the reply model can't see the candidate, so it can't vouch for it.
+4. You decide what to give the agent: `/handoff` an understood part and review the result, skip a part you already know, or `/delegate` to hand it off without understanding it.
 
 ## Slash commands in Zed
+
+Shortcuts for the same steps, and the only way to run the agent:
+
 
 - `/plan` — build the map now from onboarding
 - `/summary <text>` — explain the current part; a candidate to judge follows

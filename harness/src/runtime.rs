@@ -7,8 +7,8 @@ use anyhow::{Result, anyhow};
 
 use crate::config::{Config, ModelEntry};
 use crate::domain::{
-    CandidateProposal, JudgmentVerdict, LogReply, Map, MapChange, MapProposal, OnboardingDecision,
-    Part, PartStatus, PendingCandidate, Session, SessionMode,
+    CandidateProposal, Intent, JudgmentVerdict, LogReply, Map, MapChange, MapProposal,
+    OnboardingDecision, Part, PartStatus, PendingCandidate, Session, SessionMode,
 };
 use crate::engine::{
     Engine, EngineRequest, EngineTier, RunContext, StreamEvent, StreamSink, TierModels, ToolAccess,
@@ -430,9 +430,27 @@ impl Runtime {
                 "No part is active. `/focus <id>` picks one; `/map` shows them.",
             ));
         };
+        let had_log = !part.log.is_empty();
         part.log.push(text.to_string());
         let part = part.clone();
         session.push_turn("user", text);
+
+        let mut waiting = String::new();
+        if let Some(change) = &session.pending_change {
+            waiting.push_str(&format!(
+                "\n\nMap change waiting for the user's OK:\n{}",
+                render_change(change, &session.map)
+            ));
+        }
+        // The waiting candidate is hidden from this call: it may be flawed on
+        // purpose, and a model that can see it tends to vouch for it.
+        let mut history = format_history(session);
+        if let Some(pending) = &session.pending_candidate {
+            history = history.replace(&pending.candidate, CANDIDATE_HIDDEN);
+            waiting.push_str(
+                "\n\nA candidate for this part is waiting for the user's verdict; you can't see it. Answer questions about the general concepts only. If they ask about the candidate itself (a claim, step or number in it, or whether it's right), say that's what they're judging.",
+            );
+        }
 
         let req = EngineRequest {
             tier: EngineTier::System1,
@@ -440,11 +458,11 @@ impl Runtime {
             cwd: session.cwd.clone(),
             system_prompt: LOG_SYSTEM.to_string(),
             prompt: format!(
-                "Goal: {}\n\n{}\n\nMap:\n{}\n\nRecent conversation:\n{}\n\nLatest log entry: {text}\n\nRead any files you need first, then respond with JSON only.",
+                "Goal: {}\n\n{}\n\nMap:\n{}{waiting}\n\nRecent conversation:\n{}\n\nLatest message: {text}\n\nRead any files you need first, then respond with JSON only.",
                 session.goal.as_deref().unwrap_or("(session goal)"),
                 describe_part(&part),
                 session.map.render(session.active.as_deref()),
-                format_history(session),
+                history,
             ),
             files: files.to_vec(),
             stream_text: false,
@@ -452,6 +470,7 @@ impl Runtime {
             ctx: RunContext::default(),
         };
         let current = session.map.clone();
+        let change_waiting = session.pending_change.is_some();
         let (decision, shown): (LogReply, _) = run_gated_streamed(
             self.engine.as_ref(),
             self.store.as_ref(),
@@ -459,10 +478,20 @@ impl Runtime {
             "log",
             &req,
             sink.clone(),
-            |r: &LogReply| check_log_reply(r, &current),
+            |r: &LogReply| check_log_reply(r, &current, change_waiting),
             Some("reply"),
         )
         .await?;
+
+        if decision.intent != Intent::Log {
+            // Not evidence for the log: the message is a step in the loop.
+            if let Some(p) = session.map.get_mut(&part.id) {
+                p.log.pop();
+            }
+            return self
+                .route_intent(session, &decision, text, had_log, files, sink)
+                .await;
+        }
         flush(&sink, &decision.reply, &shown);
 
         let mut visible = String::new();
@@ -475,6 +504,44 @@ impl Runtime {
         }
         session.push_turn("assistant", &full);
         Ok(TurnOutput::text(visible))
+    }
+
+    /// Carries out what a chat message meant, the way its command would.
+    async fn route_intent(
+        &self,
+        session: &mut Session,
+        decision: &LogReply,
+        text: &str,
+        had_log: bool,
+        files: &[PathBuf],
+        sink: StreamSink,
+    ) -> Result<TurnOutput> {
+        match decision.intent {
+            Intent::Summary if had_log => {
+                // `/summary` records the message itself.
+                session.history.pop();
+                self.handle_summary(session, text, files, sink).await
+            }
+            Intent::Summary => {
+                if let Some(p) = session.active_part_mut() {
+                    p.log.push(text.to_string());
+                }
+                let reply = "Noted in your log. The evidence starts there: keep writing your thinking and reasons as you work on this part, then explain it as a whole again for a candidate to judge.";
+                session.push_turn("assistant", reply);
+                Ok(TurnOutput::text(reply))
+            }
+            Intent::Known => self.handle_known(session),
+            Intent::Move => Ok(match decision.part.as_deref().filter(|p| !p.is_empty()) {
+                Some(id) => self.handle_focus(session, id),
+                None => self.handle_next(session),
+            }),
+            Intent::Accept => self.handle_accept(session),
+            Intent::Reject => Ok(match session.pending_change.take() {
+                Some(_) => TurnOutput::text("Map change rejected."),
+                None => TurnOutput::text("No map change is waiting."),
+            }),
+            Intent::Log => unreachable!("log entries are answered in handle_log"),
+        }
     }
 
     async fn handle_summary(
@@ -606,16 +673,23 @@ impl Runtime {
             Some("feedback"),
         )
         .await?;
+        if !verdict.is_judgment {
+            // A question or another step: the candidate keeps waiting.
+            session.pending_candidate = Some(pending);
+            session.history.pop();
+            return self.handle_log(session, judgment, files, sink).await;
+        }
         flush(&sink, &verdict.feedback, &shown);
 
         let next = if verdict.pass {
             self.set_status(session, &part.id, PartStatus::Understood, &verdict.feedback)?;
             format!(
-                "\n\n**{}** understood. `/next` moves on; `/handoff` if this part has work for the agent.",
+                "\n\n**{}** understood. Say when to move on (`/next`), or `/handoff` if this part has work for the agent.",
                 part.title
             )
         } else {
-            "\n\nKeep logging, then `/summary` again for a new candidate.".to_string()
+            "\n\nKeep working through it here, then explain the part again for a new candidate."
+                .to_string()
         };
         session.push_turn("assistant", format!("{}{next}", verdict.feedback));
         Ok(TurnOutput::changed(next))
@@ -851,6 +925,8 @@ impl Runtime {
     }
 }
 
+const CANDIDATE_HIDDEN: &str = "(candidate hidden while the user judges it)";
+
 const REVIEW_PROMPT: &str =
     "\n\nReview the result: `/approve`, or `/object <what's wrong and why>` to send it back.";
 
@@ -873,7 +949,7 @@ fn render_part(part: &Part, hint: bool) -> String {
     }
     if hint && part.status == PartStatus::Open {
         out.push_str(
-            "\n\nLog your thinking and reasons as you work. `/summary <text>` when you can explain it; `/known` if you already know it; `/delegate` to hand it off without understanding it.",
+            "\n\nTalk it through here as you work: your thinking and reasons are the log. When you can explain the whole part, say so and explain it (`/summary`); say if you already know it (`/known`); `/delegate` hands it off without understanding it.",
         );
     }
     out
@@ -976,20 +1052,28 @@ const CHANGE_SYSTEM: &str = r#"You propose a change to Pathfinder's map of what 
 Return ONLY a JSON object:
 {"brief": "...", "goal": null, "parts": [], "remove": []}"#;
 
-const LOG_SYSTEM: &str = r#"The user is working on one part of a task and logging their thinking and the reasons behind their steps and choices. The log is evidence of their understanding.
+const LOG_SYSTEM: &str = r#"The user is working on one part of a task and chatting with Pathfinder as they go. Most messages are their log: their thinking and the reasons behind their steps and choices, or a question. The log is evidence of their understanding.
 
-Reply briefly to the latest entry: answer what they ask, or point out what the entry reveals. If they ask whether something is right, say whether it is, even when it belongs to another part. Don't repeat what you already said in the conversation. Do not do the work for them and do not write their explanation of the part for them.
+First decide what the latest message is (`intent`):
+- `log`: thinking, reasoning, an attempt or a question. The default; when unsure, it's `log`.
+- `summary`: they offer their explanation of the part as a whole, ready to be checked ("I think I get it: ...", "so to sum up, ..."). Not a single point or a question.
+- `known`: they clearly say they already know this whole part and want to skip it. Knowing some of it isn't enough.
+- `move`: they want to go on to the next part, or to a named one (put its id in `part`).
+- `accept` / `reject`: they answer a waiting map change ("yes, add it", "no, keep the map").
+For anything but `log`, set `reply` to "" and `map_change` to null: Pathfinder takes the step.
+
+For `log`, reply briefly: answer what they ask, or point out what the entry reveals. If they ask whether something is right, say whether it is, even when it belongs to another part. Don't repeat what you already said in the conversation. Do not do the work for them and do not write their explanation of the part for them.
 
 The user decides which parts they do themselves and which go to an agent. Never raise that.
 
-If the entry reveals the map is wrong (a missing dependency, a part that doesn't belong, a wrong edge), propose a change in `map_change`; the user accepts or rejects it. Otherwise set it to null. A change has `brief` (one sentence to the user, saying "you"), `goal` (only when the entry changes what the task is, e.g. a new purpose or scope: the new goal as one sentence starting with a verb, not in first person; otherwise null), `parts` (to add, or update by id: id, title, note, depends_on; new ids are short hyphenated slugs of at most 12 characters) and `remove` (ids of parts with no work yet).
+If a `log` message reveals the map is wrong (a missing dependency, a part that doesn't belong, a wrong edge), propose a change in `map_change`; the user accepts or rejects it. Otherwise set it to null. A change has `brief` (one sentence to the user, saying "you"), `goal` (only when the message changes what the task is, e.g. a new purpose or scope: the new goal as one sentence starting with a verb, not in first person; otherwise null), `parts` (to add, or update by id: id, title, note, depends_on; new ids are short hyphenated slugs of at most 12 characters) and `remove` (ids of parts with no work yet).
 
 Call `read` before writing your JSON if a file matters: `reply` ends your turn.
 
 Return ONLY a JSON object:
-{"reply": "...", "map_change": null}
+{"intent": "log", "part": null, "reply": "...", "map_change": null}
 or, with a change:
-{"reply": "...", "map_change": {"brief": "...", "goal": null, "parts": [], "remove": []}}"#;
+{"intent": "log", "part": null, "reply": "...", "map_change": {"brief": "...", "goal": null, "parts": [], "remove": []}}"#;
 
 const CANDIDATE_SYSTEM: &str = r#"You make a candidate for the user to judge. Their judgment decides whether they understand the part well enough to direct an agent and tell whether its result is right.
 
@@ -1010,8 +1094,10 @@ You have the candidate, the hidden key (correct or flawed, and why) and the user
 
 `feedback`: reveal the key and say what their judgment got right or missed.
 
+If the message isn't a verdict on the candidate at all (a question about it or the part, a thought for their log, a request to skip or move on), set `is_judgment` to false and `feedback` to "": it is handled as chat and the candidate keeps waiting. "I don't know" or "not sure" is a verdict: it fails.
+
 Return ONLY a JSON object:
-{"pass": false, "feedback": "..."}"#;
+{"is_judgment": true, "pass": false, "feedback": "..."}"#;
 
 const AGENT_SYSTEM: &str = r#"You do the work for one part of a task in the user's workspace, using the tools available. End with a report of what you changed or found, concrete enough for the user to review."#;
 
@@ -1025,6 +1111,7 @@ mod tests {
 
     struct FakeEngine {
         replies: Mutex<VecDeque<(ToolAccess, EngineTier, String)>>,
+        prompts: Mutex<Vec<String>>,
     }
 
     impl FakeEngine {
@@ -1036,6 +1123,7 @@ mod tests {
                         .map(|(t, tier, s)| (t, tier, s.to_string()))
                         .collect(),
                 ),
+                prompts: Mutex::new(Vec::new()),
             }
         }
     }
@@ -1055,6 +1143,7 @@ mod tests {
                     .expect("unexpected engine call");
                 assert_eq!(req.tools, tools, "tool access mismatch");
                 assert_eq!(req.tier, tier, "engine tier mismatch");
+                self.prompts.lock().unwrap().push(req.prompt.clone());
                 // Stream raw text in small chunks, as the CLIs do.
                 if req.stream_text {
                     let chars: Vec<char> = reply.chars().collect();
@@ -1364,10 +1453,114 @@ mod tests {
         turn(&rt, "thinking").await;
         turn(&rt, "/summary s").await;
         let out = turn(&rt, "looks wrong").await;
-        assert!(out.reply.contains("/summary"));
+        assert!(out.reply.contains("explain the part again"));
         let s = rt.load_session("s").unwrap().unwrap();
         assert_eq!(s.map.get("route").unwrap().status, PartStatus::Open);
         assert!(s.pending_candidate.is_none());
+    }
+
+    #[tokio::test]
+    async fn chat_drives_the_loop() {
+        let (rt, engine) = runtime(
+            FakeEngine::new(vec![
+                (ReadOnly, S1, ONBOARD_READY),
+                (ReadOnly, S2, MAP),
+                (
+                    ReadOnly,
+                    S1,
+                    r#"{"intent":"log","reply":"Ok.","map_change":null}"#,
+                ),
+                (
+                    ReadOnly,
+                    S1,
+                    r#"{"intent":"summary","reply":"","map_change":null}"#,
+                ),
+                (
+                    ReadOnly,
+                    S2,
+                    r#"{"candidate":"w = 0.5 so z = 99","key_reason":"r"}"#,
+                ),
+                // A question while the candidate waits: not a verdict.
+                (
+                    ReadOnly,
+                    S2,
+                    r#"{"is_judgment":false,"pass":false,"feedback":""}"#,
+                ),
+                (
+                    ReadOnly,
+                    S1,
+                    r#"{"intent":"log","reply":"It means x.","map_change":null}"#,
+                ),
+                (
+                    ReadOnly,
+                    S2,
+                    r#"{"is_judgment":true,"pass":true,"feedback":"Right."}"#,
+                ),
+                (
+                    ReadOnly,
+                    S1,
+                    r#"{"intent":"move","part":null,"reply":"","map_change":null}"#,
+                ),
+                (
+                    ReadOnly,
+                    S1,
+                    r#"{"intent":"known","reply":"","map_change":null}"#,
+                ),
+            ]),
+            false,
+        );
+        turn(&rt, "goal").await;
+        turn(&rt, "thinking").await;
+        turn(&rt, "I get it: it routes by name").await;
+        let s = rt.load_session("s").unwrap().unwrap();
+        assert!(s.pending_candidate.is_some());
+        let part = s.map.get("route").unwrap();
+        assert_eq!(part.log, vec!["thinking".to_string()]);
+        assert_eq!(part.summary.as_deref(), Some("I get it: it routes by name"));
+
+        let out = turn(&rt, "what does dispatch mean here?").await;
+        assert!(!out.reply.contains("understood"));
+        // The chat reply never sees the waiting candidate.
+        let log_prompt = engine.prompts.lock().unwrap().last().cloned().unwrap();
+        assert!(log_prompt.contains("what does dispatch mean here?"));
+        assert!(!log_prompt.contains("z = 99"));
+        let s = rt.load_session("s").unwrap().unwrap();
+        assert!(s.pending_candidate.is_some());
+
+        turn(&rt, "it's correct because names map to handlers").await;
+        let s = rt.load_session("s").unwrap().unwrap();
+        assert_eq!(s.map.get("route").unwrap().status, PartStatus::Understood);
+
+        turn(&rt, "ok, next part").await;
+        let s = rt.load_session("s").unwrap().unwrap();
+        let next = s.active.clone().unwrap();
+        assert_ne!(next, "route");
+
+        turn(&rt, "I already know this one").await;
+        let s = rt.load_session("s").unwrap().unwrap();
+        assert_eq!(s.map.get(&next).unwrap().status, PartStatus::Known);
+    }
+
+    #[tokio::test]
+    async fn a_summary_needs_a_log_first() {
+        let (rt, _) = runtime(
+            FakeEngine::new(vec![
+                (ReadOnly, S1, ONBOARD_READY),
+                (ReadOnly, S2, MAP),
+                (
+                    ReadOnly,
+                    S1,
+                    r#"{"intent":"summary","reply":"","map_change":null}"#,
+                ),
+            ]),
+            false,
+        );
+        turn(&rt, "goal").await;
+        let out = turn(&rt, "I get it: it routes by name").await;
+        assert!(out.reply.contains("Noted in your log"));
+        let s = rt.load_session("s").unwrap().unwrap();
+        assert!(s.pending_candidate.is_none());
+        assert_eq!(s.map.get("route").unwrap().log.len(), 1);
     }
 
     #[tokio::test]

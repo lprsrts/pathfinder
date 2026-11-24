@@ -350,6 +350,27 @@ fn remember(seen: &mut String, attempt: &Mutex<String>) {
     }
 }
 
+/// Doubles backslashes that don't start a JSON escape, such as LaTeX `\(`
+/// that models write inside strings.
+fn fix_escapes(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len() + 8);
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek() {
+            Some('"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't' | 'u') => {
+                out.push(c);
+                out.push(chars.next().unwrap());
+            }
+            _ => out.push_str("\\\\"),
+        }
+    }
+    out
+}
+
 fn is_only_invalid_json<T>(outcome: &std::result::Result<T, Vec<Violation>>) -> bool {
     matches!(outcome, Err(v) if v.len() == 1 && v[0].code == "invalid_json")
 }
@@ -360,12 +381,14 @@ where
     C: Fn(&T) -> Vec<Violation>,
 {
     let candidate = extract_json_object(raw);
-    let parsed: T = serde_json::from_str(candidate).map_err(|err| {
-        vec![Violation::new(
-            "invalid_json",
-            format!("could not parse JSON: {err}"),
-        )]
-    })?;
+    let parsed: T = serde_json::from_str(candidate)
+        .or_else(|err| serde_json::from_str(&fix_escapes(candidate)).map_err(|_| err))
+        .map_err(|err| {
+            vec![Violation::new(
+                "invalid_json",
+                format!("could not parse JSON: {err}"),
+            )]
+        })?;
     let violations = check(&parsed);
     if violations.is_empty() {
         Ok(parsed)
@@ -376,6 +399,13 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tolerates_latex_backslashes() {
+        let raw = r#"{"reply": "sum \( 4(0.5) \) is \"ok\"\n"}"#;
+        let v: serde_json::Value = serde_json::from_str(&super::fix_escapes(raw)).unwrap();
+        assert_eq!(v["reply"], "sum \\( 4(0.5) \\) is \"ok\"\n");
+    }
+
     use super::*;
 
     #[test]
