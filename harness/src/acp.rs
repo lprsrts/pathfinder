@@ -22,7 +22,7 @@ use uuid::Uuid;
 
 use crate::auth::Credentials;
 use crate::catalog::{self, ModelCache};
-use crate::config::Config;
+use crate::config::{Config, Route};
 use crate::domain::{PartStatus, Session};
 use crate::engine::{StreamEvent, StreamSink};
 use crate::runtime::{ModelChoices, Runtime, TurnInput};
@@ -65,7 +65,7 @@ pub async fn run_stdio(runtime: Arc<Runtime>, creds: Arc<Credentials>) -> Result
                         warn!("ChatGPT sign-in failed: {e:#}");
                         return responder.respond_with_error(AcpError::auth_required());
                     }
-                    catalog::refresh(&creds_auth, &reqwest::Client::new()).await;
+                    catalog::refresh(&creds_auth, &reqwest::Client::new(), &[Route::Chatgpt]).await;
                 }
                 if ensure_models(&creds_auth).await {
                     responder.respond(AuthenticateResponse::new())
@@ -253,7 +253,7 @@ async fn ensure_models(creds: &Arc<Credentials>) -> bool {
     if Config::load().catalog().is_empty() {
         let refreshed = tokio::time::timeout(
             std::time::Duration::from_secs(20),
-            catalog::refresh(creds, &reqwest::Client::new()),
+            catalog::refresh(creds, &reqwest::Client::new(), &Route::DISCOVERED),
         )
         .await;
         if refreshed.is_err() {
@@ -264,7 +264,7 @@ async fn ensure_models(creds: &Arc<Credentials>) -> bool {
     if cache.is_stale() {
         let creds = creds.clone();
         tokio::spawn(async move {
-            catalog::refresh(&creds, &reqwest::Client::new()).await;
+            catalog::refresh(&creds, &reqwest::Client::new(), &Route::DISCOVERED).await;
         });
     }
     true

@@ -43,7 +43,7 @@ pub async fn auth(args: &[String]) -> Result<()> {
                         " The token couldn't be revoked with OpenAI, but it was deleted here."
                     }
                 );
-                refresh(&creds).await;
+                refresh(&creds, Route::Chatgpt).await;
                 Ok(())
             }
             Some(other) => bail!("to remove a {other} key use `harness auth remove {other}`"),
@@ -56,7 +56,7 @@ pub async fn auth(args: &[String]) -> Result<()> {
             } else {
                 println!("Pathfinder has no stored {} key.", route.provider_name());
             }
-            refresh(&creds).await;
+            refresh(&creds, route).await;
             Ok(())
         }
         Some("import") => {
@@ -66,7 +66,7 @@ pub async fn auth(args: &[String]) -> Result<()> {
                     "Copied {}-api-key into Pathfinder's keychain entry.",
                     route.provider_id()
                 );
-                refresh(&creds).await;
+                refresh(&creds, route).await;
             } else {
                 println!("No {}-api-key keychain item found.", route.provider_id());
             }
@@ -79,7 +79,12 @@ pub async fn auth(args: &[String]) -> Result<()> {
 
 pub async fn models(args: &[String]) -> Result<()> {
     let cache = if args.iter().any(|a| a == "--refresh") {
-        catalog::refresh(&Credentials::system(), &reqwest::Client::new()).await
+        catalog::refresh(
+            &Credentials::system(),
+            &reqwest::Client::new(),
+            &Route::DISCOVERED,
+        )
+        .await
     } else {
         ModelCache::load()
     };
@@ -145,7 +150,7 @@ async fn set(creds: &Credentials, name: Option<&str>, from_stdin: bool) -> Resul
     }
     creds.set_key(route, key)?;
     println!("Saved to your keychain. Start a new Pathfinder thread to use it.");
-    refresh(creds).await;
+    refresh(creds, route).await;
     Ok(())
 }
 
@@ -165,7 +170,7 @@ async fn login_chatgpt(creds: &Credentials) -> Result<()> {
             .map(|e| format!(" as {e}"))
             .unwrap_or_default()
     );
-    refresh(creds).await;
+    refresh(creds, Route::Chatgpt).await;
     let count = ModelCache::load()
         .providers
         .get("chatgpt")
@@ -194,8 +199,9 @@ pub fn open_browser(url: &str) {
         .spawn();
 }
 
-async fn refresh(creds: &Credentials) {
-    catalog::refresh(creds, &reqwest::Client::new()).await;
+/// Refreshes the model list of the one provider a command changed.
+async fn refresh(creds: &Credentials, route: Route) {
+    catalog::refresh(creds, &reqwest::Client::new(), &[route]).await;
 }
 
 fn status(creds: &Credentials) -> Result<()> {

@@ -221,11 +221,12 @@ fn keep(route: Route, id: &str) -> bool {
     }
 }
 
-/// Refreshes the cache for every provider with a key. Providers that fail
-/// keep their previous list.
-pub async fn refresh(creds: &Credentials, http: &reqwest::Client) -> ModelCache {
+/// Refreshes the cache for these providers. Providers whose list can't be
+/// fetched keep their previous list. Reads only env vars, Pathfinder's own
+/// keychain entries and the ChatGPT session, so it never prompts.
+pub async fn refresh(creds: &Credentials, http: &reqwest::Client, routes: &[Route]) -> ModelCache {
     let mut cache = ModelCache::load();
-    for route in Route::DISCOVERED {
+    for &route in routes {
         let key = if route == Route::Chatgpt {
             let session = creds.chatgpt();
             if session.signed_in() {
@@ -240,7 +241,7 @@ pub async fn refresh(creds: &Credentials, http: &reqwest::Client) -> ModelCache 
                 None
             }
         } else {
-            creds.lookup(route).map(|(key, _)| key)
+            creds.lookup_own(route).map(|(key, _)| key)
         };
         let Some(key) = key else {
             cache.providers.remove(route.provider_id());

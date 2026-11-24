@@ -112,6 +112,17 @@ impl Credentials {
 
     /// Finds a key and where it came from, without caching.
     pub fn lookup(&self, route: Route) -> Option<(String, KeySource)> {
+        self.find(route, true)
+    }
+
+    /// Like `lookup`, but never reads shared `<provider>-api-key` items:
+    /// macOS asks before another tool's item is read, so background work
+    /// (model discovery) must not touch them.
+    pub fn lookup_own(&self, route: Route) -> Option<(String, KeySource)> {
+        self.find(route, false)
+    }
+
+    fn find(&self, route: Route, include_shared: bool) -> Option<(String, KeySource)> {
         if self.use_env {
             if let Some(var) = route.key_env() {
                 if let Ok(v) = env::var(var) {
@@ -131,7 +142,7 @@ impl Credentials {
         if let Some(key) = read(SERVICE, &own_account(route)) {
             return Some((key, KeySource::Keychain));
         }
-        if !self.user.is_empty() {
+        if include_shared && !self.user.is_empty() {
             if let Some(key) = read(&shared_service(route), &self.user) {
                 return Some((key.trim().to_string(), KeySource::Shared));
             }
@@ -217,6 +228,10 @@ mod tests {
         assert_eq!(
             (key.as_str(), source),
             ("sk-ant-shared-0000000000", KeySource::Shared)
+        );
+        assert!(
+            creds.lookup_own(Route::Anthropic).is_none(),
+            "discovery must not read shared items"
         );
 
         creds

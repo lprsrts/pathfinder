@@ -62,7 +62,7 @@ The key is checked with the provider, then stored in your OS keychain (macOS Key
 
 - `harness auth status` shows which keys are available and where they come from.
 - `harness auth remove <provider>` deletes Pathfinder's stored key.
-- `harness auth import <provider>` copies an existing `<provider>-api-key` keychain item (e.g. one your scripts already use) into Pathfinder's own entry. Pathfinder can read such items directly too, but macOS asks you to allow that.
+- `harness auth import <provider>` copies an existing `<provider>-api-key` keychain item (e.g. one your scripts already use) into Pathfinder's own entry. Pathfinder can read such items directly too when it runs a model, but macOS asks you to allow that, so importing once is quieter. Model discovery never reads them: it lists models only for providers with an environment variable or Pathfinder's own entry.
 
 Keys are looked up in this order: `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`, Pathfinder's keychain entry, then a `<provider>-api-key` keychain item.
 
