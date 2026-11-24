@@ -92,10 +92,11 @@ pub fn check_change(change: &MapChange, current: &Map) -> Vec<Violation> {
     for part in change.parts.iter().filter(|p| current.get(&p.id).is_none()) {
         check_id(&mut out, &part.id);
     }
-    if change.parts.is_empty() && change.remove.is_empty() {
+    let new_goal = change.goal.as_deref().is_some_and(|g| !g.trim().is_empty());
+    if change.parts.is_empty() && change.remove.is_empty() && !new_goal {
         out.push(Violation::new(
             "empty_change",
-            "a map change must add, update or remove at least one part",
+            "a map change must change the goal or add, update or remove at least one part",
         ));
     }
     if let Err(e) = current.with_change(change) {
@@ -189,6 +190,7 @@ mod tests {
         let bad = LogReply {
             reply: "Noted.".into(),
             map_change: Some(MapChange {
+                goal: None,
                 brief: "drop a".into(),
                 parts: vec![],
                 remove: vec!["a".into()],
@@ -199,6 +201,7 @@ mod tests {
         let good = LogReply {
             reply: "Noted.".into(),
             map_change: Some(MapChange {
+                goal: None,
                 brief: "add b".into(),
                 parts: vec![proposed("b", &["a"])],
                 remove: vec![],

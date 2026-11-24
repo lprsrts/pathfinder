@@ -362,6 +362,9 @@ impl Runtime {
         match session.map.with_change(&change) {
             Ok(map) => {
                 session.map = map;
+                if let Some(goal) = change.goal.filter(|g| !g.trim().is_empty()) {
+                    session.goal = Some(goal);
+                }
                 if session
                     .active
                     .as_deref()
@@ -893,6 +896,9 @@ fn describe_part(part: &Part) -> String {
 /// `+` adds a part, `~` updates one already on the map.
 fn render_change(change: &MapChange, map: &Map) -> String {
     let mut lines = vec![format!("Proposed map change: {}", change.brief)];
+    if let Some(goal) = change.goal.as_deref().filter(|g| !g.trim().is_empty()) {
+        lines.push(format!("Goal → {goal}"));
+    }
     for p in &change.parts {
         let deps = if p.depends_on.is_empty() {
             String::new()
@@ -964,10 +970,11 @@ const CHANGE_SYSTEM: &str = r#"You propose a change to Pathfinder's map of what 
 - `remove`: ids of parts to drop. Only parts with no work or outcome can be removed.
 - No size limit. No cycles.
 
+- `goal`: only when what changed alters what the task is (a new purpose or scope): the new goal as one sentence starting with a verb, not in first person. Otherwise null.
 `brief`: one sentence to the user, saying "you", on what changes and why.
 
 Return ONLY a JSON object:
-{"brief": "...", "parts": [], "remove": []}"#;
+{"brief": "...", "goal": null, "parts": [], "remove": []}"#;
 
 const LOG_SYSTEM: &str = r#"The user is working on one part of a task and logging their thinking and the reasons behind their steps and choices. The log is evidence of their understanding.
 
@@ -975,12 +982,14 @@ Reply briefly to the latest entry: answer what they ask, or point out what the e
 
 The user decides which parts they do themselves and which go to an agent. Never raise that.
 
-If the entry reveals the map is wrong (a missing dependency, a part that doesn't belong, a wrong edge), propose a change in `map_change`; the user accepts or rejects it. Otherwise set it to null. A change has `brief` (one sentence to the user, saying "you"), `parts` (to add, or update by id: id, title, note, depends_on; new ids are short hyphenated slugs of at most 12 characters) and `remove` (ids of parts with no work yet).
+If the entry reveals the map is wrong (a missing dependency, a part that doesn't belong, a wrong edge), propose a change in `map_change`; the user accepts or rejects it. Otherwise set it to null. A change has `brief` (one sentence to the user, saying "you"), `goal` (only when the entry changes what the task is, e.g. a new purpose or scope: the new goal as one sentence starting with a verb, not in first person; otherwise null), `parts` (to add, or update by id: id, title, note, depends_on; new ids are short hyphenated slugs of at most 12 characters) and `remove` (ids of parts with no work yet).
 
 Call `read` before writing your JSON if a file matters: `reply` ends your turn.
 
 Return ONLY a JSON object:
-{"reply": "...", "map_change": null}"#;
+{"reply": "...", "map_change": null}
+or, with a change:
+{"reply": "...", "map_change": {"brief": "...", "goal": null, "parts": [], "remove": []}}"#;
 
 const CANDIDATE_SYSTEM: &str = r#"You make a candidate for the user to judge. Their judgment decides whether they understand the part well enough to direct an agent and tell whether its result is right.
 
@@ -1413,5 +1422,33 @@ mod tests {
         let s = rt.load_session("s").unwrap().unwrap();
         assert!(s.map.get("store").is_some());
         assert!(s.pending_change.is_none());
+    }
+
+    #[tokio::test]
+    async fn accepted_change_can_reset_the_goal() {
+        let (rt, _) = runtime(
+            FakeEngine::new(vec![
+                (ReadOnly, S1, ONBOARD_READY),
+                (ReadOnly, S2, MAP),
+                (
+                    ReadOnly,
+                    S1,
+                    r#"{"reply":"That changes the task.","map_change":{"brief":"You need conv layers","goal":"Understand convolutional networks for an image classifier","parts":[{"id":"conv","title":"Conv layers","depends_on":[]}],"remove":[]}}"#,
+                ),
+            ]),
+            false,
+        );
+        turn(&rt, "goal").await;
+        let before = rt.load_session("s").unwrap().unwrap().goal;
+        let out = turn(&rt, "I really need this for a CNN").await;
+        assert!(out.reply.contains("Goal → Understand convolutional"));
+        assert_eq!(rt.load_session("s").unwrap().unwrap().goal, before);
+
+        turn(&rt, "/accept").await;
+        let s = rt.load_session("s").unwrap().unwrap();
+        assert_eq!(
+            s.goal.as_deref(),
+            Some("Understand convolutional networks for an image classifier")
+        );
     }
 }

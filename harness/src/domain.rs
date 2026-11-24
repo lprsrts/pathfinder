@@ -437,6 +437,9 @@ impl MapProposal {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MapChange {
     pub brief: String,
+    /// A new goal, when the change alters what the task is (§3).
+    #[serde(default)]
+    pub goal: Option<String>,
     #[serde(default)]
     pub parts: Vec<ProposedPart>,
     #[serde(default)]
@@ -567,6 +570,7 @@ mod tests {
         let m = map(vec![part("a", &[], PartStatus::Open), worked]);
 
         let change = MapChange {
+            goal: None,
             brief: "x".into(),
             parts: vec![
                 ProposedPart {
@@ -589,6 +593,7 @@ mod tests {
         assert_eq!(next.get("a").unwrap().title, "Renamed");
 
         let remove_worked = MapChange {
+            goal: None,
             brief: "x".into(),
             parts: vec![],
             remove: vec!["b".into()],
@@ -596,6 +601,7 @@ mod tests {
         assert!(m.with_change(&remove_worked).is_err());
 
         let cycle = MapChange {
+            goal: None,
             brief: "x".into(),
             parts: vec![ProposedPart {
                 id: "a".into(),
