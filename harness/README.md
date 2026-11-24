@@ -28,27 +28,36 @@ Add to `~/.config/zed/settings.json`:
 }
 ```
 
-## Models and CLIs
+## Models and routes
 
-Pathfinder runs models through `pi`, Claude Code (`claude`) or Codex (`codex`), so each can use the logins and subscriptions of its own CLI. It uses a fast model (System 1: onboarding, log replies) and a stronger one (System 2: map, candidates, judgment, agent work).
+Pathfinder uses a fast model (System 1: onboarding, log replies) and a stronger one (System 2: map, candidates, judgment, agent work). Each model runs on a **route**:
 
-List the models in `~/.config/harness/config.json`. They appear, grouped by CLI, in the two model pickers of Zed's agent panel; `system1`/`system2` are the defaults for new sessions. The file is re-read on every turn, so edits apply without restarting Zed.
+| Route | What runs it | Credentials |
+|---|---|---|
+| `anthropic` | Pathfinder's own agent, Anthropic Messages API | `ANTHROPIC_API_KEY` |
+| `openai` | Pathfinder's own agent, OpenAI Responses API | `OPENAI_API_KEY` |
+| `claude` | Claude Code CLI (`claude -p`) | the CLI's own login |
+| `codex` | Codex CLI (`codex exec`) | the CLI's own login |
+
+On the API routes Pathfinder runs its own tool loop (read, list, find, search in the workspace) and streams the model's thinking and tool calls into Zed. Agent work (`/handoff`, `/delegate`) currently needs a `claude` or `codex` main model; it comes to the API routes next.
+
+List the models in `~/.config/harness/config.json`. They appear, grouped by route, in the two model pickers of Zed's agent panel; `system1`/`system2` are the defaults for new sessions. The file is re-read on every turn, so edits apply without restarting Zed.
 
 ```json
 {
   "models": [
-    { "id": "claude-haiku", "label": "Haiku", "backend": "claude", "model": "haiku", "effort": "low" },
-    { "id": "codex-sol", "label": "GPT-6.1 Sol", "backend": "codex", "model": "gpt-6.1-sol", "effort": "high" },
-    { "id": "pi-luna", "label": "GPT-6 Luna", "backend": "pi", "model": "openai/gpt-6-luna", "effort": "low" }
+    { "id": "haiku", "label": "Haiku 5.5", "route": "anthropic", "model": "claude-haiku-5-5", "effort": "low" },
+    { "id": "sonnet", "label": "Sonnet 5.5", "route": "anthropic", "model": "claude-sonnet-5-5", "effort": "medium" },
+    { "id": "codex-sol", "label": "GPT-6.1 Sol", "route": "codex", "model": "gpt-6.1-sol", "effort": "high" }
   ],
-  "system1": "claude-haiku",
-  "system2": "codex-sol"
+  "system1": "haiku",
+  "system2": "sonnet"
 }
 ```
 
-- `backend`: `pi`, `claude` or `codex`. `model` is passed to that CLI (empty uses its default); `effort` maps to pi's `--thinking`, Claude Code's `--effort` and Codex's `model_reasoning_effort`.
-- Agent work (`/handoff`, `/delegate`) may edit files and run shell commands in the workspace: Codex in its `workspace-write` sandbox, Claude Code with its sandbox enabled.
-- Binaries: `pi_bin`, `claude_bin`, `codex_bin` (or `HARNESS_PI_BIN`, `HARNESS_CLAUDE_BIN`, `HARNESS_CODEX_BIN`). `HARNESS_DB_PATH` moves the session database.
+- `model` is the provider's model id (or the CLI's model name; empty uses its default). `effort` is the reasoning effort (`low`, `medium`, `high`, ...).
+- On the CLI routes, agent work may edit files and run shell commands in the workspace: Codex in its `workspace-write` sandbox, Claude Code with its sandbox enabled.
+- Binaries: `claude_bin`, `codex_bin` (or `HARNESS_CLAUDE_BIN`, `HARNESS_CODEX_BIN`). `HARNESS_DB_PATH` moves the session database.
 
 ## How a session goes
 

@@ -4,14 +4,16 @@ use anyhow::Result;
 
 use super::cli::CliEngine;
 use super::{BoxFuture, Engine, EngineRequest, StreamSink};
+use crate::agent::ApiEngine;
 
 pub struct RouterEngine {
     cli: CliEngine,
+    api: ApiEngine,
 }
 
 impl RouterEngine {
-    pub fn new(cli: CliEngine) -> Self {
-        Self { cli }
+    pub fn new(cli: CliEngine, api: ApiEngine) -> Self {
+        Self { cli, api }
     }
 }
 
@@ -21,6 +23,10 @@ impl Engine for RouterEngine {
         req: &'a EngineRequest,
         sink: StreamSink,
     ) -> BoxFuture<'a, Result<String>> {
-        self.cli.run_text(req, sink)
+        if req.model().route.is_cli() {
+            self.cli.run_text(req, sink)
+        } else {
+            self.api.run_text(req, sink)
+        }
     }
 }
