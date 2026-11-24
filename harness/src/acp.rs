@@ -87,12 +87,14 @@ pub async fn run_stdio(runtime: Arc<Runtime>) -> Result<()> {
                             .respond_with_error(AcpError::internal_error().data(err.to_string()));
                     }
                 };
+                // ACP: replay the whole conversation before answering the load.
+                replay_history(&cx, &req.session_id, &loaded);
+                if !loaded.map.parts.is_empty() {
+                    let _ = send_plan(&cx, req.session_id.clone(), &loaded);
+                }
                 let options = model_options(&rt_load.model_choices(&loaded));
                 responder.respond(LoadSessionResponse::new().config_options(options))?;
-                let _ = send_commands(&cx, req.session_id.clone());
-                if !loaded.map.parts.is_empty() {
-                    let _ = send_plan(&cx, req.session_id, &loaded);
-                }
+                let _ = send_commands(&cx, req.session_id);
                 Ok(())
             },
             agent_client_protocol::on_receive_request!(),
@@ -177,6 +179,27 @@ pub async fn run_stdio(runtime: Arc<Runtime>) -> Result<()> {
 }
 
 /// The two model pickers, with entries grouped by CLI.
+/// Sends a loaded session's turns back to the client, in order.
+fn replay_history(cx: &ConnectionTo<Client>, session_id: &SessionId, session: &Session) {
+    let mut previous_role: Option<&str> = None;
+    for turn in &session.history {
+        // Consecutive chunks merge into one message; keep turns apart.
+        let text = if previous_role == Some(turn.role.as_str()) {
+            format!("\n\n{}", turn.content)
+        } else {
+            turn.content.clone()
+        };
+        previous_role = Some(turn.role.as_str());
+        let chunk = ContentChunk::new(ContentBlock::from(text));
+        let update = if turn.role == "user" {
+            SessionUpdate::UserMessageChunk(chunk)
+        } else {
+            SessionUpdate::AgentMessageChunk(chunk)
+        };
+        let _ = cx.send_notification(SessionNotification::new(session_id.clone(), update));
+    }
+}
+
 /// The two model pickers. Zed's buttons show only the selected option's name
 /// (the picker's name and description appear on hover), so each option names
 /// its CLI: pi and Codex offer the same model names.
