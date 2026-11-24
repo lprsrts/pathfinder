@@ -11,8 +11,8 @@ use crate::domain::{
     PartStatus, PendingCandidate, Session, SessionMode,
 };
 use crate::engine::{
-    Engine, EngineRequest, EngineTier, StreamEvent, StreamSink, TierModels, ToolAccess, run_gated,
-    run_gated_streamed,
+    Engine, EngineRequest, EngineTier, RunContext, StreamEvent, StreamSink, TierModels, ToolAccess,
+    run_gated, run_gated_streamed,
 };
 use crate::store::Store;
 use crate::validate::{
@@ -64,9 +64,12 @@ pub struct Runtime {
 /// The model pickers' state for one session.
 pub struct ModelChoices {
     pub catalog: Vec<ModelEntry>,
-    pub system1: String,
-    pub system2: String,
+    pub system1: Option<String>,
+    pub system2: Option<String>,
 }
+
+pub const NO_MODEL: &str =
+    "No model is configured. Add models to `~/.config/harness/config.json` (see the README).";
 
 impl Runtime {
     pub fn new(store: Arc<Store>, engine: Arc<dyn Engine>) -> Self {
@@ -78,20 +81,25 @@ impl Runtime {
         }
     }
 
-    fn models(&self, session: &Session) -> TierModels {
+    fn models(&self, session: &Session) -> Result<TierModels> {
         let config = (self.config)();
-        TierModels {
-            system1: config.pick(session.system1.as_deref(), false),
-            system2: config.pick(session.system2.as_deref(), true),
-        }
+        let pick = |choice: &Option<String>, system2| {
+            config
+                .pick(choice.as_deref(), system2)
+                .ok_or_else(|| anyhow!(NO_MODEL))
+        };
+        Ok(TierModels {
+            system1: pick(&session.system1, false)?,
+            system2: pick(&session.system2, true)?,
+        })
     }
 
     pub fn model_choices(&self, session: &Session) -> ModelChoices {
-        let models = self.models(session);
+        let config = (self.config)();
         ModelChoices {
-            catalog: (self.config)().catalog(),
-            system1: models.system1.id,
-            system2: models.system2.id,
+            catalog: config.catalog(),
+            system1: config.pick(session.system1.as_deref(), false).map(|m| m.id),
+            system2: config.pick(session.system2.as_deref(), true).map(|m| m.id),
         }
     }
 
@@ -219,7 +227,8 @@ impl Runtime {
             ),
             files: files.to_vec(),
             stream_text: false,
-            models: self.models(session),
+            models: self.models(session)?,
+            ctx: RunContext::default(),
         };
         let (decision, shown): (OnboardingDecision, _) = run_gated_streamed(
             self.engine.as_ref(),
@@ -267,7 +276,8 @@ impl Runtime {
             ),
             files: files.to_vec(),
             stream_text: false,
-            models: self.models(session),
+            models: self.models(session)?,
+            ctx: RunContext::default(),
         };
         let (proposal, shown): (MapProposal, _) = run_gated_streamed(
             self.engine.as_ref(),
@@ -326,7 +336,8 @@ impl Runtime {
             ),
             files: files.to_vec(),
             stream_text: false,
-            models: self.models(session),
+            models: self.models(session)?,
+            ctx: RunContext::default(),
         };
         let current = session.map.clone();
         let change: MapChange = run_gated(
@@ -433,7 +444,8 @@ impl Runtime {
             ),
             files: files.to_vec(),
             stream_text: false,
-            models: self.models(session),
+            models: self.models(session)?,
+            ctx: RunContext::default(),
         };
         let current = session.map.clone();
         let (decision, shown): (LogReply, _) = run_gated_streamed(
@@ -512,7 +524,8 @@ impl Runtime {
             ),
             files: files.to_vec(),
             stream_text: false,
-            models: self.models(session),
+            models: self.models(session)?,
+            ctx: RunContext::default(),
         };
         let header = format!("Candidate for **{}**:\n\n", part.title);
         sink(StreamEvent::TextDelta(header.clone()));
@@ -575,7 +588,8 @@ impl Runtime {
             ),
             files: files.to_vec(),
             stream_text: false,
-            models: self.models(session),
+            models: self.models(session)?,
+            ctx: RunContext::default(),
         };
         let (verdict, shown): (JudgmentVerdict, _) = run_gated_streamed(
             self.engine.as_ref(),
@@ -784,7 +798,8 @@ impl Runtime {
             prompt,
             files: files.to_vec(),
             stream_text: true,
-            models: self.models(session),
+            models: self.models(session)?,
+            ctx: RunContext::default(),
         };
         self.engine.run_text(&req, sink).await
     }
@@ -1036,11 +1051,26 @@ mod tests {
 
     use EngineTier::{System1 as S1, System2 as S2};
 
+    /// Two models; the fake engine ignores their routes.
+    fn test_config() -> Config {
+        let entry = |id: &str| crate::config::ModelEntry {
+            id: id.into(),
+            label: id.into(),
+            route: crate::config::Route::Anthropic,
+            model: id.into(),
+            effort: None,
+        };
+        Config {
+            models: vec![entry("fast"), entry("main")],
+            ..Config::default()
+        }
+    }
+
     fn test_models() -> TierModels {
-        let config = Config::default();
+        let config = test_config();
         TierModels {
-            system1: config.pick(None, false),
-            system2: config.pick(None, true),
+            system1: config.pick(None, false).unwrap(),
+            system2: config.pick(None, true).unwrap(),
         }
     }
 
@@ -1050,14 +1080,14 @@ mod tests {
             Arc::new(Store::open_in_memory().unwrap()),
             Arc::new(FakeEngine::new(vec![])),
         );
-        rt.config = Config::default;
+        rt.config = test_config;
         rt.create_session("s".into(), PathBuf::from(".")).unwrap();
         assert!(rt.set_model("s", true, "nope").is_err());
-        let s = rt.set_model("s", false, "pi-system2").unwrap();
-        assert_eq!(s.system1.as_deref(), Some("pi-system2"));
+        let s = rt.set_model("s", false, "main").unwrap();
+        assert_eq!(s.system1.as_deref(), Some("main"));
         let choices = rt.model_choices(&s);
-        assert_eq!(choices.system1, "pi-system2");
-        assert_eq!(choices.system2, "pi-system2");
+        assert_eq!(choices.system1.as_deref(), Some("main"));
+        assert_eq!(choices.system2.as_deref(), Some("main"));
         assert_eq!(choices.catalog.len(), 2);
     }
     use ToolAccess::{Full, ReadOnly};
@@ -1072,7 +1102,7 @@ mod tests {
         let engine = Arc::new(engine);
         let mut rt = Runtime::new(Arc::new(Store::open_in_memory().unwrap()), engine.clone());
         rt.flaw_coin = if flawed { || true } else { || false };
-        rt.config = Config::default;
+        rt.config = test_config;
         rt.create_session("s".into(), PathBuf::from(".")).unwrap();
         (rt, engine)
     }
@@ -1197,6 +1227,7 @@ mod tests {
             files: vec![],
             stream_text: false,
             models: test_models(),
+            ctx: RunContext::default(),
         };
         let d: OnboardingDecision = run_gated(
             &engine,

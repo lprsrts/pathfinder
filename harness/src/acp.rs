@@ -4,14 +4,14 @@ use std::sync::Arc;
 use agent_client_protocol::v1::ConnectionTo;
 use agent_client_protocol::v1::schema::{
     AgentCapabilities, AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate,
-    CancelNotification, ContentBlock, ContentChunk, EmbeddedResourceResource, Implementation,
-    InitializeRequest, InitializeResponse, LoadSessionRequest, LoadSessionResponse,
+    CancelNotification, Content, ContentBlock, ContentChunk, Diff, EmbeddedResourceResource,
+    Implementation, InitializeRequest, InitializeResponse, LoadSessionRequest, LoadSessionResponse,
     NewSessionRequest, NewSessionResponse, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus,
     PromptCapabilities, PromptRequest, PromptResponse, SessionConfigOption,
     SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigSelectGroup,
     SessionConfigSelectOption, SessionId, SessionNotification, SessionUpdate,
     SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason, ToolCall,
-    ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+    ToolCallContent, ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
     ToolKind as AcpToolKind, UnstructuredCommandInput,
 };
 use agent_client_protocol::{Agent, Client, Error as AcpError, Stdio};
@@ -22,7 +22,7 @@ use uuid::Uuid;
 use crate::domain::{PartStatus, Session};
 use crate::engine::{StreamEvent, StreamSink};
 use crate::runtime::{ModelChoices, Runtime, TurnInput};
-use crate::stream::ToolKind;
+use crate::stream::{ToolContent, ToolKind};
 
 pub async fn run_stdio(runtime: Arc<Runtime>) -> Result<()> {
     let rt_new = runtime.clone();
@@ -204,10 +204,13 @@ fn replay_history(cx: &ConnectionTo<Client>, session_id: &SessionId, session: &S
 /// (the picker's name and description appear on hover), so each option names
 /// its CLI: pi and Codex offer the same model names.
 fn model_options(choices: &ModelChoices) -> Vec<SessionConfigOption> {
+    if choices.catalog.is_empty() {
+        return Vec::new();
+    }
     let grouped = || -> Vec<SessionConfigSelectGroup> {
         let mut groups: Vec<(&str, Vec<SessionConfigSelectOption>)> = Vec::new();
         for entry in &choices.catalog {
-            let cli = entry.backend.label();
+            let cli = entry.route.label();
             let option =
                 SessionConfigSelectOption::new(entry.id.clone(), option_label(&entry.label, cli));
             match groups.iter_mut().find(|(g, _)| *g == cli) {
@@ -222,12 +225,22 @@ fn model_options(choices: &ModelChoices) -> Vec<SessionConfigOption> {
     };
     vec![
         // Zed lists these right to left: Main first puts Fast on the left.
-        SessionConfigOption::select("system2", "Main model", choices.system2.clone(), grouped())
-            .description("System 2: map, candidates, judgment and agent work".to_string())
-            .category(SessionConfigOptionCategory::Model),
-        SessionConfigOption::select("system1", "Fast model", choices.system1.clone(), grouped())
-            .description("System 1: onboarding and log replies".to_string())
-            .category(SessionConfigOptionCategory::ModelConfig),
+        SessionConfigOption::select(
+            "system2",
+            "Main model",
+            choices.system2.clone().unwrap_or_default(),
+            grouped(),
+        )
+        .description("System 2: map, candidates, judgment and agent work".to_string())
+        .category(SessionConfigOptionCategory::Model),
+        SessionConfigOption::select(
+            "system1",
+            "Fast model",
+            choices.system1.clone().unwrap_or_default(),
+            grouped(),
+        )
+        .description("System 1: onboarding and log replies".to_string())
+        .category(SessionConfigOptionCategory::ModelConfig),
     ]
 }
 
@@ -260,6 +273,20 @@ fn make_stream_sink(cx: ConnectionTo<Client>, session_id: SessionId) -> StreamSi
                         .status(ToolCallStatus::InProgress)
                         .locations(locations),
                 )
+            }
+            StreamEvent::ToolUpdate { id, content } => {
+                let content = match content {
+                    ToolContent::Diff { path, old, new } => {
+                        ToolCallContent::Diff(Diff::new(path, new).old_text(old))
+                    }
+                    ToolContent::Text(text) => {
+                        ToolCallContent::Content(Content::new(ContentBlock::from(text)))
+                    }
+                };
+                SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                    id,
+                    ToolCallUpdateFields::new().content(vec![content]),
+                ))
             }
             StreamEvent::ToolEnd { id, ok } => SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
                 id,
@@ -321,7 +348,9 @@ fn send_commands(cx: &ConnectionTo<Client>, session_id: SessionId) -> Result<(),
         ),
         AvailableCommand::new("next", "Move to the next unresolved part"),
         AvailableCommand::new("focus", "Switch to a part by id, number or id prefix").input(
-            AvailableCommandInput::Unstructured(UnstructuredCommandInput::new("id, number (e.g. 3) or start of the id")),
+            AvailableCommandInput::Unstructured(UnstructuredCommandInput::new(
+                "id, number (e.g. 3) or start of the id",
+            )),
         ),
         AvailableCommand::new("map", "Show the map"),
     ];
@@ -457,24 +486,24 @@ fn hex_val(b: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Backend, ModelEntry};
+    use crate::config::{ModelEntry, Route};
 
     #[test]
     fn picker_options_name_the_cli() {
-        let entry = |id: &str, backend| ModelEntry {
+        let entry = |id: &str, route| ModelEntry {
             id: id.into(),
             label: "GPT-6 Luna".into(),
-            backend,
+            route,
             model: String::new(),
             effort: None,
         };
         let choices = ModelChoices {
             catalog: vec![
-                entry("pi-luna", Backend::Pi),
-                entry("codex-luna", Backend::Codex),
+                entry("anthropic-luna", Route::Anthropic),
+                entry("codex-luna", Route::Codex),
             ],
-            system1: "pi-luna".into(),
-            system2: "codex-luna".into(),
+            system1: Some("anthropic-luna".into()),
+            system2: Some("codex-luna".into()),
         };
         let json = serde_json::to_value(model_options(&choices)).unwrap();
         let names: Vec<&str> = json[1]["options"]
@@ -484,7 +513,7 @@ mod tests {
             .flat_map(|g| g["options"].as_array().unwrap())
             .map(|o| o["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names, ["GPT-6 Luna (pi)", "GPT-6 Luna (Codex)"]);
+        assert_eq!(names, ["GPT-6 Luna (Anthropic API)", "GPT-6 Luna (Codex)"]);
         assert_eq!(
             json[1]["options"][1]["options"][0]["name"],
             "GPT-6 Luna (Codex)"

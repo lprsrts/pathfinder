@@ -15,6 +15,18 @@ pub enum ToolKind {
     Other,
 }
 
+/// Content shown inside a tool call entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolContent {
+    /// A file change: `old` is None for a new file.
+    Diff {
+        path: PathBuf,
+        old: Option<String>,
+        new: String,
+    },
+    Text(String),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolStart {
     pub id: String,

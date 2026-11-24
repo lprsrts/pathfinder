@@ -2,24 +2,36 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
-/// The CLI a model runs through.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Where a model runs: an external CLI (with its own login) or a provider API
+/// that Pathfinder calls itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum Backend {
-    Pi,
+pub enum Route {
+    /// Claude Code CLI (`claude -p`), using the CLI's own login.
     Claude,
+    /// Codex CLI (`codex exec`), using the CLI's own login.
     Codex,
+    /// Anthropic Messages API with an API key.
+    Anthropic,
+    /// OpenAI Responses API with an API key.
+    Openai,
 }
 
-impl Backend {
+impl Route {
+    /// Group label in the model pickers.
     pub fn label(self) -> &'static str {
         match self {
-            Self::Pi => "pi",
             Self::Claude => "Claude Code",
             Self::Codex => "Codex",
+            Self::Anthropic => "Anthropic API",
+            Self::Openai => "OpenAI API",
         }
+    }
+
+    pub fn is_cli(self) -> bool {
+        matches!(self, Self::Claude | Self::Codex)
     }
 }
 
@@ -28,46 +40,47 @@ impl Backend {
 pub struct ModelEntry {
     pub id: String,
     pub label: String,
-    pub backend: Backend,
-    /// Model name passed to the CLI. Empty means the CLI's own default.
+    #[serde(alias = "backend")]
+    pub route: Route,
+    /// Model name passed to the route. Empty means the route's own default.
     #[serde(default)]
     pub model: String,
-    /// Thinking or reasoning effort, in the CLI's own terms (e.g. `low`, `high`).
+    /// Thinking or reasoning effort (e.g. `low`, `high`).
     #[serde(default)]
     pub effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
-    #[serde(default = "default_pi_bin")]
-    pub pi_bin: String,
     #[serde(default = "default_claude_bin")]
     pub claude_bin: String,
     #[serde(default = "default_codex_bin")]
     pub codex_bin: String,
-    /// The models offered in Zed's pickers.
-    #[serde(default)]
+    /// The models offered in Zed's pickers. Entries with an unknown route
+    /// (e.g. the removed `pi`) are skipped with a warning.
+    #[serde(default, deserialize_with = "lenient_models")]
     pub models: Vec<ModelEntry>,
     /// Default picks (entry ids) for new sessions.
     #[serde(default)]
     pub system1: Option<String>,
     #[serde(default)]
     pub system2: Option<String>,
-    // Older single-backend fields, still honored when `models` is empty.
-    #[serde(default)]
-    pub system1_model: Option<String>,
-    #[serde(default = "default_s1_thinking")]
-    pub system1_thinking: String,
-    #[serde(default)]
-    pub system2_model: Option<String>,
-    #[serde(default = "default_s2_thinking")]
-    pub system2_thinking: String,
     #[serde(default = "default_db_path")]
     pub db_path: PathBuf,
 }
 
-fn default_pi_bin() -> String {
-    "pi".to_string()
+fn lenient_models<'de, D: Deserializer<'de>>(de: D) -> Result<Vec<ModelEntry>, D::Error> {
+    let raw: Vec<serde_json::Value> = Vec::deserialize(de)?;
+    Ok(raw
+        .into_iter()
+        .filter_map(|v| match serde_json::from_value::<ModelEntry>(v.clone()) {
+            Ok(entry) => Some(entry),
+            Err(err) => {
+                tracing::warn!("skipping model entry {v}: {err}");
+                None
+            }
+        })
+        .collect())
 }
 
 fn default_claude_bin() -> String {
@@ -76,14 +89,6 @@ fn default_claude_bin() -> String {
 
 fn default_codex_bin() -> String {
     "codex".to_string()
-}
-
-fn default_s1_thinking() -> String {
-    "low".to_string()
-}
-
-fn default_s2_thinking() -> String {
-    "high".to_string()
 }
 
 fn home_dir() -> PathBuf {
@@ -116,16 +121,11 @@ fn default_db_path() -> PathBuf {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            pi_bin: default_pi_bin(),
             claude_bin: default_claude_bin(),
             codex_bin: default_codex_bin(),
             models: Vec::new(),
             system1: None,
             system2: None,
-            system1_model: None,
-            system1_thinking: default_s1_thinking(),
-            system2_model: None,
-            system2_thinking: default_s2_thinking(),
             db_path: default_db_path(),
         }
     }
@@ -151,21 +151,8 @@ impl Config {
                 }
             }
         };
-        set("HARNESS_PI_BIN", &mut cfg.pi_bin);
         set("HARNESS_CLAUDE_BIN", &mut cfg.claude_bin);
         set("HARNESS_CODEX_BIN", &mut cfg.codex_bin);
-        set("HARNESS_S1_THINKING", &mut cfg.system1_thinking);
-        set("HARNESS_S2_THINKING", &mut cfg.system2_thinking);
-        if let Ok(v) = env::var("HARNESS_S1_MODEL") {
-            if !v.trim().is_empty() {
-                cfg.system1_model = Some(v);
-            }
-        }
-        if let Ok(v) = env::var("HARNESS_S2_MODEL") {
-            if !v.trim().is_empty() {
-                cfg.system2_model = Some(v);
-            }
-        }
         if let Ok(v) = env::var("HARNESS_DB_PATH") {
             if !v.trim().is_empty() {
                 cfg.db_path = PathBuf::from(v);
@@ -174,32 +161,9 @@ impl Config {
         cfg
     }
 
-    /// The picker list. Falls back to pi entries built from the older fields.
+    /// The picker list.
     pub fn catalog(&self) -> Vec<ModelEntry> {
-        if !self.models.is_empty() {
-            return self.models.clone();
-        }
-        let legacy = |id: &str, tier: &str, model: &Option<String>, effort: &str| ModelEntry {
-            id: id.to_string(),
-            label: format!("{} ({tier})", model.as_deref().unwrap_or("pi default")),
-            backend: Backend::Pi,
-            model: model.clone().unwrap_or_default(),
-            effort: (!effort.is_empty()).then(|| effort.to_string()),
-        };
-        vec![
-            legacy(
-                "pi-system1",
-                "System 1",
-                &self.system1_model,
-                &self.system1_thinking,
-            ),
-            legacy(
-                "pi-system2",
-                "System 2",
-                &self.system2_model,
-                &self.system2_thinking,
-            ),
-        ]
+        self.models.clone()
     }
 
     pub fn entry(&self, id: &str) -> Option<ModelEntry> {
@@ -207,9 +171,9 @@ impl Config {
     }
 
     /// The entry for a tier: the session's pick if still listed, else the
-    /// configured default, else the first (System 1) or last (System 2) entry.
-    pub fn pick(&self, choice: Option<&str>, system2: bool) -> ModelEntry {
-        let catalog = self.catalog();
+    /// configured default, else the first (System 1) or last (System 2)
+    /// entry. None when no model is configured.
+    pub fn pick(&self, choice: Option<&str>, system2: bool) -> Option<ModelEntry> {
         let default = if system2 {
             &self.system2
         } else {
@@ -218,11 +182,12 @@ impl Config {
         choice
             .and_then(|id| self.entry(id))
             .or_else(|| default.as_deref().and_then(|id| self.entry(id)))
-            .unwrap_or_else(|| {
+            .or_else(|| {
+                let catalog = self.catalog();
                 if system2 {
-                    catalog.last().cloned().unwrap()
+                    catalog.last().cloned()
                 } else {
-                    catalog.first().cloned().unwrap()
+                    catalog.first().cloned()
                 }
             })
     }
@@ -232,44 +197,46 @@ impl Config {
 mod tests {
     use super::*;
 
-    fn entry(id: &str, backend: Backend) -> ModelEntry {
+    fn entry(id: &str, route: Route) -> ModelEntry {
         ModelEntry {
             id: id.into(),
             label: id.into(),
-            backend,
+            route,
             model: id.into(),
             effort: None,
         }
     }
 
     #[test]
-    fn legacy_fields_become_pi_entries() {
-        let cfg = Config {
-            system1_model: Some("openai/gpt-6-luna".into()),
-            ..Config::default()
-        };
-        let catalog = cfg.catalog();
-        assert_eq!(catalog.len(), 2);
-        assert_eq!(catalog[0].model, "openai/gpt-6-luna");
-        assert_eq!(catalog[0].effort.as_deref(), Some("low"));
-        assert_eq!(catalog[1].model, "");
-        assert_eq!(cfg.pick(None, true).id, "pi-system2");
+    fn unknown_routes_are_skipped_and_backend_is_an_alias() {
+        let cfg: Config = serde_json::from_str(
+            r#"{"models":[
+                {"id":"pi-luna","label":"x","backend":"pi","model":"m"},
+                {"id":"haiku","label":"Haiku","backend":"claude","model":"haiku"},
+                {"id":"sonnet","label":"Sonnet","route":"anthropic","model":"claude-sonnet"}
+            ]}"#,
+        )
+        .unwrap();
+        let ids: Vec<&str> = cfg.models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["haiku", "sonnet"]);
+        assert_eq!(cfg.models[1].route, Route::Anthropic);
     }
 
     #[test]
     fn pick_prefers_session_then_default_then_position() {
         let cfg = Config {
             models: vec![
-                entry("a", Backend::Pi),
-                entry("b", Backend::Claude),
-                entry("c", Backend::Codex),
+                entry("a", Route::Claude),
+                entry("b", Route::Anthropic),
+                entry("c", Route::Codex),
             ],
             system1: Some("b".into()),
             ..Config::default()
         };
-        assert_eq!(cfg.pick(Some("c"), false).id, "c");
-        assert_eq!(cfg.pick(Some("gone"), false).id, "b");
-        assert_eq!(cfg.pick(None, false).id, "b");
-        assert_eq!(cfg.pick(None, true).id, "c");
+        assert_eq!(cfg.pick(Some("c"), false).unwrap().id, "c");
+        assert_eq!(cfg.pick(Some("gone"), false).unwrap().id, "b");
+        assert_eq!(cfg.pick(None, false).unwrap().id, "b");
+        assert_eq!(cfg.pick(None, true).unwrap().id, "c");
+        assert!(Config::default().pick(None, true).is_none());
     }
 }
