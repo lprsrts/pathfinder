@@ -146,6 +146,7 @@ fn tool_name(item: &Value) -> String {
 }
 
 pub(crate) fn failure(response: &Value) -> LlmError {
+    tracing::warn!(%response, "Responses API failure");
     let code = response
         .pointer("/error/code")
         .and_then(Value::as_str)

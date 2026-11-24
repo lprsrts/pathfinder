@@ -12,8 +12,8 @@ use crate::domain::{
     OnboardingDecision, Part, PartStatus, PendingCandidate, Session, SessionMode,
 };
 use crate::engine::{
-    Engine, EngineRequest, EngineTier, RunContext, StreamEvent, StreamSink, TierModels, ToolAccess,
-    run_gated, run_gated_streamed,
+    Engine, EngineRequest, EngineTier, StreamEvent, StreamSink, TierModels, ToolAccess, run_gated,
+    run_gated_streamed,
 };
 use crate::store::Store;
 use crate::validate::{
@@ -334,7 +334,7 @@ impl Runtime {
             files: files.to_vec(),
             stream_text: false,
             models: self.models(session)?,
-            ctx: RunContext::default(),
+            ctx: crate::engine::turn_ctx(),
         };
         let (decision, shown): (OnboardingDecision, _) = run_gated_streamed(
             self.engine.as_ref(),
@@ -383,7 +383,7 @@ impl Runtime {
             files: files.to_vec(),
             stream_text: false,
             models: self.models(session)?,
-            ctx: RunContext::default(),
+            ctx: crate::engine::turn_ctx(),
         };
         let (proposal, shown): (MapProposal, _) = run_gated_streamed(
             self.engine.as_ref(),
@@ -443,7 +443,7 @@ impl Runtime {
             files: files.to_vec(),
             stream_text: false,
             models: self.models(session)?,
-            ctx: RunContext::default(),
+            ctx: crate::engine::turn_ctx(),
         };
         let current = session.map.clone();
         let change: MapChange = run_gated(
@@ -581,7 +581,7 @@ impl Runtime {
             files: files.to_vec(),
             stream_text: false,
             models: self.models(session)?,
-            ctx: RunContext::default(),
+            ctx: crate::engine::turn_ctx(),
         };
         let current = session.map.clone();
         let change_waiting = session.pending_change.is_some();
@@ -875,7 +875,7 @@ impl Runtime {
             files: files.to_vec(),
             stream_text: false,
             models: self.models(session)?,
-            ctx: RunContext::default(),
+            ctx: crate::engine::turn_ctx(),
         };
         let header = format!("Candidate for **{}**:\n\n", part.title);
         sink(StreamEvent::TextDelta(header.clone()));
@@ -939,7 +939,7 @@ impl Runtime {
             files: files.to_vec(),
             stream_text: false,
             models: self.models(session)?,
-            ctx: RunContext::default(),
+            ctx: crate::engine::turn_ctx(),
         };
         let (verdict, shown): (JudgmentVerdict, _) = run_gated_streamed(
             self.engine.as_ref(),
@@ -1170,7 +1170,7 @@ impl Runtime {
             files: files.to_vec(),
             stream_text: true,
             models: self.models(session)?,
-            ctx: RunContext::default(),
+            ctx: crate::engine::turn_ctx(),
         };
         self.engine.run_text(&req, sink).await
     }
@@ -1398,7 +1398,11 @@ If the message isn't a verdict on the candidate at all (a question about it or t
 Return ONLY a JSON object:
 {"is_judgment": true, "pass": false, "feedback": "..."}"#;
 
-const AGENT_SYSTEM: &str = r#"You do the work for one part of a task in the user's workspace, using the tools available. End with a report of what you changed or found, concrete enough for the user to review."#;
+const AGENT_SYSTEM: &str = r#"You do the work for one part of a task in the user's workspace, using the tools available.
+
+Work in the open: before each step, say in one short sentence what you're about to do and why, then do it. Read and search before changing files; change them with `edit` (or `write` for new files); run builds, tests, installs and git with `bash`. The user approves each command and watches it run. If they decline one, find another way or explain what's blocked.
+
+Stay within this part. End with a report of what you changed or found, concrete enough for the user to review."#;
 
 #[cfg(test)]
 mod tests {
@@ -1636,7 +1640,7 @@ mod tests {
             files: vec![],
             stream_text: false,
             models: test_models(),
-            ctx: RunContext::default(),
+            ctx: crate::engine::turn_ctx(),
         };
         let d: OnboardingDecision = run_gated(
             &engine,

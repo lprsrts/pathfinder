@@ -19,12 +19,13 @@ use crate::auth::Credentials;
 use crate::auth::chatgpt::ChatGptError;
 use crate::config::{ModelEntry, Route};
 use crate::engine::{
-    BoxFuture, Engine, EngineRequest, EngineTier, StreamEvent, StreamSink, ToolAccess,
+    BoxFuture, CommandOutput, Engine, EngineRequest, EngineTier, Permission, StreamEvent,
+    StreamSink, ToolAccess,
 };
 use crate::llm::anthropic::Anthropic;
 use crate::llm::responses::{Bearer, Responses};
 use crate::llm::{Llm, LlmError, LlmEvent, LlmRequest, Message, Part, ToolResult, text_of};
-use crate::stream::describe_tool;
+use crate::stream::{ToolContent, describe_tool};
 use tools::ToolEnv;
 
 const MAX_TOOL_OUTPUT: usize = 30 * 1024;
@@ -137,16 +138,11 @@ impl Engine for ApiEngine {
     ) -> BoxFuture<'a, Result<String>> {
         Box::pin(async move {
             let model = req.model();
-            if req.tools == ToolAccess::Full {
-                bail!(
-                    "Agent work (/handoff, /delegate) on {} isn't available yet; pick a Claude Code or Codex main model for it.",
-                    model.route.label()
-                );
-            }
             let llm = (self.factory)(model)?;
             let specs = match req.tools {
                 ToolAccess::None => Vec::new(),
-                _ => tools::read_only_specs(),
+                ToolAccess::ReadOnly => tools::read_only_specs(),
+                ToolAccess::Full => tools::full_specs(),
             };
             let run = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
             let root: PathBuf = req.cwd.clone();
@@ -171,6 +167,9 @@ impl Engine for ApiEngine {
             let steps = max_steps(req);
 
             for step in 0..=steps {
+                if req.ctx.cancel.is_cancelled() {
+                    bail!("stopped");
+                }
                 if step == steps {
                     request.allow_tools = false;
                     request.messages.push(Message::User(
@@ -200,40 +199,181 @@ impl Engine for ApiEngine {
                     root: &root,
                     attached: &req.files,
                 };
-                // Read-only tools run concurrently; order is kept for results.
-                let results = join_all(calls.iter().map(|call| {
-                    let sink = sink.clone();
-                    let env = &env;
-                    let id = format!("{run}-{}", call.id);
-                    async move {
-                        sink(StreamEvent::ToolStart(describe_tool(
-                            id.clone(),
-                            &call.name,
-                            &call.args,
-                            &req.cwd,
-                        )));
-                        let outcome = tools::run(&call.name, &call.args, env);
-                        sink(StreamEvent::ToolEnd {
-                            id,
-                            ok: outcome.is_ok(),
-                        });
-                        let (content, is_error) = match outcome {
-                            Ok(out) => (cap(out), false),
-                            Err(err) => (err, true),
-                        };
-                        ToolResult {
-                            call_id: call.id.clone(),
-                            content,
-                            is_error,
-                        }
+                // Read-only tools run concurrently; agent work runs in order,
+                // since edits and commands depend on each other.
+                let results = if req.tools == ToolAccess::Full {
+                    let mut out = Vec::new();
+                    for call in &calls {
+                        out.push(run_call(call, &run, &env, req, &sink).await);
                     }
-                }))
-                .await;
+                    out
+                } else {
+                    join_all(
+                        calls
+                            .iter()
+                            .map(|call| run_call(call, &run, &env, req, &sink)),
+                    )
+                    .await
+                };
                 request.messages.push(Message::ToolResults(results));
             }
             unreachable!("the final step always returns")
         })
     }
+}
+
+/// Runs one tool call, showing it in the thread: diffs for file changes, a
+/// live terminal (after the user allows it) for commands.
+async fn run_call(
+    call: &crate::llm::ToolCall,
+    run: &str,
+    env: &ToolEnv<'_>,
+    req: &EngineRequest,
+    sink: &StreamSink,
+) -> ToolResult {
+    let id = format!("{run}-{}", call.id);
+    sink(StreamEvent::ToolStart(describe_tool(
+        id.clone(),
+        &call.name,
+        &call.args,
+        &req.cwd,
+    )));
+    let full = req.tools == ToolAccess::Full;
+    let outcome = match call.name.as_str() {
+        "edit" | "write" if full => {
+            tools::change_file(&call.name, &call.args, env).map(|(msg, c)| {
+                sink(StreamEvent::ToolUpdate {
+                    id: id.clone(),
+                    content: ToolContent::Diff {
+                        path: c.path,
+                        old: c.old,
+                        new: c.new,
+                    },
+                });
+                msg
+            })
+        }
+        "bash" if full => run_command(&id, &call.args, req, sink).await,
+        _ => tools::run(&call.name, &call.args, env),
+    };
+    sink(StreamEvent::ToolEnd {
+        id,
+        ok: outcome.is_ok(),
+    });
+    let (content, is_error) = match outcome {
+        Ok(out) => (cap(out), false),
+        Err(err) => (err, true),
+    };
+    ToolResult {
+        call_id: call.id.clone(),
+        content,
+        is_error,
+    }
+}
+
+/// `bash`: asks the user, then runs in the client's terminal when it has
+/// one, else here.
+async fn run_command(
+    id: &str,
+    args: &serde_json::Value,
+    req: &EngineRequest,
+    sink: &StreamSink,
+) -> Result<String, String> {
+    let command = args
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .filter(|c| !c.trim().is_empty())
+        .ok_or("`command` is required")?;
+    let timeout = Duration::from_secs(
+        args.get("timeout_secs")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(120)
+            .clamp(1, 600),
+    );
+    let cancel = &req.ctx.cancel;
+    let output = match &req.ctx.host {
+        Some(host) => {
+            // "Always allow" covers later commands with the same program.
+            let program = command.split_whitespace().next().unwrap_or(command);
+            match host.ask(id, program).await {
+                Permission::Denied => {
+                    return Err("The user declined to run this command.".into());
+                }
+                Permission::Once | Permission::Always => {}
+            }
+            match host.run_in_terminal(id, command, &req.cwd, timeout, cancel) {
+                Some(run) => run.await.map_err(|e| e.to_string())?,
+                None => run_local(id, command, &req.cwd, timeout, cancel, sink).await?,
+            }
+        }
+        // No client (tests): nobody to ask.
+        None => run_local(id, command, &req.cwd, timeout, cancel, sink).await?,
+    };
+    let status = match output.exit_code {
+        Some(0) => "Exit code 0".to_string(),
+        Some(code) => format!("Exit code {code}"),
+        None if cancel.is_cancelled() => "Stopped by the user".to_string(),
+        None => format!("Killed after {}s", timeout.as_secs()),
+    };
+    let body = output.output.trim_end();
+    let mut text = if body.is_empty() {
+        format!("{status} (no output)")
+    } else {
+        format!("{status}\n{body}")
+    };
+    if output.truncated {
+        text.push_str("\n(output truncated)");
+    }
+    match output.exit_code {
+        Some(0) => Ok(text),
+        _ => Err(text),
+    }
+}
+
+/// Runs a command here and shows its output in the tool call afterwards.
+async fn run_local(
+    id: &str,
+    command: &str,
+    cwd: &std::path::Path,
+    timeout: Duration,
+    cancel: &tokio_util::sync::CancellationToken,
+    sink: &StreamSink,
+) -> Result<CommandOutput, String> {
+    let child = tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("can't start the command: {e}"))?;
+    let finished = tokio::select! {
+        out = child.wait_with_output() => Some(out.map_err(|e| e.to_string())?),
+        _ = tokio::time::sleep(timeout) => None,
+        _ = cancel.cancelled() => None,
+    };
+    let Some(out) = finished else {
+        return Ok(CommandOutput {
+            output: String::new(),
+            exit_code: None,
+            truncated: false,
+        });
+    };
+    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&out.stderr));
+    let truncated = text.len() > MAX_TOOL_OUTPUT;
+    let text = cap(text);
+    sink(StreamEvent::ToolUpdate {
+        id: id.to_string(),
+        content: ToolContent::Text(format!("```\n$ {command}\n{}\n```", text.trim_end())),
+    });
+    Ok(CommandOutput {
+        output: text,
+        exit_code: out.status.code(),
+        truncated,
+    })
 }
 
 /// One model call, retried on transient errors while nothing has streamed.
@@ -314,7 +454,10 @@ mod tests {
                     .pop_front()
                     .expect("unexpected call");
                 if let Ok(parts) = &answer {
-                    events(LlmEvent::Text(text_of(parts)));
+                    let text = text_of(parts);
+                    if !text.is_empty() {
+                        events(LlmEvent::Text(text));
+                    }
                 }
                 answer
             })
@@ -355,7 +498,7 @@ mod tests {
                 system1: entry.clone(),
                 system2: entry,
             },
-            ctx: RunContext::default(),
+            ctx: crate::engine::turn_ctx(),
         }
     }
 
@@ -475,15 +618,79 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("usage limit"));
 
-        let (engine, _) = scripted(vec![]);
+        fs::remove_dir_all(ws).unwrap();
+    }
+
+    /// Answers every permission prompt the same way; no terminals.
+    struct FakeHost(Permission);
+
+    impl crate::engine::Host for FakeHost {
+        fn ask<'a>(&'a self, _: &'a str, _: &'a str) -> BoxFuture<'a, Permission> {
+            Box::pin(async move { self.0 })
+        }
+        fn run_in_terminal<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+            _: &'a std::path::Path,
+            _: Duration,
+            _: &'a CancellationToken,
+        ) -> Option<BoxFuture<'a, Result<CommandOutput>>> {
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_work_edits_files_and_runs_allowed_commands() {
+        let ws = workspace();
+        let script = || {
+            vec![
+                Ok(vec![
+                    Part::Text("Renaming the crate.".into()),
+                    call(
+                        "e1",
+                        "edit",
+                        json!({"path": "Cargo.toml", "old_string": "demo", "new_string": "neuron"}),
+                    ),
+                ]),
+                Ok(vec![call(
+                    "b1",
+                    "bash",
+                    json!({"command": "grep -c neuron Cargo.toml"}),
+                )]),
+                Ok(vec![Part::Text("Renamed it.".into())]),
+            ]
+        };
+        let (engine, llm) = scripted(script());
+        let mut req = request(ws.clone(), ToolAccess::Full);
+        req.ctx.host = Some(Arc::new(FakeHost(Permission::Once)));
+        let (sink, log) = recorder();
+        assert_eq!(engine.run_text(&req, sink).await.unwrap(), "Renamed it.");
         assert!(
-            engine
-                .run_text(&request(ws.clone(), ToolAccess::Full), recorder().0)
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("Claude Code or Codex")
+            fs::read_to_string(ws.join("Cargo.toml"))
+                .unwrap()
+                .contains("neuron")
         );
+        let log = log.lock().unwrap().clone();
+        assert_eq!(log[0], "text Renaming the crate.");
+        assert_eq!(log[1..4], ["start Edit Cargo.toml", "update", "end true"]);
+        assert_eq!(log[4], "start Run `grep -c neuron Cargo.toml`");
+        let seen = llm.seen.lock().unwrap();
+        let Message::ToolResults(results) = seen[2].messages.last().unwrap() else {
+            panic!("expected tool results");
+        };
+        assert!(results[0].content.starts_with("Exit code 0\n1"));
+        drop(seen);
+
+        // Declined: the command doesn't run and the model is told so.
+        let (engine, llm) = scripted(script());
+        req.ctx.host = Some(Arc::new(FakeHost(Permission::Denied)));
+        engine.run_text(&req, recorder().0).await.unwrap();
+        let seen = llm.seen.lock().unwrap();
+        let Message::ToolResults(results) = seen[2].messages.last().unwrap() else {
+            panic!("expected tool results");
+        };
+        assert!(results[0].is_error && results[0].content.contains("declined"));
         fs::remove_dir_all(ws).unwrap();
     }
 }

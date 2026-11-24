@@ -58,10 +58,72 @@ pub enum StreamEvent {
 }
 
 /// Per-request context the runtime passes to engines.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct RunContext {
     /// Cancelled when the user stops the turn.
     pub cancel: CancellationToken,
+    /// The client, for permission prompts and terminals. None in tests and
+    /// where no client is attached.
+    pub host: Option<Arc<dyn Host>>,
+}
+
+impl std::fmt::Debug for RunContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunContext")
+            .field("cancelled", &self.cancel.is_cancelled())
+            .field("host", &self.host.is_some())
+            .finish()
+    }
+}
+
+tokio::task_local! {
+    /// The context of the prompt turn being handled; set by the ACP layer.
+    static TURN: RunContext;
+}
+
+/// Runs `fut` as one prompt turn with `ctx`.
+pub async fn with_turn<F: Future>(ctx: RunContext, fut: F) -> F::Output {
+    TURN.scope(ctx, fut).await
+}
+
+/// The current turn's context, or an empty one outside a turn.
+pub fn turn_ctx() -> RunContext {
+    TURN.try_with(Clone::clone).unwrap_or_default()
+}
+
+/// What the user chose when asked before a tool runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Permission {
+    Once,
+    /// Allowed now and for the rest of the thread (same `always_key`).
+    Always,
+    Denied,
+}
+
+#[derive(Debug, Clone)]
+pub struct CommandOutput {
+    pub output: String,
+    pub exit_code: Option<i32>,
+    pub truncated: bool,
+}
+
+/// The client side of agent work: asking the user, and running commands
+/// where they can watch them.
+pub trait Host: Send + Sync {
+    /// Asks before the tool call `call_id` (already shown) runs.
+    /// `always_key` groups calls an "Always allow" answer covers.
+    fn ask<'a>(&'a self, call_id: &'a str, always_key: &'a str) -> BoxFuture<'a, Permission>;
+
+    /// Runs `command` in the client's terminal, shown live in tool call
+    /// `call_id`. None when the client has no terminals.
+    fn run_in_terminal<'a>(
+        &'a self,
+        call_id: &'a str,
+        command: &'a str,
+        cwd: &'a std::path::Path,
+        timeout: std::time::Duration,
+        cancel: &'a CancellationToken,
+    ) -> Option<BoxFuture<'a, Result<CommandOutput>>>;
 }
 
 pub type StreamSink = Arc<dyn Fn(StreamEvent) + Send + Sync>;

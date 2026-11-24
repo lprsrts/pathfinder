@@ -16,6 +16,11 @@ use agent_client_protocol::v1::schema::{
     ToolCallContent, ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
     ToolKind as AcpToolKind, UnstructuredCommandInput,
 };
+use agent_client_protocol::v1::schema::{
+    CreateTerminalRequest, KillTerminalRequest, PermissionOption, PermissionOptionKind,
+    ReleaseTerminalRequest, RequestPermissionOutcome, RequestPermissionRequest, Terminal,
+    TerminalOutputRequest, WaitForTerminalExitRequest,
+};
 use agent_client_protocol::{Agent, Client, Error as AcpError, Stdio};
 use anyhow::Result;
 use tracing::{error, info, warn};
@@ -25,7 +30,9 @@ use crate::auth::Credentials;
 use crate::catalog::{self, ModelCache};
 use crate::config::{Config, Route};
 use crate::domain::{PartStatus, Session};
-use crate::engine::{StreamEvent, StreamSink};
+use crate::engine::{
+    BoxFuture, CommandOutput, Host, Permission, RunContext, StreamEvent, StreamSink, with_turn,
+};
 use crate::runtime::{EFFORTS, ModelChoices, OptionValue, Runtime, TurnInput};
 use crate::stream::{ToolContent, ToolKind};
 
@@ -36,6 +43,8 @@ pub async fn run_stdio(runtime: Arc<Runtime>, creds: Arc<Credentials>) -> Result
     let rt_load = runtime.clone();
     let rt_prompt = runtime.clone();
     let rt_config = runtime.clone();
+    let shared = Arc::new(Shared::default());
+    let (sh_init, sh_prompt, sh_cancel) = (shared.clone(), shared.clone(), shared.clone());
     // Whether Zed can show on/off switches; set at initialize.
     let switches = Arc::new(AtomicBool::new(false));
     let (sw_init, sw_new, sw_load, sw_config) = (
@@ -57,6 +66,9 @@ pub async fn run_stdio(runtime: Arc<Runtime>, creds: Arc<Credentials>) -> Result
                     .and_then(|s| s.config_options.as_ref())
                     .is_some_and(|c| c.boolean.is_some());
                 sw_init.store(booleans, Ordering::Relaxed);
+                sh_init
+                    .terminals
+                    .store(req.client_capabilities.terminal, Ordering::Relaxed);
                 let capabilities = AgentCapabilities::new()
                     .load_session(true)
                     .prompt_capabilities(PromptCapabilities::new().embedded_context(true));
@@ -205,6 +217,7 @@ pub async fn run_stdio(runtime: Arc<Runtime>, creds: Arc<Credentials>) -> Result
         .on_receive_request(
             async move |req: PromptRequest, responder, cx| {
                 let rt = rt_prompt.clone();
+                let shared = sh_prompt.clone();
                 let sid = req.session_id.clone();
                 let input = extract_turn_input(&req.prompt);
 
@@ -218,7 +231,24 @@ pub async fn run_stdio(runtime: Arc<Runtime>, creds: Arc<Credentials>) -> Result
                 cx.spawn(async move {
                     let id_str = sid.0.to_string();
                     let sink = make_stream_sink(cx_task.clone(), sid.clone(), rec.clone());
-                    let result = rt.handle_turn(&id_str, input, sink).await;
+                    let cancel = tokio_util::sync::CancellationToken::new();
+                    shared
+                        .running
+                        .lock()
+                        .unwrap()
+                        .insert(id_str.clone(), cancel.clone());
+                    let host = AcpHost {
+                        cx: cx_task.clone(),
+                        session_id: sid.clone(),
+                        shared: shared.clone(),
+                        rec: rec.clone(),
+                    };
+                    let ctx = RunContext {
+                        cancel: cancel.clone(),
+                        host: Some(Arc::new(host)),
+                    };
+                    let result = with_turn(ctx, rt.handle_turn(&id_str, input, sink)).await;
+                    shared.running.lock().unwrap().remove(&id_str);
                     match result {
                         Ok(out) => {
                             if out.plan_changed {
@@ -229,6 +259,9 @@ pub async fn run_stdio(runtime: Arc<Runtime>, creds: Arc<Credentials>) -> Result
                             if !out.reply.is_empty() {
                                 let _ = send_text(&cx_task, sid.clone(), &rec, out.reply);
                             }
+                        }
+                        Err(_) if cancel.is_cancelled() => {
+                            let _ = send_text(&cx_task, sid.clone(), &rec, "\n\nStopped.".into());
                         }
                         Err(err) => {
                             error!("handle_turn failed: {err:#}");
@@ -243,7 +276,12 @@ pub async fn run_stdio(runtime: Arc<Runtime>, creds: Arc<Credentials>) -> Result
                     if let Err(e) = rt.record(&id_str, &serialize(&rec.take())) {
                         warn!("saving the transcript failed: {e:#}");
                     }
-                    let _ = responder.respond(PromptResponse::new(StopReason::EndTurn));
+                    let stop = if cancel.is_cancelled() {
+                        StopReason::Cancelled
+                    } else {
+                        StopReason::EndTurn
+                    };
+                    let _ = responder.respond(PromptResponse::new(stop));
                     Ok(())
                 })
             },
@@ -251,7 +289,15 @@ pub async fn run_stdio(runtime: Arc<Runtime>, creds: Arc<Credentials>) -> Result
         )
         .on_receive_notification(
             async move |notif: CancelNotification, _cx| {
-                warn!("session cancelled: {}", notif.session_id.0);
+                info!("stop requested: {}", notif.session_id.0);
+                if let Some(token) = sh_cancel
+                    .running
+                    .lock()
+                    .unwrap()
+                    .get(notif.session_id.0.as_ref())
+                {
+                    token.cancel();
+                }
                 Ok(())
             },
             agent_client_protocol::on_receive_notification!(),
@@ -323,6 +369,164 @@ async fn ensure_models(creds: &Arc<Credentials>) -> bool {
 }
 
 /// Sends a loaded session's turns back to the client, in order.
+/// Connection-wide state for agent work.
+#[derive(Default)]
+struct Shared {
+    /// The client can run terminals (`terminal/*`).
+    terminals: AtomicBool,
+    /// Stop tokens of running turns, by session.
+    running:
+        std::sync::Mutex<std::collections::HashMap<String, tokio_util::sync::CancellationToken>>,
+    /// Programs the user chose "Always allow" for, by session.
+    always: std::sync::Mutex<std::collections::HashMap<String, std::collections::HashSet<String>>>,
+}
+
+/// The client for one turn: permission prompts and terminals.
+struct AcpHost {
+    cx: ConnectionTo<Client>,
+    session_id: SessionId,
+    shared: Arc<Shared>,
+    rec: Recorder,
+}
+
+impl Host for AcpHost {
+    fn ask<'a>(&'a self, call_id: &'a str, always_key: &'a str) -> BoxFuture<'a, Permission> {
+        Box::pin(async move {
+            let sid = self.session_id.0.to_string();
+            let remembered = self
+                .shared
+                .always
+                .lock()
+                .unwrap()
+                .get(&sid)
+                .is_some_and(|set| set.contains(always_key));
+            if remembered {
+                return Permission::Always;
+            }
+            let request = RequestPermissionRequest::new(
+                self.session_id.clone(),
+                ToolCallUpdate::new(call_id.to_string(), ToolCallUpdateFields::new()),
+                vec![
+                    PermissionOption::new("allow", "Allow", PermissionOptionKind::AllowOnce),
+                    PermissionOption::new(
+                        "always",
+                        format!("Always allow `{always_key}`"),
+                        PermissionOptionKind::AllowAlways,
+                    ),
+                    PermissionOption::new("deny", "Deny", PermissionOptionKind::RejectOnce),
+                ],
+            );
+            let answer = match self.cx.send_request(request).block_task().await {
+                Ok(resp) => resp.outcome,
+                Err(e) => {
+                    warn!("permission request failed: {e}");
+                    return Permission::Denied;
+                }
+            };
+            match answer {
+                RequestPermissionOutcome::Selected(choice) => match choice.option_id.0.as_ref() {
+                    "allow" => Permission::Once,
+                    "always" => {
+                        self.shared
+                            .always
+                            .lock()
+                            .unwrap()
+                            .entry(sid)
+                            .or_default()
+                            .insert(always_key.to_string());
+                        Permission::Always
+                    }
+                    _ => Permission::Denied,
+                },
+                _ => Permission::Denied,
+            }
+        })
+    }
+
+    fn run_in_terminal<'a>(
+        &'a self,
+        call_id: &'a str,
+        command: &'a str,
+        cwd: &'a std::path::Path,
+        timeout: std::time::Duration,
+        cancel: &'a tokio_util::sync::CancellationToken,
+    ) -> Option<BoxFuture<'a, Result<CommandOutput>>> {
+        if !self.shared.terminals.load(Ordering::Relaxed) {
+            return None;
+        }
+        Some(Box::pin(async move {
+            let sid = self.session_id.clone();
+            let created = self
+                .cx
+                .send_request(
+                    CreateTerminalRequest::new(sid.clone(), "sh")
+                        .args(vec!["-c".to_string(), command.to_string()])
+                        .cwd(cwd.to_path_buf())
+                        .output_byte_limit(64 * 1024u64),
+                )
+                .block_task()
+                .await
+                .map_err(|e| anyhow::anyhow!("can't open a terminal: {e}"))?;
+            let tid = created.terminal_id;
+            // Shown live in the thread; the transcript keeps the final text.
+            let _ = self.cx.send_notification(SessionNotification::new(
+                sid.clone(),
+                SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                    call_id.to_string(),
+                    ToolCallUpdateFields::new()
+                        .content(vec![ToolCallContent::Terminal(Terminal::new(tid.clone()))]),
+                )),
+            ));
+            let wait = self
+                .cx
+                .send_request(WaitForTerminalExitRequest::new(sid.clone(), tid.clone()))
+                .block_task();
+            let exited = tokio::select! {
+                r = wait => r.ok(),
+                _ = tokio::time::sleep(timeout) => None,
+                _ = cancel.cancelled() => None,
+            };
+            if exited.is_none() {
+                let _ = self
+                    .cx
+                    .send_request(KillTerminalRequest::new(sid.clone(), tid.clone()))
+                    .block_task()
+                    .await;
+            }
+            let out = self
+                .cx
+                .send_request(TerminalOutputRequest::new(sid.clone(), tid.clone()))
+                .block_task()
+                .await
+                .map_err(|e| anyhow::anyhow!("can't read the terminal: {e}"))?;
+            let _ = self
+                .cx
+                .send_request(ReleaseTerminalRequest::new(sid.clone(), tid))
+                .block_task()
+                .await;
+            self.rec
+                .push(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                    call_id.to_string(),
+                    ToolCallUpdateFields::new().content(vec![ToolCallContent::Content(
+                        Content::new(ContentBlock::from(format!(
+                            "```\n$ {command}\n{}\n```",
+                            out.output.trim_end()
+                        ))),
+                    )]),
+                )));
+            let exit_code = match exited {
+                Some(resp) => resp.exit_status.exit_code.map(|c| c as i32),
+                None => None,
+            };
+            Ok(CommandOutput {
+                output: out.output,
+                exit_code,
+                truncated: out.truncated,
+            })
+        }))
+    }
+}
+
 /// A transcript rebuilt from the model-facing history, for sessions saved
 /// before transcripts were recorded.
 fn history_updates(session: &Session) -> Vec<SessionUpdate> {

@@ -85,6 +85,137 @@ pub fn read_only_specs() -> Vec<ToolSpec> {
     ]
 }
 
+/// Read-only tools plus `edit`, `write` and `bash`, for agent work.
+pub fn full_specs() -> Vec<ToolSpec> {
+    let mut specs = read_only_specs();
+    specs.extend([
+        ToolSpec {
+            name: "edit".into(),
+            description: "Replace exact text in a workspace file. `old_string` must appear exactly once unless `replace_all` is true; include enough surrounding lines to make it unique. Read the file first.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path, relative to the workspace."},
+                    "old_string": {"type": "string"},
+                    "new_string": {"type": "string"},
+                    "replace_all": {"type": "boolean"}
+                },
+                "required": ["path", "old_string", "new_string"],
+                "additionalProperties": false
+            }),
+        },
+        ToolSpec {
+            name: "write".into(),
+            description: "Create a workspace file, or replace all of its content. Creates missing folders. Prefer `edit` for changes to existing files.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path, relative to the workspace."},
+                    "content": {"type": "string"}
+                },
+                "required": ["path", "content"],
+                "additionalProperties": false
+            }),
+        },
+        ToolSpec {
+            name: "bash".into(),
+            description: "Run a shell command in the workspace. The user is asked first and watches it run. Returns its output and exit code. Use it for building, testing, installing and git; use the file tools to read and change files.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"},
+                    "timeout_secs": {"type": "integer", "description": "Default 120, at most 600."}
+                },
+                "required": ["command"],
+                "additionalProperties": false
+            }),
+        },
+    ]);
+    specs
+}
+
+/// A file a tool changed: `old` is None for a new file.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Change {
+    pub path: PathBuf,
+    pub old: Option<String>,
+    pub new: String,
+}
+
+/// Runs `edit` or `write`, returning a message for the model and the change.
+pub fn change_file(
+    name: &str,
+    args: &Value,
+    env: &ToolEnv<'_>,
+) -> Result<(String, Change), String> {
+    let path = str_arg(args, "path").ok_or("`path` is required")?;
+    let full = confine(env.root, path, true, &[])?;
+    let old = match fs::read_to_string(&full) {
+        Ok(text) => Some(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(format!("can't read {path}: {e}")),
+    };
+    let new = match name {
+        "write" => args
+            .get("content")
+            .and_then(Value::as_str)
+            .ok_or("`content` is required")?
+            .to_string(),
+        "edit" => {
+            let text = old
+                .as_deref()
+                .ok_or_else(|| format!("{path} doesn't exist; use `write` to create it"))?;
+            let from = args
+                .get("old_string")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .ok_or("`old_string` is required")?;
+            let to = args.get("new_string").and_then(Value::as_str).unwrap_or("");
+            let all = args
+                .get("replace_all")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            match text.matches(from).count() {
+                0 => {
+                    return Err(format!(
+                        "`old_string` was not found in {path}; read the file and copy the text exactly"
+                    ));
+                }
+                n if n > 1 && !all => {
+                    return Err(format!(
+                        "`old_string` appears {n} times in {path}; add surrounding lines to make it unique, or set `replace_all`"
+                    ));
+                }
+                _ => {}
+            }
+            if all {
+                text.replace(from, to)
+            } else {
+                text.replacen(from, to, 1)
+            }
+        }
+        other => return Err(format!("`{other}` doesn't change files")),
+    };
+    if let Some(parent) = full.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("can't create folders for {path}: {e}"))?;
+    }
+    fs::write(&full, &new).map_err(|e| format!("can't write {path}: {e}"))?;
+    let lines = new.lines().count();
+    let message = match (&old, name) {
+        (None, _) => format!("Created {path} ({lines} lines)."),
+        (Some(_), "write") => format!("Replaced {path} ({lines} lines)."),
+        _ => format!("Edited {path}."),
+    };
+    Ok((
+        message,
+        Change {
+            path: full,
+            old,
+            new,
+        },
+    ))
+}
+
 /// Runs a tool. Errors are returned as text for the model to read.
 pub fn run(name: &str, args: &Value, env: &ToolEnv<'_>) -> Result<String, String> {
     match name {
@@ -345,5 +476,69 @@ mod tests {
         );
         assert!(run("bash", &json!({}), &env).is_err());
         fs::remove_dir_all(ws).unwrap();
+    }
+
+    #[test]
+    fn edit_and_write_change_files_inside_only() {
+        let root = workspace();
+        let env = ToolEnv {
+            root: &root,
+            attached: &[],
+        };
+        let (msg, change) = change_file(
+            "write",
+            &json!({"path": "notes/a.txt", "content": "one\ntwo\n"}),
+            &env,
+        )
+        .unwrap();
+        assert!(msg.starts_with("Created notes/a.txt"));
+        assert_eq!(change.old, None);
+        let (_, change) = change_file(
+            "edit",
+            &json!({"path": "notes/a.txt", "old_string": "two", "new_string": "2"}),
+            &env,
+        )
+        .unwrap();
+        assert_eq!(change.old.as_deref(), Some("one\ntwo\n"));
+        assert_eq!(
+            fs::read_to_string(root.join("notes/a.txt")).unwrap(),
+            "one\n2\n"
+        );
+        // Not found, ambiguous, outside the workspace, inside .git.
+        assert!(
+            change_file(
+                "edit",
+                &json!({"path": "notes/a.txt", "old_string": "zzz", "new_string": ""}),
+                &env
+            )
+            .unwrap_err()
+            .contains("not found")
+        );
+        fs::write(root.join("dup.txt"), "x x").unwrap();
+        assert!(
+            change_file(
+                "edit",
+                &json!({"path": "dup.txt", "old_string": "x", "new_string": "y"}),
+                &env
+            )
+            .unwrap_err()
+            .contains("2 times")
+        );
+        assert!(
+            change_file(
+                "write",
+                &json!({"path": "../out.txt", "content": "x"}),
+                &env
+            )
+            .is_err()
+        );
+        assert!(
+            change_file(
+                "write",
+                &json!({"path": ".git/hooks/pre-commit", "content": "x"}),
+                &env
+            )
+            .is_err()
+        );
     }
 }
