@@ -152,6 +152,18 @@ pub fn extract_json_object(raw: &str) -> &str {
 /// Runs a structured proposal through its shape check (see validate.rs).
 /// When starting on System 1, any parse error or failed check automatically
 /// escalates to System 2 with exact machine-readable violation feedback.
+/// Starts each model call's reasoning as a new paragraph, so the reasoning
+/// of several calls in one turn doesn't run together.
+fn paragraphs(sink: StreamSink) -> StreamSink {
+    let started = std::sync::atomic::AtomicBool::new(false);
+    Arc::new(move |ev| match ev {
+        StreamEvent::Thought(t) if !started.swap(true, std::sync::atomic::Ordering::Relaxed) => {
+            sink(StreamEvent::Thought(format!("\n\n{}", t.trim_start())))
+        }
+        other => sink(other),
+    })
+}
+
 pub async fn run_gated<T, C>(
     engine: &dyn Engine,
     store: &Store,
@@ -242,32 +254,23 @@ where
         let is_escalation =
             idx > 0 && base_req.tier == EngineTier::System1 && tier == EngineTier::System2;
 
-        if idx == 0 {
-            sink(StreamEvent::Thought(format!(
-                "Drafting {kind} ({})...\n",
-                tier.label()
-            )));
-        } else if is_escalation && idx == 1 {
-            let codes = last_violations
-                .iter()
-                .map(|v| v.code)
-                .collect::<Vec<_>>()
-                .join(", ");
-            sink(StreamEvent::Thought(format!(
-                "System 1 output failed the shape check ({codes}) — escalating to System 2...\n"
-            )));
-        } else {
-            let codes = last_violations
-                .iter()
-                .map(|v| v.code)
-                .collect::<Vec<_>>()
-                .join(", ");
-            sink(StreamEvent::Thought(format!(
-                "Output failed the shape check ({codes}) — retrying...\n"
-            )));
+        // The thinking block holds the models' own reasoning; Pathfinder adds
+        // only a short note when it has to retry.
+        if idx > 0 {
+            tracing::info!(
+                kind,
+                violations = ?last_violations.iter().map(|v| v.code).collect::<Vec<_>>(),
+                "retrying"
+            );
+            sink(StreamEvent::Thought(if is_escalation && idx == 1 {
+                "\n\nThe fast model's answer didn't fit; asking the main model.\n".to_string()
+            } else {
+                "\n\nThe answer didn't fit; trying again.\n".to_string()
+            }));
         }
 
         let (attempt_sink, mut shown) = field_sink(&seen);
+        let attempt_sink = paragraphs(attempt_sink);
         let raw = engine.run_text(&req, attempt_sink).await?;
         remember(&mut seen, &shown);
         let mut outcome = evaluate_proposal::<T, _>(&raw, &check);
@@ -285,7 +288,7 @@ where
                 outcome.as_ref().err().map(Vec::as_slice).unwrap_or(&[]),
             );
             sink(StreamEvent::Thought(
-                "Answer was not JSON — reformatting...\n".to_string(),
+                "\n\nReformatting the answer.\n".to_string(),
             ));
             let mut repair = req.clone();
             repair.tools = ToolAccess::None;
@@ -296,6 +299,7 @@ where
                 raw.trim()
             );
             let (repair_sink, repair_shown) = field_sink(&seen);
+            let repair_sink = paragraphs(repair_sink);
             let repaired = engine.run_text(&repair, repair_sink).await?;
             remember(&mut seen, &repair_shown);
             shown = repair_shown;

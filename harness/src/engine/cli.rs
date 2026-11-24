@@ -32,16 +32,6 @@ impl Engine for CliEngine {
     ) -> BoxFuture<'a, Result<String>> {
         Box::pin(async move {
             let model = req.model();
-            sink(StreamEvent::Thought(format!(
-                "{} via {}{}...\n",
-                req.tier.label(),
-                model.route.label(),
-                if model.model.is_empty() {
-                    String::new()
-                } else {
-                    format!(" ({})", model.model)
-                }
-            )));
             // Tool call ids must be unique per thread; CLI ids repeat across runs.
             let run = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
             match model.route {
@@ -110,7 +100,24 @@ async fn run_jsonl(
 }
 
 impl CliEngine {
+    /// Claude Code hides its thinking in `-p` mode unless asked with
+    /// `--thinking-display summarized`; versions without the flag run without it.
     async fn run_claude(&self, req: &EngineRequest, sink: StreamSink, run: &str) -> Result<String> {
+        match self.run_claude_with(req, sink.clone(), run, true).await {
+            Err(e) if e.to_string().contains("thinking-display") => {
+                self.run_claude_with(req, sink, run, false).await
+            }
+            other => other,
+        }
+    }
+
+    async fn run_claude_with(
+        &self,
+        req: &EngineRequest,
+        sink: StreamSink,
+        run: &str,
+        show_thinking: bool,
+    ) -> Result<String> {
         let model = req.model();
         let mut cmd = Command::new(&self.config.claude_bin);
         cmd.current_dir(&req.cwd).args([
@@ -122,6 +129,9 @@ impl CliEngine {
             "--no-session-persistence",
             "--strict-mcp-config",
         ]);
+        if show_thinking {
+            cmd.args(["--thinking-display", "summarized"]);
+        }
         if !model.model.is_empty() {
             cmd.args(["--model", &model.model]);
         }
@@ -152,6 +162,7 @@ impl CliEngine {
 
         let mut result: Option<(bool, String)> = None;
         let mut text_started = false;
+        let mut thought_streamed = false;
         let (status, stderr) = run_jsonl(
             cmd,
             &self.config.claude_bin,
@@ -164,6 +175,7 @@ impl CliEngine {
                     run,
                     &req.cwd,
                     &mut text_started,
+                    &mut thought_streamed,
                     &mut result,
                 )
             },
@@ -215,6 +227,8 @@ impl CliEngine {
         if let Some(effort) = model.effort.as_deref().filter(|e| !e.is_empty()) {
             cmd.args(["-c", &format!("model_reasoning_effort=\"{effort}\"")]);
         }
+        // Without this, `codex exec` emits no reasoning at all.
+        cmd.args(["-c", "model_reasoning_summary=\"detailed\""]);
         // Codex has no system-prompt flag; the instructions lead the prompt.
         let mut prompt = format!("<instructions>\n{}\n</instructions>\n\n", req.system_prompt);
         if req.tools == ToolAccess::None {
@@ -258,12 +272,25 @@ fn process_claude_event(
     run: &str,
     cwd: &Path,
     text_started: &mut bool,
+    thought_streamed: &mut bool,
     result: &mut Option<(bool, String)>,
 ) {
     match val.get("type").and_then(Value::as_str) {
-        // Token-level text, from --include-partial-messages.
-        Some("stream_event") if stream_text => {
+        // Token-level text and thinking, from --include-partial-messages.
+        Some("stream_event") => {
             let event = &val["event"];
+            if let Some(t) = event
+                .pointer("/delta/thinking")
+                .and_then(Value::as_str)
+                .filter(|t| !t.is_empty())
+            {
+                *thought_streamed = true;
+                sink(StreamEvent::Thought(t.to_string()));
+                return;
+            }
+            if !stream_text {
+                return;
+            }
             match event.get("type").and_then(Value::as_str) {
                 Some("content_block_start")
                     if event.pointer("/content_block/type").and_then(Value::as_str)
@@ -289,7 +316,8 @@ fn process_claude_event(
                 .unwrap_or_default();
             for item in content {
                 match item.get("type").and_then(Value::as_str) {
-                    Some("thinking") => {
+                    // Already streamed as deltas when partial messages are on.
+                    Some("thinking") if !*thought_streamed => {
                         if let Some(t) = item.get("thinking").and_then(Value::as_str) {
                             if !t.is_empty() {
                                 sink(StreamEvent::Thought(t.to_string()));
@@ -442,9 +470,14 @@ fn process_codex_event(
             ended(status_ok());
         }
         (Some("item.completed"), "reasoning") => {
-            let t = text();
+            // Summaries come as heading lines; keep each its own paragraph.
+            let t = text()
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .collect::<Vec<_>>()
+                .join("\n\n");
             if !t.is_empty() {
-                sink(StreamEvent::Thought(t));
+                sink(StreamEvent::Thought(format!("{t}\n\n")));
             }
         }
         (Some("item.completed"), "agent_message") => {
@@ -491,8 +524,10 @@ mod tests {
     #[test]
     fn claude_streams_text_and_tool_calls() {
         let (sink, events) = recording_sink();
-        let (mut result, mut text_started) = (None, false);
+        let (mut result, mut text_started, mut thought_streamed) = (None, false, false);
         for line in [
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"Checking a.rs"}}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"Checking a.rs","signature":"s"}]}}"#,
             r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu1","name":"Read","input":{"file_path":"/w/a.rs"}}]}}"#,
             r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tu1","content":"..."}]}}"#,
             r#"{"type":"stream_event","event":{"type":"content_block_start","content_block":{"type":"text","text":""}}}"#,
@@ -507,6 +542,7 @@ mod tests {
                 "r",
                 Path::new("/w"),
                 &mut text_started,
+                &mut thought_streamed,
                 &mut result,
             );
         }
@@ -514,6 +550,8 @@ mod tests {
         assert_eq!(
             *events.lock().unwrap(),
             [
+                // Streamed once; the full block that follows isn't repeated.
+                "thought Checking a.rs",
                 "start r-tu1 Read a.rs",
                 "end r-tu1 true",
                 r#"text {"a""#,

@@ -137,12 +137,6 @@ impl Engine for ApiEngine {
     ) -> BoxFuture<'a, Result<String>> {
         Box::pin(async move {
             let model = req.model();
-            sink(StreamEvent::Thought(format!(
-                "{} via {} ({})...\n",
-                req.tier.label(),
-                model.route.label(),
-                model.model
-            )));
             if req.tools == ToolAccess::Full {
                 bail!(
                     "Agent work (/handoff, /delegate) on {} isn't available yet; pick a Claude Code or Codex main model for it.",
@@ -272,8 +266,9 @@ async fn complete_with_retry(
                     .retry_after()
                     .unwrap_or(Duration::from_secs(1 << (attempt - 1)))
                     .min(Duration::from_secs(30));
+                tracing::warn!("{err}; retrying in {}s", wait.as_secs());
                 sink(StreamEvent::Thought(format!(
-                    "{err} — retrying in {}s...\n",
+                    "\n\nThe provider didn't answer; retrying in {}s.\n",
                     wait.as_secs()
                 )));
                 tokio::time::sleep(wait).await;
