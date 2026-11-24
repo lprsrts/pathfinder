@@ -481,6 +481,9 @@ pub enum Intent {
     /// Accept or reject the waiting map change.
     Accept,
     Reject,
+    /// They ask to change the plan, or say something that changes the
+    /// task's scope or purpose: the main model proposes a map change.
+    Replan,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -458,6 +458,7 @@ impl Runtime {
         .await?;
         let reply = render_change(&change, &session.map);
         session.pending_change = Some(change);
+        session.push_turn("assistant", &reply);
         Ok(TurnOutput::text(reply))
     }
 
@@ -562,7 +563,7 @@ impl Runtime {
         if let Some(pending) = &session.pending_candidate {
             history = history.replace(&pending.candidate, CANDIDATE_HIDDEN);
             waiting.push_str(
-                "\n\nA candidate for this part is waiting for the user's verdict; it's hidden from you. Answer questions about the general concepts only. If they ask about the candidate itself (a claim, step or number in it, or whether it's right), say that's what they're judging. Don't mention that it's hidden from you.",
+                "\n\nA candidate for this part is waiting for the user's verdict; it's hidden from you, so you don't know whether it's right. Never say it is right or wrong, or that any detail of it is. Answer questions about the general concepts only. If they ask about the candidate itself (a claim, step or number in it, or whether it's right), say that's what they're judging. Don't mention that it's hidden from you.",
             );
         }
 
@@ -654,6 +655,7 @@ impl Runtime {
                     "known" => Intent::Known,
                     "move" => Intent::Move,
                     "accept" => Intent::Accept,
+                    "replan" => Intent::Replan,
                     _ => Intent::Reject,
                 };
                 let had_log = session.active_part().is_some_and(|p| !p.log.is_empty());
@@ -686,6 +688,7 @@ impl Runtime {
             ("summary".into(), "They offer their own explanation of the whole current part, ready to be checked.".into()),
             ("known".into(), "They clearly say they already know this whole part and want to skip it.".into()),
             ("move".into(), "They want to go on to the next part, or to another named part.".into()),
+            ("replan".into(), "They ask to change the plan, or say something that changes the whole task's scope or purpose (a new constraint, requirement or aim).".into()),
         ];
         if session.pending_change.is_some() {
             steps.push((
@@ -776,12 +779,21 @@ impl Runtime {
         if step.probability < DECISION_THRESHOLD {
             return None;
         }
+        // While a candidate waits, only a confident "log" skips the judge; the
+        // judge sends anything that isn't a verdict back to chat anyway.
+        let mut choice = step.choice.clone();
+        if session.pending_candidate.is_some()
+            && choice == "log"
+            && step.probability < CONFIDENT_LOG
+        {
+            choice = VERDICT.to_string();
+        }
         let part = decision
             .answers
             .get("part")
             .filter(|a| a.probability >= DECISION_THRESHOLD)
             .map(|a| a.choice.clone());
-        Some((step.choice.clone(), part, decision.by))
+        Some((choice, part, decision.by))
     }
 
     /// Carries out what a chat message meant, the way its command would.
@@ -819,6 +831,7 @@ impl Runtime {
                 Some(_) => TurnOutput::text("Map change rejected."),
                 None => TurnOutput::text("No map change is waiting."),
             }),
+            Intent::Replan => self.handle_replan(session, text, files, sink).await,
             Intent::Log => unreachable!("log entries are answered in handle_log"),
         }
     }
@@ -863,8 +876,9 @@ impl Runtime {
             cwd: session.cwd.clone(),
             system_prompt: CANDIDATE_SYSTEM.to_string(),
             prompt: format!(
-                "Goal: {}\n\n{}\n\nMake this candidate {}.\n\nRead any files you need first, then respond with JSON only.",
+                "Goal: {}\n\nMap (`▶` is this part; parts after it in `needs` order may be new to the user):\n{}\n\n{}\n\nMake this candidate {}.\n\nRead any files you need first, then respond with JSON only.",
                 session.goal.as_deref().unwrap_or("(session goal)"),
+                session.map.render(Some(&part.id)),
                 describe_part(&part),
                 if flawed {
                     "FLAWED: exactly one real flaw"
@@ -878,18 +892,40 @@ impl Runtime {
             ctx: crate::engine::turn_ctx(),
         };
         let header = format!("Candidate for **{}**:\n\n", part.title);
-        sink(StreamEvent::TextDelta(header.clone()));
+        // The candidate's reasoning would give away whether (and where) it's
+        // flawed, so it's never shown. The header goes right before the
+        // candidate's first words, after any files the model reads.
+        sink(StreamEvent::Thought(
+            "Writing a candidate for you to judge; its reasoning stays hidden.\n".into(),
+        ));
+        let header_sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let candidate_sink: StreamSink = {
+            let (inner, header, sent) = (sink.clone(), header.clone(), header_sent.clone());
+            Arc::new(move |ev| match ev {
+                StreamEvent::Thought(_) => {}
+                StreamEvent::TextDelta(t) => {
+                    if !sent.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        inner(StreamEvent::TextDelta(header.clone()));
+                    }
+                    inner(StreamEvent::TextDelta(t));
+                }
+                other => inner(other),
+            })
+        };
         let (proposal, shown): (CandidateProposal, _) = run_gated_streamed(
             self.engine.as_ref(),
             self.store.as_ref(),
             &session.id,
             "candidate",
             &req,
-            sink.clone(),
+            candidate_sink,
             check_candidate,
             Some("candidate"),
         )
         .await?;
+        if !header_sent.load(std::sync::atomic::Ordering::Relaxed) {
+            sink(StreamEvent::TextDelta(header.clone()));
+        }
         flush(&sink, &proposal.candidate, &shown);
 
         const ASK: &str = "\n\nIs it right? Say why.";
@@ -1221,6 +1257,9 @@ impl Runtime {
 /// The decision model's step for a verdict on a waiting candidate.
 const VERDICT: &str = "verdict";
 
+/// While a candidate waits, a "log" needs this much to skip the judge.
+const CONFIDENT_LOG: f64 = 0.9;
+
 /// Below this, the decision model's step is ignored and the LLM decides.
 const DECISION_THRESHOLD: f64 = 0.6;
 
@@ -1332,7 +1371,7 @@ const MAP_SYSTEM: &str = r#"You sketch the map for Pathfinder: what the task dep
 - A part is something the task depends on: a piece of the work, or of the understanding needed to judge the work. It is not a lesson and not an assignment: the user decides during the work which parts they do themselves and which go to an agent.
 - No size limit. Use as many parts as the task needs and no more; a small task can be a single part.
 - `depends_on` lists parts that must be understood or done before this one makes sense. No cycles.
-- `id`: a short descriptive slug the user types in commands: lowercase words joined by hyphens, at most 12 characters (e.g. `weights`, `fwd-pass`, `loss`). Unique.
+- `id`: a short descriptive slug the user types in commands: lowercase words joined by hyphens, at most 12 characters (e.g. `weights`, `fwd-pass`, `loss`). Unique. It names what the part is actually about, not a broad field: `colliders`, not `probability`. Users skip parts by their names.
 - Start where the user is: if the goal or conversation says what they already know or don't, shape the parts for that (e.g. include the basics for a newcomer). Keep parts they say they know on the map; they can mark them known themselves.
 - `note`: one line on what the part covers. `brief`: what the map covers, in one or two sentences.
 
@@ -1359,13 +1398,16 @@ First decide what the latest message is (`intent`):
 - `known`: they clearly say they already know this whole part and want to skip it. Knowing some of it isn't enough.
 - `move`: they want to go on to the next part, or to a named one (put its id in `part`). For `known`, also put a part they name to go to in `part`.
 - `accept` / `reject`: they answer a waiting map change ("yes, add it", "no, keep the map").
+- `replan`: they ask to change the plan, or say something that changes the whole task's scope or purpose (a new constraint or aim).
 For anything but `log`, set `reply` to "" and `map_change` to null: Pathfinder takes the step.
 
 For `log`, reply briefly (math as plain text or Unicode, never LaTeX): answer what they ask, or point out what the entry reveals. If they ask whether something is right, say whether it is, even when it belongs to another part. Don't repeat what you already said in the conversation. Do not do the work for them and do not write their explanation of the part for them.
 
-The user decides which parts they do themselves and which go to an agent. Never raise that.
+The user decides which parts they do themselves and which go to an agent. Don't suggest it. If they ask you to just do the work, say plainly how: `/handoff` gives an understood part to the agent and they review the result; `/delegate` hands it off without understanding it, recorded as such. Then carry on with the part unless they choose one.
 
-If a `log` message reveals the map is wrong (a missing dependency, a part that doesn't belong, a wrong edge), propose a change in `map_change`; the user accepts or rejects it. Otherwise set it to null. A change has `brief` (one sentence to the user, saying "you"), `goal` (only when the message changes what the task is, e.g. a new purpose or scope: the new goal as one sentence starting with a verb, not in first person; otherwise null), `parts` (to add, or update by id: id, title, note, depends_on; new ids are short hyphenated slugs of at most 12 characters) and `remove` (ids of parts with no work yet).
+If a `log` message reveals the map is wrong (a missing dependency, a part that doesn't belong, a wrong edge, or a new constraint that changes the task's scope), propose a change in `map_change`; the user accepts or rejects it. Otherwise set it to null. A change has `brief` (one sentence to the user, saying "you"), `goal` (only when the message changes what the task is, e.g. a new purpose or scope: the new goal as one sentence starting with a verb, not in first person; otherwise null), `parts` (to add, or update by id: id, title, note, depends_on; new ids are short hyphenated slugs of at most 12 characters) and `remove` (ids of parts with no work yet).
+
+If the message shows a gap in something this part depends on, especially a part they delegated or claimed to know (see the map's statuses), explain it in plain words, and propose a small part for it in `map_change` so the gap is on the map.
 
 Call `read` before writing your JSON if a file matters: `reply` ends your turn.
 
@@ -1376,7 +1418,7 @@ or, with a change:
 
 const CANDIDATE_SYSTEM: &str = r#"You make a candidate for the user to judge. Their judgment decides whether they understand the part well enough to direct an agent and tell whether its result is right.
 
-A candidate is a concrete approach or result for this part, as an agent might produce it. Pick whichever fits the part. Keep it short enough to judge in a minute or two: a short paragraph, a few steps or a small snippet, under 150 words. Don't restate the user's summary back to them. Write math as plain text or Unicode (z = 2x₁ − x₂), never LaTeX.
+A candidate is a concrete approach or result for this part, as an agent might produce it. Pick whichever fits the part. Stay within this part: use only ideas from this part, the parts it depends on and the user's log, at the level they're working at. Don't bring in terms or steps from later parts; the user may not have met them yet. Keep it short enough to judge in a minute or two: a short paragraph, a few steps or a small snippet, under 150 words. Don't restate the user's summary back to them. Write math as plain text or Unicode (z = 2x₁ − x₂), never LaTeX.
 
 You are told whether to make it correct or flawed. A flawed candidate contains exactly one real flaw that matters for the goal and that someone who understands the part would catch. It must look plausible: never hint at the flaw.
 
@@ -2033,7 +2075,7 @@ mod tests {
             vec![
                 ("log", 0.9, None),
                 ("summary", 0.8, None),
-                ("log", 0.85, None),
+                ("log", 0.95, None),
                 ("verdict", 0.9, None),
             ],
         );
