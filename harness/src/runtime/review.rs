@@ -45,6 +45,20 @@ pub fn check_rate(checks: &str, any_only_shown: bool) -> f64 {
     }
 }
 
+/// What planting a check produced, attempt by attempt (for the evals).
+#[derive(Debug, Default)]
+pub(super) struct PlantOutcome {
+    pub attempts: Vec<Attempt>,
+    /// The kept plant: added lines and the flaw.
+    pub kept: Option<(Vec<String>, String)>,
+}
+
+#[derive(Debug)]
+pub(super) struct Attempt {
+    pub parses: bool,
+    pub changes_behaviour: Option<f64>,
+}
+
 /// A uniform roll in [0, 1). `HARNESS_CHECK_ROLL` fixes it, for trying
 /// checks out (0 checks every review that can be checked).
 pub fn roll() -> f64 {
@@ -399,6 +413,20 @@ impl Runtime {
             .enumerate()
             .find(|(_, h)| h.label == "reviewable" && !h.hunk.added.is_empty())?;
         let file = ledger::file_at(root, after, &target.path).unwrap_or_default();
+        let outcome = self.plant(session, part, target, &file).await;
+        outcome.kept.map(|(added, flaw)| (i, added, flaw))
+    }
+
+    /// Plants a flaw in `target`, retrying once; records each attempt.
+    pub(super) async fn plant(
+        &self,
+        session: &Session,
+        part: &Part,
+        target: &RecordedHunk,
+        file: &str,
+    ) -> PlantOutcome {
+        let mut outcome = PlantOutcome::default();
+        let file = file.to_string();
         let labels: Vec<String> = target.concepts.clone();
         for _ in 0..2 {
             let req = EngineRequest {
@@ -417,7 +445,10 @@ impl Runtime {
                 ),
                 files: vec![],
                 stream_text: false,
-                models: self.models(session).ok()?,
+                models: match self.models(session) {
+                    Ok(m) => m,
+                    Err(_) => return outcome,
+                },
                 ctx: crate::engine::turn_ctx(),
             };
             let original = target.hunk.added.clone();
@@ -447,12 +478,17 @@ impl Runtime {
                 Ok(p) => p,
                 Err(e) => {
                     tracing::warn!("planting a review check: {e:#}");
-                    return None;
+                    return outcome;
                 }
             };
             let added: Vec<String> = planted.added.lines().map(str::to_string).collect();
             let content = splice(&file, target.hunk.new_start, target.hunk.new_len, &added);
-            if !still_parses(&target.path, &content) {
+            let parses = still_parses(&target.path, &content);
+            outcome.attempts.push(Attempt {
+                parses,
+                changes_behaviour: None,
+            });
+            if !parses {
                 continue;
             }
             let q = [Question {
@@ -484,15 +520,19 @@ impl Runtime {
                             1.0 - a.probability
                         }
                     });
+                    if let Some(last) = outcome.attempts.last_mut() {
+                        last.changes_behaviour = p;
+                    }
                     if p.is_some_and(|p| p >= CHANGES_BEHAVIOUR) {
-                        return Some((i, added, planted.flaw));
+                        outcome.kept = Some((added, planted.flaw));
+                        return outcome;
                     }
                 }
                 // Without a decision model there's no gate either: no check.
-                _ => return None,
+                _ => return outcome,
             }
         }
-        None
+        outcome
     }
 
     /// `/approve` on a staged review.
@@ -627,7 +667,12 @@ impl Runtime {
             .await
     }
 
-    async fn caught(&self, session: &Session, planted: &Secret, objection: &str) -> Result<bool> {
+    pub(super) async fn caught(
+        &self,
+        session: &Session,
+        planted: &Secret,
+        objection: &str,
+    ) -> Result<bool> {
         let req = EngineRequest {
             tier: EngineTier::System2,
             tools: ToolAccess::None,

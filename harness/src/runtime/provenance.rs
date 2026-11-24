@@ -14,13 +14,41 @@ use crate::ledger::{self, Entry, FileDiff, Hunk};
 use crate::understanding::{self, ConceptState};
 
 /// A hunk is tagged with a concept at this probability (A7).
-const TAG: f64 = 0.6;
+pub(super) const TAG: f64 = 0.6;
 /// "Something else" at this probability leaves the hunk untagged.
-const SOMETHING_ELSE: f64 = 0.5;
+pub(super) const SOMETHING_ELSE: f64 = 0.5;
 /// Hunks past this many in one run are left untagged (counted delegated).
 const MAX_TAGGED_HUNKS: usize = 40;
 /// The Tagger sees at most this much of a hunk.
 const HUNK_CHARS: usize = 4000;
+
+/// The Tagger's probabilities for one hunk.
+#[derive(Debug, Clone)]
+pub(super) struct TagScores {
+    pub something_else: f64,
+    pub concepts: Vec<(String, f64)>,
+}
+
+impl TagScores {
+    /// Tags at `tag`; untagged when "something else" reaches `other`.
+    pub fn apply(&self, tag: f64, other: f64) -> (Vec<String>, f64) {
+        if self.something_else >= other {
+            return (vec![], 0.0);
+        }
+        let tagged: Vec<(String, f64)> = self
+            .concepts
+            .iter()
+            .filter(|(_, p)| *p >= tag)
+            .cloned()
+            .collect();
+        let confidence = tagged.iter().map(|(_, p)| *p).fold(1.0, f64::min);
+        if tagged.is_empty() {
+            (vec![], 0.0)
+        } else {
+            (tagged.into_iter().map(|(c, _)| c).collect(), confidence)
+        }
+    }
+}
 
 /// A hunk as the ledger recorded it.
 #[derive(Debug, Clone)]
@@ -216,7 +244,7 @@ impl Runtime {
     /// The Tagger (A7): a predicate per core concept of the part plus
     /// "something else", in one decision request. Untagged when no
     /// decision service answers: it then counts as delegated.
-    async fn tag(
+    pub(super) async fn tag(
         &self,
         session: &Session,
         part: &Part,
@@ -224,8 +252,23 @@ impl Runtime {
         path: &str,
         hunk: &Hunk,
     ) -> (Vec<String>, f64) {
+        match self.tag_scores(session, part, labels, path, hunk).await {
+            Some(scores) => scores.apply(TAG, SOMETHING_ELSE),
+            None => (vec![], 0.0),
+        }
+    }
+
+    /// The Tagger's raw probabilities; None when no decision service answers.
+    pub(super) async fn tag_scores(
+        &self,
+        session: &Session,
+        part: &Part,
+        labels: &std::collections::HashMap<String, String>,
+        path: &str,
+        hunk: &Hunk,
+    ) -> Option<TagScores> {
         if part.concepts.is_empty() || session.decisions_off {
-            return (vec![], 0.0);
+            return None;
         }
         let label = |c: &String| labels.get(c).cloned().unwrap_or_else(|| c.clone());
         let mut questions: Vec<Question> = part
@@ -267,34 +310,28 @@ impl Runtime {
             .await
         {
             Ok(Some(d)) => d,
-            Ok(None) => return (vec![], 0.0),
+            Ok(None) => return None,
             Err(e) => {
                 tracing::warn!("tagging a hunk: {e:#}");
-                return (vec![], 0.0);
+                return None;
             }
         };
-        if decision
-            .answers
-            .get("else")
-            .is_some_and(|a| yes_p(a) >= SOMETHING_ELSE)
-        {
-            return (vec![], 0.0);
-        }
-        let mut tagged = Vec::new();
-        let mut confidence: f64 = 1.0;
-        for (i, c) in part.concepts.iter().enumerate() {
-            if let Some(a) = decision.answers.get(&format!("t{i}")) {
-                let p = yes_p(a);
-                if p >= TAG {
-                    tagged.push(c.clone());
-                    confidence = confidence.min(p);
-                }
-            }
-        }
-        if tagged.is_empty() {
-            confidence = 0.0;
-        }
-        (tagged, confidence)
+        Some(TagScores {
+            something_else: decision.answers.get("else").map(yes_p).unwrap_or(0.0),
+            concepts: part
+                .concepts
+                .iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    let p = decision
+                        .answers
+                        .get(&format!("t{i}"))
+                        .map(yes_p)
+                        .unwrap_or(0.0);
+                    (c.clone(), p)
+                })
+                .collect(),
+        })
     }
 
     /// A review entry per change entry: the verdict comes later than the

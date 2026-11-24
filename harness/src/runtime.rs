@@ -24,6 +24,7 @@ use crate::validate::{
 use crate::workspace::WorkspaceSnapshot;
 
 mod concepts;
+pub mod eval;
 mod gate;
 mod provenance;
 mod review;

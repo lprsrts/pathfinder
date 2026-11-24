@@ -479,6 +479,42 @@ impl Store {
         Ok(out)
     }
 
+    /// Every saved session (for the evals' evidence report).
+    pub fn all_sessions(&self) -> Result<Vec<Session>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT state_json FROM sessions ORDER BY updated_at")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            if let Ok(s) = serde_json::from_str(&row?) {
+                out.push(s);
+            }
+        }
+        Ok(out)
+    }
+
+    /// (concept, kind) → count of a session's events.
+    pub fn event_counts(&self, session_id: &str) -> Result<HashMap<(String, String), usize>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT concept, kind, COUNT(*) FROM events WHERE session_id = ?1 GROUP BY concept, kind",
+        )?;
+        let rows = stmt.query_map(params![session_id], |row| {
+            Ok((
+                (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
+                row.get::<_, i64>(2)? as usize,
+            ))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<HashMap<_, _>>>()?)
+    }
+
+    pub fn ledger_workspaces(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT DISTINCT workspace FROM ledger ORDER BY workspace")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     // --- Secrets (theory A6) ---
 
     pub fn add_secret(&self, session_id: &str, secret: &Secret) -> Result<()> {

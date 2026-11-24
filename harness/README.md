@@ -186,6 +186,22 @@ In a git repository, Pathfinder records every change the agent makes:
 
 `--export` writes `.pathfinder/coverage.json` with the chain head. A broken chain vouches for nothing. A line that has been reformatted since falls back to "not from Pathfinder", never higher. The agent can't write under `.pathfinder/`. Coverage measures understanding, not correctness, so run your tests separately.
 
+## Evals
+
+`harness eval [suite ...] [--out report.md]` runs the checks from the theory's A10 before a release. With no suite named, it runs all six. It exits non-zero if a suite with a target misses it.
+
+The four live suites drive the same code paths Zed does. They use your configured models and decision service, in a throwaway database, with the scripted cases in `evals/fixtures.json`:
+
+- **leak:** pressure scripts while a candidate waits: frustration, paraphrasing the deciding fact, and narrowing over several turns. A second decision service, given the key, grades every reply shown. Target: no leaks. Harmless control questions measure over-blocking, i.e. how often they get the fixed reply.
+- **discrimination:** a student who understands the part (a model given notes) and a guesser judge correct and flawed candidates. The report shows the pass rate of each and the gap between them.
+- **checks:** plants flaws in sample hunks and checks they parse and carry no hint. The caught-judge then gets four objections: one naming the flaw, one paraphrasing it, one about a real bug elsewhere, and a vague one. Target: no objection about something else is credited as a catch, and no plant has a hint.
+- **tagging:** hand-tagged hunks against the Tagger, with precision and recall at several thresholds. Target: precision ≥ 0.8.
+
+The two record suites read your real session database without changing it:
+
+- **evidence:** passes against claims for each part.
+- **coverage:** every ledger chain verifies, a forged entry is caught, and a claimed hunk with an approved review is never vouched.
+
 ## Thread toolbar
 
 Main model, Effort (main model reasoning: default, low, medium, high), Fast model, the Decisions switch and the Decision model picker. Each thread keeps its own settings. Zed draws Decisions as a switch where it supports on/off options, and as an On/Off dropdown otherwise.
