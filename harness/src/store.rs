@@ -70,6 +70,13 @@ impl Store {
                 recorded_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
             CREATE INDEX IF NOT EXISTS idx_critic_session ON critic_events(session_id);
+            -- What Zed was shown, one ACP session update per row, replayed on load.
+            CREATE TABLE IF NOT EXISTS transcript (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                update_json TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_transcript_session ON transcript(session_id, seq);
             "#,
         )?;
         // Outcomes gained a `status` column next to the §8 record in `outcome`.
@@ -80,6 +87,27 @@ impl Store {
             conn.execute("ALTER TABLE outcomes ADD COLUMN status TEXT", [])?;
         }
         Ok(())
+    }
+
+    pub fn append_transcript(&self, session_id: &str, updates: &[String]) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        for update in updates {
+            tx.execute(
+                "INSERT INTO transcript (session_id, update_json) VALUES (?1, ?2)",
+                params![session_id, update],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn load_transcript(&self, session_id: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT update_json FROM transcript WHERE session_id = ?1 ORDER BY seq")?;
+        let rows = stmt.query_map(params![session_id], |row| row.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<String>>>()?)
     }
 
     pub fn save_session(&self, session: &Session) -> Result<()> {

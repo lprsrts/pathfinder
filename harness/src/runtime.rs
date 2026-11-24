@@ -233,6 +233,15 @@ impl Runtime {
         self.store.load_session(id)
     }
 
+    /// Saves what the client was shown this turn (serialized updates).
+    pub fn record(&self, id: &str, updates: &[String]) -> Result<()> {
+        self.store.append_transcript(id, updates)
+    }
+
+    pub fn transcript(&self, id: &str) -> Result<Vec<String>> {
+        self.store.load_transcript(id)
+    }
+
     pub async fn handle_turn(
         &self,
         session_id: &str,

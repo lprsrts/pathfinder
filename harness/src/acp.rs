@@ -139,8 +139,28 @@ pub async fn run_stdio(runtime: Arc<Runtime>, creds: Arc<Credentials>) -> Result
                             .respond_with_error(AcpError::internal_error().data(err.to_string()));
                     }
                 };
-                // ACP: replay the whole conversation before answering the load.
-                replay_history(&cx, &req.session_id, &loaded);
+                // ACP: replay the whole conversation before answering the load,
+                // as it was shown: messages, thinking and tool calls.
+                let updates: Vec<SessionUpdate> = match rt_load.transcript(&id) {
+                    Ok(saved) if !saved.is_empty() => saved
+                        .iter()
+                        .filter_map(|json| serde_json::from_str(json).ok())
+                        .collect(),
+                    _ => {
+                        // Saved before transcripts: rebuild from the history once.
+                        let rebuilt = history_updates(&loaded);
+                        if let Err(e) = rt_load.record(&id, &serialize(&rebuilt)) {
+                            warn!("saving rebuilt transcript failed: {e:#}");
+                        }
+                        rebuilt
+                    }
+                };
+                for update in updates {
+                    let _ = cx.send_notification(SessionNotification::new(
+                        req.session_id.clone(),
+                        update,
+                    ));
+                }
                 if !loaded.map.parts.is_empty() {
                     let _ = send_plan(&cx, req.session_id.clone(), &loaded);
                 }
@@ -189,10 +209,17 @@ pub async fn run_stdio(runtime: Arc<Runtime>, creds: Arc<Credentials>) -> Result
                 let input = extract_turn_input(&req.prompt);
 
                 let cx_task = cx.clone();
+                let rec = Recorder::default();
+                for block in &req.prompt {
+                    rec.push(SessionUpdate::UserMessageChunk(ContentChunk::new(
+                        block.clone(),
+                    )));
+                }
                 cx.spawn(async move {
                     let id_str = sid.0.to_string();
-                    let sink = make_stream_sink(cx_task.clone(), sid.clone());
-                    match rt.handle_turn(&id_str, input, sink).await {
+                    let sink = make_stream_sink(cx_task.clone(), sid.clone(), rec.clone());
+                    let result = rt.handle_turn(&id_str, input, sink).await;
+                    match result {
                         Ok(out) => {
                             if out.plan_changed {
                                 if let Ok(Some(session)) = rt.load_session(&id_str) {
@@ -200,20 +227,23 @@ pub async fn run_stdio(runtime: Arc<Runtime>, creds: Arc<Credentials>) -> Result
                                 }
                             }
                             if !out.reply.is_empty() {
-                                let _ = send_text(&cx_task, sid.clone(), out.reply);
+                                let _ = send_text(&cx_task, sid.clone(), &rec, out.reply);
                             }
-                            let _ = responder.respond(PromptResponse::new(StopReason::EndTurn));
                         }
                         Err(err) => {
                             error!("handle_turn failed: {err:#}");
                             let _ = send_text(
                                 &cx_task,
                                 sid.clone(),
+                                &rec,
                                 format!("Something went wrong running the model: {err}"),
                             );
-                            let _ = responder.respond(PromptResponse::new(StopReason::EndTurn));
                         }
                     }
+                    if let Err(e) = rt.record(&id_str, &serialize(&rec.take())) {
+                        warn!("saving the transcript failed: {e:#}");
+                    }
+                    let _ = responder.respond(PromptResponse::new(StopReason::EndTurn));
                     Ok(())
                 })
             },
@@ -293,7 +323,10 @@ async fn ensure_models(creds: &Arc<Credentials>) -> bool {
 }
 
 /// Sends a loaded session's turns back to the client, in order.
-fn replay_history(cx: &ConnectionTo<Client>, session_id: &SessionId, session: &Session) {
+/// A transcript rebuilt from the model-facing history, for sessions saved
+/// before transcripts were recorded.
+fn history_updates(session: &Session) -> Vec<SessionUpdate> {
+    let mut out = Vec::new();
     let mut previous_role: Option<&str> = None;
     for turn in &session.history {
         // Consecutive chunks merge into one message; keep turns apart.
@@ -304,13 +337,58 @@ fn replay_history(cx: &ConnectionTo<Client>, session_id: &SessionId, session: &S
         };
         previous_role = Some(turn.role.as_str());
         let chunk = ContentChunk::new(ContentBlock::from(text));
-        let update = if turn.role == "user" {
+        out.push(if turn.role == "user" {
             SessionUpdate::UserMessageChunk(chunk)
         } else {
             SessionUpdate::AgentMessageChunk(chunk)
-        };
-        let _ = cx.send_notification(SessionNotification::new(session_id.clone(), update));
+        });
     }
+    out
+}
+
+/// Collects what one prompt turn showed, merging streamed text so each
+/// message or thinking block is saved as one update.
+#[derive(Clone, Default)]
+struct Recorder(Arc<std::sync::Mutex<Vec<SessionUpdate>>>);
+
+impl Recorder {
+    fn push(&self, update: SessionUpdate) {
+        let mut all = self.0.lock().unwrap();
+        let text = |u: &SessionUpdate| match u {
+            SessionUpdate::AgentMessageChunk(c)
+            | SessionUpdate::AgentThoughtChunk(c)
+            | SessionUpdate::UserMessageChunk(c) => match &c.content {
+                ContentBlock::Text(t) => Some(t.text.clone()),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let (Some(last), Some(more)) = (all.last_mut(), text(&update)) {
+            let same = std::mem::discriminant(last) == std::mem::discriminant(&update);
+            if same && text(last).is_some() {
+                let merged = text(last).unwrap() + &more;
+                let chunk = ContentChunk::new(ContentBlock::from(merged));
+                *last = match update {
+                    SessionUpdate::AgentMessageChunk(_) => SessionUpdate::AgentMessageChunk(chunk),
+                    SessionUpdate::AgentThoughtChunk(_) => SessionUpdate::AgentThoughtChunk(chunk),
+                    _ => SessionUpdate::UserMessageChunk(chunk),
+                };
+                return;
+            }
+        }
+        all.push(update);
+    }
+
+    fn take(&self) -> Vec<SessionUpdate> {
+        std::mem::take(&mut self.0.lock().unwrap())
+    }
+}
+
+fn serialize(updates: &[SessionUpdate]) -> Vec<String> {
+    updates
+        .iter()
+        .filter_map(|u| serde_json::to_string(u).ok())
+        .collect()
 }
 
 /// The thread's toolbar: main model, effort, fast model, and the Decisions
@@ -440,7 +518,7 @@ fn model_name(entry: &crate::config::ModelEntry, catalog: &[crate::config::Model
     format!("{name} · {route}")
 }
 
-fn make_stream_sink(cx: ConnectionTo<Client>, session_id: SessionId) -> StreamSink {
+fn make_stream_sink(cx: ConnectionTo<Client>, session_id: SessionId, rec: Recorder) -> StreamSink {
     Arc::new(move |ev: StreamEvent| {
         let update = match ev {
             StreamEvent::Thought(text) => {
@@ -489,6 +567,7 @@ fn make_stream_sink(cx: ConnectionTo<Client>, session_id: SessionId) -> StreamSi
                 }),
             )),
         };
+        rec.push(update.clone());
         let _ = cx.send_notification(SessionNotification::new(session_id.clone(), update));
     })
 }
@@ -496,12 +575,12 @@ fn make_stream_sink(cx: ConnectionTo<Client>, session_id: SessionId) -> StreamSi
 fn send_text(
     cx: &ConnectionTo<Client>,
     session_id: SessionId,
+    rec: &Recorder,
     text: String,
 ) -> Result<(), AcpError> {
-    cx.send_notification(SessionNotification::new(
-        session_id,
-        SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::from(text))),
-    ))
+    let update = SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::from(text)));
+    rec.push(update.clone());
+    cx.send_notification(SessionNotification::new(session_id, update))
 }
 
 fn send_commands(cx: &ConnectionTo<Client>, session_id: SessionId) -> Result<(), AcpError> {
@@ -776,5 +855,31 @@ mod tests {
         assert_eq!(json.as_array().unwrap().len(), 5);
         assert_eq!(json[4]["type"], "select");
         assert_eq!(json[4]["currentValue"], "off");
+    }
+    #[test]
+    fn recorder_merges_streamed_text_into_blocks() {
+        let rec = Recorder::default();
+        let msg = |t: &str| {
+            SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::from(t.to_string())))
+        };
+        let thought = |t: &str| {
+            SessionUpdate::AgentThoughtChunk(ContentChunk::new(ContentBlock::from(t.to_string())))
+        };
+        rec.push(thought("Reading "));
+        rec.push(thought("the file"));
+        rec.push(SessionUpdate::ToolCall(ToolCall::new("t1", "Read a.rs")));
+        rec.push(msg("Hel"));
+        rec.push(msg("lo"));
+        let saved = serialize(&rec.take());
+        assert_eq!(saved.len(), 3);
+        let back: Vec<SessionUpdate> = saved
+            .iter()
+            .map(|j| serde_json::from_str(j).unwrap())
+            .collect();
+        assert!(matches!(&back[0], SessionUpdate::AgentThoughtChunk(c)
+            if matches!(&c.content, ContentBlock::Text(t) if t.text == "Reading the file")));
+        assert!(matches!(&back[2], SessionUpdate::AgentMessageChunk(c)
+            if matches!(&c.content, ContentBlock::Text(t) if t.text == "Hello")));
+        assert!(rec.take().is_empty());
     }
 }
