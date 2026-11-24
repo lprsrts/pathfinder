@@ -222,7 +222,7 @@ impl Map {
         let mut lines = vec!["Map:".to_string()];
         for part in &self.parts {
             let marker = if Some(part.id.as_str()) == active {
-                "▶"
+                "- ▶"
             } else {
                 "-"
             };

@@ -288,11 +288,11 @@ impl Runtime {
         session.pending_candidate = None;
         session.advance();
 
-        let mut rest = session.map.render(session.active.as_deref());
-        if let Some(part) = session.active_part() {
-            rest.push_str("\n\n");
-            rest.push_str(&render_part(part));
-        }
+        // The map itself shows in Zed's plan panel (and on `/map`).
+        let rest = session
+            .active_part()
+            .map(|part| render_part(part, true))
+            .unwrap_or_default();
         session.push_turn("assistant", format!("{}\n\n{rest}", proposal.brief));
         Ok(TurnOutput::changed(format!("\n\n{rest}")))
     }
@@ -361,10 +361,7 @@ impl Runtime {
                 } else if session.mode == SessionMode::Done && !session.map.all_resolved() {
                     session.advance();
                 }
-                Ok(TurnOutput::changed(format!(
-                    "Map updated.\n\n{}",
-                    session.map.render(session.active.as_deref())
-                )))
+                Ok(TurnOutput::changed("Map updated."))
             }
             Err(e) => Ok(TurnOutput::text(format!(
                 "That change no longer fits the map ({e}). Dropped it."
@@ -379,7 +376,7 @@ impl Runtime {
                 session.active = Some(id);
                 session.mode = SessionMode::Working;
                 session.pending_candidate = None;
-                TurnOutput::changed(render_part(session.active_part().unwrap()))
+                TurnOutput::changed(render_part(session.active_part().unwrap(), false))
             }
             None if session.map.all_resolved() => {
                 session.advance();
@@ -399,7 +396,7 @@ impl Runtime {
         session.active = Some(id.to_string());
         session.mode = SessionMode::Working;
         session.pending_candidate = None;
-        TurnOutput::changed(render_part(session.active_part().unwrap()))
+        TurnOutput::changed(render_part(session.active_part().unwrap(), false))
     }
 
     // --- §5 Evidence: log, summary, candidate ---
@@ -818,7 +815,10 @@ impl Runtime {
 
     fn after_resolution(&self, session: &mut Session, lead: String) -> TurnOutput {
         let reply = match session.advance() {
-            Some(_) => format!("{lead}\n\n{}", render_part(session.active_part().unwrap())),
+            Some(_) => format!(
+                "{lead}\n\n{}",
+                render_part(session.active_part().unwrap(), false)
+            ),
             None if session.mode == SessionMode::Done => {
                 format!("{lead}\n\nEvery part is resolved.")
             }
@@ -840,13 +840,16 @@ fn flush(sink: &StreamSink, full: &str, shown: &str) {
     }
 }
 
-fn render_part(part: &Part) -> String {
+/// A part as you start on it. The command hint shows only with the first part.
+fn render_part(part: &Part, hint: bool) -> String {
     let mut out = format!("**{}** (`{}`)", part.title, part.id);
     if !part.note.trim().is_empty() {
         out.push_str(&format!("\n{}", part.note.trim()));
     }
-    out.push_str(&format!("\nStatus: {}.", part.status.label()));
-    if part.status == PartStatus::Open {
+    if part.status != PartStatus::Open {
+        out.push_str(&format!("\nStatus: {}.", part.status.label()));
+    }
+    if hint && part.status == PartStatus::Open {
         out.push_str(
             "\n\nLog your thinking and reasons as you work. `/summary <text>` when you can explain it; `/known` if you already know it; `/delegate` to hand it off without understanding it.",
         );
@@ -1122,6 +1125,9 @@ mod tests {
 
         let out = turn(&rt, "add a /status command").await;
         assert!(out.reply.contains("Command routing"));
+        // The map lives in Zed's plan panel; replies only introduce the part.
+        assert!(!out.reply.contains("Map:"));
+        assert!(!out.reply.contains("What status reports"));
         assert_eq!(
             rt.load_session("s").unwrap().unwrap().active.as_deref(),
             Some("route")
