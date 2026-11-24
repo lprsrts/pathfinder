@@ -40,7 +40,7 @@ Pathfinder uses a fast model (System 1: onboarding, log replies) and a stronger 
 | `claude` | Claude Code CLI (`claude -p`) | the CLI's own login |
 | `codex` | Codex CLI (`codex exec`) | the CLI's own login |
 
-On the API routes Pathfinder runs its own tool loop and streams the model's thinking and tool calls into Zed. Conversation turns can read, list, find and search the workspace. Agent work (`/handoff`, `/delegate`) can also edit and write files, shown as diffs, and run commands: Zed asks you first (Allow, Always allow for that program, or Deny) and runs each one in its terminal, so you watch it. The agent says what it's about to do before each step, and the stop button ends the run. File tools stay inside the workspace and never write to `.git`; commands run as you, unsandboxed, which is why each one asks.
+On the API routes Pathfinder runs its own tool loop and streams the model's thinking and tool calls into Zed. Conversation turns can read, list, find and search the workspace. Agent work (`/handoff`, `/delegate`) can also edit and write files, shown as diffs and written through Zed so they appear in its Review Changes view (keep or reject each change), and run commands: Zed asks you first (Allow, Always allow for that program, or Deny) and runs each one in its terminal, so you watch it. The agent says what it's about to do before each step, and the stop button ends the run. File tools stay inside the workspace and never write to `.git`; commands run as you, unsandboxed, which is why each one asks.
 
 ### Sign in with ChatGPT
 

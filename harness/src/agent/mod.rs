@@ -240,19 +240,17 @@ async fn run_call(
     )));
     let full = req.tools == ToolAccess::Full;
     let outcome = match call.name.as_str() {
-        "edit" | "write" if full => {
-            tools::change_file(&call.name, &call.args, env).map(|(msg, c)| {
-                sink(StreamEvent::ToolUpdate {
-                    id: id.clone(),
-                    content: ToolContent::Diff {
-                        path: c.path,
-                        old: c.old,
-                        new: c.new,
-                    },
-                });
-                msg
-            })
-        }
+        "edit" | "write" if full => change_file(call, env, req).await.map(|(msg, c)| {
+            sink(StreamEvent::ToolUpdate {
+                id: id.clone(),
+                content: ToolContent::Diff {
+                    path: c.path,
+                    old: c.old,
+                    new: c.new,
+                },
+            });
+            msg
+        }),
         "bash" if full => run_command(&id, &call.args, req, sink).await,
         _ => tools::run(&call.name, &call.args, env),
     };
@@ -269,6 +267,47 @@ async fn run_call(
         content,
         is_error,
     }
+}
+
+/// `edit` and `write`. Through the client when it offers file access, so
+/// the change shows up in its review of the agent's edits; here otherwise.
+async fn change_file(
+    call: &crate::llm::ToolCall,
+    env: &ToolEnv<'_>,
+    req: &EngineRequest,
+) -> Result<(String, tools::Change), String> {
+    let (path, full) = tools::change_target(&call.args, env)?;
+    let host = req.ctx.host.as_deref();
+    let old = match host.and_then(|h| h.read_file(&full)) {
+        // A file the client can't open is read here, which also tells a
+        // missing file from an unreadable one.
+        Some(read) => match read.await {
+            Ok(text) => Some(text),
+            Err(_) => tools::read_existing(&full, &path)?,
+        },
+        None => tools::read_existing(&full, &path)?,
+    };
+    let (message, new) = tools::apply_change(&call.name, &call.args, &path, old.as_deref())?;
+    match host.and_then(|h| h.write_file(&full, &new)) {
+        Some(write) => {
+            if let Some(parent) = full.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("can't create folders for {path}: {e}"))?;
+            }
+            write
+                .await
+                .map_err(|e| format!("can't write {path}: {e}"))?;
+        }
+        None => tools::write_here(&full, &path, &new)?,
+    }
+    Ok((
+        message,
+        tools::Change {
+            path: full,
+            old,
+            new,
+        },
+    ))
 }
 
 /// `bash`: asks the user, then runs in the client's terminal when it has
@@ -691,6 +730,70 @@ mod tests {
             panic!("expected tool results");
         };
         assert!(results[0].is_error && results[0].content.contains("declined"));
+        fs::remove_dir_all(ws).unwrap();
+    }
+
+    /// A client with file access: records writes instead of touching disk.
+    #[derive(Default)]
+    struct FileHost(Mutex<Vec<(PathBuf, String)>>);
+
+    impl crate::engine::Host for FileHost {
+        fn ask<'a>(&'a self, _: &'a str, _: &'a str) -> BoxFuture<'a, Permission> {
+            Box::pin(async { Permission::Once })
+        }
+        fn run_in_terminal<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+            _: &'a std::path::Path,
+            _: Duration,
+            _: &'a CancellationToken,
+        ) -> Option<BoxFuture<'a, Result<CommandOutput>>> {
+            None
+        }
+        fn read_file<'a>(
+            &'a self,
+            path: &'a std::path::Path,
+        ) -> Option<BoxFuture<'a, Result<String>>> {
+            Some(Box::pin(async move { Ok(fs::read_to_string(path)?) }))
+        }
+        fn write_file<'a>(
+            &'a self,
+            path: &'a std::path::Path,
+            content: &'a str,
+        ) -> Option<BoxFuture<'a, Result<()>>> {
+            self.0
+                .lock()
+                .unwrap()
+                .push((path.to_path_buf(), content.to_string()));
+            Some(Box::pin(async { Ok(()) }))
+        }
+    }
+
+    #[tokio::test]
+    async fn edits_go_through_the_client_when_it_offers_files() {
+        let ws = workspace();
+        let (engine, _) = scripted(vec![
+            Ok(vec![call(
+                "e1",
+                "edit",
+                json!({"path": "Cargo.toml", "old_string": "demo", "new_string": "neuron"}),
+            )]),
+            Ok(vec![Part::Text("Done.".into())]),
+        ]);
+        let host = Arc::new(FileHost::default());
+        let mut req = request(ws.clone(), ToolAccess::Full);
+        req.ctx.host = Some(host.clone());
+        engine.run_text(&req, recorder().0).await.unwrap();
+        let writes = host.0.lock().unwrap();
+        assert_eq!(writes.len(), 1);
+        assert!(writes[0].0.ends_with("Cargo.toml") && writes[0].1.contains("neuron"));
+        // The client applies it; Pathfinder didn't write the file itself.
+        assert!(
+            fs::read_to_string(ws.join("Cargo.toml"))
+                .unwrap()
+                .contains("demo")
+        );
         fs::remove_dir_all(ws).unwrap();
     }
 }

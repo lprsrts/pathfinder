@@ -124,6 +124,25 @@ pub trait Host: Send + Sync {
         timeout: std::time::Duration,
         cancel: &'a CancellationToken,
     ) -> Option<BoxFuture<'a, Result<CommandOutput>>>;
+
+    /// Reads a file through the client, which sees unsaved edits. None when
+    /// the client doesn't offer it.
+    fn read_file<'a>(
+        &'a self,
+        _path: &'a std::path::Path,
+    ) -> Option<BoxFuture<'a, Result<String>>> {
+        None
+    }
+
+    /// Writes a file through the client, which tracks it for review. None
+    /// when the client doesn't offer it.
+    fn write_file<'a>(
+        &'a self,
+        _path: &'a std::path::Path,
+        _content: &'a str,
+    ) -> Option<BoxFuture<'a, Result<()>>> {
+        None
+    }
 }
 
 pub type StreamSink = Arc<dyn Fn(StreamEvent) + Send + Sync>;

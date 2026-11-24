@@ -142,19 +142,21 @@ pub struct Change {
     pub new: String,
 }
 
-/// Runs `edit` or `write`, returning a message for the model and the change.
-pub fn change_file(
+/// The file an `edit` or `write` call targets: its path as given, and where
+/// it resolves inside the workspace.
+pub fn change_target(args: &Value, env: &ToolEnv<'_>) -> Result<(String, PathBuf), String> {
+    let path = str_arg(args, "path").ok_or("`path` is required")?;
+    Ok((path.to_string(), confine(env.root, path, true, &[])?))
+}
+
+/// The new content for `edit` or `write`, given the current one (None when
+/// the file doesn't exist), and a message for the model.
+pub fn apply_change(
     name: &str,
     args: &Value,
-    env: &ToolEnv<'_>,
-) -> Result<(String, Change), String> {
-    let path = str_arg(args, "path").ok_or("`path` is required")?;
-    let full = confine(env.root, path, true, &[])?;
-    let old = match fs::read_to_string(&full) {
-        Ok(text) => Some(text),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(format!("can't read {path}: {e}")),
-    };
+    path: &str,
+    old: Option<&str>,
+) -> Result<(String, String), String> {
     let new = match name {
         "write" => args
             .get("content")
@@ -162,9 +164,8 @@ pub fn change_file(
             .ok_or("`content` is required")?
             .to_string(),
         "edit" => {
-            let text = old
-                .as_deref()
-                .ok_or_else(|| format!("{path} doesn't exist; use `write` to create it"))?;
+            let text =
+                old.ok_or_else(|| format!("{path} doesn't exist; use `write` to create it"))?;
             let from = args
                 .get("old_string")
                 .and_then(Value::as_str)
@@ -196,16 +197,43 @@ pub fn change_file(
         }
         other => return Err(format!("`{other}` doesn't change files")),
     };
-    if let Some(parent) = full.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("can't create folders for {path}: {e}"))?;
-    }
-    fs::write(&full, &new).map_err(|e| format!("can't write {path}: {e}"))?;
     let lines = new.lines().count();
-    let message = match (&old, name) {
+    let message = match (old, name) {
         (None, _) => format!("Created {path} ({lines} lines)."),
         (Some(_), "write") => format!("Replaced {path} ({lines} lines)."),
         _ => format!("Edited {path}."),
     };
+    Ok((message, new))
+}
+
+/// Reads a file to change; None when it doesn't exist yet.
+pub fn read_existing(full: &Path, path: &str) -> Result<Option<String>, String> {
+    match fs::read_to_string(full) {
+        Ok(text) => Ok(Some(text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("can't read {path}: {e}")),
+    }
+}
+
+/// Writes a changed file here, creating missing folders.
+pub fn write_here(full: &Path, path: &str, content: &str) -> Result<(), String> {
+    if let Some(parent) = full.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("can't create folders for {path}: {e}"))?;
+    }
+    fs::write(full, content).map_err(|e| format!("can't write {path}: {e}"))
+}
+
+/// Runs `edit` or `write` on the local file system.
+#[cfg(test)]
+pub fn change_file(
+    name: &str,
+    args: &Value,
+    env: &ToolEnv<'_>,
+) -> Result<(String, Change), String> {
+    let (path, full) = change_target(args, env)?;
+    let old = read_existing(&full, &path)?;
+    let (message, new) = apply_change(name, args, &path, old.as_deref())?;
+    write_here(&full, &path, &new)?;
     Ok((
         message,
         Change {

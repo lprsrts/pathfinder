@@ -18,8 +18,9 @@ use agent_client_protocol::v1::schema::{
 };
 use agent_client_protocol::v1::schema::{
     CreateTerminalRequest, KillTerminalRequest, PermissionOption, PermissionOptionKind,
-    ReleaseTerminalRequest, RequestPermissionOutcome, RequestPermissionRequest, Terminal,
-    TerminalOutputRequest, WaitForTerminalExitRequest,
+    ReadTextFileRequest, ReleaseTerminalRequest, RequestPermissionOutcome,
+    RequestPermissionRequest, Terminal, TerminalOutputRequest, WaitForTerminalExitRequest,
+    WriteTextFileRequest,
 };
 use agent_client_protocol::{Agent, Client, Error as AcpError, Stdio};
 use anyhow::Result;
@@ -69,6 +70,13 @@ pub async fn run_stdio(runtime: Arc<Runtime>, creds: Arc<Credentials>) -> Result
                 sh_init
                     .terminals
                     .store(req.client_capabilities.terminal, Ordering::Relaxed);
+                let fs_caps = &req.client_capabilities.fs;
+                sh_init
+                    .read_files
+                    .store(fs_caps.read_text_file, Ordering::Relaxed);
+                sh_init
+                    .write_files
+                    .store(fs_caps.write_text_file, Ordering::Relaxed);
                 let capabilities = AgentCapabilities::new()
                     .load_session(true)
                     .prompt_capabilities(PromptCapabilities::new().embedded_context(true));
@@ -374,6 +382,9 @@ async fn ensure_models(creds: &Arc<Credentials>) -> bool {
 struct Shared {
     /// The client can run terminals (`terminal/*`).
     terminals: AtomicBool,
+    /// The client can read and write files (`fs/*`), tracking agent edits.
+    read_files: AtomicBool,
+    write_files: AtomicBool,
     /// Stop tokens of running turns, by session.
     running:
         std::sync::Mutex<std::collections::HashMap<String, tokio_util::sync::CancellationToken>>,
@@ -390,6 +401,46 @@ struct AcpHost {
 }
 
 impl Host for AcpHost {
+    fn read_file<'a>(&'a self, path: &'a std::path::Path) -> Option<BoxFuture<'a, Result<String>>> {
+        if !self.shared.read_files.load(Ordering::Relaxed) {
+            return None;
+        }
+        Some(Box::pin(async move {
+            let resp = self
+                .cx
+                .send_request(ReadTextFileRequest::new(
+                    self.session_id.clone(),
+                    path.to_path_buf(),
+                ))
+                .block_task()
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            Ok(resp.content)
+        }))
+    }
+
+    fn write_file<'a>(
+        &'a self,
+        path: &'a std::path::Path,
+        content: &'a str,
+    ) -> Option<BoxFuture<'a, Result<()>>> {
+        if !self.shared.write_files.load(Ordering::Relaxed) {
+            return None;
+        }
+        Some(Box::pin(async move {
+            self.cx
+                .send_request(WriteTextFileRequest::new(
+                    self.session_id.clone(),
+                    path.to_path_buf(),
+                    content.to_string(),
+                ))
+                .block_task()
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            Ok(())
+        }))
+    }
+
     fn ask<'a>(&'a self, call_id: &'a str, always_key: &'a str) -> BoxFuture<'a, Permission> {
         Box::pin(async move {
             let sid = self.session_id.0.to_string();
