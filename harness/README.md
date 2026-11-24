@@ -34,14 +34,30 @@ Pathfinder uses a fast model (System 1: onboarding, log replies) and a stronger 
 
 | Route | What runs it | Credentials |
 |---|---|---|
-| `anthropic` | Pathfinder's own agent, Anthropic Messages API | `ANTHROPIC_API_KEY` |
-| `openai` | Pathfinder's own agent, OpenAI Responses API | `OPENAI_API_KEY` |
+| `anthropic` | Pathfinder's own agent, Anthropic Messages API | API key (see below) |
+| `openai` | Pathfinder's own agent, OpenAI Responses API | API key (see below) |
 | `claude` | Claude Code CLI (`claude -p`) | the CLI's own login |
 | `codex` | Codex CLI (`codex exec`) | the CLI's own login |
 
 On the API routes Pathfinder runs its own tool loop (read, list, find, search in the workspace) and streams the model's thinking and tool calls into Zed. Agent work (`/handoff`, `/delegate`) currently needs a `claude` or `codex` main model; it comes to the API routes next.
 
-List the models in `~/.config/harness/config.json`. They appear, grouped by route, in the two model pickers of Zed's agent panel; `system1`/`system2` are the defaults for new sessions. The file is re-read on every turn, so edits apply without restarting Zed.
+### API keys
+
+```bash
+harness auth set anthropic     # or: harness auth set openai
+```
+
+The key is checked with the provider, then stored in your OS keychain (macOS Keychain, Windows Credential Manager, Linux Secret Service). When no model is available, Zed shows an **Add an API key** button that runs the same command in a terminal. Other commands:
+
+- `harness auth status` shows which keys are available and where they come from.
+- `harness auth remove <provider>` deletes Pathfinder's stored key.
+- `harness auth import <provider>` copies an existing `<provider>-api-key` keychain item (e.g. one your scripts already use) into Pathfinder's own entry. Pathfinder can read such items directly too, but macOS asks you to allow that.
+
+Keys are looked up in this order: `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`, Pathfinder's keychain entry, then a `<provider>-api-key` keychain item.
+
+### Choosing models
+
+With a key in place, Pathfinder lists the provider's current models in Zed's pickers by itself (cached for a day; `harness models --refresh` updates now). To pin your own list or defaults, use `~/.config/harness/config.json`. They appear, grouped by route, in the two model pickers of Zed's agent panel; `system1`/`system2` are the defaults for new sessions. The file is re-read on every turn, so edits apply without restarting Zed.
 
 ```json
 {
@@ -55,6 +71,7 @@ List the models in `~/.config/harness/config.json`. They appear, grouped by rout
 }
 ```
 
+- Set `"discover": false` to show only the models you list.
 - `model` is the provider's model id (or the CLI's model name; empty uses its default). `effort` is the reasoning effort (`low`, `medium`, `high`, ...).
 - On the CLI routes, agent work may edit files and run shell commands in the workspace: Codex in its `workspace-write` sandbox, Claude Code with its sandbox enabled.
 - Binaries: `claude_bin`, `codex_bin` (or `HARNESS_CLAUDE_BIN`, `HARNESS_CODEX_BIN`). `HARNESS_DB_PATH` moves the session database.

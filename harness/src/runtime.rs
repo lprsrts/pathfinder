@@ -1062,6 +1062,7 @@ mod tests {
         };
         Config {
             models: vec![entry("fast"), entry("main")],
+            discover: false,
             ..Config::default()
         }
     }

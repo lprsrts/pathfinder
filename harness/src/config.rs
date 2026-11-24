@@ -33,6 +33,42 @@ impl Route {
     pub fn is_cli(self) -> bool {
         matches!(self, Self::Claude | Self::Codex)
     }
+
+    /// API routes Pathfinder calls itself, in display order.
+    pub const API: [Route; 2] = [Route::Anthropic, Route::Openai];
+
+    /// Provider id used in commands and keychain entries.
+    pub fn provider_id(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Anthropic => "anthropic",
+            Self::Openai => "openai",
+        }
+    }
+
+    pub fn from_provider_id(id: &str) -> Option<Route> {
+        Self::API.into_iter().find(|r| r.provider_id() == id)
+    }
+
+    /// Provider name for prompts ("Anthropic", "OpenAI").
+    pub fn provider_name(self) -> &'static str {
+        match self {
+            Self::Claude => "Claude Code",
+            Self::Codex => "Codex",
+            Self::Anthropic => "Anthropic",
+            Self::Openai => "OpenAI",
+        }
+    }
+
+    /// Environment variable that overrides stored keys.
+    pub fn key_env(self) -> Option<&'static str> {
+        match self {
+            Self::Anthropic => Some("ANTHROPIC_API_KEY"),
+            Self::Openai => Some("OPENAI_API_KEY"),
+            Self::Claude | Self::Codex => None,
+        }
+    }
 }
 
 /// One entry in the model picker.
@@ -65,6 +101,9 @@ pub struct Config {
     pub system1: Option<String>,
     #[serde(default)]
     pub system2: Option<String>,
+    /// Add the models your API keys give access to (cached, refreshed daily).
+    #[serde(default = "default_true")]
+    pub discover: bool,
     #[serde(default = "default_db_path")]
     pub db_path: PathBuf,
 }
@@ -81,6 +120,10 @@ fn lenient_models<'de, D: Deserializer<'de>>(de: D) -> Result<Vec<ModelEntry>, D
             }
         })
         .collect())
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_claude_bin() -> String {
@@ -126,6 +169,7 @@ impl Default for Config {
             models: Vec::new(),
             system1: None,
             system2: None,
+            discover: true,
             db_path: default_db_path(),
         }
     }
@@ -161,9 +205,28 @@ impl Config {
         cfg
     }
 
-    /// The picker list.
+    /// The picker list: pinned models, then discovered ones not already
+    /// pinned.
     pub fn catalog(&self) -> Vec<ModelEntry> {
-        self.models.clone()
+        let discovered = if self.discover {
+            crate::catalog::ModelCache::load().entries()
+        } else {
+            Vec::new()
+        };
+        self.merged(discovered)
+    }
+
+    fn merged(&self, discovered: Vec<ModelEntry>) -> Vec<ModelEntry> {
+        let mut out = self.models.clone();
+        for entry in discovered {
+            if !out
+                .iter()
+                .any(|m| m.route == entry.route && m.model == entry.model)
+            {
+                out.push(entry);
+            }
+        }
+        out
     }
 
     pub fn entry(&self, id: &str) -> Option<ModelEntry> {
@@ -174,23 +237,38 @@ impl Config {
     /// configured default, else the first (System 1) or last (System 2)
     /// entry. None when no model is configured.
     pub fn pick(&self, choice: Option<&str>, system2: bool) -> Option<ModelEntry> {
-        let default = if system2 {
-            &self.system2
-        } else {
-            &self.system1
-        };
-        choice
-            .and_then(|id| self.entry(id))
-            .or_else(|| default.as_deref().and_then(|id| self.entry(id)))
-            .or_else(|| {
-                let catalog = self.catalog();
-                if system2 {
-                    catalog.last().cloned()
-                } else {
-                    catalog.first().cloned()
-                }
-            })
+        pick_from(&self.catalog(), self, choice, system2)
     }
+}
+
+/// Model-name hints for a sensible default per tier when none is configured.
+const FAST_HINTS: [&str; 4] = ["haiku", "luna", "mini", "flash"];
+const MAIN_HINTS: [&str; 3] = ["sonnet", "sol", "opus"];
+
+fn pick_from(
+    catalog: &[ModelEntry],
+    cfg: &Config,
+    choice: Option<&str>,
+    system2: bool,
+) -> Option<ModelEntry> {
+    let find = |id: &str| catalog.iter().find(|m| m.id == id).cloned();
+    let default = if system2 { &cfg.system2 } else { &cfg.system1 };
+    let hints: &[&str] = if system2 { &MAIN_HINTS } else { &FAST_HINTS };
+    choice
+        .and_then(find)
+        .or_else(|| default.as_deref().and_then(find))
+        .or_else(|| {
+            hints
+                .iter()
+                .find_map(|h| catalog.iter().find(|m| m.model.contains(h)).cloned())
+        })
+        .or_else(|| {
+            if system2 {
+                catalog.last().cloned()
+            } else {
+                catalog.first().cloned()
+            }
+        })
 }
 
 #[cfg(test)]
@@ -223,6 +301,29 @@ mod tests {
     }
 
     #[test]
+    fn discovered_models_merge_and_hint_defaults() {
+        let cfg = Config {
+            models: vec![entry("pinned-sonnet", Route::Anthropic)],
+            ..Config::default()
+        };
+        let mut haiku = entry("anthropic:claude-haiku-5-5", Route::Anthropic);
+        haiku.model = "claude-haiku-5-5".into();
+        let mut dup = entry("anthropic:pinned-sonnet", Route::Anthropic);
+        dup.model = "pinned-sonnet".into();
+        let merged = cfg.merged(vec![dup, haiku]);
+        let ids: Vec<&str> = merged.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["pinned-sonnet", "anthropic:claude-haiku-5-5"]);
+        assert_eq!(
+            pick_from(&merged, &cfg, None, false).unwrap().id,
+            "anthropic:claude-haiku-5-5"
+        );
+        assert_eq!(
+            pick_from(&merged, &cfg, None, true).unwrap().id,
+            "pinned-sonnet"
+        );
+    }
+
+    #[test]
     fn pick_prefers_session_then_default_then_position() {
         let cfg = Config {
             models: vec![
@@ -231,12 +332,17 @@ mod tests {
                 entry("c", Route::Codex),
             ],
             system1: Some("b".into()),
+            discover: false,
             ..Config::default()
         };
         assert_eq!(cfg.pick(Some("c"), false).unwrap().id, "c");
         assert_eq!(cfg.pick(Some("gone"), false).unwrap().id, "b");
         assert_eq!(cfg.pick(None, false).unwrap().id, "b");
         assert_eq!(cfg.pick(None, true).unwrap().id, "c");
-        assert!(Config::default().pick(None, true).is_none());
+        let empty = Config {
+            discover: false,
+            ..Config::default()
+        };
+        assert!(empty.pick(None, true).is_none());
     }
 }

@@ -3,7 +3,8 @@ use std::sync::Arc;
 
 use agent_client_protocol::v1::ConnectionTo;
 use agent_client_protocol::v1::schema::{
-    AgentCapabilities, AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate,
+    AgentCapabilities, AuthMethod, AuthMethodAgent, AuthMethodTerminal, AuthenticateRequest,
+    AuthenticateResponse, AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate,
     CancelNotification, Content, ContentBlock, ContentChunk, Diff, EmbeddedResourceResource,
     Implementation, InitializeRequest, InitializeResponse, LoadSessionRequest, LoadSessionResponse,
     NewSessionRequest, NewSessionResponse, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus,
@@ -19,13 +20,18 @@ use anyhow::Result;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+use crate::auth::Credentials;
+use crate::catalog::{self, ModelCache};
+use crate::config::Config;
 use crate::domain::{PartStatus, Session};
 use crate::engine::{StreamEvent, StreamSink};
 use crate::runtime::{ModelChoices, Runtime, TurnInput};
 use crate::stream::{ToolContent, ToolKind};
 
-pub async fn run_stdio(runtime: Arc<Runtime>) -> Result<()> {
+pub async fn run_stdio(runtime: Arc<Runtime>, creds: Arc<Credentials>) -> Result<()> {
     let rt_new = runtime.clone();
+    let creds_new = creds.clone();
+    let creds_auth = creds.clone();
     let rt_load = runtime.clone();
     let rt_prompt = runtime.clone();
     let rt_config = runtime.clone();
@@ -40,13 +46,27 @@ pub async fn run_stdio(runtime: Arc<Runtime>) -> Result<()> {
                     .prompt_capabilities(PromptCapabilities::new().embedded_context(true));
                 let resp = InitializeResponse::new(req.protocol_version)
                     .agent_capabilities(capabilities)
+                    .auth_methods(auth_methods(req.client_capabilities.auth.terminal))
                     .agent_info(Implementation::new("harness", env!("CARGO_PKG_VERSION")));
                 responder.respond(resp)
             },
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_request(
+            async move |_req: AuthenticateRequest, responder, _cx| {
+                if ensure_models(&creds_auth).await {
+                    responder.respond(AuthenticateResponse::new())
+                } else {
+                    responder.respond_with_error(AcpError::auth_required())
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
             async move |req: NewSessionRequest, responder, cx| {
+                if !ensure_models(&creds_new).await {
+                    return responder.respond_with_error(AcpError::auth_required());
+                }
                 let id = Uuid::new_v4().to_string();
                 match rt_new.create_session(id.clone(), req.cwd) {
                     Ok(session) => {
@@ -179,6 +199,48 @@ pub async fn run_stdio(runtime: Arc<Runtime>) -> Result<()> {
 }
 
 /// The two model pickers, with entries grouped by CLI.
+/// Sign-in options shown when no model is usable. Terminal methods make Zed
+/// re-run this binary with the given arguments in a terminal.
+fn auth_methods(terminal: bool) -> Vec<AuthMethod> {
+    let description = "Store an Anthropic or OpenAI API key in your keychain. Claude Code and Codex models use their own CLI logins instead (see the README).";
+    if terminal {
+        vec![AuthMethod::Terminal(
+            AuthMethodTerminal::new("api-key", "Add an API key")
+                .args(vec!["auth".into(), "set".into()])
+                .description(description.to_string()),
+        )]
+    } else {
+        vec![AuthMethod::Agent(
+            AuthMethodAgent::new("api-key", "Add an API key")
+                .description("Run `harness auth set` in a terminal, then try again.".to_string()),
+        )]
+    }
+}
+
+/// True when at least one model is usable. Refreshes the discovered model
+/// cache first when it's empty, otherwise in the background when stale.
+async fn ensure_models(creds: &Arc<Credentials>) -> bool {
+    let cache = ModelCache::load();
+    if Config::load().catalog().is_empty() {
+        let refreshed = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            catalog::refresh(creds, &reqwest::Client::new()),
+        )
+        .await;
+        if refreshed.is_err() {
+            warn!("model discovery timed out");
+        }
+        return !Config::load().catalog().is_empty();
+    }
+    if cache.is_stale() {
+        let creds = creds.clone();
+        tokio::spawn(async move {
+            catalog::refresh(&creds, &reqwest::Client::new()).await;
+        });
+    }
+    true
+}
+
 /// Sends a loaded session's turns back to the client, in order.
 fn replay_history(cx: &ConnectionTo<Client>, session_id: &SessionId, session: &Session) {
     let mut previous_role: Option<&str> = None;

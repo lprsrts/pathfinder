@@ -15,6 +15,7 @@ use std::time::Duration;
 use anyhow::{Result, anyhow, bail};
 use futures_util::future::join_all;
 
+use crate::auth::Credentials;
 use crate::config::{ModelEntry, Route};
 use crate::engine::{
     BoxFuture, Engine, EngineRequest, EngineTier, StreamEvent, StreamSink, ToolAccess,
@@ -43,29 +44,22 @@ impl ApiEngine {
         Self { factory }
     }
 
-    /// Clients backed by API keys from the environment.
-    pub fn from_env() -> Self {
+    /// Clients authenticated with keys from env vars or the keychain.
+    pub fn with_credentials(creds: Arc<Credentials>) -> Self {
         let http = reqwest::Client::new();
         Self::new(Arc::new(
             move |entry: &ModelEntry| -> Result<Arc<dyn Llm>> {
-                let key = |var: &str| {
-                    env::var(var)
-                        .ok()
-                        .filter(|v| !v.trim().is_empty())
-                        .ok_or_else(|| {
-                            anyhow!("{} needs an API key: set {var}", entry.route.label())
-                        })
-                };
+                let key = creds.api_key(entry.route)?;
                 let base = |var: &str| env::var(var).ok().filter(|v| !v.trim().is_empty());
                 Ok(match entry.route {
                     Route::Anthropic => Arc::new(Anthropic::new(
                         http.clone(),
-                        key("ANTHROPIC_API_KEY")?,
+                        key,
                         base("HARNESS_ANTHROPIC_BASE_URL"),
                     )),
                     Route::Openai => Arc::new(Responses::new(
                         http.clone(),
-                        key("OPENAI_API_KEY")?,
+                        key,
                         base("HARNESS_OPENAI_BASE_URL"),
                     )),
                     other => bail!("{} is not an API route", other.label()),
@@ -154,7 +148,16 @@ impl Engine for ApiEngine {
                 instructions: format!("{}{}", req.system_prompt, PROTOCOL_NOTE),
                 messages: vec![Message::User(first_message(req))],
                 tools: specs,
-                effort: model.effort.clone(),
+                // Unset effort follows the tier: quick for System 1.
+                effort: model.effort.clone().or_else(|| {
+                    Some(
+                        match req.tier {
+                            EngineTier::System1 => "low",
+                            EngineTier::System2 => "medium",
+                        }
+                        .to_string(),
+                    )
+                }),
                 allow_tools: req.tools != ToolAccess::None,
                 cache_key: None,
             };
