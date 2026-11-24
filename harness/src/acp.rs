@@ -313,11 +313,9 @@ fn replay_history(cx: &ConnectionTo<Client>, session_id: &SessionId, session: &S
     }
 }
 
-/// The thread's toolbar, laid out like the Claude Code and Codex adapters:
-/// model pickers, an effort level for the main model, and the Decisions
-/// switch with its service picker. Zed's buttons show only the selected
-/// option's name (name and description appear on hover), so model options
-/// name their route.
+/// The thread's toolbar: main model, effort, fast model, and the Decisions
+/// switch with its service picker. Zed shows only the selected option's name
+/// on each button, so names stay short.
 fn model_options(choices: &ModelChoices, switches: bool) -> Vec<SessionConfigOption> {
     if choices.catalog.is_empty() {
         return Vec::new();
@@ -325,12 +323,14 @@ fn model_options(choices: &ModelChoices, switches: bool) -> Vec<SessionConfigOpt
     let grouped = || -> Vec<SessionConfigSelectGroup> {
         let mut groups: Vec<(&str, Vec<SessionConfigSelectOption>)> = Vec::new();
         for entry in &choices.catalog {
-            let cli = entry.route.label();
-            let option =
-                SessionConfigSelectOption::new(entry.id.clone(), option_label(&entry.label, cli));
-            match groups.iter_mut().find(|(g, _)| *g == cli) {
+            let group = entry.route.label();
+            let option = SessionConfigSelectOption::new(
+                entry.id.clone(),
+                model_name(entry, &choices.catalog),
+            );
+            match groups.iter_mut().find(|(g, _)| *g == group) {
                 Some((_, options)) => options.push(option),
-                None => groups.push((cli, vec![option])),
+                None => groups.push((group, vec![option])),
             }
         }
         groups
@@ -352,7 +352,7 @@ fn model_options(choices: &ModelChoices, switches: bool) -> Vec<SessionConfigOpt
             choices.system2.clone().unwrap_or_default(),
             grouped(),
         )
-        .description("System 2: map, candidates, judgment and agent work".to_string())
+        .description("Map, candidates, judging".to_string())
         .category(SessionConfigOptionCategory::Model),
         SessionConfigOption::select(
             "effort",
@@ -360,20 +360,10 @@ fn model_options(choices: &ModelChoices, switches: bool) -> Vec<SessionConfigOpt
             choices.effort.clone(),
             EFFORTS
                 .iter()
-                .map(|level| {
-                    SessionConfigSelectOption::new(*level, effort_name(level)).description(
-                        match *level {
-                            "default" => "The model's own setting, or medium",
-                            "low" => "Faster, shallower candidates and judgments",
-                            "medium" => "Balanced",
-                            _ => "Slower, more careful candidates and judgments",
-                        }
-                        .to_string(),
-                    )
-                })
+                .map(|level| SessionConfigSelectOption::new(*level, effort_name(level)))
                 .collect::<Vec<_>>(),
         )
-        .description("Reasoning effort for the main model".to_string())
+        .description("Main model effort".to_string())
         .category(SessionConfigOptionCategory::ThoughtLevel),
         SessionConfigOption::select(
             "system1",
@@ -381,16 +371,12 @@ fn model_options(choices: &ModelChoices, switches: bool) -> Vec<SessionConfigOpt
             choices.system1.clone().unwrap_or_default(),
             grouped(),
         )
-        .description("System 1: onboarding and log replies".to_string())
+        .description("Onboarding, replies".to_string())
         .category(SessionConfigOptionCategory::ModelConfig),
     ];
     let Some(current) = choices.decision_model else {
         return options;
     };
-    let description = format!(
-        "Before the LLM, {} decides what each chat message is: a log entry, an explanation, a skip, a move or a verdict",
-        current.label()
-    );
     options.push(
         if switches {
             SessionConfigOption::boolean("decisions", "Decisions", choices.decisions_on)
@@ -401,12 +387,11 @@ fn model_options(choices: &ModelChoices, switches: bool) -> Vec<SessionConfigOpt
                 if choices.decisions_on { "on" } else { "off" },
                 vec![
                     SessionConfigSelectOption::new("on", "Decisions on"),
-                    SessionConfigSelectOption::new("off", "Decisions off")
-                        .description("The LLM decides each message's step itself".to_string()),
+                    SessionConfigSelectOption::new("off", "Decisions off"),
                 ],
             )
         }
-        .description(description)
+        .description("Classify each message before the model replies".to_string())
         .category(SessionConfigOptionCategory::ModelConfig),
     );
     if choices.decisions_on && choices.decision_available.len() > 1 {
@@ -419,20 +404,33 @@ fn model_options(choices: &ModelChoices, switches: bool) -> Vec<SessionConfigOpt
                     .decision_available
                     .iter()
                     .map(|p| {
-                        SessionConfigSelectOption::new(p.id(), p.label())
-                            .description(p.summary().to_string())
+                        SessionConfigSelectOption::new(p.id(), p.short())
+                            .description(p.model().to_string())
                     })
                     .collect::<Vec<_>>(),
             )
-            .description("Which decision service reads each chat message first".to_string())
             .category(SessionConfigOptionCategory::ModelConfig),
         );
     }
     options
 }
 
-fn option_label(model: &str, cli: &str) -> String {
-    format!("{model} ({cli})")
+/// A model's button name: its label without "Claude ", plus the route only
+/// when another route offers a model of the same name.
+fn model_name(entry: &crate::config::ModelEntry, catalog: &[crate::config::ModelEntry]) -> String {
+    let short = |label: &str| label.strip_prefix("Claude ").unwrap_or(label).to_string();
+    let name = short(&entry.label);
+    let shared = catalog
+        .iter()
+        .any(|o| o.route != entry.route && short(&o.label).eq_ignore_ascii_case(&name));
+    if !shared {
+        return name;
+    }
+    let route = match entry.route {
+        Route::Anthropic | Route::Openai => "API",
+        other => other.label(),
+    };
+    format!("{name} · {route}")
 }
 
 fn make_stream_sink(cx: ConnectionTo<Client>, session_id: SessionId) -> StreamSink {
@@ -677,7 +675,7 @@ mod tests {
     use crate::decide::Provider;
 
     #[test]
-    fn picker_options_name_the_cli() {
+    fn picker_names_are_short_and_name_the_route_only_when_needed() {
         let entry = |id: &str, route| ModelEntry {
             id: id.into(),
             label: "GPT-6 Luna".into(),
@@ -705,11 +703,19 @@ mod tests {
             .flat_map(|g| g["options"].as_array().unwrap())
             .map(|o| o["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names, ["GPT-6 Luna (Anthropic API)", "GPT-6 Luna (Codex)"]);
+        assert_eq!(names, ["GPT-6 Luna · API", "GPT-6 Luna · Codex"]);
         assert_eq!(
             json[2]["options"][1]["options"][0]["name"],
-            "GPT-6 Luna (Codex)"
+            "GPT-6 Luna · Codex"
         );
+        let solo = ModelEntry {
+            id: "h".into(),
+            label: "Claude Haiku 5.5".into(),
+            route: Route::Anthropic,
+            model: String::new(),
+            effort: None,
+        };
+        assert_eq!(model_name(&solo, &[solo.clone()]), "Haiku 5.5");
         // No decision service with a key: no Decisions controls.
         assert_eq!(json.as_array().unwrap().len(), 3);
     }

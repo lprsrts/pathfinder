@@ -89,12 +89,21 @@ impl Provider {
         }
     }
 
-    /// One line for the picker.
-    pub fn summary(self) -> &'static str {
+    /// Name on the toolbar button.
+    pub fn short(self) -> &'static str {
         match self {
-            Self::Openai => "OpenAI Decisions API; uses your OpenAI API key",
-            Self::Gemini => "Google's Decisions API; text, images, audio, video and PDF",
-            Self::Typesafe => "Fastest and cheapest (about 0.2 s)",
+            Self::Openai => "OpenAI",
+            Self::Gemini => "Gemini",
+            Self::Typesafe => "Jev",
+        }
+    }
+
+    /// The model it runs, shown on hover.
+    pub fn model(self) -> &'static str {
+        match self {
+            Self::Openai => "gpt-6-luna",
+            Self::Gemini => "gemini-decision-1",
+            Self::Typesafe => "jev-1.14.0",
         }
     }
 
