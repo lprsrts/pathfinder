@@ -34,9 +34,11 @@ pub fn describe_tool(id: String, name: &str, input: &Value, cwd: &Path) -> ToolS
         let p = PathBuf::from(p);
         if p.is_absolute() { p } else { cwd.join(p) }
     });
-    let shown = path
-        .as_ref()
-        .map(|p| p.strip_prefix(cwd).unwrap_or(p).display().to_string());
+    let shown = path.as_ref().map(|p| match p.strip_prefix(cwd) {
+        Ok(rel) if rel.as_os_str().is_empty() => ".".to_string(),
+        Ok(rel) => rel.display().to_string(),
+        Err(_) => p.display().to_string(),
+    });
 
     let lower = name.to_ascii_lowercase();
     let (kind, title) = match lower.as_str() {
@@ -54,7 +56,11 @@ pub fn describe_tool(id: String, name: &str, input: &Value, cwd: &Path) -> ToolS
         ),
         "glob" | "grep" | "find" | "ls" => {
             let what = str_field(&["pattern", "query"]).or_else(|| shown.clone());
-            let label = capitalize(&lower);
+            let label = if lower == "ls" {
+                "List".to_string()
+            } else {
+                capitalize(&lower)
+            };
             match what {
                 Some(w) => (ToolKind::Search, format!("{label} `{w}`")),
                 None => (ToolKind::Search, label),

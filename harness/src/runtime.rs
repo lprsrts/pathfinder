@@ -1244,6 +1244,50 @@ mod tests {
         assert_eq!(out.reply, "");
     }
 
+    /// Runs one onboarding turn whose first answer fails the JSON check and is
+    /// reformatted; returns everything the user saw.
+    async fn shown_after_repair(repaired_reply: &str) -> String {
+        let repaired = format!(r#"{{"reply":"{repaired_reply}","ready_to_map":false}}"#);
+        let (rt, engine) = runtime(
+            FakeEngine::new(vec![
+                (
+                    ReadOnly,
+                    S1,
+                    r#"{"reply":"What should it show?"} {"ready_to_map":false}"#,
+                ),
+                (ToolAccess::None, S1, &repaired),
+            ]),
+            false,
+        );
+        let seen = Arc::new(Mutex::new(String::new()));
+        let record = seen.clone();
+        let sink: StreamSink = Arc::new(move |ev| {
+            if let crate::engine::StreamEvent::TextDelta(t) = ev {
+                record.lock().unwrap().push_str(&t);
+            }
+        });
+        let input = TurnInput {
+            text: "add /status".into(),
+            files: vec![],
+        };
+        let out = rt.handle_turn("s", input, sink).await.unwrap();
+        assert!(engine.replies.lock().unwrap().is_empty());
+        let shown = seen.lock().unwrap().clone();
+        shown + &out.reply
+    }
+
+    #[tokio::test]
+    async fn repeated_reply_after_retry_is_shown_once() {
+        assert_eq!(
+            shown_after_repair("What should it show?").await,
+            "What should it show?"
+        );
+        assert_eq!(
+            shown_after_repair("Which status fields?").await,
+            "What should it show?\n\nWhich status fields?"
+        );
+    }
+
     #[tokio::test]
     async fn failed_judgment_keeps_part_open() {
         let (rt, _) = runtime(

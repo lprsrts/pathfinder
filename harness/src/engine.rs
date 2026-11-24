@@ -231,7 +231,7 @@ impl CliEngine {
                 cmd.arg("--no-tools");
             }
             ToolAccess::ReadOnly => {
-                cmd.args(["--tools", "read"]);
+                cmd.args(["--tools", "read,ls,find,grep"]);
             }
             ToolAccess::Full => {}
         }
@@ -845,34 +845,40 @@ where
 {
     let mut req = base_req.clone();
     req.stream_text = field.is_some();
-    let mut shown_any = false;
+    // What the user has seen so far from earlier attempts of this call.
+    let mut seen = String::new();
     // Wraps the sink so raw JSON never reaches the user, only the decoded
-    // `field`. Returns the wrapped sink and a record of what it showed.
-    let field_sink = |shown_any: bool| -> (StreamSink, Arc<Mutex<String>>) {
-        let shown = Arc::new(Mutex::new(String::new()));
+    // `field`. A retry that repeats `seen` stays hidden; one that differs is
+    // shown in full as a new paragraph. Returns the sink and the attempt's text.
+    let field_sink = |seen: &str| -> (StreamSink, Arc<Mutex<String>>) {
+        let decoded = Arc::new(Mutex::new(String::new()));
         let Some(field) = field else {
-            return (sink.clone(), shown);
+            return (sink.clone(), decoded);
         };
         let streamer = Mutex::new(FieldStreamer::new(field));
-        let separator_due = Mutex::new(shown_any);
+        let seen = seen.to_string();
+        let diverged = Mutex::new(seen.is_empty());
         let inner = sink.clone();
-        let record = shown.clone();
+        let record = decoded.clone();
         let wrapped: StreamSink = Arc::new(move |ev| match ev {
             StreamEvent::TextDelta(t) => {
                 let out = streamer.lock().unwrap().push(&t);
                 if out.is_empty() {
                     return;
                 }
-                // A retry after visible text starts a new paragraph.
-                if std::mem::take(&mut *separator_due.lock().unwrap()) {
-                    inner(StreamEvent::TextDelta("\n\n".to_string()));
+                let mut all = record.lock().unwrap();
+                all.push_str(&out);
+                let mut diverged = diverged.lock().unwrap();
+                if *diverged {
+                    inner(StreamEvent::TextDelta(out));
+                } else if !seen.starts_with(all.as_str()) {
+                    *diverged = true;
+                    inner(StreamEvent::TextDelta(format!("\n\n{all}")));
                 }
-                record.lock().unwrap().push_str(&out);
-                inner(StreamEvent::TextDelta(out));
             }
             other => inner(other),
         });
-        (wrapped, shown)
+        (wrapped, decoded)
     };
 
     let attempts: Vec<EngineTier> = match base_req.tier {
@@ -916,9 +922,9 @@ where
             )));
         }
 
-        let (attempt_sink, mut shown) = field_sink(shown_any);
+        let (attempt_sink, mut shown) = field_sink(&seen);
         let raw = engine.run_text(&req, attempt_sink).await?;
-        shown_any |= !shown.lock().unwrap().is_empty();
+        remember(&mut seen, &shown);
         let mut outcome = evaluate_proposal::<T, _>(&raw, &check);
 
         // Weak models often answer well but drop the JSON envelope after a
@@ -944,9 +950,9 @@ where
                 base_req.prompt,
                 raw.trim()
             );
-            let (repair_sink, repair_shown) = field_sink(shown_any);
+            let (repair_sink, repair_shown) = field_sink(&seen);
             let repaired = engine.run_text(&repair, repair_sink).await?;
-            shown_any |= !repair_shown.lock().unwrap().is_empty();
+            remember(&mut seen, &repair_shown);
             shown = repair_shown;
             outcome = evaluate_proposal::<T, _>(&repaired, &check);
         }
@@ -989,6 +995,14 @@ where
         "{kind} output failed the shape check after retries:\n{}",
         format_violations(&last_violations)
     )
+}
+
+/// Keeps the longest text the user has seen, so a repeat stays hidden.
+fn remember(seen: &mut String, attempt: &Mutex<String>) {
+    let attempt = attempt.lock().unwrap();
+    if !attempt.is_empty() && !seen.starts_with(attempt.as_str()) {
+        *seen = attempt.clone();
+    }
 }
 
 fn is_only_invalid_json<T>(outcome: &std::result::Result<T, Vec<Violation>>) -> bool {
