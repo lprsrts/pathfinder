@@ -345,15 +345,7 @@ fn model_options(choices: &ModelChoices, switches: bool) -> Vec<SessionConfigOpt
         _ => "Default",
     };
     let mut options = vec![
-        // Zed lists these right to left: Main first puts Fast on the left.
-        SessionConfigOption::select(
-            "system2",
-            "Main model",
-            choices.system2.clone().unwrap_or_default(),
-            grouped(),
-        )
-        .description("Map, candidates, judging".to_string())
-        .category(SessionConfigOptionCategory::Model),
+        // Zed draws these right to left: Fast model, Main model, then its Effort.
         SessionConfigOption::select(
             "effort",
             "Effort",
@@ -365,6 +357,14 @@ fn model_options(choices: &ModelChoices, switches: bool) -> Vec<SessionConfigOpt
         )
         .description("Main model effort".to_string())
         .category(SessionConfigOptionCategory::ThoughtLevel),
+        SessionConfigOption::select(
+            "system2",
+            "Main model",
+            choices.system2.clone().unwrap_or_default(),
+            grouped(),
+        )
+        .description("Map, candidates, judging".to_string())
+        .category(SessionConfigOptionCategory::Model),
         SessionConfigOption::select(
             "system1",
             "Fast model",
@@ -748,15 +748,15 @@ mod tests {
         assert_eq!(
             ids,
             [
-                "system2",
                 "effort",
+                "system2",
                 "system1",
                 "decisions",
                 "decision_model"
             ]
         );
-        assert_eq!(json[1]["category"], "thought_level");
-        assert_eq!(json[1]["currentValue"], "high");
+        assert_eq!(json[0]["category"], "thought_level");
+        assert_eq!(json[0]["currentValue"], "high");
         assert_eq!(json[3]["type"], "boolean");
         assert_eq!(json[3]["currentValue"], true);
         assert_eq!(json[4]["currentValue"], "typesafe");
