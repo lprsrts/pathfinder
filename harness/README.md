@@ -69,5 +69,5 @@ List the models in `~/.config/harness/config.json`. They appear, grouped by CLI,
 - `/accept`, `/reject` — settle a proposed map change
 - `/replan [what changed]` — ask for a map change
 - `/next` — move to the next unresolved part
-- `/focus <id>` — switch to any part
+- `/focus <id>` — switch to any part; also takes its number in the plan (`/focus 3`) or the start of its id (`/focus fwd`)
 - `/map` — show the map

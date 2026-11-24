@@ -183,6 +183,39 @@ impl Map {
         Ok(())
     }
 
+    /// Finds a part by exact id, 1-based position, or unique id prefix.
+    pub fn resolve(&self, query: &str) -> Result<String, String> {
+        let query = query.trim().trim_start_matches('`').trim_end_matches('`');
+        if let Some(part) = self.get(query) {
+            return Ok(part.id.clone());
+        }
+        if let Ok(n) = query.parse::<usize>() {
+            return match n.checked_sub(1).and_then(|i| self.parts.get(i)) {
+                Some(part) => Ok(part.id.clone()),
+                None => Err(format!(
+                    "There is no part {n}; the map has {}.",
+                    self.parts.len()
+                )),
+            };
+        }
+        let matches: Vec<&Part> = self
+            .parts
+            .iter()
+            .filter(|p| p.id.starts_with(query))
+            .collect();
+        match matches.as_slice() {
+            [one] => Ok(one.id.clone()),
+            [] => Err(format!("No part matches `{query}`. `/map` shows the ids.")),
+            many => Err(format!(
+                "`{query}` matches {}. Type more of the id.",
+                many.iter()
+                    .map(|p| format!("`{}`", p.id))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        }
+    }
+
     pub fn get(&self, id: &str) -> Option<&Part> {
         self.parts.iter().find(|p| p.id == id)
     }
@@ -480,6 +513,26 @@ mod tests {
             .map(|i| part(&format!("p{i}"), &[], PartStatus::Open))
             .collect();
         assert!(map(many).validate().is_ok());
+    }
+
+    #[test]
+    fn resolve_takes_id_number_or_unique_prefix() {
+        let m = map(vec![
+            part("weights", &[], PartStatus::Open),
+            part("fwd-pass", &["weights"], PartStatus::Open),
+            part("fwd-check", &[], PartStatus::Open),
+        ]);
+        assert_eq!(m.resolve("weights").unwrap(), "weights");
+        assert_eq!(m.resolve("2").unwrap(), "fwd-pass");
+        assert_eq!(m.resolve("we").unwrap(), "weights");
+        assert_eq!(m.resolve("fwd-c").unwrap(), "fwd-check");
+        assert!(
+            m.resolve("fwd")
+                .unwrap_err()
+                .contains("`fwd-pass`, `fwd-check`")
+        );
+        assert!(m.resolve("9").is_err());
+        assert!(m.resolve("zz").is_err());
     }
 
     #[test]

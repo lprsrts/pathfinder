@@ -46,7 +46,7 @@ impl TurnOutput {
     }
 }
 
-pub const COMMANDS_HELP: &str = "Commands: `/plan`, `/summary <text>`, `/handoff [notes]`, `/approve`, `/object <reason>`, `/known`, `/delegate [notes]`, `/accept`, `/reject`, `/replan [what changed]`, `/next`, `/focus <id>`, `/map`.";
+pub const COMMANDS_HELP: &str = "Commands: `/plan`, `/summary <text>`, `/handoff [notes]`, `/approve`, `/object <reason>`, `/known`, `/delegate [notes]`, `/accept`, `/reject`, `/replan [what changed]`, `/next`, `/focus <id|number|prefix>`, `/map`.";
 
 /// Decides whether the next candidate is flawed (§5.3).
 fn random_flaw() -> bool {
@@ -386,14 +386,17 @@ impl Runtime {
         }
     }
 
-    fn handle_focus(&self, session: &mut Session, id: &str) -> TurnOutput {
-        if id.is_empty() {
-            return TurnOutput::text("Usage: `/focus <id>`. `/map` shows the ids.");
+    fn handle_focus(&self, session: &mut Session, query: &str) -> TurnOutput {
+        if query.is_empty() {
+            return TurnOutput::text(
+                "Usage: `/focus <id>`, its number in the plan, or the start of its id.",
+            );
         }
-        if session.map.get(id).is_none() {
-            return TurnOutput::text(format!("No part `{id}` on the map."));
-        }
-        session.active = Some(id.to_string());
+        let id = match session.map.resolve(query) {
+            Ok(id) => id,
+            Err(message) => return TurnOutput::text(message),
+        };
+        session.active = Some(id);
         session.mode = SessionMode::Working;
         session.pending_candidate = None;
         TurnOutput::changed(render_part(session.active_part().unwrap(), false))
@@ -925,14 +928,15 @@ const MAP_SYSTEM: &str = r#"You sketch the map for Pathfinder: what the task dep
 - A part is something the task depends on: a piece of the work, or of the understanding needed to judge the work. It is not a lesson and not an assignment: the user decides during the work which parts they do themselves and which go to an agent.
 - No size limit. Use as many parts as the task needs and no more; a small task can be a single part.
 - `depends_on` lists parts that must be understood or done before this one makes sense. No cycles.
-- `id`: short lowercase id. `note`: one line on what the part covers. `brief`: what the map covers.
+- `id`: a short descriptive slug the user types in commands: lowercase words joined by hyphens, at most 12 characters (e.g. `weights`, `fwd-pass`, `loss`). Unique.
+- `note`: one line on what the part covers. `brief`: what the map covers.
 
 Return ONLY a JSON object:
-{"brief": "...", "parts": [{"id": "p1", "title": "...", "note": "...", "depends_on": []}]}"#;
+{"brief": "...", "parts": [{"id": "weights", "title": "...", "note": "...", "depends_on": []}]}"#;
 
 const CHANGE_SYSTEM: &str = r#"You propose a change to Pathfinder's map of what the task depends on, because something changed. The user accepts or rejects it.
 
-- `parts`: parts to add, or existing parts to update (same id), each with id, title, note, depends_on.
+- `parts`: parts to add, or existing parts to update (same id), each with id, title, note, depends_on. New ids: `id`: a short descriptive slug the user types in commands: lowercase words joined by hyphens, at most 12 characters (e.g. `weights`, `fwd-pass`, `loss`). Unique.
 - `remove`: ids of parts to drop. Only parts with no work or outcome can be removed.
 - No size limit. No cycles.
 
@@ -945,7 +949,7 @@ Reply briefly to the latest entry: answer what they ask, or point out what the e
 
 The user decides which parts they do themselves and which go to an agent. Never raise that.
 
-If the entry reveals the map is wrong (a missing dependency, a part that doesn't belong, a wrong edge), propose a change in `map_change`; the user accepts or rejects it. Otherwise set it to null. A change has `brief`, `parts` (to add, or update by id: id, title, note, depends_on) and `remove` (ids of parts with no work yet).
+If the entry reveals the map is wrong (a missing dependency, a part that doesn't belong, a wrong edge), propose a change in `map_change`; the user accepts or rejects it. Otherwise set it to null. A change has `brief`, `parts` (to add, or update by id: id, title, note, depends_on; new ids are short hyphenated slugs of at most 12 characters) and `remove` (ids of parts with no work yet).
 
 Call `read` before writing your JSON if a file matters: `reply` ends your turn.
 

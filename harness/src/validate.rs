@@ -52,11 +52,33 @@ pub fn check_onboarding(d: &OnboardingDecision) -> Vec<Violation> {
     out
 }
 
+/// Ids are typed in commands, so they must be short slugs.
+const MAX_ID_LEN: usize = 16;
+
+fn check_id(out: &mut Vec<Violation>, id: &str) {
+    let ok = !id.is_empty()
+        && id.len() <= MAX_ID_LEN
+        && id
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && !id.starts_with('-')
+        && !id.ends_with('-');
+    if !ok {
+        out.push(Violation::new(
+            "bad_id",
+            format!(
+                "part id `{id}` must be a short slug: lowercase letters, digits and hyphens, at most 12 characters (e.g. `fwd-pass`)"
+            ),
+        ));
+    }
+}
+
 pub fn check_map(p: &MapProposal) -> Vec<Violation> {
     let mut out = Vec::new();
     require_text(&mut out, &p.brief, "brief");
     for part in &p.parts {
         require_text(&mut out, &part.title, "parts[].title");
+        check_id(&mut out, &part.id);
     }
     if let Err(e) = p.to_map().validate() {
         out.push(Violation::new("invalid_map", e.to_string()));
@@ -67,6 +89,9 @@ pub fn check_map(p: &MapProposal) -> Vec<Violation> {
 pub fn check_change(change: &MapChange, current: &Map) -> Vec<Violation> {
     let mut out = Vec::new();
     require_text(&mut out, &change.brief, "brief");
+    for part in change.parts.iter().filter(|p| current.get(&p.id).is_none()) {
+        check_id(&mut out, &part.id);
+    }
     if change.parts.is_empty() && change.remove.is_empty() {
         out.push(Violation::new(
             "empty_change",
@@ -141,6 +166,12 @@ mod tests {
             parts: (0..12).map(|i| proposed(&format!("p{i}"), &[])).collect(),
         };
         assert!(check_map(&ok).is_empty());
+
+        let long_id = MapProposal {
+            brief: "b".into(),
+            parts: vec![proposed("Forward_Pass_Of_The_Neuron", &[])],
+        };
+        assert_eq!(check_map(&long_id)[0].code, "bad_id");
 
         let cyclic = MapProposal {
             brief: "b".into(),

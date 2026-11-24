@@ -320,8 +320,8 @@ fn send_commands(cx: &ConnectionTo<Client>, session_id: SessionId) -> Result<(),
             AvailableCommandInput::Unstructured(UnstructuredCommandInput::new("What changed?")),
         ),
         AvailableCommand::new("next", "Move to the next unresolved part"),
-        AvailableCommand::new("focus", "Switch to a part by id").input(
-            AvailableCommandInput::Unstructured(UnstructuredCommandInput::new("part id")),
+        AvailableCommand::new("focus", "Switch to a part by id, number or id prefix").input(
+            AvailableCommandInput::Unstructured(UnstructuredCommandInput::new("id, number (e.g. 3) or start of the id")),
         ),
         AvailableCommand::new("map", "Show the map"),
     ];
