@@ -341,6 +341,9 @@ pub struct Session {
     /// the model entry or the tier default.
     #[serde(default)]
     pub effort: Option<String>,
+    /// The same for the fast model.
+    #[serde(default)]
+    pub fast_effort: Option<String>,
     /// The Decisions switch: off skips the decision model for this thread.
     #[serde(default)]
     pub decisions_off: bool,
@@ -365,6 +368,7 @@ impl Session {
             system1: None,
             system2: None,
             effort: None,
+            fast_effort: None,
             decisions_off: false,
             decision_model: None,
             history: Vec::new(),

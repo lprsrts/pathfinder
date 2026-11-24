@@ -85,6 +85,8 @@ pub struct ModelChoices {
     pub system2: Option<String>,
     /// Main model effort: `default`, `low`, `medium` or `high`.
     pub effort: String,
+    /// Fast model effort, the same levels.
+    pub fast_effort: String,
     /// Decision services with a key, in auto order.
     pub decision_available: Vec<Provider>,
     pub decisions_on: bool,
@@ -127,14 +129,15 @@ impl Runtime {
                 .pick(choice.as_deref(), system2)
                 .ok_or_else(|| anyhow!(NO_MODEL))
         };
+        let mut system1 = pick(&session.system1, false)?;
         let mut system2 = pick(&session.system2, true)?;
+        if let Some(effort) = &session.fast_effort {
+            system1.effort = Some(effort.clone());
+        }
         if let Some(effort) = &session.effort {
             system2.effort = Some(effort.clone());
         }
-        Ok(TierModels {
-            system1: pick(&session.system1, false)?,
-            system2,
-        })
+        Ok(TierModels { system1, system2 })
     }
 
     pub fn model_choices(&self, session: &Session) -> ModelChoices {
@@ -151,6 +154,10 @@ impl Runtime {
             system1: config.pick(session.system1.as_deref(), false).map(|m| m.id),
             system2: config.pick(session.system2.as_deref(), true).map(|m| m.id),
             effort: session.effort.clone().unwrap_or_else(|| "default".into()),
+            fast_effort: session
+                .fast_effort
+                .clone()
+                .unwrap_or_else(|| "default".into()),
             decisions_on: !session.decisions_off && decision_model.is_some(),
             decision_available: available,
             decision_model,
@@ -180,11 +187,16 @@ impl Runtime {
                 };
                 *slot = Some(id);
             }
-            ("effort", OptionValue::Id(level)) => {
+            ("effort" | "fast_effort", OptionValue::Id(level)) => {
                 if !EFFORTS.contains(&level.as_str()) {
                     return Err(anyhow!("unknown effort `{level}`"));
                 }
-                session.effort = (level != "default").then_some(level);
+                let slot = if option == "effort" {
+                    &mut session.effort
+                } else {
+                    &mut session.fast_effort
+                };
+                *slot = (level != "default").then_some(level);
             }
             // A switch, or an Off/On dropdown where switches aren't supported.
             ("decisions", OptionValue::Bool(on)) => session.decisions_off = !on,
@@ -1870,6 +1882,14 @@ mod tests {
             .set_option("s", "effort", OptionValue::Id("default".into()))
             .unwrap();
         assert_eq!(s.effort, None);
+        let s = rt
+            .set_option("s", "fast_effort", OptionValue::Id("medium".into()))
+            .unwrap();
+        assert_eq!(
+            rt.models(&s).unwrap().system1.effort.as_deref(),
+            Some("medium")
+        );
+        assert_eq!(rt.models(&s).unwrap().system2.effort, None);
 
         let s = rt
             .set_option("s", "decisions", OptionValue::Bool(false))

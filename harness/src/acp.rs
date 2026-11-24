@@ -344,19 +344,18 @@ fn model_options(choices: &ModelChoices, switches: bool) -> Vec<SessionConfigOpt
         "high" => "High",
         _ => "Default",
     };
+    let levels = || {
+        EFFORTS
+            .iter()
+            .map(|level| SessionConfigSelectOption::new(*level, effort_name(level)))
+            .collect::<Vec<_>>()
+    };
     let mut options = vec![
-        // Zed draws these right to left: Fast model, Main model, then its Effort.
-        SessionConfigOption::select(
-            "effort",
-            "Effort",
-            choices.effort.clone(),
-            EFFORTS
-                .iter()
-                .map(|level| SessionConfigSelectOption::new(*level, effort_name(level)))
-                .collect::<Vec<_>>(),
-        )
-        .description("Main model effort".to_string())
-        .category(SessionConfigOptionCategory::ThoughtLevel),
+        // Zed draws these right to left, so each model sits before its effort:
+        // Fast model, Fast effort, Main model, Effort.
+        SessionConfigOption::select("effort", "Effort", choices.effort.clone(), levels())
+            .description("Main model effort".to_string())
+            .category(SessionConfigOptionCategory::ThoughtLevel),
         SessionConfigOption::select(
             "system2",
             "Main model",
@@ -365,6 +364,14 @@ fn model_options(choices: &ModelChoices, switches: bool) -> Vec<SessionConfigOpt
         )
         .description("Map, candidates, judging".to_string())
         .category(SessionConfigOptionCategory::Model),
+        SessionConfigOption::select(
+            "fast_effort",
+            "Fast effort",
+            choices.fast_effort.clone(),
+            levels(),
+        )
+        .description("Fast model effort; default is low".to_string())
+        .category(SessionConfigOptionCategory::ModelConfig),
         SessionConfigOption::select(
             "system1",
             "Fast model",
@@ -691,12 +698,13 @@ mod tests {
             system1: Some("anthropic-luna".into()),
             system2: Some("codex-luna".into()),
             effort: "default".into(),
+            fast_effort: "default".into(),
             decision_available: vec![],
             decisions_on: false,
             decision_model: None,
         };
         let json = serde_json::to_value(model_options(&choices, true)).unwrap();
-        let names: Vec<&str> = json[2]["options"]
+        let names: Vec<&str> = json[3]["options"]
             .as_array()
             .unwrap()
             .iter()
@@ -705,7 +713,7 @@ mod tests {
             .collect();
         assert_eq!(names, ["GPT-6 Luna · API", "GPT-6 Luna · Codex"]);
         assert_eq!(
-            json[2]["options"][1]["options"][0]["name"],
+            json[3]["options"][1]["options"][0]["name"],
             "GPT-6 Luna · Codex"
         );
         let solo = ModelEntry {
@@ -717,7 +725,7 @@ mod tests {
         };
         assert_eq!(model_name(&solo, &[solo.clone()]), "Haiku 5.5");
         // No decision service with a key: no Decisions controls.
-        assert_eq!(json.as_array().unwrap().len(), 3);
+        assert_eq!(json.as_array().unwrap().len(), 4);
     }
 
     #[test]
@@ -734,6 +742,7 @@ mod tests {
             system1: Some("m".into()),
             system2: Some("m".into()),
             effort: "high".into(),
+            fast_effort: "default".into(),
             decision_available: vec![Provider::Typesafe, Provider::Openai],
             decisions_on: on,
             decision_model: Some(Provider::Typesafe),
@@ -750,6 +759,7 @@ mod tests {
             [
                 "effort",
                 "system2",
+                "fast_effort",
                 "system1",
                 "decisions",
                 "decision_model"
@@ -757,14 +767,14 @@ mod tests {
         );
         assert_eq!(json[0]["category"], "thought_level");
         assert_eq!(json[0]["currentValue"], "high");
-        assert_eq!(json[3]["type"], "boolean");
-        assert_eq!(json[3]["currentValue"], true);
-        assert_eq!(json[4]["currentValue"], "typesafe");
+        assert_eq!(json[4]["type"], "boolean");
+        assert_eq!(json[4]["currentValue"], true);
+        assert_eq!(json[5]["currentValue"], "typesafe");
 
         // Off: no service picker. Without switch support: an Off/On dropdown.
         let json = serde_json::to_value(model_options(&choices(false), false)).unwrap();
-        assert_eq!(json.as_array().unwrap().len(), 4);
-        assert_eq!(json[3]["type"], "select");
-        assert_eq!(json[3]["currentValue"], "off");
+        assert_eq!(json.as_array().unwrap().len(), 5);
+        assert_eq!(json[4]["type"], "select");
+        assert_eq!(json[4]["currentValue"], "off");
     }
 }
