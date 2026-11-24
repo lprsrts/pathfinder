@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 pub const LEAK_THRESHOLD: f64 = 0.3;
 
 /// Shown when a draft fails the gate twice, or the check itself fails.
-pub const FIXED_REPLY: &str = "That's what the candidate is testing, so I can't answer it before your verdict. Say whether you think it's right and why; the feedback afterwards covers it.";
+pub const FIXED_REPLY: &str = "That's what you're judging right now, so I can't settle it before your verdict. Give your verdict with your reasons; what was right or wrong is shown afterwards.";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Secret {

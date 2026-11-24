@@ -20,7 +20,7 @@ struct Rewrite {
     reply: String,
 }
 
-const REWRITE_SYSTEM: &str = r#"The user is judging a candidate (a proposed approach or result) and hasn't given their verdict yet. Your draft reply to their latest message was held back because it judges the candidate, hints at whether or where it is right or wrong, or settles the point it tests.
+const REWRITE_SYSTEM: &str = r#"The user is judging a candidate (a proposed approach or result, or an agent's change under review) and hasn't given their verdict yet. Your draft reply to their latest message was held back because it judges the candidate, hints at whether or where it is right or wrong, or settles the point it tests.
 
 Rewrite it without any of that. Keep what is still useful: general explanations of the concepts, definitions, how to think about such a question, what to check. Don't say the candidate is right or wrong, don't point at a step, line or number in it, and don't give the fact that decides it. Don't mention that anything was held back. Math as plain text, never LaTeX.
 
@@ -181,12 +181,22 @@ impl Runtime {
     /// Retires every active secret the thread no longer waits on: after a
     /// verdict, or when the candidate was dropped by a skip or a move.
     pub(super) fn retire_stale_secrets(&self, session: &Session) {
-        let keep = session
+        // A candidate waiting for a verdict, and reviews still in staging.
+        let keep: Vec<String> = session
             .pending_candidate
             .as_ref()
-            .and_then(|p| p.secret.clone());
+            .and_then(|p| p.secret.clone())
+            .into_iter()
+            .chain(
+                session
+                    .map
+                    .parts
+                    .iter()
+                    .filter_map(|p| p.staging.as_ref().and_then(|s| s.secret.clone())),
+            )
+            .collect();
         for s in self.store.active_secrets(&session.id).unwrap_or_default() {
-            if Some(&s.id) != keep.as_ref()
+            if !keep.contains(&s.id)
                 && let Err(e) = self.store.retire_secret(&s.id)
             {
                 tracing::warn!("retiring a secret: {e:#}");

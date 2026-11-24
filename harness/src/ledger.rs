@@ -58,6 +58,81 @@ pub fn snapshot(root: &Path) -> Result<String> {
     Ok(tree?.trim().to_string())
 }
 
+fn scratch_index(root: &Path) -> Result<PathBuf> {
+    let real = git(root, &["rev-parse", "--git-path", "index"], None)?;
+    let real = root.join(real.trim());
+    let scratch =
+        std::env::temp_dir().join(format!("harness-index-{}", uuid::Uuid::new_v4().simple()));
+    if real.exists() {
+        std::fs::copy(&real, &scratch).ok();
+    }
+    Ok(scratch)
+}
+
+/// Like `snapshot`, of another directory using `root`'s object store and
+/// ignore rules; `drop` names entries to leave out (the staging copy's
+/// links to ignored folders).
+pub fn snapshot_worktree(root: &Path, worktree: &Path, drop: &[String]) -> Result<String> {
+    let scratch = scratch_index(root)?;
+    let wt = format!("--work-tree={}", worktree.display());
+    let mut result = git(root, &[&wt, "add", "-A"], Some(&scratch));
+    for name in drop {
+        if result.is_ok() {
+            result = git(
+                root,
+                &["rm", "-r", "-q", "--cached", "--ignore-unmatch", "--", name],
+                Some(&scratch),
+            );
+        }
+    }
+    let tree = result.and_then(|_| git(root, &["write-tree"], Some(&scratch)));
+    std::fs::remove_file(&scratch).ok();
+    Ok(tree?.trim().to_string())
+}
+
+/// Writes `tree` out into `dir` (a staging copy), then links the
+/// workspace's ignored top-level entries (dependencies, virtualenvs, build
+/// folders) so builds and tests work there. Returns the linked names.
+pub fn materialize(root: &Path, tree: &str, dir: &Path) -> Result<Vec<String>> {
+    std::fs::create_dir_all(dir)?;
+    let scratch = scratch_index(root)?;
+    let prefix = format!("--prefix={}/", dir.display());
+    let result = git(root, &["read-tree", tree], Some(&scratch)).and_then(|_| {
+        git(
+            root,
+            &["checkout-index", "-a", "-f", &prefix],
+            Some(&scratch),
+        )
+    });
+    std::fs::remove_file(&scratch).ok();
+    result?;
+    let ignored = git(
+        root,
+        &[
+            "status",
+            "--ignored",
+            "--porcelain=v1",
+            "--untracked-files=normal",
+        ],
+        None,
+    )?;
+    let mut linked = Vec::new();
+    for line in ignored.lines() {
+        let Some(path) = line.strip_prefix("!! ") else {
+            continue;
+        };
+        let name = path.trim_end_matches('/');
+        if name.contains('/') || name == ".pathfinder" {
+            continue;
+        }
+        #[cfg(unix)]
+        if std::os::unix::fs::symlink(root.join(name), dir.join(name)).is_ok() {
+            linked.push(name.to_string());
+        }
+    }
+    Ok(linked)
+}
+
 /// A file's content in a snapshot; `None` if it isn't there.
 pub fn file_at(root: &Path, tree: &str, path: &str) -> Option<String> {
     git(root, &["show", &format!("{tree}:{path}")], None).ok()

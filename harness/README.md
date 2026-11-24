@@ -133,6 +133,37 @@ Before an LLM sees a chat message, a decision model can say which step it is (a 
 
 In a thread, the **Decisions** switch turns it on or off and the **Decision model** picker (shown when more than one service has a key) chooses the service; otherwise the first one with a key is used, in that order. `HARNESS_DECISION=openai|gemini|typesafe|off` sets the default for every thread (`off` wins). Each decision shows in the thinking panel with its probability.
 
+## Handoff and checked review
+
+In a git repository, `/handoff` runs the agent in a staging copy of your workspace: tracked and untracked files, with ignored folders such as virtualenvs and `node_modules` linked in.
+
+While the agent works:
+- its commands still run in Zed's terminal, in the copy;
+- its prose and diffs are held back;
+- your files don't change.
+
+When it finishes, you get the review as diffs in the thread.
+
+Now and then one hunk of a review is replaced by a plausible flaw in a concept the change relies on. The **Checks** picker sets how often:
+
+| Checks | Part's concepts `shown` | Part's concepts all `solid` |
+|---|---|---|
+| Off | never | never |
+| Light (default) | 0.15 | 0.05 |
+| Normal | 0.25 | 0.15 |
+
+A planted flaw must still parse, where a checker is available (Python, JavaScript, JSON). A decision model must also confirm it changes the behaviour the part is about. Without a decision service, reviews are never checked.
+
+Every review holds a secret, checked or not, so Pathfinder's replies about it are gated the same way in both cases. How your verdict counts:
+
+- **`/approve` on a checked review:** a missed check. The concepts it relied on drop to shaky, and the ledger records `checked_missed`, so nothing is vouched.
+- **`/object` that names the planted flaw:** a caught check. It counts as fresh evidence (`review_ok`) and the lines are vouched.
+- **Any other objection:** goes back to the agent in the copy as usual. It is never scored as a miss.
+
+Either way, only the agent's real result is written, through Zed so it shows in Review Changes. A file you changed meanwhile is left alone and named. The agent's report follows your verdict. `/delegate` never runs in staging and is never checked.
+
+`HARNESS_CHECK_ROLL=0` checks every review that can be checked, which is useful for trying it out.
+
 ## Understanding coverage
 
 In a git repository, Pathfinder records every change the agent makes:

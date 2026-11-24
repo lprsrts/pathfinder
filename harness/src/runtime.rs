@@ -26,6 +26,7 @@ use crate::workspace::WorkspaceSnapshot;
 mod concepts;
 mod gate;
 mod provenance;
+mod review;
 
 pub struct TurnInput {
     pub text: String,
@@ -78,6 +79,8 @@ pub struct Runtime {
     store: Arc<Store>,
     engine: Arc<dyn Engine>,
     flaw_coin: fn() -> bool,
+    /// Rolls whether a review is checked (A8).
+    check_roll: fn() -> f64,
     /// Read on every use, so config edits apply without a restart.
     config: fn() -> Config,
     /// First pass over chat messages (see decide.rs).
@@ -98,7 +101,11 @@ pub struct ModelChoices {
     pub decisions_on: bool,
     /// The service in use when on: the thread's pick, else the first available.
     pub decision_model: Option<Provider>,
+    /// Review checks: `off`, `light` or `normal` (§13).
+    pub checks: String,
 }
+
+pub const CHECKS: [&str; 3] = ["off", "light", "normal"];
 
 /// Main model effort levels offered in the picker.
 pub const EFFORTS: [&str; 4] = ["default", "low", "medium", "high"];
@@ -118,6 +125,7 @@ impl Runtime {
             store,
             engine,
             flaw_coin: random_flaw,
+            check_roll: review::roll,
             config: Config::load,
             decider: Arc::new(NoDecider),
         }
@@ -167,6 +175,7 @@ impl Runtime {
             decisions_on: !session.decisions_off && decision_model.is_some(),
             decision_available: available,
             decision_model,
+            checks: session.checks.clone().unwrap_or_else(|| "light".into()),
         }
     }
 
@@ -215,6 +224,9 @@ impl Runtime {
                 }
                 session.decision_model = Some(id);
                 session.decisions_off = false;
+            }
+            ("checks", OptionValue::Id(level)) if CHECKS.contains(&level.as_str()) => {
+                session.checks = (level != "light").then_some(level);
             }
             (other, _) => return Err(anyhow!("unknown option or value for `{other}`")),
         }
@@ -304,7 +316,7 @@ impl Runtime {
             "/summary" => self.handle_summary(session, arg, files, sink).await,
             "/handoff" => self.handle_handoff(session, arg, files, sink).await,
             "/object" => self.handle_object(session, arg, files, sink).await,
-            "/approve" => self.handle_approve(session),
+            "/approve" => self.handle_approve(session).await,
             "/known" => self.handle_known(session, Some(arg)),
             "/delegate" => self.handle_delegate(session, arg, files, sink).await,
             "/accept" => self.handle_accept(session).await,
@@ -614,8 +626,7 @@ impl Runtime {
         let reply_sink = match &gate {
             gate::GateMode::Checked(_) => {
                 sink(StreamEvent::Thought(
-                    "Checking the reply against the candidate you're judging before showing it.\n"
-                        .into(),
+                    "Checking the reply against what you're judging before showing it.\n".into(),
                 ));
                 gate::held(&sink)
             }
@@ -1213,7 +1224,7 @@ impl Runtime {
         session.pending_candidate = None;
         let before = self.snapshot_before(session);
         let result = self
-            .run_agent(session, &part, false, instructions, files, sink)
+            .run_agent(session, &part, false, instructions, files, sink, None)
             .await?;
         self.record_changes(session, &part, before, true, instructions)
             .await;
@@ -1258,9 +1269,16 @@ impl Runtime {
                 )));
             }
         }
+        // §13: in a git repository the agent works in a staging copy and
+        // nothing reaches your files until your verdict.
+        if let Some(root) = crate::ledger::repo_root(&session.cwd) {
+            return self
+                .handoff_staged(session, part, &root, instructions, files, sink)
+                .await;
+        }
         let before = self.snapshot_before(session);
         let result = self
-            .run_agent(session, &part, true, instructions, files, sink)
+            .run_agent(session, &part, true, instructions, files, sink, None)
             .await?;
         let changes = self
             .record_changes(session, &part, before, false, instructions)
@@ -1291,6 +1309,9 @@ impl Runtime {
         if reason.is_empty() {
             return Ok(TurnOutput::text("Usage: `/object <what's wrong and why>`."));
         }
+        if part.staging.is_some() {
+            return self.object_staged(session, part, reason, files, sink).await;
+        }
         self.record_review(
             session,
             &part.id,
@@ -1305,7 +1326,7 @@ impl Runtime {
         let part = session.map.get(&part.id).cloned().unwrap();
         let before = self.snapshot_before(session);
         let result = self
-            .run_agent(session, &part, true, "", files, sink)
+            .run_agent(session, &part, true, "", files, sink, None)
             .await?;
         let changes = self.record_changes(session, &part, before, false, "").await;
         if let Some(p) = session.map.get_mut(&part.id) {
@@ -1315,7 +1336,7 @@ impl Runtime {
         Ok(TurnOutput::text(REVIEW_PROMPT))
     }
 
-    fn handle_approve(&self, session: &mut Session) -> Result<TurnOutput> {
+    async fn handle_approve(&self, session: &mut Session) -> Result<TurnOutput> {
         let Some(part) = session.active_part().cloned() else {
             return Ok(TurnOutput::text("No part is active."));
         };
@@ -1323,6 +1344,9 @@ impl Runtime {
             return Ok(TurnOutput::text(
                 "Nothing is waiting for your review on this part.",
             ));
+        }
+        if part.staging.is_some() {
+            return self.approve_staged(session, part).await;
         }
         self.record_review(session, &part.id, &part.unreviewed, "approved", None);
         if let Some(p) = session.map.get_mut(&part.id) {
@@ -1340,6 +1364,7 @@ impl Runtime {
         instructions: &str,
         files: &[PathBuf],
         sink: StreamSink,
+        staging: Option<&std::path::Path>,
     ) -> Result<String> {
         let mut prompt = format!(
             "Goal: {}\n\n{}\n\n{}",
@@ -1361,16 +1386,22 @@ impl Runtime {
         if !instructions.is_empty() {
             prompt.push_str(&format!("\n\nUser instructions: {instructions}"));
         }
+        let mut ctx = crate::engine::turn_ctx();
+        if staging.is_some() {
+            prompt.push_str("\n\nYou are working in a copy of the user's workspace (your working directory). Edit and run things there as usual; the user reviews the result before it reaches their files.");
+            // Edits stay in the copy: never through the client's files.
+            ctx.host = ctx.host.map(review::without_files);
+        }
         let req = EngineRequest {
             tier: EngineTier::System2,
             tools: ToolAccess::Full,
-            cwd: session.cwd.clone(),
+            cwd: staging.map_or_else(|| session.cwd.clone(), std::path::Path::to_path_buf),
             system_prompt: AGENT_SYSTEM.to_string(),
             prompt,
             files: files.to_vec(),
             stream_text: true,
             models: self.models(session)?,
-            ctx: crate::engine::turn_ctx(),
+            ctx,
         };
         self.engine.run_text(&req, sink).await
     }
@@ -1426,7 +1457,7 @@ const DECISION_THRESHOLD: f64 = 0.6;
 
 const CANDIDATE_HIDDEN: &str = "(candidate hidden while the user judges it)";
 
-const REVIEW_PROMPT: &str =
+pub(crate) const REVIEW_PROMPT: &str =
     "\n\nReview the result: `/approve`, or `/object <what's wrong and why>` to send it back.";
 
 /// Makes sure the user has seen `full`: if streaming didn't show it, send it
@@ -1691,6 +1722,9 @@ mod tests {
         Config {
             models: vec![entry("fast"), entry("main")],
             discover: false,
+            db_path: std::env::temp_dir()
+                .join("harness-test")
+                .join("harness.sqlite"),
             ..Config::default()
         }
     }
@@ -1732,7 +1766,11 @@ mod tests {
         let mut rt = Runtime::new(Arc::new(Store::open_in_memory().unwrap()), engine.clone());
         rt.flaw_coin = if flawed { || true } else { || false };
         rt.config = test_config;
-        rt.create_session("s".into(), PathBuf::from(".")).unwrap();
+        // Outside any git repository, so handoffs run in place.
+        let dir =
+            std::env::temp_dir().join(format!("harness-rt-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        rt.create_session("s".into(), dir).unwrap();
         (rt, engine)
     }
 

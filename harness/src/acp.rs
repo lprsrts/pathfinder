@@ -754,6 +754,25 @@ fn model_options(choices: &ModelChoices, switches: bool) -> Vec<SessionConfigOpt
             .category(SessionConfigOptionCategory::ModelConfig),
         );
     }
+    if choices.decisions_on {
+        options.push(
+            SessionConfigOption::select(
+                "checks",
+                "Checks",
+                choices.checks.clone(),
+                vec![
+                    SessionConfigSelectOption::new("off", "Checks off")
+                        .description("Reviews are never checked".to_string()),
+                    SessionConfigSelectOption::new("light", "Light checks")
+                        .description("About 1 review in 7 has a planted flaw".to_string()),
+                    SessionConfigSelectOption::new("normal", "Normal checks")
+                        .description("About 1 review in 4 has a planted flaw".to_string()),
+                ],
+            )
+            .description("How often a handoff review contains a planted flaw to catch".to_string())
+            .category(SessionConfigOptionCategory::ModelConfig),
+        );
+    }
     options
 }
 
@@ -1047,6 +1066,7 @@ mod tests {
             decision_available: vec![],
             decisions_on: false,
             decision_model: None,
+            checks: "light".into(),
         };
         let json = serde_json::to_value(model_options(&choices, true)).unwrap();
         let names: Vec<&str> = json[3]["options"]
@@ -1091,6 +1111,7 @@ mod tests {
             decision_available: vec![Provider::Typesafe, Provider::Openai],
             decisions_on: on,
             decision_model: Some(Provider::Typesafe),
+            checks: "light".into(),
         };
         let json = serde_json::to_value(model_options(&choices(true), true)).unwrap();
         let ids: Vec<&str> = json
@@ -1107,7 +1128,8 @@ mod tests {
                 "fast_effort",
                 "system1",
                 "decisions",
-                "decision_model"
+                "decision_model",
+                "checks"
             ]
         );
         assert_eq!(json[0]["category"], "thought_level");

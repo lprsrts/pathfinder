@@ -90,6 +90,30 @@ pub struct Part {
     /// Ledger change entries from the agent's latest run, awaiting review.
     #[serde(default)]
     pub unreviewed: Vec<String>,
+    /// A handoff's isolated copy, held until your verdict (§13, A8).
+    #[serde(default)]
+    pub staging: Option<Staging>,
+}
+
+/// Where a handoff runs until your verdict. Whether the review is checked
+/// lives only in the secret, never here.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Staging {
+    pub dir: PathBuf,
+    /// The workspace as a git tree when the handoff began.
+    pub base: String,
+    /// The agent's result as a git tree, once it finished.
+    #[serde(default)]
+    pub result: Option<String>,
+    /// The review's secret: a planted flaw, or the plain review key.
+    #[serde(default)]
+    pub secret: Option<String>,
+    /// The agent's report, shown after your verdict.
+    #[serde(default)]
+    pub report: String,
+    /// Ignored top-level folders linked into the copy, left out of snapshots.
+    #[serde(default)]
+    pub linked: Vec<String>,
 }
 
 impl Part {
@@ -106,6 +130,7 @@ impl Part {
             objections: Vec::new(),
             concepts: Vec::new(),
             unreviewed: Vec::new(),
+            staging: None,
         }
     }
 }
@@ -379,6 +404,9 @@ pub struct Session {
     #[serde(default)]
     pub decision_model: Option<String>,
     pub history: Vec<TurnRecord>,
+    /// Review checks (§13): `off`, `light` or `normal`; None is `light`.
+    #[serde(default)]
+    pub checks: Option<String>,
     /// Gap concepts already raised in this thread, so each is raised once.
     #[serde(default)]
     pub gaps_raised: Vec<String>,
@@ -403,6 +431,7 @@ impl Session {
             decision_model: None,
             history: Vec::new(),
             gaps_raised: Vec::new(),
+            checks: None,
         }
     }
 

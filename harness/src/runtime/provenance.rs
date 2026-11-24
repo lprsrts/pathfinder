@@ -22,6 +22,15 @@ const MAX_TAGGED_HUNKS: usize = 40;
 /// The Tagger sees at most this much of a hunk.
 const HUNK_CHARS: usize = 4000;
 
+/// A hunk as the ledger recorded it.
+#[derive(Debug, Clone)]
+pub(super) struct RecordedHunk {
+    pub path: String,
+    pub hunk: Hunk,
+    pub concepts: Vec<String>,
+    pub label: String,
+}
+
 /// The workspace as it was before the agent ran.
 pub(super) struct Before {
     root: PathBuf,
@@ -63,16 +72,53 @@ impl Runtime {
         let Some(before) = before else {
             return vec![];
         };
-        let diffs = match ledger::snapshot(&before.root)
-            .and_then(|after| Ok((ledger::diff(&before.root, &before.tree, &after)?, after)))
-        {
+        let after = match ledger::snapshot(&before.root) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("snapshotting the agent's work: {e:#}");
+                return vec![];
+            }
+        };
+        self.record_between(
+            session,
+            part,
+            &before.root,
+            &before.tree,
+            &after,
+            handed_off_blind,
+            instructions,
+        )
+        .await
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect()
+    }
+
+    /// Ledger entries for the hunks between two trees of `root`'s repository;
+    /// returns each entry's id with its hunk.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn record_between(
+        &self,
+        session: &Session,
+        part: &Part,
+        root: &std::path::Path,
+        before_tree: &str,
+        after: &str,
+        handed_off_blind: bool,
+        instructions: &str,
+    ) -> Vec<(String, RecordedHunk)> {
+        let before = Before {
+            root: root.to_path_buf(),
+            tree: before_tree.to_string(),
+        };
+        let files = match ledger::diff(&before.root, &before.tree, after) {
             Ok(d) => d,
             Err(e) => {
                 tracing::warn!("diffing the agent's work: {e:#}");
                 return vec![];
             }
         };
-        let (files, after) = diffs;
+        let after = after.to_string();
         let workspace = before.root.to_string_lossy().into_owned();
         let views = self
             .concept_views(session, &part.concepts)
@@ -101,6 +147,7 @@ impl Runtime {
                     tagged += 1;
                     self.tag(session, part, &labels, &path, &hunk).await
                 };
+                let concepts_for_entry = concepts.clone();
                 let states: Vec<(String, ConceptState)> = concepts
                     .iter()
                     .map(|c| (c.clone(), understanding::state_of(&views, c)))
@@ -131,7 +178,7 @@ impl Runtime {
                     path: path.clone(),
                     hunk: hunk.ranges(),
                     line_hashes: hashes,
-                    concepts: concepts.clone(),
+                    concepts: concepts_for_entry,
                     tag_confidence: confidence,
                     label: label.into(),
                     rationale: json!({
@@ -150,7 +197,15 @@ impl Runtime {
                     hash: String::new(),
                 };
                 match self.store.append_ledger(&workspace, entry) {
-                    Ok(e) => ids.push(e.id),
+                    Ok(e) => ids.push((
+                        e.id,
+                        RecordedHunk {
+                            path: path.clone(),
+                            hunk: hunk.clone(),
+                            concepts,
+                            label: label.to_string(),
+                        },
+                    )),
                     Err(e) => tracing::warn!("appending to the ledger: {e:#}"),
                 }
             }
