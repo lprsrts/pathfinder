@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::sync::Mutex;
@@ -6,6 +7,7 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::domain::Session;
+use crate::understanding::{Concept, Event, EventKind, Misconception, NewEvent};
 use crate::validate::Violation;
 
 pub struct Store {
@@ -77,6 +79,44 @@ impl Store {
                 update_json TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_transcript_session ON transcript(session_id, seq);
+            -- The understanding model (theory A4). `events` is append-only.
+            CREATE TABLE IF NOT EXISTS concepts (
+                workspace TEXT NOT NULL,
+                id TEXT NOT NULL,
+                label TEXT NOT NULL,
+                aliases_json TEXT NOT NULL DEFAULT '[]',
+                created_by TEXT NOT NULL,
+                PRIMARY KEY (workspace, id)
+            );
+            CREATE TABLE IF NOT EXISTS prerequisites (
+                workspace TEXT NOT NULL,
+                concept TEXT NOT NULL,
+                needs TEXT NOT NULL,
+                source TEXT NOT NULL,
+                PRIMARY KEY (workspace, concept, needs)
+            );
+            CREATE TABLE IF NOT EXISTS events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                workspace TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                concept TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                ref TEXT,
+                detail_json TEXT NOT NULL DEFAULT 'null',
+                at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_events_concept ON events(workspace, concept, id);
+            CREATE TRIGGER IF NOT EXISTS events_append_only_update BEFORE UPDATE ON events
+                BEGIN SELECT RAISE(ABORT, 'events are append-only'); END;
+            CREATE TRIGGER IF NOT EXISTS events_append_only_delete BEFORE DELETE ON events
+                BEGIN SELECT RAISE(ABORT, 'events are append-only'); END;
+            CREATE TABLE IF NOT EXISTS misconceptions (
+                id TEXT PRIMARY KEY,
+                workspace TEXT NOT NULL,
+                concept TEXT NOT NULL,
+                statement TEXT NOT NULL,
+                source TEXT NOT NULL
+            );
             "#,
         )?;
         // Outcomes gained a `status` column next to the §8 record in `outcome`.
@@ -203,6 +243,198 @@ impl Store {
         )?;
         Ok(())
     }
+
+    // --- The understanding model (theory A4) ---
+
+    pub fn concepts(&self, workspace: &str) -> Result<Vec<Concept>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, label, aliases_json, created_by FROM concepts WHERE workspace = ?1 ORDER BY id",
+        )?;
+        let rows = stmt.query_map(params![workspace], |row| {
+            let aliases: String = row.get(2)?;
+            Ok(Concept {
+                id: row.get(0)?,
+                label: row.get(1)?,
+                aliases: serde_json::from_str(&aliases).unwrap_or_default(),
+                created_by: row.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Inserts the concept, or adds new aliases to the one already there.
+    pub fn upsert_concept(&self, workspace: &str, concept: &Concept) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT aliases_json FROM concepts WHERE workspace = ?1 AND id = ?2",
+                params![workspace, concept.id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match existing {
+            None => {
+                conn.execute(
+                    "INSERT INTO concepts (workspace, id, label, aliases_json, created_by) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        workspace,
+                        concept.id,
+                        concept.label,
+                        serde_json::to_string(&concept.aliases)?,
+                        concept.created_by
+                    ],
+                )?;
+            }
+            Some(raw) => {
+                let mut aliases: Vec<String> = serde_json::from_str(&raw).unwrap_or_default();
+                let before = aliases.len();
+                for a in &concept.aliases {
+                    if !aliases.iter().any(|x| x.eq_ignore_ascii_case(a)) {
+                        aliases.push(a.clone());
+                    }
+                }
+                if aliases.len() != before {
+                    conn.execute(
+                        "UPDATE concepts SET aliases_json = ?3 WHERE workspace = ?1 AND id = ?2",
+                        params![workspace, concept.id, serde_json::to_string(&aliases)?],
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn add_prerequisite(
+        &self,
+        workspace: &str,
+        concept: &str,
+        needs: &str,
+        source: &str,
+    ) -> Result<()> {
+        if concept == needs {
+            return Ok(());
+        }
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO prerequisites (workspace, concept, needs, source) VALUES (?1, ?2, ?3, ?4)",
+            params![workspace, concept, needs, source],
+        )?;
+        Ok(())
+    }
+
+    /// concept → the concepts it needs first.
+    pub fn prerequisites(&self, workspace: &str) -> Result<HashMap<String, Vec<String>>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT concept, needs FROM prerequisites WHERE workspace = ?1 ORDER BY concept, needs",
+        )?;
+        let rows = stmt.query_map(params![workspace], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut out: HashMap<String, Vec<String>> = HashMap::new();
+        for row in rows {
+            let (c, n) = row?;
+            out.entry(c).or_default().push(n);
+        }
+        Ok(out)
+    }
+
+    /// Appends events in one transaction, stamped with `at`; returns their ids.
+    pub fn append_events(
+        &self,
+        workspace: &str,
+        session_id: &str,
+        events: &[NewEvent],
+        at: i64,
+    ) -> Result<Vec<i64>> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let mut ids = Vec::new();
+        for e in events {
+            tx.execute(
+                "INSERT INTO events (workspace, session_id, concept, kind, ref, detail_json, at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    workspace,
+                    session_id,
+                    e.concept,
+                    e.kind.as_str(),
+                    e.reference,
+                    serde_json::to_string(&e.detail)?,
+                    at
+                ],
+            )?;
+            ids.push(tx.last_insert_rowid());
+        }
+        tx.commit()?;
+        Ok(ids)
+    }
+
+    /// Every event for `concepts` in this workspace, oldest first.
+    pub fn events(&self, workspace: &str, concepts: &[String]) -> Result<Vec<Event>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, concept, kind, ref, detail_json, at FROM events WHERE workspace = ?1 AND concept = ?2 ORDER BY id",
+        )?;
+        let mut out = Vec::new();
+        for c in concepts {
+            let rows = stmt.query_map(params![workspace, c], |row| {
+                let kind: String = row.get(2)?;
+                let detail: String = row.get(4)?;
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    kind,
+                    row.get::<_, Option<String>>(3)?,
+                    detail,
+                    row.get::<_, i64>(5)?,
+                ))
+            })?;
+            for row in rows {
+                let (id, concept, kind, reference, detail, at) = row?;
+                let Some(kind) = EventKind::parse(&kind) else {
+                    continue;
+                };
+                out.push(Event {
+                    id,
+                    concept,
+                    kind,
+                    reference,
+                    detail: serde_json::from_str(&detail).unwrap_or_default(),
+                    at,
+                });
+            }
+        }
+        out.sort_by_key(|e| e.id);
+        Ok(out)
+    }
+
+    pub fn add_misconception(&self, workspace: &str, m: &Misconception) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO misconceptions (id, workspace, concept, statement, source) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![m.id, workspace, m.concept, m.statement, m.source],
+        )?;
+        Ok(())
+    }
+
+    pub fn misconception(&self, id: &str) -> Result<Option<Misconception>> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row(
+                "SELECT id, concept, statement, source FROM misconceptions WHERE id = ?1",
+                params![id],
+                |row| {
+                    Ok(Misconception {
+                        id: row.get(0)?,
+                        concept: row.get(1)?,
+                        statement: row.get(2)?,
+                        source: row.get(3)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
 }
 
 #[cfg(test)]
@@ -242,5 +474,24 @@ mod tests {
                 &[Violation::new("empty_field", "`reply` must not be empty")],
             )
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod understanding_tests {
+    use super::*;
+
+    #[test]
+    fn events_are_append_only() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .append_events("/w", "s", &[NewEvent::new("c", EventKind::Claim)], 5)
+            .unwrap();
+        let events = store.events("/w", &["c".into()]).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, EventKind::Claim);
+        let conn = store.conn.lock().unwrap();
+        assert!(conn.execute("DELETE FROM events", []).is_err());
+        assert!(conn.execute("UPDATE events SET kind = 'pass'", []).is_err());
     }
 }

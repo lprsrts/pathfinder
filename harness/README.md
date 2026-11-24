@@ -94,6 +94,19 @@ With a key in place, Pathfinder lists the provider's current models in Zed's pic
 3. When you explain the part, you're shown a candidate (an approach or result, right or with one real flaw) and say whether it's right and why. That decides whether the part is understood. While it waits you can still ask questions; the reply model can't see the candidate, so it can't vouch for it.
 4. You decide what to give the agent: `/handoff` an understood part and review the result, skip a part you already know, or `/delegate` to hand it off without understanding it.
 
+## What understanding is made of
+
+Each part rests on one to four core concepts, which the map names (`Rests on:` under the part). Every concept's state (unknown, claimed, delegated, shaky, shown, solid) comes from an append-only log of events in the session database, kept per workspace (git root), so it carries over to new sessions in the same repo:
+
+- Only a passed candidate counts as evidence. "Already known" records a claim, which never becomes evidence.
+- A part is understood once each core concept has evidence, so a part can take more than one candidate. Each candidate is aimed at the concepts with the least evidence.
+- A wrong belief stated in your log is recorded only when a decision model is confident it's there (p ≥ 0.8). So is one that a failed verdict shows. The next candidate on that concept is then flawed on purpose in that same way, and passing it closes the misconception.
+- Thinking aloud never lowers a state. A failed check does.
+- `solid` (two passes, one on a flawed candidate) cools back to `shown` after 30 days without a fresh check.
+- When a part rests on a concept no open part covers, or one you claimed, handed off or failed, the part's introduction says so and proposes a small part for it.
+
+`/why` shows what the current part's status rests on.
+
 ## Decision models
 
 Before an LLM sees a chat message, a decision model can say which step it is (a log entry, an explanation of the part, a skip, a move, a map-change answer, or a verdict on a waiting candidate). Skips and moves then happen without an LLM call, a question about a waiting candidate skips the judge, and log replies get the decision in their prompt. If the decision model is unsure, unset or unreachable, the LLM decides as part of its reply.
@@ -127,3 +140,4 @@ Shortcuts for the same steps, and the only way to run the agent:
 - `/next` — move to the next unresolved part
 - `/focus <id>` — switch to any part; also takes its number in the plan (`/focus 3`) or the start of its id (`/focus fwd`)
 - `/map` — show the map
+- `/why` — what the current part's status rests on: each concept's state, checks and open misconceptions

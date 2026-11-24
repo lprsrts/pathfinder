@@ -11,6 +11,7 @@ mod llm;
 mod runtime;
 mod store;
 mod stream;
+mod understanding;
 mod validate;
 mod workspace;
 

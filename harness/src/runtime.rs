@@ -16,10 +16,13 @@ use crate::engine::{
     run_gated_streamed,
 };
 use crate::store::Store;
+use crate::understanding::EventKind;
 use crate::validate::{
     check_candidate, check_change, check_log_reply, check_map, check_onboarding, check_verdict,
 };
 use crate::workspace::WorkspaceSnapshot;
+
+mod concepts;
 
 pub struct TurnInput {
     pub text: String,
@@ -47,7 +50,7 @@ impl TurnOutput {
     }
 }
 
-pub const COMMANDS_HELP: &str = "Commands: `/plan`, `/summary <text>`, `/handoff [notes]`, `/approve`, `/object <reason>`, `/known`, `/delegate [notes]`, `/accept`, `/reject`, `/replan [what changed]`, `/next`, `/focus <id|number|prefix>`, `/map`.";
+pub const COMMANDS_HELP: &str = "Commands: `/plan`, `/summary <text>`, `/handoff [notes]`, `/approve`, `/object <reason>`, `/known`, `/delegate [notes]`, `/accept`, `/reject`, `/replan [what changed]`, `/next`, `/focus <id|number|prefix>`, `/map`, `/why`.";
 
 /// No decision model: the LLM decides each message's step itself.
 struct NoDecider;
@@ -299,7 +302,8 @@ impl Runtime {
             "/approve" => self.handle_approve(session),
             "/known" => self.handle_known(session, Some(arg)),
             "/delegate" => self.handle_delegate(session, arg, files, sink).await,
-            "/accept" => self.handle_accept(session),
+            "/accept" => self.handle_accept(session).await,
+            "/why" => Ok(TurnOutput::text(self.why(session))),
             "/reject" => Ok(match session.pending_change.take() {
                 Some(_) => TurnOutput::text("Map change rejected."),
                 None => TurnOutput::text("No map change is waiting."),
@@ -373,11 +377,12 @@ impl Runtime {
             cwd: session.cwd.clone(),
             system_prompt: MAP_SYSTEM.to_string(),
             prompt: format!(
-                "Goal: {}\n\nWorkspace snapshot:\n{snapshot}\n\nOnboarding conversation:\n{}\n\nRead any files you need first, then respond with JSON only.",
+                "Goal: {}\n\nWorkspace snapshot:\n{snapshot}{}\n\nOnboarding conversation:\n{}\n\nRead any files you need first, then respond with JSON only.",
                 session
                     .goal
                     .as_deref()
                     .unwrap_or("(infer from the conversation)"),
+                self.known_concepts_prompt(session),
                 format_history(session)
             ),
             files: files.to_vec(),
@@ -402,13 +407,17 @@ impl Runtime {
         session.active = None;
         session.pending_change = None;
         session.pending_candidate = None;
+        session.gaps_raised.clear();
+        if let Err(e) = self
+            .register_map_concepts(session, &proposal.concepts, "map")
+            .await
+        {
+            tracing::warn!("registering the map's concepts: {e:#}");
+        }
         session.advance();
 
         // The map itself shows in Zed's plan panel (and on `/map`).
-        let rest = session
-            .active_part()
-            .map(|part| render_part(part, true))
-            .unwrap_or_default();
+        let rest = self.enter_part(session, true);
         session.push_turn("assistant", format!("{}\n\n{rest}", proposal.brief));
         Ok(TurnOutput::changed(format!("\n\n{rest}")))
     }
@@ -462,13 +471,19 @@ impl Runtime {
         Ok(TurnOutput::text(reply))
     }
 
-    fn handle_accept(&self, session: &mut Session) -> Result<TurnOutput> {
+    async fn handle_accept(&self, session: &mut Session) -> Result<TurnOutput> {
         let Some(change) = session.pending_change.take() else {
             return Ok(TurnOutput::text("No map change is waiting."));
         };
         match session.map.with_change(&change) {
             Ok(map) => {
                 session.map = map;
+                if let Err(e) = self
+                    .register_map_concepts(session, &change.concepts, "map")
+                    .await
+                {
+                    tracing::warn!("registering the change's concepts: {e:#}");
+                }
                 if let Some(goal) = change.goal.filter(|g| !g.trim().is_empty()) {
                     session.goal = Some(goal);
                 }
@@ -497,7 +512,7 @@ impl Runtime {
                 session.active = Some(id);
                 session.mode = SessionMode::Working;
                 session.pending_candidate = None;
-                TurnOutput::changed(render_part(session.active_part().unwrap(), false))
+                TurnOutput::changed(self.enter_part(session, false))
             }
             None if session.map.all_resolved() => {
                 session.advance();
@@ -520,7 +535,7 @@ impl Runtime {
         session.active = Some(id);
         session.mode = SessionMode::Working;
         session.pending_candidate = None;
-        TurnOutput::changed(render_part(session.active_part().unwrap(), false))
+        TurnOutput::changed(self.enter_part(session, false))
     }
 
     // --- §5 Evidence: log, summary, candidate ---
@@ -573,9 +588,10 @@ impl Runtime {
             cwd: session.cwd.clone(),
             system_prompt: LOG_SYSTEM.to_string(),
             prompt: format!(
-                "Goal: {}\n\n{}\n\nMap:\n{}{waiting}\n\nRecent conversation:\n{}\n\nLatest message: {text}\n\nRead any files you need first, then respond with JSON only.",
+                "Goal: {}\n\n{}{}\n\nMap:\n{}{waiting}\n\nRecent conversation:\n{}\n\nLatest message: {text}\n\nRead any files you need first, then respond with JSON only.",
                 session.goal.as_deref().unwrap_or("(session goal)"),
                 describe_part(&part),
+                self.concepts_prompt(session, &part),
                 session.map.render(session.active.as_deref()),
                 history,
             ),
@@ -617,6 +633,17 @@ impl Runtime {
         }
         flush(&sink, &decision.reply, &shown);
 
+        if let Err(e) = self
+            .extract_from_log(
+                session,
+                text,
+                &decision.concepts,
+                decision.misconception.as_ref(),
+            )
+            .await
+        {
+            tracing::warn!("extracting concepts from the log: {e:#}");
+        }
         let mut visible = String::new();
         let mut full = decision.reply;
         if let Some(change) = decision.map_change {
@@ -826,7 +853,7 @@ impl Runtime {
                 Some(id) => self.handle_focus(session, id),
                 None => self.handle_next(session),
             }),
-            Intent::Accept => self.handle_accept(session),
+            Intent::Accept => self.handle_accept(session).await,
             Intent::Reject => Ok(match session.pending_change.take() {
                 Some(_) => TurnOutput::text("Map change rejected."),
                 None => TurnOutput::text("No map change is waiting."),
@@ -869,14 +896,56 @@ impl Runtime {
         let part = part.clone();
         session.push_turn("user", format!("/summary {summary}"));
 
-        let flawed = (self.flaw_coin)();
+        let visible = self.write_candidate(session, &part.id, files, sink).await?;
+        Ok(TurnOutput::text(visible))
+    }
+
+    /// Writes a candidate for the part and leaves it waiting (§5.3). It
+    /// checks the concepts A5 picks; an open misconception makes it flawed
+    /// on purpose, embodying that belief. Returns what is left to show.
+    async fn write_candidate(
+        &self,
+        session: &mut Session,
+        part_id: &str,
+        files: &[PathBuf],
+        sink: StreamSink,
+    ) -> Result<String> {
+        let part = session
+            .map
+            .get(part_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("unknown part `{part_id}`"))?;
+        let picked = self.next_targets(session, part_id);
+        let mut flawed = (self.flaw_coin)();
+        let mut checks = String::new();
+        let (mut targets, mut misconception) = (Vec::new(), None);
+        if let Some((t, m, labels)) = picked {
+            let names: Vec<String> = t
+                .concepts
+                .iter()
+                .map(|c| format!("{} (`{c}`)", labels.get(c).map(String::as_str).unwrap_or(c)))
+                .collect();
+            checks = format!(
+                "\n\nThis candidate checks: {}. Build it around these concepts.",
+                names.join(", ")
+            );
+            if let Some(m) = &m {
+                flawed = true;
+                checks.push_str(&format!(
+                    "\nThe user showed this wrong belief: \"{}\". Make the one flaw embody it, so only someone past it would catch it.",
+                    m.statement
+                ));
+            }
+            targets = t.concepts;
+            misconception = m.map(|m| m.id);
+        }
         let req = EngineRequest {
             tier: EngineTier::System2,
             tools: ToolAccess::ReadOnly,
             cwd: session.cwd.clone(),
             system_prompt: CANDIDATE_SYSTEM.to_string(),
             prompt: format!(
-                "Goal: {}\n\nMap (`▶` is this part; parts after it in `needs` order may be new to the user):\n{}\n\n{}\n\nMake this candidate {}.\n\nRead any files you need first, then respond with JSON only.",
+                "Goal: {}\n\nMap (`▶` is this part; parts after it in `needs` order may be new to the user):\n{}\n\n{}{checks}\n\nMake this candidate {}.\n\nRead any files you need first, then respond with JSON only.",
                 session.goal.as_deref().unwrap_or("(session goal)"),
                 session.map.render(Some(&part.id)),
                 describe_part(&part),
@@ -929,16 +998,18 @@ impl Runtime {
         flush(&sink, &proposal.candidate, &shown);
 
         const ASK: &str = "\n\nIs it right? Say why.";
-        let visible = ASK.to_string();
         let reply = format!("{header}{}{ASK}", proposal.candidate);
         session.pending_candidate = Some(PendingCandidate {
             part_id: part.id,
             candidate: proposal.candidate,
             key_correct: !flawed,
             key_reason: proposal.key_reason,
+            targets,
+            misconception,
+            id: format!("cand-{}", uuid::Uuid::new_v4().simple()),
         });
         session.push_turn("assistant", &reply);
-        Ok(TurnOutput::text(visible))
+        Ok(ASK.to_string())
     }
 
     async fn handle_judgment(
@@ -995,8 +1066,29 @@ impl Runtime {
             return self.handle_log(session, judgment, files, sink, None).await;
         }
         flush(&sink, &verdict.feedback, &shown);
+        self.record_verdict(
+            session,
+            &pending,
+            verdict.pass,
+            verdict.misconception.as_deref(),
+        );
 
-        let next = if verdict.pass {
+        // §10: the part is understood once every core concept has evidence;
+        // a part from before concepts were recorded needs one pass.
+        let status = self.understanding_status(session, &part.id);
+        let understood = match status {
+            Some(s) => s == crate::understanding::UnderstandingStatus::Understood,
+            None => verdict.pass,
+        };
+        if verdict.pass && !understood {
+            let next =
+                "\n\nPassed. This part rests on more than that check covered, so one more:\n\n";
+            session.push_turn("assistant", format!("{}{next}", verdict.feedback));
+            sink(StreamEvent::TextDelta(next.to_string()));
+            let ask = self.write_candidate(session, &part.id, files, sink).await?;
+            return Ok(TurnOutput::text(ask));
+        }
+        let next = if understood {
             self.set_status(session, &part.id, PartStatus::Understood, &verdict.feedback)?;
             format!(
                 "\n\n**{}** understood. Say when to move on (`/next`), or `/handoff` if this part has work for the agent.",
@@ -1027,6 +1119,7 @@ impl Runtime {
         }
         session.pending_candidate = None;
         self.set_status(session, &part.id, PartStatus::Known, "claimed by the user")?;
+        self.record_skip(session, &part.id, EventKind::Claim);
         let lead = format!("**{}** recorded as already known.", part.title);
         let target = then
             .filter(|q| !q.is_empty() && *q != "next")
@@ -1037,10 +1130,7 @@ impl Runtime {
         };
         session.active = Some(id);
         session.mode = SessionMode::Working;
-        let reply = format!(
-            "{lead}\n\n{}",
-            render_part(session.active_part().unwrap(), false)
-        );
+        let reply = format!("{lead}\n\n{}", self.enter_part(session, false));
         session.push_turn("assistant", &reply);
         Ok(TurnOutput::changed(reply))
     }
@@ -1078,6 +1168,7 @@ impl Runtime {
             p.result = Some(result.clone());
         }
         self.set_status(session, &part.id, PartStatus::Delegated, &result)?;
+        self.record_skip(session, &part.id, EventKind::Delegated);
         Ok(self.after_resolution(
             session,
             format!(
@@ -1240,10 +1331,7 @@ impl Runtime {
 
     fn after_resolution(&self, session: &mut Session, lead: String) -> TurnOutput {
         let reply = match session.advance() {
-            Some(_) => format!(
-                "{lead}\n\n{}",
-                render_part(session.active_part().unwrap(), false)
-            ),
+            Some(_) => format!("{lead}\n\n{}", self.enter_part(session, false)),
             None if session.mode == SessionMode::Done => {
                 format!("{lead}\n\nEvery part is resolved.")
             }
@@ -1374,13 +1462,15 @@ const MAP_SYSTEM: &str = r#"You sketch the map for Pathfinder: what the task dep
 - `id`: a short descriptive slug the user types in commands: lowercase words joined by hyphens, at most 12 characters (e.g. `weights`, `fwd-pass`, `loss`). Unique. It names what the part is actually about, not a broad field: `colliders`, not `probability`. Users skip parts by their names.
 - Start where the user is: if the goal or conversation says what they already know or don't, shape the parts for that (e.g. include the basics for a newcomer). Keep parts they say they know on the map; they can mark them known themselves.
 - `note`: one line on what the part covers. `brief`: what the map covers, in one or two sentences.
+- `concepts`: the ideas the parts rest on, the record Pathfinder keeps of what the user has shown they understand. Each has an `id` (a lowercase hyphenated slug naming the idea itself, e.g. `d-separation`, `chain-rule`), a short `label`, and `needs`: the concept ids it builds on. Include a concept the task needs even if no part covers it (a prerequisite the user may lack). Reuse ids of concepts already recorded in this workspace when it's the same idea.
+- Each part lists its 1–4 core `concepts` (ids from `concepts`): what someone must understand to judge an agent's work on that part. Usually one or two.
 
 Return ONLY a JSON object:
-{"brief": "...", "parts": [{"id": "weights", "title": "...", "note": "...", "depends_on": []}]}"#;
+{"brief": "...", "concepts": [{"id": "weighted-sum", "label": "Weighted sum of inputs", "needs": []}], "parts": [{"id": "weights", "title": "...", "note": "...", "depends_on": [], "concepts": ["weighted-sum"]}]}"#;
 
 const CHANGE_SYSTEM: &str = r#"You propose a change to Pathfinder's map of what the task depends on, because something changed. The user accepts or rejects it.
 
-- `parts`: parts to add, or existing parts to update (same id), each with id, title, note, depends_on. New ids: `id`: a short descriptive slug the user types in commands: lowercase words joined by hyphens, at most 12 characters (e.g. `weights`, `fwd-pass`, `loss`). Unique.
+- `parts`: parts to add, or existing parts to update (same id), each with id, title, note, depends_on and its 1–4 core `concepts` (concept ids). New concepts go in `concepts` (id, label, needs), as in the map. New ids: `id`: a short descriptive slug the user types in commands: lowercase words joined by hyphens, at most 12 characters (e.g. `weights`, `fwd-pass`, `loss`). Unique.
 - `remove`: ids of parts to drop. Only parts with no work or outcome can be removed.
 - No size limit. No cycles.
 
@@ -1388,7 +1478,7 @@ const CHANGE_SYSTEM: &str = r#"You propose a change to Pathfinder's map of what 
 `brief`: one sentence to the user, saying "you", on what changes and why.
 
 Return ONLY a JSON object:
-{"brief": "...", "goal": null, "parts": [], "remove": []}"#;
+{"brief": "...", "goal": null, "parts": [], "remove": [], "concepts": []}"#;
 
 const LOG_SYSTEM: &str = r#"The user is working on one part of a task and chatting with Pathfinder as they go. Most messages are their log: their thinking and the reasons behind their steps and choices, or a question. The log is evidence of their understanding.
 
@@ -1409,12 +1499,17 @@ If a `log` message reveals the map is wrong (a missing dependency, a part that d
 
 If the message shows a gap in something this part depends on, especially a part they delegated or claimed to know (see the map's statuses), explain it in plain words, and propose a small part for it in `map_change` so the gap is on the map.
 
+For `log`, also record what the message is about, without judging it:
+- `concepts`: the concepts it touches, as concept ids from the lists (from any part, not part ids). A short name only for an idea on neither list. Empty if none.
+- In `misconception`, `concept` is likewise a concept id from the lists when one fits.
+- `misconception`: only if the message plainly states a wrong belief (not a question, not a guess they're testing): `{"concept": id or name, "statement": the belief in one sentence}`. Otherwise null. A separate check confirms it; it never changes what you reply.
+
 Call `read` before writing your JSON if a file matters: `reply` ends your turn.
 
 Return ONLY a JSON object:
-{"intent": "log", "part": null, "reply": "...", "map_change": null}
+{"intent": "log", "part": null, "reply": "...", "map_change": null, "concepts": [], "misconception": null}
 or, with a change:
-{"intent": "log", "part": null, "reply": "...", "map_change": {"brief": "...", "goal": null, "parts": [], "remove": []}}"#;
+{"intent": "log", "part": null, "reply": "...", "map_change": {"brief": "...", "goal": null, "parts": [], "remove": []}, "concepts": [], "misconception": null}"#;
 
 const CANDIDATE_SYSTEM: &str = r#"You make a candidate for the user to judge. Their judgment decides whether they understand the part well enough to direct an agent and tell whether its result is right.
 
@@ -1435,10 +1530,12 @@ You have the candidate, the hidden key (correct or flawed, and why) and the user
 
 `feedback`: reveal the key and say what their judgment got right or missed.
 
+`misconception`: when they fail because they hold a wrong belief (not just a slip or "don't know"), state that belief in one sentence; otherwise null.
+
 If the message isn't a verdict on the candidate at all (a question about it or the part, a thought for their log, a request to skip or move on), set `is_judgment` to false and `feedback` to "": it is handled as chat and the candidate keeps waiting. "I don't know" or "not sure" is a verdict: it fails.
 
 Return ONLY a JSON object:
-{"is_judgment": true, "pass": false, "feedback": "..."}"#;
+{"is_judgment": true, "pass": false, "feedback": "...", "misconception": null}"#;
 
 const AGENT_SYSTEM: &str = r#"You do the work for one part of a task in the user's workspace, using the tools available.
 
@@ -1802,6 +1899,125 @@ mod tests {
         let s = rt.load_session("s").unwrap().unwrap();
         assert_eq!(s.map.get("route").unwrap().status, PartStatus::Open);
         assert!(s.pending_candidate.is_none());
+    }
+
+    const MAP_CONCEPTS: &str = r#"{"brief":"Two parts.","concepts":[
+        {"id":"dispatch","label":"Dispatch by name","needs":["closures"]},
+        {"id":"handlers","label":"Handler functions","needs":[]},
+        {"id":"registry","label":"Command registry","needs":[]},
+        {"id":"closures","label":"Closures","needs":[]},
+        {"id":"status-fields","label":"Status fields","needs":["dispatch"]}],
+        "parts":[
+        {"id":"route","title":"Command routing","depends_on":[],"concepts":["dispatch","handlers","registry"]},
+        {"id":"report","title":"What status reports","depends_on":["route"],"concepts":["status-fields"]}]}"#;
+
+    #[tokio::test]
+    async fn understanding_comes_from_evidence_per_concept() {
+        let (rt, engine) = runtime(
+            FakeEngine::new(vec![
+                (ReadOnly, S1, ONBOARD_READY),
+                (ReadOnly, S2, MAP_CONCEPTS),
+                (
+                    ReadOnly,
+                    S1,
+                    r#"{"intent":"log","reply":"Ok.","map_change":null,"concepts":["dispatch","Dispatch by name"],"misconception":null}"#,
+                ),
+                (ReadOnly, S2, r#"{"candidate":"c1","key_reason":"r"}"#),
+                (
+                    ReadOnly,
+                    S2,
+                    r#"{"is_judgment":true,"pass":true,"feedback":"Right."}"#,
+                ),
+                (ReadOnly, S2, r#"{"candidate":"c2","key_reason":"r"}"#),
+                (
+                    ReadOnly,
+                    S2,
+                    r#"{"is_judgment":true,"pass":false,"feedback":"No.","misconception":"The registry is a global singleton."}"#,
+                ),
+                (ReadOnly, S2, r#"{"candidate":"c3","key_reason":"r"}"#),
+                (
+                    ReadOnly,
+                    S2,
+                    r#"{"is_judgment":true,"pass":true,"feedback":"Caught it."}"#,
+                ),
+            ]),
+            false,
+        );
+        turn(&rt, "goal").await;
+        let s = rt.load_session("s").unwrap().unwrap();
+        let route = s.map.get("route").unwrap();
+        assert_eq!(route.concepts, vec!["dispatch", "handlers", "registry"]);
+        // Closures sit under dispatch and no part covers them: a gap.
+        let gap = s
+            .pending_change
+            .clone()
+            .expect("a gap is proposed as a part");
+        assert_eq!(gap.parts[0].concepts, vec!["closures".to_string()]);
+        assert!(s.gaps_raised.contains(&"closures".to_string()));
+        turn(&rt, "/reject").await;
+
+        turn(&rt, "dispatch looks the name up").await;
+        assert!(
+            rt.why(&rt.load_session("s").unwrap().unwrap())
+                .contains("unknown")
+        );
+
+        // Two concepts with no evidence go first; a pass covers only those.
+        turn(&rt, "/summary it routes by name to a handler").await;
+        let s = rt.load_session("s").unwrap().unwrap();
+        assert_eq!(
+            s.pending_candidate.as_ref().unwrap().targets,
+            vec!["dispatch", "handlers"]
+        );
+        let out = turn(&rt, "right, the name picks the handler").await;
+        assert!(!out.reply.contains("understood"));
+        let s = rt.load_session("s").unwrap().unwrap();
+        assert_eq!(s.map.get("route").unwrap().status, PartStatus::Open);
+        assert_eq!(
+            s.pending_candidate.as_ref().unwrap().targets,
+            vec!["registry"]
+        );
+
+        // A failed verdict that shows a wrong belief opens a misconception;
+        // the next candidate is flawed on purpose and embodies it.
+        turn(&rt, "it's right").await;
+        turn(&rt, "/summary the registry maps names to handlers").await;
+        let prompt = engine.prompts.lock().unwrap().last().cloned().unwrap();
+        assert!(prompt.contains("The registry is a global singleton."));
+        assert!(prompt.contains("FLAWED"));
+        let s = rt.load_session("s").unwrap().unwrap();
+        let pending = s.pending_candidate.as_ref().unwrap();
+        assert!(!pending.key_correct);
+        assert!(pending.misconception.is_some());
+
+        turn(&rt, "wrong: it assumes one global registry").await;
+        let s = rt.load_session("s").unwrap().unwrap();
+        assert_eq!(s.map.get("route").unwrap().status, PartStatus::Understood);
+        let why = rt.why(&s);
+        assert!(!why.contains("open misconception"), "{why}");
+        assert!(why.contains("Command registry: shown"), "{why}");
+    }
+
+    #[tokio::test]
+    async fn a_claim_is_recorded_but_never_counts_as_evidence() {
+        let (rt, _) = runtime(
+            FakeEngine::new(vec![
+                (ReadOnly, S1, ONBOARD_READY),
+                (ReadOnly, S2, MAP_CONCEPTS),
+            ]),
+            false,
+        );
+        turn(&rt, "goal").await;
+        turn(&rt, "/reject").await;
+        turn(&rt, "/known").await;
+        let s = rt.load_session("s").unwrap().unwrap();
+        assert_eq!(s.map.get("route").unwrap().status, PartStatus::Known);
+        assert_eq!(s.active.as_deref(), Some("report"));
+        let views = rt.concept_views(&s, &["dispatch".to_string()]).unwrap();
+        assert_eq!(
+            crate::understanding::state_of(&views, "dispatch"),
+            crate::understanding::ConceptState::Claimed
+        );
     }
 
     #[tokio::test]

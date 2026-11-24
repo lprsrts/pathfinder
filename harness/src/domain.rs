@@ -84,6 +84,9 @@ pub struct Part {
     /// Objections you sent back to the agent (§7).
     #[serde(default)]
     pub objections: Vec<String>,
+    /// The 1–4 core concepts the part rests on (§10, A4).
+    #[serde(default)]
+    pub concepts: Vec<String>,
 }
 
 impl Part {
@@ -98,6 +101,7 @@ impl Part {
             summary: None,
             result: None,
             objections: Vec::new(),
+            concepts: Vec::new(),
         }
     }
 }
@@ -294,6 +298,9 @@ impl Map {
                     existing.title = proposed.title.clone();
                     existing.note = proposed.note.clone();
                     existing.depends_on = proposed.depends_on.clone();
+                    if !proposed.concepts.is_empty() {
+                        existing.concepts = proposed.concepts.clone();
+                    }
                 }
                 None => map.parts.push(proposed.clone().into_part()),
             }
@@ -310,6 +317,14 @@ pub struct PendingCandidate {
     pub candidate: String,
     pub key_correct: bool,
     pub key_reason: String,
+    /// The concepts it checks (A5).
+    #[serde(default)]
+    pub targets: Vec<String>,
+    /// The misconception it was built to embody (T1).
+    #[serde(default)]
+    pub misconception: Option<String>,
+    #[serde(default)]
+    pub id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -352,6 +367,9 @@ pub struct Session {
     #[serde(default)]
     pub decision_model: Option<String>,
     pub history: Vec<TurnRecord>,
+    /// Gap concepts already raised in this thread, so each is raised once.
+    #[serde(default)]
+    pub gaps_raised: Vec<String>,
 }
 
 impl Session {
@@ -372,6 +390,7 @@ impl Session {
             decisions_off: false,
             decision_model: None,
             history: Vec::new(),
+            gaps_raised: Vec::new(),
         }
     }
 
@@ -424,18 +443,35 @@ pub struct ProposedPart {
     pub note: String,
     #[serde(default)]
     pub depends_on: Vec<String>,
+    /// Core concept ids, 1–4.
+    #[serde(default)]
+    pub concepts: Vec<String>,
 }
 
 impl ProposedPart {
     pub fn into_part(self) -> Part {
-        Part::new(self.id, self.title, self.note, self.depends_on)
+        let mut part = Part::new(self.id, self.title, self.note, self.depends_on);
+        part.concepts = self.concepts;
+        part
     }
+}
+
+/// A concept the map rests on, with the concepts it needs first.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProposedConcept {
+    pub id: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub needs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct MapProposal {
     pub brief: String,
     pub parts: Vec<ProposedPart>,
+    #[serde(default)]
+    pub concepts: Vec<ProposedConcept>,
 }
 
 impl MapProposal {
@@ -462,6 +498,9 @@ pub struct MapChange {
     pub parts: Vec<ProposedPart>,
     #[serde(default)]
     pub remove: Vec<String>,
+    /// New concepts the added or updated parts rest on.
+    #[serde(default)]
+    pub concepts: Vec<ProposedConcept>,
 }
 
 /// What a chat message in a working session means, so plain chat drives the
@@ -497,6 +536,19 @@ pub struct LogReply {
     pub reply: String,
     #[serde(default)]
     pub map_change: Option<MapChange>,
+    /// Concepts the message touched: ids from the part's list, or short
+    /// names of new ones (the Extractor, A2).
+    #[serde(default)]
+    pub concepts: Vec<String>,
+    /// A wrong belief the message states, if any.
+    #[serde(default)]
+    pub misconception: Option<ProposedMisconception>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProposedMisconception {
+    pub concept: String,
+    pub statement: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -515,6 +567,9 @@ pub struct JudgmentVerdict {
     pub pass: bool,
     #[serde(default)]
     pub feedback: String,
+    /// On a fail: the wrong belief their judgment showed, if one did.
+    #[serde(default)]
+    pub misconception: Option<String>,
 }
 
 fn yes() -> bool {
@@ -634,15 +689,18 @@ mod tests {
                     title: "New".into(),
                     note: String::new(),
                     depends_on: vec!["a".into()],
+                    concepts: vec![],
                 },
                 ProposedPart {
                     id: "a".into(),
                     title: "Renamed".into(),
                     note: String::new(),
                     depends_on: vec![],
+                    concepts: vec![],
                 },
             ],
             remove: vec![],
+            concepts: vec![],
         };
         let next = m.with_change(&change).unwrap();
         assert_eq!(next.parts.len(), 3);
@@ -653,6 +711,7 @@ mod tests {
             brief: "x".into(),
             parts: vec![],
             remove: vec!["b".into()],
+            concepts: vec![],
         };
         assert!(m.with_change(&remove_worked).is_err());
 
@@ -664,8 +723,10 @@ mod tests {
                 title: "A".into(),
                 note: String::new(),
                 depends_on: vec!["a".into()],
+                concepts: vec![],
             }],
             remove: vec![],
+            concepts: vec![],
         };
         assert!(m.with_change(&cycle).is_err());
     }

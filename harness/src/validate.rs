@@ -81,6 +81,21 @@ pub fn check_map(p: &MapProposal) -> Vec<Violation> {
         require_text(&mut out, &part.title, "parts[].title");
         check_id(&mut out, &part.id);
     }
+    // Maps from before concepts existed have none; otherwise each part
+    // rests on 1–4 core concepts (A4).
+    if !p.concepts.is_empty() {
+        for part in &p.parts {
+            if part.concepts.is_empty() || part.concepts.len() > 4 {
+                out.push(Violation::new(
+                    "core_concepts",
+                    format!(
+                        "part `{}` must list 1–4 core concept ids in `concepts`",
+                        part.id
+                    ),
+                ));
+            }
+        }
+    }
     if let Err(e) = p.to_map().validate() {
         out.push(Violation::new("invalid_map", e.to_string()));
     }
@@ -165,6 +180,7 @@ mod tests {
             title: format!("Part {id}"),
             note: String::new(),
             depends_on: deps.iter().map(|s| s.to_string()).collect(),
+            concepts: vec![],
         }
     }
 
@@ -192,18 +208,21 @@ mod tests {
         let ok = MapProposal {
             brief: "b".into(),
             parts: (0..12).map(|i| proposed(&format!("p{i}"), &[])).collect(),
+            concepts: vec![],
         };
         assert!(check_map(&ok).is_empty());
 
         let long_id = MapProposal {
             brief: "b".into(),
             parts: vec![proposed("Forward_Pass_Of_The_Neuron", &[])],
+            concepts: vec![],
         };
         assert_eq!(check_map(&long_id)[0].code, "bad_id");
 
         let cyclic = MapProposal {
             brief: "b".into(),
             parts: vec![proposed("a", &["b"]), proposed("b", &["a"])],
+            concepts: vec![],
         };
         assert_eq!(check_map(&cyclic)[0].code, "invalid_map");
     }
@@ -215,6 +234,8 @@ mod tests {
             part: None,
             reply: String::new(),
             map_change: None,
+            concepts: vec![],
+            misconception: None,
         };
         let map = Map { parts: vec![] };
         assert_eq!(
@@ -239,7 +260,10 @@ mod tests {
                 brief: "drop a".into(),
                 parts: vec![],
                 remove: vec!["a".into()],
+                concepts: vec![],
             }),
+            concepts: vec![],
+            misconception: None,
         };
         assert_eq!(
             check_log_reply(&bad, &current, false, false)[0].code,
@@ -255,7 +279,10 @@ mod tests {
                 brief: "add b".into(),
                 parts: vec![proposed("b", &["a"])],
                 remove: vec![],
+                concepts: vec![],
             }),
+            concepts: vec![],
+            misconception: None,
         };
         assert!(check_log_reply(&good, &current, false, false).is_empty());
     }
