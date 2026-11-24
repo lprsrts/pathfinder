@@ -8,11 +8,13 @@ use anyhow::{Context, Result, bail};
 use crate::auth::{Credentials, check_key_shape, mask};
 use crate::catalog::{self, ModelCache};
 use crate::config::Route;
+use crate::decide::{self, Provider, Question};
 
 const AUTH_USAGE: &str = "Usage:
   harness auth login chatgpt                      Sign in with ChatGPT (uses your plan)
   harness auth logout chatgpt [--forget]          Sign out; --forget also drops the registration
   harness auth set [anthropic|openai] [--stdin]   Store an API key in Pathfinder's auth file
+  harness auth set [gemini|typesafe] [--stdin]    Store a decision-model key (Gemini Decision 1, TypeSafe Jev)
   harness auth remove <provider>                  Remove Pathfinder's stored key
   harness auth import <provider>                  Copy a <provider>-api-key macOS keychain item
   harness auth status                             Show which keys are available";
@@ -48,7 +50,28 @@ pub async fn auth(args: &[String]) -> Result<()> {
             }
             Some(other) => bail!("to remove a {other} key use `harness auth remove {other}`"),
         },
-        Some("set") => set(&creds, positional.get(1).copied(), flag("--stdin")).await,
+        Some("set") => match decision_only(positional.get(1).copied()) {
+            Some(p) => set_decision(&creds, p, flag("--stdin")).await,
+            None => set(&creds, positional.get(1).copied(), flag("--stdin")).await,
+        },
+        Some("remove" | "import") if decision_only(positional.get(1).copied()).is_some() => {
+            let p = decision_only(positional.get(1).copied()).unwrap();
+            if positional[0] == "remove" {
+                if creds.remove_named(p.key_name())? {
+                    println!("Removed Pathfinder's {} key.", p.label());
+                } else {
+                    println!("Pathfinder has no stored {} key.", p.label());
+                }
+            } else if creds.import_named(p.key_name())? {
+                println!(
+                    "Copied the {} keychain item into Pathfinder's auth file.",
+                    p.key_name()
+                );
+            } else {
+                println!("No {} keychain item found.", p.key_name());
+            }
+            Ok(())
+        }
         Some("remove") => {
             let route = provider(positional.get(1).copied())?;
             if creds.remove_key(route)? {
@@ -97,6 +120,41 @@ pub async fn models(args: &[String]) -> Result<()> {
     for entry in entries {
         println!("{:<44} {}", entry.id, entry.label);
     }
+    Ok(())
+}
+
+/// Decision services whose key isn't also a model route's (OpenAI's is).
+fn decision_only(name: Option<&str>) -> Option<Provider> {
+    name.and_then(Provider::from_id)
+        .filter(|p| *p != Provider::Openai)
+}
+
+async fn set_decision(creds: &Credentials, p: Provider, from_stdin: bool) -> Result<()> {
+    let key = if from_stdin || !io::stdin().is_terminal() {
+        let mut line = String::new();
+        io::stdin().lock().read_line(&mut line)?;
+        line
+    } else {
+        rpassword::prompt_password(format!("Paste your {} API key (hidden): ", p.label()))?
+    };
+    let key = key.trim();
+    check_key_shape(key).map_err(anyhow::Error::msg)?;
+    print!("Checking the key with {}... ", p.label());
+    io::stdout().flush()?;
+    let probe = [Question {
+        name: "probe".into(),
+        instructions: "Is this a greeting?".into(),
+        options: vec![("yes".into(), String::new()), ("no".into(), String::new())],
+    }];
+    match decide::call(&reqwest::Client::new(), p, key, "hello", &probe).await {
+        Ok(_) => println!("ok."),
+        Err(e) => bail!("{e:#}. The key was not saved."),
+    }
+    creds.set_named(p.key_name(), key)?;
+    println!(
+        "Saved to Pathfinder's auth file. Chat messages now go through {} first.",
+        p.label()
+    );
     Ok(())
 }
 
@@ -233,6 +291,23 @@ fn status(creds: &Credentials) -> Result<()> {
                 route.provider_id()
             ),
         }
+    }
+    let decision = Provider::ALL.into_iter().find_map(|p| {
+        creds
+            .named_key(p.key_name(), p.key_env())
+            .map(|(_, s)| (p, s))
+    });
+    match decision {
+        Some((p, source)) => println!(
+            "{:<10} {} (key from {})",
+            "Decisions",
+            p.label(),
+            source.describe()
+        ),
+        None => println!(
+            "{:<10} none (`harness auth set gemini` or `typesafe`, or an OpenAI key)",
+            "Decisions"
+        ),
     }
     let cache = ModelCache::load();
     println!("\n{} models discovered.", cache.entries().len());

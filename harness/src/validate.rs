@@ -108,8 +108,22 @@ pub fn check_change(change: &MapChange, current: &Map) -> Vec<Violation> {
 
 /// `change_waiting`: whether a map change is waiting for the user's OK, the
 /// only time `accept` or `reject` makes sense.
-pub fn check_log_reply(r: &LogReply, current: &Map, change_waiting: bool) -> Vec<Violation> {
+/// `decided_log`: a decision model already classified the message as a log
+/// entry, so a reply is required whatever `intent` says.
+pub fn check_log_reply(
+    r: &LogReply,
+    current: &Map,
+    change_waiting: bool,
+    decided_log: bool,
+) -> Vec<Violation> {
     let mut out = Vec::new();
+    if decided_log {
+        require_text(&mut out, &r.reply, "reply");
+        if let Some(change) = &r.map_change {
+            out.extend(check_change(change, current));
+        }
+        return out;
+    }
     if matches!(r.intent, Intent::Accept | Intent::Reject) && !change_waiting {
         out.push(Violation::new(
             "no_change_waiting",
@@ -204,10 +218,10 @@ mod tests {
         };
         let map = Map { parts: vec![] };
         assert_eq!(
-            check_log_reply(&reply, &map, false)[0].code,
+            check_log_reply(&reply, &map, false, false)[0].code,
             "no_change_waiting"
         );
-        assert!(check_log_reply(&reply, &map, true).is_empty());
+        assert!(check_log_reply(&reply, &map, true, false).is_empty());
     }
 
     #[test]
@@ -228,7 +242,7 @@ mod tests {
             }),
         };
         assert_eq!(
-            check_log_reply(&bad, &current, false)[0].code,
+            check_log_reply(&bad, &current, false, false)[0].code,
             "invalid_change"
         );
 
@@ -243,6 +257,6 @@ mod tests {
                 remove: vec![],
             }),
         };
-        assert!(check_log_reply(&good, &current, false).is_empty());
+        assert!(check_log_reply(&good, &current, false, false).is_empty());
     }
 }

@@ -94,6 +94,18 @@ With a key in place, Pathfinder lists the provider's current models in Zed's pic
 3. When you explain the part, you're shown a candidate (an approach or result, right or with one real flaw) and say whether it's right and why. That decides whether the part is understood. While it waits you can still ask questions; the reply model can't see the candidate, so it can't vouch for it.
 4. You decide what to give the agent: `/handoff` an understood part and review the result, skip a part you already know, or `/delegate` to hand it off without understanding it.
 
+## Decision models
+
+Before an LLM sees a chat message, a decision model can say which step it is (a log entry, an explanation of the part, a skip, a move, a map-change answer, or a verdict on a waiting candidate). Skips and moves then happen without an LLM call, a question about a waiting candidate skips the judge, and log replies get the decision in their prompt. If the decision model is unsure, unset or unreachable, the LLM decides as part of its reply.
+
+| Service | Model | Key |
+|---|---|---|
+| OpenAI Decisions API | `gpt-6-luna` | your OpenAI API key (ChatGPT sign-in tokens aren't accepted) |
+| Gemini Decision 1 | `gemini-decision-1` | `harness auth set gemini` (or `GEMINI_API_KEY`) |
+| TypeSafe Jev | `jev-1.14.0` | `harness auth set typesafe` (or `TYPESAFE_API_KEY`) |
+
+The first one with a key is used, in that order. `HARNESS_DECISION=openai|gemini|typesafe|off` picks one. Each decision shows in the thinking panel with its probability.
+
 ## Slash commands in Zed
 
 Shortcuts for the same steps, and the only way to run the agent:

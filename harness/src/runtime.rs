@@ -6,6 +6,7 @@ use std::sync::Arc;
 use anyhow::{Result, anyhow};
 
 use crate::config::{Config, ModelEntry};
+use crate::decide::{Decide, Decision, Question};
 use crate::domain::{
     CandidateProposal, Intent, JudgmentVerdict, LogReply, Map, MapChange, MapProposal,
     OnboardingDecision, Part, PartStatus, PendingCandidate, Session, SessionMode,
@@ -48,6 +49,19 @@ impl TurnOutput {
 
 pub const COMMANDS_HELP: &str = "Commands: `/plan`, `/summary <text>`, `/handoff [notes]`, `/approve`, `/object <reason>`, `/known`, `/delegate [notes]`, `/accept`, `/reject`, `/replan [what changed]`, `/next`, `/focus <id|number|prefix>`, `/map`.";
 
+/// No decision model: the LLM decides each message's step itself.
+struct NoDecider;
+
+impl Decide for NoDecider {
+    fn decide<'a>(
+        &'a self,
+        _input: &'a str,
+        _questions: &'a [Question],
+    ) -> futures_util::future::BoxFuture<'a, Result<Option<Decision>>> {
+        Box::pin(async { Ok(None) })
+    }
+}
+
 /// Decides whether the next candidate is flawed (§5.3).
 fn random_flaw() -> bool {
     uuid::Uuid::new_v4().as_bytes()[0] & 1 == 1
@@ -59,6 +73,8 @@ pub struct Runtime {
     flaw_coin: fn() -> bool,
     /// Read on every use, so config edits apply without a restart.
     config: fn() -> Config,
+    /// First pass over chat messages (see decide.rs).
+    decider: Arc<dyn Decide>,
 }
 
 /// The model pickers' state for one session.
@@ -78,7 +94,13 @@ impl Runtime {
             engine,
             flaw_coin: random_flaw,
             config: Config::load,
+            decider: Arc::new(NoDecider),
         }
+    }
+
+    pub fn with_decider(mut self, decider: Arc<dyn Decide>) -> Self {
+        self.decider = decider;
+        self
     }
 
     fn models(&self, session: &Session) -> Result<TierModels> {
@@ -153,11 +175,7 @@ impl Runtime {
                     self.handle_onboarding(&mut session, text, files, sink)
                         .await?
                 }
-                SessionMode::Working if session.pending_candidate.is_some() => {
-                    self.handle_judgment(&mut session, text, files, sink)
-                        .await?
-                }
-                SessionMode::Working => self.handle_log(&mut session, text, files, sink).await?,
+                SessionMode::Working => self.handle_chat(&mut session, text, files, sink).await?,
                 SessionMode::Done => TurnOutput::text(
                     "Every part is resolved. `/replan <what changed>` to extend the map, or start a new session.",
                 ),
@@ -418,12 +436,15 @@ impl Runtime {
 
     // --- §5 Evidence: log, summary, candidate ---
 
+    /// `decided_by`: the decision model that already classified the message
+    /// as a log entry; the LLM then only replies.
     async fn handle_log(
         &self,
         session: &mut Session,
         text: &str,
         files: &[PathBuf],
         sink: StreamSink,
+        decided_by: Option<&str>,
     ) -> Result<TurnOutput> {
         let Some(part) = session.active_part_mut() else {
             return Ok(TurnOutput::text(
@@ -436,6 +457,11 @@ impl Runtime {
         session.push_turn("user", text);
 
         let mut waiting = String::new();
+        if let Some(by) = decided_by {
+            waiting.push_str(&format!(
+                "\n\nDecision: {by} classified this message as a log entry. Set `intent` to \"log\" and reply to it."
+            ));
+        }
         if let Some(change) = &session.pending_change {
             waiting.push_str(&format!(
                 "\n\nMap change waiting for the user's OK:\n{}",
@@ -448,7 +474,7 @@ impl Runtime {
         if let Some(pending) = &session.pending_candidate {
             history = history.replace(&pending.candidate, CANDIDATE_HIDDEN);
             waiting.push_str(
-                "\n\nA candidate for this part is waiting for the user's verdict; you can't see it. Answer questions about the general concepts only. If they ask about the candidate itself (a claim, step or number in it, or whether it's right), say that's what they're judging.",
+                "\n\nA candidate for this part is waiting for the user's verdict; it's hidden from you. Answer questions about the general concepts only. If they ask about the candidate itself (a claim, step or number in it, or whether it's right), say that's what they're judging. Don't mention that it's hidden from you.",
             );
         }
 
@@ -478,18 +504,26 @@ impl Runtime {
             "log",
             &req,
             sink.clone(),
-            |r: &LogReply| check_log_reply(r, &current, change_waiting),
+            |r: &LogReply| check_log_reply(r, &current, change_waiting, decided_by.is_some()),
             Some("reply"),
         )
         .await?;
 
-        if decision.intent != Intent::Log {
+        if decision.intent != Intent::Log && decided_by.is_none() {
             // Not evidence for the log: the message is a step in the loop.
             if let Some(p) = session.map.get_mut(&part.id) {
                 p.log.pop();
             }
             return self
-                .route_intent(session, &decision, text, had_log, files, sink)
+                .route_intent(
+                    session,
+                    decision.intent,
+                    decision.part.as_deref(),
+                    text,
+                    had_log,
+                    files,
+                    sink,
+                )
                 .await;
         }
         flush(&sink, &decision.reply, &shown);
@@ -506,17 +540,166 @@ impl Runtime {
         Ok(TurnOutput::text(visible))
     }
 
+    /// A chat message while working. The decision model, when configured,
+    /// first says which step it is; the LLM then only does that step. With no
+    /// decision model, or an unsure one, the LLM decides as part of its reply.
+    async fn handle_chat(
+        &self,
+        session: &mut Session,
+        text: &str,
+        files: &[PathBuf],
+        sink: StreamSink,
+    ) -> Result<TurnOutput> {
+        if session.active_part().is_none() {
+            return self.handle_log(session, text, files, sink, None).await;
+        }
+        match self.decide_step(session, text, &sink).await {
+            Some((step, _, _)) if step == VERDICT => {
+                self.handle_judgment(session, text, files, sink).await
+            }
+            Some((step, _, by)) if step == "log" => {
+                self.handle_log(session, text, files, sink, Some(&by)).await
+            }
+            Some((step, part, _)) => {
+                let intent = match step.as_str() {
+                    "summary" => Intent::Summary,
+                    "known" => Intent::Known,
+                    "move" => Intent::Move,
+                    "accept" => Intent::Accept,
+                    _ => Intent::Reject,
+                };
+                let had_log = session.active_part().is_some_and(|p| !p.log.is_empty());
+                session.push_turn("user", text);
+                self.route_intent(session, intent, part.as_deref(), text, had_log, files, sink)
+                    .await
+            }
+            None if session.pending_candidate.is_some() => {
+                self.handle_judgment(session, text, files, sink).await
+            }
+            None => self.handle_log(session, text, files, sink, None).await,
+        }
+    }
+
+    /// Asks the decision model which step `text` is: (step, part for a move,
+    /// who decided). `None` when there's no decision model, it fails, or it
+    /// isn't sure enough.
+    async fn decide_step(
+        &self,
+        session: &Session,
+        text: &str,
+        sink: &StreamSink,
+    ) -> Option<(String, Option<String>, String)> {
+        let part = session.active_part()?;
+        let mut steps: Vec<(String, String)> = vec![
+            ("log".into(), "Their thinking, reasoning, an attempt, or a question (including a question about a waiting candidate).".into()),
+            ("summary".into(), "They offer their own explanation of the whole current part, ready to be checked.".into()),
+            ("known".into(), "They clearly say they already know this whole part and want to skip it.".into()),
+            ("move".into(), "They want to go on to the next part, or to another named part.".into()),
+        ];
+        if session.pending_change.is_some() {
+            steps.push((
+                "accept".into(),
+                "They agree to the waiting map change.".into(),
+            ));
+            steps.push((
+                "reject".into(),
+                "They turn down the waiting map change.".into(),
+            ));
+        }
+        if session.pending_candidate.is_some() {
+            steps.push((VERDICT.into(), "They give their verdict on the waiting candidate: whether it's right, ideally why (\"I don't know\" counts).".into()));
+        }
+        let mut questions = vec![Question {
+            name: "step".into(),
+            instructions: "What is the user's latest message, given the session state?".into(),
+            options: steps,
+        }];
+        if session.map.parts.len() > 1 {
+            let mut options = vec![(
+                "next".into(),
+                "The next unresolved part, or no particular part.".into(),
+            )];
+            options.extend(
+                session
+                    .map
+                    .parts
+                    .iter()
+                    .take(250)
+                    .map(|p| (p.id.clone(), p.title.clone())),
+            );
+            questions.push(Question {
+                name: "part".into(),
+                instructions: "If they want to go to a part, which one do they name?".into(),
+                options,
+            });
+        }
+
+        let mut input = format!(
+            "Goal: {}\nCurrent part: {} (`{}`): {}\nLog entries on this part so far: {}\n",
+            session.goal.as_deref().unwrap_or("(none)"),
+            part.title,
+            part.id,
+            part.note,
+            part.log.len()
+        );
+        match &session.pending_change {
+            Some(change) => input.push_str(&format!(
+                "Map change waiting for the user's OK:\n{}\n",
+                render_change(change, &session.map)
+            )),
+            None => input.push_str("No map change is waiting.\n"),
+        }
+        match &session.pending_candidate {
+            Some(c) => input.push_str(&format!(
+                "Candidate waiting for the user's verdict:\n{}\n",
+                c.candidate
+            )),
+            None => input.push_str("No candidate is waiting.\n"),
+        }
+        let start = session.history.len().saturating_sub(6);
+        input.push_str("\nRecent conversation:\n");
+        for t in &session.history[start..] {
+            input.push_str(&format!("{}: {}\n", t.role, t.content));
+        }
+        input.push_str(&format!("\nLatest message: {text}"));
+
+        let decision = match self.decider.decide(&input, &questions).await {
+            Ok(Some(d)) => d,
+            Ok(None) => return None,
+            Err(e) => {
+                tracing::warn!("decision model failed: {e:#}");
+                sink(StreamEvent::Thought(format!(
+                    "Decision model unavailable ({e}); the LLM decides.\n"
+                )));
+                return None;
+            }
+        };
+        let step = decision.answers.get("step")?;
+        sink(StreamEvent::Thought(format!(
+            "{}: {} ({:.0}%)\n",
+            decision.by,
+            step.choice,
+            step.probability * 100.0
+        )));
+        if step.probability < DECISION_THRESHOLD {
+            return None;
+        }
+        let part = decision.answers.get("part").map(|a| a.choice.clone());
+        Some((step.choice.clone(), part, decision.by))
+    }
+
     /// Carries out what a chat message meant, the way its command would.
     async fn route_intent(
         &self,
         session: &mut Session,
-        decision: &LogReply,
+        intent: Intent,
+        part: Option<&str>,
         text: &str,
         had_log: bool,
         files: &[PathBuf],
         sink: StreamSink,
     ) -> Result<TurnOutput> {
-        match decision.intent {
+        match intent {
             Intent::Summary if had_log => {
                 // `/summary` records the message itself.
                 session.history.pop();
@@ -531,7 +714,7 @@ impl Runtime {
                 Ok(TurnOutput::text(reply))
             }
             Intent::Known => self.handle_known(session),
-            Intent::Move => Ok(match decision.part.as_deref().filter(|p| !p.is_empty()) {
+            Intent::Move => Ok(match part.filter(|p| !p.is_empty() && *p != "next") {
                 Some(id) => self.handle_focus(session, id),
                 None => self.handle_next(session),
             }),
@@ -677,7 +860,7 @@ impl Runtime {
             // A question or another step: the candidate keeps waiting.
             session.pending_candidate = Some(pending);
             session.history.pop();
-            return self.handle_log(session, judgment, files, sink).await;
+            return self.handle_log(session, judgment, files, sink, None).await;
         }
         flush(&sink, &verdict.feedback, &shown);
 
@@ -925,6 +1108,12 @@ impl Runtime {
     }
 }
 
+/// The decision model's step for a verdict on a waiting candidate.
+const VERDICT: &str = "verdict";
+
+/// Below this, the decision model's step is ignored and the LLM decides.
+const DECISION_THRESHOLD: f64 = 0.6;
+
 const CANDIDATE_HIDDEN: &str = "(candidate hidden while the user judges it)";
 
 const REVIEW_PROMPT: &str =
@@ -1062,7 +1251,7 @@ First decide what the latest message is (`intent`):
 - `accept` / `reject`: they answer a waiting map change ("yes, add it", "no, keep the map").
 For anything but `log`, set `reply` to "" and `map_change` to null: Pathfinder takes the step.
 
-For `log`, reply briefly: answer what they ask, or point out what the entry reveals. If they ask whether something is right, say whether it is, even when it belongs to another part. Don't repeat what you already said in the conversation. Do not do the work for them and do not write their explanation of the part for them.
+For `log`, reply briefly (math as plain text or Unicode, never LaTeX): answer what they ask, or point out what the entry reveals. If they ask whether something is right, say whether it is, even when it belongs to another part. Don't repeat what you already said in the conversation. Do not do the work for them and do not write their explanation of the part for them.
 
 The user decides which parts they do themselves and which go to an agent. Never raise that.
 
@@ -1077,7 +1266,7 @@ or, with a change:
 
 const CANDIDATE_SYSTEM: &str = r#"You make a candidate for the user to judge. Their judgment decides whether they understand the part well enough to direct an agent and tell whether its result is right.
 
-A candidate is a concrete approach or result for this part, as an agent might produce it. Pick whichever fits the part. Keep it short enough to judge in a minute or two: a short paragraph, a few steps or a small snippet, under 150 words. Don't restate the user's summary back to them.
+A candidate is a concrete approach or result for this part, as an agent might produce it. Pick whichever fits the part. Keep it short enough to judge in a minute or two: a short paragraph, a few steps or a small snippet, under 150 words. Don't restate the user's summary back to them. Write math as plain text or Unicode (z = 2x₁ − x₂), never LaTeX.
 
 You are told whether to make it correct or flawed. A flawed candidate contains exactly one real flaw that matters for the goal and that someone who understands the part would catch. It must look plausible: never hint at the flaw.
 
@@ -1539,6 +1728,148 @@ mod tests {
         turn(&rt, "I already know this one").await;
         let s = rt.load_session("s").unwrap().unwrap();
         assert_eq!(s.map.get(&next).unwrap().status, PartStatus::Known);
+    }
+
+    /// Scripted decision answers: (step, probability, part).
+    struct FakeDecider(Mutex<VecDeque<(&'static str, f64, Option<&'static str>)>>);
+
+    impl Decide for FakeDecider {
+        fn decide<'a>(
+            &'a self,
+            _input: &'a str,
+            questions: &'a [Question],
+        ) -> futures_util::future::BoxFuture<'a, Result<Option<Decision>>> {
+            let next = self.0.lock().unwrap().pop_front();
+            let offered: Vec<String> = questions[0].options.iter().map(|o| o.0.clone()).collect();
+            Box::pin(async move {
+                let (step, probability, part) = next.expect("unexpected decision call");
+                assert!(
+                    offered.iter().any(|o| o == step),
+                    "{step} not offered: {offered:?}"
+                );
+                let mut answers = std::collections::HashMap::new();
+                answers.insert(
+                    "step".to_string(),
+                    crate::decide::Answer {
+                        choice: step.into(),
+                        probability,
+                    },
+                );
+                if let Some(part) = part {
+                    answers.insert(
+                        "part".to_string(),
+                        crate::decide::Answer {
+                            choice: part.into(),
+                            probability: 0.9,
+                        },
+                    );
+                }
+                Ok(Some(Decision {
+                    by: "Fake".into(),
+                    answers,
+                }))
+            })
+        }
+    }
+
+    fn with_decisions(
+        rt: Runtime,
+        steps: Vec<(&'static str, f64, Option<&'static str>)>,
+    ) -> Runtime {
+        rt.with_decider(Arc::new(FakeDecider(Mutex::new(steps.into()))))
+    }
+
+    #[tokio::test]
+    async fn decided_steps_skip_the_llm() {
+        let (rt, _) = runtime(
+            FakeEngine::new(vec![(ReadOnly, S1, ONBOARD_READY), (ReadOnly, S2, MAP)]),
+            false,
+        );
+        let rt = with_decisions(
+            rt,
+            vec![("known", 0.95, None), ("move", 0.9, Some("route"))],
+        );
+        turn(&rt, "goal").await;
+        turn(&rt, "I already know routing").await;
+        let s = rt.load_session("s").unwrap().unwrap();
+        assert_eq!(s.map.get("route").unwrap().status, PartStatus::Known);
+        assert_eq!(s.active.as_deref(), Some("report"));
+        turn(&rt, "go back to routing").await;
+        let s = rt.load_session("s").unwrap().unwrap();
+        assert_eq!(s.active.as_deref(), Some("route"));
+    }
+
+    #[tokio::test]
+    async fn a_question_about_a_waiting_candidate_skips_the_judge() {
+        let (rt, engine) = runtime(
+            FakeEngine::new(vec![
+                (ReadOnly, S1, ONBOARD_READY),
+                (ReadOnly, S2, MAP),
+                (
+                    ReadOnly,
+                    S1,
+                    r#"{"intent":"log","reply":"Ok.","map_change":null}"#,
+                ),
+                (ReadOnly, S2, r#"{"candidate":"z = 99","key_reason":"r"}"#),
+                // Decided as a log entry: only the reply LLM runs, no judge.
+                (
+                    ReadOnly,
+                    S1,
+                    r#"{"intent":"summary","reply":"It means x.","map_change":null}"#,
+                ),
+                (ReadOnly, S2, r#"{"pass":true,"feedback":"Right."}"#),
+            ]),
+            false,
+        );
+        let rt = with_decisions(
+            rt,
+            vec![
+                ("log", 0.9, None),
+                ("summary", 0.8, None),
+                ("log", 0.85, None),
+                ("verdict", 0.9, None),
+            ],
+        );
+        turn(&rt, "goal").await;
+        turn(&rt, "thinking").await;
+        turn(&rt, "I get it: names map to handlers").await;
+        let out = turn(&rt, "what does dispatch mean?").await;
+        // The LLM's own intent is ignored once the decision model has spoken.
+        assert!(!out.reply.contains("Candidate"));
+        let prompt = engine.prompts.lock().unwrap().last().cloned().unwrap();
+        assert!(prompt.contains("Fake classified this message as a log entry"));
+        assert!(!prompt.contains("z = 99"));
+        assert!(
+            rt.load_session("s")
+                .unwrap()
+                .unwrap()
+                .pending_candidate
+                .is_some()
+        );
+        turn(&rt, "right, names map to handlers").await;
+        let s = rt.load_session("s").unwrap().unwrap();
+        assert_eq!(s.map.get("route").unwrap().status, PartStatus::Understood);
+    }
+
+    #[tokio::test]
+    async fn an_unsure_decision_leaves_it_to_the_llm() {
+        let (rt, _) = runtime(
+            FakeEngine::new(vec![
+                (ReadOnly, S1, ONBOARD_READY),
+                (ReadOnly, S2, MAP),
+                (
+                    ReadOnly,
+                    S1,
+                    r#"{"intent":"known","reply":"","map_change":null}"#,
+                ),
+            ]),
+            false,
+        );
+        let rt = with_decisions(rt, vec![("summary", 0.4, None)]);
+        turn(&rt, "goal").await;
+        turn(&rt, "hmm, I sort of know this").await;
+        let s = rt.load_session("s").unwrap().unwrap();
+        assert_eq!(s.map.get("route").unwrap().status, PartStatus::Known);
     }
 
     #[tokio::test]

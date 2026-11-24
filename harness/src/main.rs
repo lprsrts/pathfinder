@@ -4,6 +4,7 @@ mod auth;
 mod catalog;
 mod cli;
 mod config;
+mod decide;
 mod domain;
 mod engine;
 mod llm;
@@ -53,7 +54,10 @@ async fn main() -> Result<()> {
                 CliEngine::new(cfg),
                 ApiEngine::with_credentials(creds.clone()),
             ));
-            let runtime = Arc::new(Runtime::new(store, engine));
+            let runtime = Arc::new(
+                Runtime::new(store, engine)
+                    .with_decider(Arc::new(decide::SystemDecider::new(creds.clone()))),
+            );
             acp::run_stdio(runtime, creds).await
         }
         Some("auth") => cli::auth(&args[1..]).await,

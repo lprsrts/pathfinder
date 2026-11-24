@@ -167,6 +167,43 @@ impl Credentials {
         self.store.delete(&key_name(route))
     }
 
+    /// A key that isn't a model route's, such as a decision service's: the
+    /// environment variable, then the auth file entry `name`.
+    pub fn named_key(&self, name: &str, env_var: &'static str) -> Option<(String, KeySource)> {
+        if self.use_env {
+            if let Ok(v) = env::var(env_var) {
+                if !v.trim().is_empty() {
+                    return Some((v.trim().to_string(), KeySource::Env(env_var)));
+                }
+            }
+        }
+        self.store
+            .get(name)
+            .ok()
+            .flatten()
+            .filter(|v| !v.trim().is_empty())
+            .map(|v| (v, KeySource::File))
+    }
+
+    pub fn set_named(&self, name: &str, key: &str) -> Result<()> {
+        self.store.set(name, key)
+    }
+
+    pub fn remove_named(&self, name: &str) -> Result<bool> {
+        self.store.delete(name)
+    }
+
+    /// Copies the keychain item `name` into the auth file entry `name`.
+    pub fn import_named(&self, name: &str) -> Result<bool> {
+        match (self.keychain)(name)? {
+            Some(key) if !key.trim().is_empty() => {
+                self.store.set(name, key.trim())?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
     /// Copies a `<provider>-api-key` keychain item into the auth file.
     pub fn import_keychain(&self, route: Route) -> Result<bool> {
         match (self.keychain)(&key_name(route))? {
