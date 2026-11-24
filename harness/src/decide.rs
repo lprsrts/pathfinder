@@ -58,7 +58,8 @@ pub enum Provider {
 }
 
 impl Provider {
-    pub const ALL: [Provider; 3] = [Provider::Openai, Provider::Gemini, Provider::Typesafe];
+    /// Auto order: fastest and cheapest first.
+    pub const ALL: [Provider; 3] = [Provider::Typesafe, Provider::Openai, Provider::Gemini];
 
     /// Used in `harness auth set <id>` and `HARNESS_DECISION`.
     pub fn id(self) -> &'static str {
@@ -205,7 +206,7 @@ impl Provider {
 }
 
 /// The configured service: `HARNESS_DECISION` (`openai`, `gemini`,
-/// `typesafe` or `off`), else the first with a key, in that order.
+/// `typesafe` or `off`), else the first with a key: Jev, OpenAI, Gemini.
 pub struct SystemDecider {
     creds: Arc<Credentials>,
     http: reqwest::Client,

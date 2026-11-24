@@ -100,9 +100,9 @@ Before an LLM sees a chat message, a decision model can say which step it is (a 
 
 | Service | Model | Key |
 |---|---|---|
+| TypeSafe Jev | `jev-1.14.0` | `harness auth set typesafe` (or `TYPESAFE_API_KEY`) |
 | OpenAI Decisions API | `gpt-6-luna` | your OpenAI API key (ChatGPT sign-in tokens aren't accepted) |
 | Gemini Decision 1 | `gemini-decision-1` | `harness auth set gemini` (or `GEMINI_API_KEY`) |
-| TypeSafe Jev | `jev-1.14.0` | `harness auth set typesafe` (or `TYPESAFE_API_KEY`) |
 
 The first one with a key is used, in that order. `HARNESS_DECISION=openai|gemini|typesafe|off` picks one. Each decision shows in the thinking panel with its probability.
 
