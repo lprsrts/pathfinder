@@ -297,7 +297,7 @@ impl Runtime {
             "/handoff" => self.handle_handoff(session, arg, files, sink).await,
             "/object" => self.handle_object(session, arg, files, sink).await,
             "/approve" => self.handle_approve(session),
-            "/known" => self.handle_known(session),
+            "/known" => self.handle_known(session, Some(arg)),
             "/delegate" => self.handle_delegate(session, arg, files, sink).await,
             "/accept" => self.handle_accept(session),
             "/reject" => Ok(match session.pending_change.take() {
@@ -720,7 +720,7 @@ impl Runtime {
             );
             questions.push(Question {
                 name: "part".into(),
-                instructions: "If they want to go to a part, which one do they name?".into(),
+                instructions: "Which part do they ask to go to, if any (also when they skip this one)?".into(),
                 options,
             });
         }
@@ -776,7 +776,11 @@ impl Runtime {
         if step.probability < DECISION_THRESHOLD {
             return None;
         }
-        let part = decision.answers.get("part").map(|a| a.choice.clone());
+        let part = decision
+            .answers
+            .get("part")
+            .filter(|a| a.probability >= DECISION_THRESHOLD)
+            .map(|a| a.choice.clone());
         Some((step.choice.clone(), part, decision.by))
     }
 
@@ -805,7 +809,7 @@ impl Runtime {
                 session.push_turn("assistant", reply);
                 Ok(TurnOutput::text(reply))
             }
-            Intent::Known => self.handle_known(session),
+            Intent::Known => self.handle_known(session, part),
             Intent::Move => Ok(match part.filter(|p| !p.is_empty() && *p != "next") {
                 Some(id) => self.handle_focus(session, id),
                 None => self.handle_next(session),
@@ -972,7 +976,9 @@ impl Runtime {
 
     // --- §6 Skips ---
 
-    fn handle_known(&self, session: &mut Session) -> Result<TurnOutput> {
+    /// `then`: a part to go to afterwards ("I know this, take me to X"),
+    /// instead of the next unresolved one.
+    fn handle_known(&self, session: &mut Session, then: Option<&str>) -> Result<TurnOutput> {
         let Some(part) = session.active_part().cloned() else {
             return Ok(TurnOutput::text("No part is active."));
         };
@@ -985,10 +991,22 @@ impl Runtime {
         }
         session.pending_candidate = None;
         self.set_status(session, &part.id, PartStatus::Known, "claimed by the user")?;
-        Ok(self.after_resolution(
-            session,
-            format!("**{}** recorded as already known.", part.title),
-        ))
+        let lead = format!("**{}** recorded as already known.", part.title);
+        let target = then
+            .filter(|q| !q.is_empty() && *q != "next")
+            .and_then(|q| session.map.resolve(q).ok())
+            .filter(|id| *id != part.id);
+        let Some(id) = target else {
+            return Ok(self.after_resolution(session, lead));
+        };
+        session.active = Some(id);
+        session.mode = SessionMode::Working;
+        let reply = format!(
+            "{lead}\n\n{}",
+            render_part(session.active_part().unwrap(), false)
+        );
+        session.push_turn("assistant", &reply);
+        Ok(TurnOutput::changed(reply))
     }
 
     async fn handle_delegate(
@@ -1339,7 +1357,7 @@ First decide what the latest message is (`intent`):
 - `log`: thinking, reasoning, an attempt or a question. The default; when unsure, it's `log`.
 - `summary`: they offer their explanation of the part as a whole, ready to be checked ("I think I get it: ...", "so to sum up, ..."). Not a single point or a question.
 - `known`: they clearly say they already know this whole part and want to skip it. Knowing some of it isn't enough.
-- `move`: they want to go on to the next part, or to a named one (put its id in `part`).
+- `move`: they want to go on to the next part, or to a named one (put its id in `part`). For `known`, also put a part they name to go to in `part`.
 - `accept` / `reject`: they answer a waiting map change ("yes, add it", "no, keep the map").
 For anything but `log`, set `reply` to "" and `map_change` to null: Pathfinder takes the step.
 
@@ -1938,6 +1956,30 @@ mod tests {
             .unwrap();
         turn(&rt, "goal").await;
         assert_eq!(turn(&rt, "thinking").await.reply, "");
+    }
+
+    #[tokio::test]
+    async fn a_skip_can_go_to_a_named_part() {
+        const MAP3: &str = r#"{"brief":"Three parts.","parts":[
+            {"id":"a","title":"A","depends_on":[]},
+            {"id":"b","title":"B","depends_on":[]},
+            {"id":"c","title":"C","depends_on":[]}]}"#;
+        let (rt, _) = runtime(
+            FakeEngine::new(vec![(ReadOnly, S1, ONBOARD_READY), (ReadOnly, S2, MAP3)]),
+            false,
+        );
+        // The second skip names no part: the next unresolved one follows.
+        let rt = with_decisions(rt, vec![("known", 0.95, Some("c")), ("known", 0.9, None)]);
+        turn(&rt, "goal").await;
+        let out = turn(&rt, "I know this one already, get to c").await;
+        let s = rt.load_session("s").unwrap().unwrap();
+        assert_eq!(s.map.get("a").unwrap().status, PartStatus::Known);
+        assert_eq!(s.active.as_deref(), Some("c"));
+        assert!(out.reply.contains("**C**"));
+        turn(&rt, "know this too").await;
+        let s = rt.load_session("s").unwrap().unwrap();
+        assert_eq!(s.map.get("c").unwrap().status, PartStatus::Known);
+        assert_eq!(s.active.as_deref(), Some("b"));
     }
 
     #[tokio::test]

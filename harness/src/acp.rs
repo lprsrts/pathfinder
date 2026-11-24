@@ -606,7 +606,11 @@ fn send_commands(cx: &ConnectionTo<Client>, session_id: SessionId) -> Result<(),
                 "What's wrong and why",
             )),
         ),
-        AvailableCommand::new("known", "Skip this part as already known"),
+        AvailableCommand::new("known", "Skip this part as already known").input(
+            AvailableCommandInput::Unstructured(UnstructuredCommandInput::new(
+                "part to go to next (optional)",
+            )),
+        ),
         AvailableCommand::new("delegate", "Hand this part off without understanding it").input(
             AvailableCommandInput::Unstructured(UnstructuredCommandInput::new(
                 "Optional instructions",
