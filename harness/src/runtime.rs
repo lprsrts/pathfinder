@@ -7,8 +7,8 @@ use anyhow::{Result, anyhow};
 
 use crate::config::{Config, ModelEntry};
 use crate::domain::{
-    CandidateProposal, JudgmentVerdict, LogReply, MapChange, MapProposal, OnboardingDecision, Part,
-    PartStatus, PendingCandidate, Session, SessionMode,
+    CandidateProposal, JudgmentVerdict, LogReply, Map, MapChange, MapProposal, OnboardingDecision,
+    Part, PartStatus, PendingCandidate, Session, SessionMode,
 };
 use crate::engine::{
     Engine, EngineRequest, EngineTier, RunContext, StreamEvent, StreamSink, TierModels, ToolAccess,
@@ -350,7 +350,7 @@ impl Runtime {
             |c: &MapChange| check_change(c, &current),
         )
         .await?;
-        let reply = render_change(&change);
+        let reply = render_change(&change, &session.map);
         session.pending_change = Some(change);
         Ok(TurnOutput::text(reply))
     }
@@ -437,10 +437,11 @@ impl Runtime {
             cwd: session.cwd.clone(),
             system_prompt: LOG_SYSTEM.to_string(),
             prompt: format!(
-                "Goal: {}\n\n{}\n\nMap:\n{}\n\nLatest log entry: {text}\n\nRead any files you need first, then respond with JSON only.",
+                "Goal: {}\n\n{}\n\nMap:\n{}\n\nRecent conversation:\n{}\n\nLatest log entry: {text}\n\nRead any files you need first, then respond with JSON only.",
                 session.goal.as_deref().unwrap_or("(session goal)"),
                 describe_part(&part),
                 session.map.render(session.active.as_deref()),
+                format_history(session),
             ),
             files: files.to_vec(),
             stream_text: false,
@@ -464,7 +465,7 @@ impl Runtime {
         let mut visible = String::new();
         let mut full = decision.reply;
         if let Some(change) = decision.map_change {
-            let rendered = format!("\n\n{}", render_change(&change));
+            let rendered = format!("\n\n{}", render_change(&change, &session.map));
             visible.push_str(&rendered);
             full.push_str(&rendered);
             session.pending_change = Some(change);
@@ -607,7 +608,7 @@ impl Runtime {
         let next = if verdict.pass {
             self.set_status(session, &part.id, PartStatus::Understood, &verdict.feedback)?;
             format!(
-                "\n\n**{}** understood. `/handoff` gives the work to the agent; or keep it yourself and `/next`.",
+                "\n\n**{}** understood. `/next` moves on; `/handoff` if this part has work for the agent.",
                 part.title
             )
         } else {
@@ -889,7 +890,8 @@ fn describe_part(part: &Part) -> String {
     out
 }
 
-fn render_change(change: &MapChange) -> String {
+/// `+` adds a part, `~` updates one already on the map.
+fn render_change(change: &MapChange, map: &Map) -> String {
     let mut lines = vec![format!("Proposed map change: {}", change.brief)];
     for p in &change.parts {
         let deps = if p.depends_on.is_empty() {
@@ -897,7 +899,8 @@ fn render_change(change: &MapChange) -> String {
         } else {
             format!(" (needs {})", p.depends_on.join(", "))
         };
-        lines.push(format!("+ `{}` {}{deps}", p.id, p.title));
+        let mark = if map.get(&p.id).is_some() { "~" } else { "+" };
+        lines.push(format!("{mark} `{}` {}{deps}", p.id, p.title));
     }
     for id in &change.remove {
         lines.push(format!("- remove `{id}`"));
@@ -910,7 +913,7 @@ fn render_map_and_pending(session: &Session) -> String {
     let mut out = session.map.render(session.active.as_deref());
     if let Some(change) = &session.pending_change {
         out.push_str("\n\n");
-        out.push_str(&render_change(change));
+        out.push_str(&render_change(change, &session.map));
     }
     out
 }
@@ -961,16 +964,18 @@ const CHANGE_SYSTEM: &str = r#"You propose a change to Pathfinder's map of what 
 - `remove`: ids of parts to drop. Only parts with no work or outcome can be removed.
 - No size limit. No cycles.
 
+`brief`: one sentence to the user, saying "you", on what changes and why.
+
 Return ONLY a JSON object:
-{"brief": "what changed", "parts": [], "remove": []}"#;
+{"brief": "...", "parts": [], "remove": []}"#;
 
 const LOG_SYSTEM: &str = r#"The user is working on one part of a task and logging their thinking and the reasons behind their steps and choices. The log is evidence of their understanding.
 
-Reply briefly to the latest entry: answer what they ask, or point out what the entry reveals. Do not do the work for them and do not give away the part's answer.
+Reply briefly to the latest entry: answer what they ask, or point out what the entry reveals. If they ask whether something is right, say whether it is, even when it belongs to another part. Don't repeat what you already said in the conversation. Do not do the work for them and do not write their explanation of the part for them.
 
 The user decides which parts they do themselves and which go to an agent. Never raise that.
 
-If the entry reveals the map is wrong (a missing dependency, a part that doesn't belong, a wrong edge), propose a change in `map_change`; the user accepts or rejects it. Otherwise set it to null. A change has `brief`, `parts` (to add, or update by id: id, title, note, depends_on; new ids are short hyphenated slugs of at most 12 characters) and `remove` (ids of parts with no work yet).
+If the entry reveals the map is wrong (a missing dependency, a part that doesn't belong, a wrong edge), propose a change in `map_change`; the user accepts or rejects it. Otherwise set it to null. A change has `brief` (one sentence to the user, saying "you"), `parts` (to add, or update by id: id, title, note, depends_on; new ids are short hyphenated slugs of at most 12 characters) and `remove` (ids of parts with no work yet).
 
 Call `read` before writing your JSON if a file matters: `reply` ends your turn.
 
@@ -979,7 +984,7 @@ Return ONLY a JSON object:
 
 const CANDIDATE_SYSTEM: &str = r#"You make a candidate for the user to judge. Their judgment decides whether they understand the part well enough to direct an agent and tell whether its result is right.
 
-A candidate is a concrete approach or result for this part, as an agent might produce it. Pick whichever fits the part.
+A candidate is a concrete approach or result for this part, as an agent might produce it. Pick whichever fits the part. Keep it short enough to judge in a minute or two: a short paragraph, a few steps or a small snippet, under 150 words. Don't restate the user's summary back to them.
 
 You are told whether to make it correct or flawed. A flawed candidate contains exactly one real flaw that matters for the goal and that someone who understands the part would catch. It must look plausible: never hint at the flaw.
 

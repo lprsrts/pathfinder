@@ -60,7 +60,8 @@ fn request_body_for(req: &LlmRequest, chatgpt: bool) -> Value {
         // Nothing is stored server-side; reasoning is carried in the history.
         "store": false,
         "include": ["reasoning.encrypted_content"],
-        "reasoning": {"summary": "auto"},
+        // "auto" returns empty summaries on the ChatGPT route.
+        "reasoning": {"summary": "detailed"},
     });
     if let Some(effort) = &req.effort {
         body["reasoning"]["effort"] = json!(effort);
@@ -217,7 +218,7 @@ impl StreamState {
                 return Err(LlmError::Protocol(format!("response incomplete: {reason}")));
             }
             Some("error") => return Err(failure(&json!({"error": v}))),
-            _ => {}
+            other => tracing::debug!(event = other.unwrap_or("?"), "unhandled Responses event"),
         }
         Ok(false)
     }
