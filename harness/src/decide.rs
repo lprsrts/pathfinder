@@ -42,12 +42,19 @@ pub struct Decision {
 }
 
 pub trait Decide: Send + Sync {
-    /// `Ok(None)` when no decision service is configured.
+    /// `prefer`: a service id the thread picked. `Ok(None)` when no decision
+    /// service is configured.
     fn decide<'a>(
         &'a self,
         input: &'a str,
         questions: &'a [Question],
+        prefer: Option<&'a str>,
     ) -> BoxFuture<'a, Result<Option<Decision>>>;
+
+    /// Services with a key, in auto order, for the thread's picker.
+    fn available(&self) -> Vec<Provider> {
+        Vec::new()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +86,15 @@ impl Provider {
             Self::Openai => "OpenAI Decisions (gpt-6-luna)",
             Self::Gemini => "Gemini Decision 1",
             Self::Typesafe => "TypeSafe Jev",
+        }
+    }
+
+    /// One line for the picker.
+    pub fn summary(self) -> &'static str {
+        match self {
+            Self::Openai => "OpenAI Decisions API; uses your OpenAI API key",
+            Self::Gemini => "Google's Decisions API; text, images, audio, video and PDF",
+            Self::Typesafe => "Fastest and cheapest (about 0.2 s)",
         }
     }
 
@@ -223,9 +239,15 @@ impl SystemDecider {
         }
     }
 
-    fn pick(&self) -> Result<Option<(Provider, String)>> {
+    fn pick(&self, prefer: Option<&str>) -> Result<Option<(Provider, String)>> {
         let wanted = env::var("HARNESS_DECISION").unwrap_or_default();
-        let candidates: Vec<Provider> = match wanted.trim() {
+        // `off` in the environment wins; otherwise the thread's pick does.
+        let wanted = match (wanted.trim(), prefer) {
+            ("off", _) => "off",
+            (_, Some(p)) => p,
+            (w, None) => w,
+        };
+        let candidates: Vec<Provider> = match wanted {
             "" | "auto" => Provider::ALL.to_vec(),
             "off" => return Ok(None),
             id => vec![Provider::from_id(id).ok_or_else(|| {
@@ -245,9 +267,10 @@ impl Decide for SystemDecider {
         &'a self,
         input: &'a str,
         questions: &'a [Question],
+        prefer: Option<&'a str>,
     ) -> BoxFuture<'a, Result<Option<Decision>>> {
         Box::pin(async move {
-            let Some((provider, key)) = self.pick()? else {
+            let Some((provider, key)) = self.pick(prefer)? else {
                 return Ok(None);
             };
             let answers = call(&self.http, provider, &key, input, questions).await?;
@@ -256,6 +279,13 @@ impl Decide for SystemDecider {
                 answers,
             }))
         })
+    }
+
+    fn available(&self) -> Vec<Provider> {
+        Provider::ALL
+            .into_iter()
+            .filter(|p| self.creds.named_key(p.key_name(), p.key_env()).is_some())
+            .collect()
     }
 }
 

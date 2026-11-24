@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use agent_client_protocol::v1::ConnectionTo;
 use agent_client_protocol::v1::schema::{
@@ -25,7 +26,7 @@ use crate::catalog::{self, ModelCache};
 use crate::config::{Config, Route};
 use crate::domain::{PartStatus, Session};
 use crate::engine::{StreamEvent, StreamSink};
-use crate::runtime::{ModelChoices, Runtime, TurnInput};
+use crate::runtime::{EFFORTS, ModelChoices, OptionValue, Runtime, TurnInput};
 use crate::stream::{ToolContent, ToolKind};
 
 pub async fn run_stdio(runtime: Arc<Runtime>, creds: Arc<Credentials>) -> Result<()> {
@@ -35,12 +36,27 @@ pub async fn run_stdio(runtime: Arc<Runtime>, creds: Arc<Credentials>) -> Result
     let rt_load = runtime.clone();
     let rt_prompt = runtime.clone();
     let rt_config = runtime.clone();
+    // Whether Zed can show on/off switches; set at initialize.
+    let switches = Arc::new(AtomicBool::new(false));
+    let (sw_init, sw_new, sw_load, sw_config) = (
+        switches.clone(),
+        switches.clone(),
+        switches.clone(),
+        switches.clone(),
+    );
 
     Agent
         .v1()
         .name("harness")
         .on_receive_request(
             async move |req: InitializeRequest, responder, _cx| {
+                let booleans = req
+                    .client_capabilities
+                    .session
+                    .as_ref()
+                    .and_then(|s| s.config_options.as_ref())
+                    .is_some_and(|c| c.boolean.is_some());
+                sw_init.store(booleans, Ordering::Relaxed);
                 let capabilities = AgentCapabilities::new()
                     .load_session(true)
                     .prompt_capabilities(PromptCapabilities::new().embedded_context(true));
@@ -84,7 +100,10 @@ pub async fn run_stdio(runtime: Arc<Runtime>, creds: Arc<Credentials>) -> Result
                 match rt_new.create_session(id.clone(), req.cwd) {
                     Ok(session) => {
                         let sid = SessionId::new(id);
-                        let options = model_options(&rt_new.model_choices(&session));
+                        let options = model_options(
+                            &rt_new.model_choices(&session),
+                            sw_new.load(Ordering::Relaxed),
+                        );
                         responder.respond(
                             NewSessionResponse::new(sid.clone()).config_options(options),
                         )?;
@@ -125,7 +144,10 @@ pub async fn run_stdio(runtime: Arc<Runtime>, creds: Arc<Credentials>) -> Result
                 if !loaded.map.parts.is_empty() {
                     let _ = send_plan(&cx, req.session_id.clone(), &loaded);
                 }
-                let options = model_options(&rt_load.model_choices(&loaded));
+                let options = model_options(
+                    &rt_load.model_choices(&loaded),
+                    sw_load.load(Ordering::Relaxed),
+                );
                 responder.respond(LoadSessionResponse::new().config_options(options))?;
                 let _ = send_commands(&cx, req.session_id);
                 Ok(())
@@ -135,23 +157,23 @@ pub async fn run_stdio(runtime: Arc<Runtime>, creds: Arc<Credentials>) -> Result
         .on_receive_request(
             async move |req: SetSessionConfigOptionRequest, responder, _cx| {
                 let id = req.session_id.0.to_string();
-                let system2 = match req.config_id.0.as_ref() {
-                    "system1" => false,
-                    "system2" => true,
-                    other => {
+                let value = match &req.value {
+                    SessionConfigOptionValue::Boolean { value } => OptionValue::Bool(*value),
+                    SessionConfigOptionValue::ValueId { value } => {
+                        OptionValue::Id(value.0.to_string())
+                    }
+                    _ => {
                         return responder.respond_with_error(
-                            AcpError::invalid_params().data(format!("unknown option `{other}`")),
+                            AcpError::invalid_params().data("unsupported value"),
                         );
                     }
                 };
-                let SessionConfigOptionValue::ValueId { value } = &req.value else {
-                    return responder.respond_with_error(
-                        AcpError::invalid_params().data("expected a model id"),
-                    );
-                };
-                match rt_config.set_model(&id, system2, &value.0) {
+                match rt_config.set_option(&id, req.config_id.0.as_ref(), value) {
                     Ok(session) => {
-                        let options = model_options(&rt_config.model_choices(&session));
+                        let options = model_options(
+                            &rt_config.model_choices(&session),
+                            sw_config.load(Ordering::Relaxed),
+                        );
                         responder.respond(SetSessionConfigOptionResponse::new(options))
                     }
                     Err(err) => responder
@@ -291,10 +313,12 @@ fn replay_history(cx: &ConnectionTo<Client>, session_id: &SessionId, session: &S
     }
 }
 
-/// The two model pickers. Zed's buttons show only the selected option's name
-/// (the picker's name and description appear on hover), so each option names
-/// its CLI: pi and Codex offer the same model names.
-fn model_options(choices: &ModelChoices) -> Vec<SessionConfigOption> {
+/// The thread's toolbar, laid out like the Claude Code and Codex adapters:
+/// model pickers, an effort level for the main model, and the Decisions
+/// switch with its service picker. Zed's buttons show only the selected
+/// option's name (name and description appear on hover), so model options
+/// name their route.
+fn model_options(choices: &ModelChoices, switches: bool) -> Vec<SessionConfigOption> {
     if choices.catalog.is_empty() {
         return Vec::new();
     }
@@ -314,7 +338,13 @@ fn model_options(choices: &ModelChoices) -> Vec<SessionConfigOption> {
             .map(|(g, options)| SessionConfigSelectGroup::new(g, g, options))
             .collect()
     };
-    vec![
+    let effort_name = |level: &str| match level {
+        "low" => "Low",
+        "medium" => "Medium",
+        "high" => "High",
+        _ => "Default",
+    };
+    let mut options = vec![
         // Zed lists these right to left: Main first puts Fast on the left.
         SessionConfigOption::select(
             "system2",
@@ -325,6 +355,27 @@ fn model_options(choices: &ModelChoices) -> Vec<SessionConfigOption> {
         .description("System 2: map, candidates, judgment and agent work".to_string())
         .category(SessionConfigOptionCategory::Model),
         SessionConfigOption::select(
+            "effort",
+            "Effort",
+            choices.effort.clone(),
+            EFFORTS
+                .iter()
+                .map(|level| {
+                    SessionConfigSelectOption::new(*level, effort_name(level)).description(
+                        match *level {
+                            "default" => "The model's own setting, or medium",
+                            "low" => "Faster, shallower candidates and judgments",
+                            "medium" => "Balanced",
+                            _ => "Slower, more careful candidates and judgments",
+                        }
+                        .to_string(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )
+        .description("Reasoning effort for the main model".to_string())
+        .category(SessionConfigOptionCategory::ThoughtLevel),
+        SessionConfigOption::select(
             "system1",
             "Fast model",
             choices.system1.clone().unwrap_or_default(),
@@ -332,7 +383,52 @@ fn model_options(choices: &ModelChoices) -> Vec<SessionConfigOption> {
         )
         .description("System 1: onboarding and log replies".to_string())
         .category(SessionConfigOptionCategory::ModelConfig),
-    ]
+    ];
+    let Some(current) = choices.decision_model else {
+        return options;
+    };
+    let description = format!(
+        "Before the LLM, {} decides what each chat message is: a log entry, an explanation, a skip, a move or a verdict",
+        current.label()
+    );
+    options.push(
+        if switches {
+            SessionConfigOption::boolean("decisions", "Decisions", choices.decisions_on)
+        } else {
+            SessionConfigOption::select(
+                "decisions",
+                "Decisions",
+                if choices.decisions_on { "on" } else { "off" },
+                vec![
+                    SessionConfigSelectOption::new("on", "Decisions on"),
+                    SessionConfigSelectOption::new("off", "Decisions off")
+                        .description("The LLM decides each message's step itself".to_string()),
+                ],
+            )
+        }
+        .description(description)
+        .category(SessionConfigOptionCategory::ModelConfig),
+    );
+    if choices.decisions_on && choices.decision_available.len() > 1 {
+        options.push(
+            SessionConfigOption::select(
+                "decision_model",
+                "Decision model",
+                current.id(),
+                choices
+                    .decision_available
+                    .iter()
+                    .map(|p| {
+                        SessionConfigSelectOption::new(p.id(), p.label())
+                            .description(p.summary().to_string())
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .description("Which decision service reads each chat message first".to_string())
+            .category(SessionConfigOptionCategory::ModelConfig),
+        );
+    }
+    options
 }
 
 fn option_label(model: &str, cli: &str) -> String {
@@ -578,6 +674,7 @@ fn hex_val(b: u8) -> Option<u8> {
 mod tests {
     use super::*;
     use crate::config::{ModelEntry, Route};
+    use crate::decide::Provider;
 
     #[test]
     fn picker_options_name_the_cli() {
@@ -595,9 +692,13 @@ mod tests {
             ],
             system1: Some("anthropic-luna".into()),
             system2: Some("codex-luna".into()),
+            effort: "default".into(),
+            decision_available: vec![],
+            decisions_on: false,
+            decision_model: None,
         };
-        let json = serde_json::to_value(model_options(&choices)).unwrap();
-        let names: Vec<&str> = json[1]["options"]
+        let json = serde_json::to_value(model_options(&choices, true)).unwrap();
+        let names: Vec<&str> = json[2]["options"]
             .as_array()
             .unwrap()
             .iter()
@@ -606,8 +707,58 @@ mod tests {
             .collect();
         assert_eq!(names, ["GPT-6 Luna (Anthropic API)", "GPT-6 Luna (Codex)"]);
         assert_eq!(
-            json[1]["options"][1]["options"][0]["name"],
+            json[2]["options"][1]["options"][0]["name"],
             "GPT-6 Luna (Codex)"
         );
+        // No decision service with a key: no Decisions controls.
+        assert_eq!(json.as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn decisions_show_as_a_switch_and_a_service_picker() {
+        let entry = ModelEntry {
+            id: "m".into(),
+            label: "M".into(),
+            route: Route::Anthropic,
+            model: String::new(),
+            effort: None,
+        };
+        let choices = |on| ModelChoices {
+            catalog: vec![entry.clone()],
+            system1: Some("m".into()),
+            system2: Some("m".into()),
+            effort: "high".into(),
+            decision_available: vec![Provider::Typesafe, Provider::Openai],
+            decisions_on: on,
+            decision_model: Some(Provider::Typesafe),
+        };
+        let json = serde_json::to_value(model_options(&choices(true), true)).unwrap();
+        let ids: Vec<&str> = json
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|o| o["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                "system2",
+                "effort",
+                "system1",
+                "decisions",
+                "decision_model"
+            ]
+        );
+        assert_eq!(json[1]["category"], "thought_level");
+        assert_eq!(json[1]["currentValue"], "high");
+        assert_eq!(json[3]["type"], "boolean");
+        assert_eq!(json[3]["currentValue"], true);
+        assert_eq!(json[4]["currentValue"], "typesafe");
+
+        // Off: no service picker. Without switch support: an Off/On dropdown.
+        let json = serde_json::to_value(model_options(&choices(false), false)).unwrap();
+        assert_eq!(json.as_array().unwrap().len(), 4);
+        assert_eq!(json[3]["type"], "select");
+        assert_eq!(json[3]["currentValue"], "off");
     }
 }

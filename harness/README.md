@@ -104,7 +104,11 @@ Before an LLM sees a chat message, a decision model can say which step it is (a 
 | OpenAI Decisions API | `gpt-6-luna` | your OpenAI API key (ChatGPT sign-in tokens aren't accepted) |
 | Gemini Decision 1 | `gemini-decision-1` | `harness auth set gemini` (or `GEMINI_API_KEY`) |
 
-The first one with a key is used, in that order. `HARNESS_DECISION=openai|gemini|typesafe|off` picks one. Each decision shows in the thinking panel with its probability.
+In a thread, the **Decisions** switch turns it on or off and the **Decision model** picker (shown when more than one service has a key) chooses the service; otherwise the first one with a key is used, in that order. `HARNESS_DECISION=openai|gemini|typesafe|off` sets the default for every thread (`off` wins). Each decision shows in the thinking panel with its probability.
+
+## Thread toolbar
+
+Main model, Effort (main model reasoning: default, low, medium, high), Fast model, the Decisions switch and the Decision model picker. Each thread keeps its own settings. Zed draws Decisions as a switch where it supports on/off options, and as an On/Off dropdown otherwise.
 
 ## Slash commands in Zed
 

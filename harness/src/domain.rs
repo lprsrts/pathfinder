@@ -337,6 +337,17 @@ pub struct Session {
     pub system1: Option<String>,
     #[serde(default)]
     pub system2: Option<String>,
+    /// Effort for the main model (`low`, `medium`, `high`); None follows
+    /// the model entry or the tier default.
+    #[serde(default)]
+    pub effort: Option<String>,
+    /// The Decisions switch: off skips the decision model for this thread.
+    #[serde(default)]
+    pub decisions_off: bool,
+    /// Decision service id (`typesafe`, `openai`, `gemini`); None picks the
+    /// first one with a key.
+    #[serde(default)]
+    pub decision_model: Option<String>,
     pub history: Vec<TurnRecord>,
 }
 
@@ -353,6 +364,9 @@ impl Session {
             pending_change: None,
             system1: None,
             system2: None,
+            effort: None,
+            decisions_off: false,
+            decision_model: None,
             history: Vec::new(),
         }
     }

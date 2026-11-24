@@ -6,7 +6,7 @@ use std::sync::Arc;
 use anyhow::{Result, anyhow};
 
 use crate::config::{Config, ModelEntry};
-use crate::decide::{Decide, Decision, Question};
+use crate::decide::{Decide, Decision, Provider, Question};
 use crate::domain::{
     CandidateProposal, Intent, JudgmentVerdict, LogReply, Map, MapChange, MapProposal,
     OnboardingDecision, Part, PartStatus, PendingCandidate, Session, SessionMode,
@@ -57,6 +57,7 @@ impl Decide for NoDecider {
         &'a self,
         _input: &'a str,
         _questions: &'a [Question],
+        _prefer: Option<&'a str>,
     ) -> futures_util::future::BoxFuture<'a, Result<Option<Decision>>> {
         Box::pin(async { Ok(None) })
     }
@@ -82,6 +83,22 @@ pub struct ModelChoices {
     pub catalog: Vec<ModelEntry>,
     pub system1: Option<String>,
     pub system2: Option<String>,
+    /// Main model effort: `default`, `low`, `medium` or `high`.
+    pub effort: String,
+    /// Decision services with a key, in auto order.
+    pub decision_available: Vec<Provider>,
+    pub decisions_on: bool,
+    /// The service in use when on: the thread's pick, else the first available.
+    pub decision_model: Option<Provider>,
+}
+
+/// Main model effort levels offered in the picker.
+pub const EFFORTS: [&str; 4] = ["default", "low", "medium", "high"];
+
+/// A value from one of the thread's pickers or switches.
+pub enum OptionValue {
+    Id(String),
+    Bool(bool),
 }
 
 pub const NO_MODEL: &str =
@@ -110,38 +127,88 @@ impl Runtime {
                 .pick(choice.as_deref(), system2)
                 .ok_or_else(|| anyhow!(NO_MODEL))
         };
+        let mut system2 = pick(&session.system2, true)?;
+        if let Some(effort) = &session.effort {
+            system2.effort = Some(effort.clone());
+        }
         Ok(TierModels {
             system1: pick(&session.system1, false)?,
-            system2: pick(&session.system2, true)?,
+            system2,
         })
     }
 
     pub fn model_choices(&self, session: &Session) -> ModelChoices {
         let config = (self.config)();
+        let available = self.decider.available();
+        let decision_model = session
+            .decision_model
+            .as_deref()
+            .and_then(Provider::from_id)
+            .filter(|p| available.contains(p))
+            .or_else(|| available.first().copied());
         ModelChoices {
             catalog: config.catalog(),
             system1: config.pick(session.system1.as_deref(), false).map(|m| m.id),
             system2: config.pick(session.system2.as_deref(), true).map(|m| m.id),
+            effort: session.effort.clone().unwrap_or_else(|| "default".into()),
+            decisions_on: !session.decisions_off && decision_model.is_some(),
+            decision_available: available,
+            decision_model,
         }
     }
 
-    /// Sets a session's System 1 or System 2 model from the picker.
-    pub fn set_model(&self, session_id: &str, system2: bool, entry_id: &str) -> Result<Session> {
+    /// Applies one picker or switch from the thread's toolbar.
+    pub fn set_option(
+        &self,
+        session_id: &str,
+        option: &str,
+        value: OptionValue,
+    ) -> Result<Session> {
         let mut session = self
             .store
             .load_session(session_id)?
             .ok_or_else(|| anyhow!("unknown session `{session_id}`"))?;
-        if (self.config)().entry(entry_id).is_none() {
-            return Err(anyhow!("unknown model `{entry_id}`"));
+        match (option, value) {
+            ("system1" | "system2", OptionValue::Id(id)) => {
+                if (self.config)().entry(&id).is_none() {
+                    return Err(anyhow!("unknown model `{id}`"));
+                }
+                let slot = if option == "system2" {
+                    &mut session.system2
+                } else {
+                    &mut session.system1
+                };
+                *slot = Some(id);
+            }
+            ("effort", OptionValue::Id(level)) => {
+                if !EFFORTS.contains(&level.as_str()) {
+                    return Err(anyhow!("unknown effort `{level}`"));
+                }
+                session.effort = (level != "default").then_some(level);
+            }
+            // A switch, or an Off/On dropdown where switches aren't supported.
+            ("decisions", OptionValue::Bool(on)) => session.decisions_off = !on,
+            ("decisions", OptionValue::Id(v)) if v == "on" || v == "off" => {
+                session.decisions_off = v == "off";
+            }
+            ("decision_model", OptionValue::Id(id)) => {
+                if Provider::from_id(&id).is_none() {
+                    return Err(anyhow!("unknown decision model `{id}`"));
+                }
+                session.decision_model = Some(id);
+                session.decisions_off = false;
+            }
+            (other, _) => return Err(anyhow!("unknown option or value for `{other}`")),
         }
-        let slot = if system2 {
-            &mut session.system2
-        } else {
-            &mut session.system1
-        };
-        *slot = Some(entry_id.to_string());
         self.store.save_session(&session)?;
         Ok(session)
+    }
+
+    /// Sets a session's System 1 or System 2 model from the picker.
+    #[cfg(test)]
+    pub fn set_model(&self, session_id: &str, system2: bool, entry_id: &str) -> Result<Session> {
+        let option = if system2 { "system2" } else { "system1" };
+        self.set_option(session_id, option, OptionValue::Id(entry_id.into()))
     }
 
     pub fn create_session(&self, id: String, cwd: PathBuf) -> Result<Session> {
@@ -589,6 +656,9 @@ impl Runtime {
         text: &str,
         sink: &StreamSink,
     ) -> Option<(String, Option<String>, String)> {
+        if session.decisions_off {
+            return None;
+        }
         let part = session.active_part()?;
         let mut steps: Vec<(String, String)> = vec![
             ("log".into(), "Their thinking, reasoning, an attempt, or a question (including a question about a waiting candidate).".into()),
@@ -663,7 +733,8 @@ impl Runtime {
         }
         input.push_str(&format!("\nLatest message: {text}"));
 
-        let decision = match self.decider.decide(&input, &questions).await {
+        let prefer = session.decision_model.as_deref();
+        let decision = match self.decider.decide(&input, &questions, prefer).await {
             Ok(Some(d)) => d,
             Ok(None) => return None,
             Err(e) => {
@@ -1738,6 +1809,7 @@ mod tests {
             &'a self,
             _input: &'a str,
             questions: &'a [Question],
+            _prefer: Option<&'a str>,
         ) -> futures_util::future::BoxFuture<'a, Result<Option<Decision>>> {
             let next = self.0.lock().unwrap().pop_front();
             let offered: Vec<String> = questions[0].options.iter().map(|o| o.0.clone()).collect();
@@ -1777,6 +1849,66 @@ mod tests {
         steps: Vec<(&'static str, f64, Option<&'static str>)>,
     ) -> Runtime {
         rt.with_decider(Arc::new(FakeDecider(Mutex::new(steps.into()))))
+    }
+
+    #[test]
+    fn toolbar_options_persist_per_thread() {
+        let (rt, _) = runtime(FakeEngine::new(vec![]), false);
+        let s = rt
+            .set_option("s", "effort", OptionValue::Id("high".into()))
+            .unwrap();
+        assert_eq!(
+            rt.models(&s).unwrap().system2.effort.as_deref(),
+            Some("high")
+        );
+        assert_eq!(rt.model_choices(&s).effort, "high");
+        assert!(
+            rt.set_option("s", "effort", OptionValue::Id("max".into()))
+                .is_err()
+        );
+        let s = rt
+            .set_option("s", "effort", OptionValue::Id("default".into()))
+            .unwrap();
+        assert_eq!(s.effort, None);
+
+        let s = rt
+            .set_option("s", "decisions", OptionValue::Bool(false))
+            .unwrap();
+        assert!(s.decisions_off);
+        let s = rt
+            .set_option("s", "decisions", OptionValue::Id("on".into()))
+            .unwrap();
+        assert!(!s.decisions_off);
+        let s = rt
+            .set_option("s", "decision_model", OptionValue::Id("openai".into()))
+            .unwrap();
+        assert_eq!(s.decision_model.as_deref(), Some("openai"));
+        assert!(
+            rt.set_option("s", "decision_model", OptionValue::Id("x".into()))
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn decisions_off_skips_the_decision_model() {
+        let (rt, _) = runtime(
+            FakeEngine::new(vec![
+                (ReadOnly, S1, ONBOARD_READY),
+                (ReadOnly, S2, MAP),
+                (
+                    ReadOnly,
+                    S1,
+                    r#"{"intent":"log","reply":"Ok.","map_change":null}"#,
+                ),
+            ]),
+            false,
+        );
+        // An empty script: any decision call would panic.
+        let rt = with_decisions(rt, vec![]);
+        rt.set_option("s", "decisions", OptionValue::Bool(false))
+            .unwrap();
+        turn(&rt, "goal").await;
+        assert_eq!(turn(&rt, "thinking").await.reply, "");
     }
 
     #[tokio::test]
