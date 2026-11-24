@@ -15,6 +15,7 @@ use crate::engine::{
     Engine, EngineRequest, EngineTier, StreamEvent, StreamSink, TierModels, ToolAccess, run_gated,
     run_gated_streamed,
 };
+use crate::secrets::Secret;
 use crate::store::Store;
 use crate::understanding::EventKind;
 use crate::validate::{
@@ -23,6 +24,7 @@ use crate::validate::{
 use crate::workspace::WorkspaceSnapshot;
 
 mod concepts;
+mod gate;
 
 pub struct TurnInput {
     pub text: String,
@@ -256,6 +258,7 @@ impl Runtime {
             .load_session(session_id)?
             .ok_or_else(|| anyhow!("unknown session `{session_id}`"))?;
 
+        self.migrate_pending_key(&mut session);
         let text = input.text.trim();
         let files = &input.files;
         let output = if text.starts_with('/') {
@@ -273,6 +276,7 @@ impl Runtime {
             }
         };
 
+        self.retire_stale_secrets(&session);
         self.store.save_session(&session)?;
         Ok(output)
     }
@@ -602,13 +606,26 @@ impl Runtime {
         };
         let current = session.map.clone();
         let change_waiting = session.pending_change.is_some();
-        let (decision, shown): (LogReply, _) = run_gated_streamed(
+        // While a secret is active the reply is held for the gate (A6),
+        // thinking included: it may re-derive what the candidate tests.
+        let gate = self.gate_mode(session);
+        let reply_sink = match &gate {
+            gate::GateMode::Checked(_) => {
+                sink(StreamEvent::Thought(
+                    "Checking the reply against the candidate you're judging before showing it.\n"
+                        .into(),
+                ));
+                gate::held(&sink)
+            }
+            _ => sink.clone(),
+        };
+        let (mut decision, shown): (LogReply, _) = run_gated_streamed(
             self.engine.as_ref(),
             self.store.as_ref(),
             &session.id,
             "log",
             &req,
-            sink.clone(),
+            reply_sink,
             |r: &LogReply| check_log_reply(r, &current, change_waiting, decided_by.is_some()),
             Some("reply"),
         )
@@ -631,7 +648,15 @@ impl Runtime {
                 )
                 .await;
         }
-        flush(&sink, &decision.reply, &shown);
+        match &gate {
+            gate::GateMode::Checked(secrets) => {
+                decision.reply = self
+                    .gate_reply(session, secrets, text, decision.reply, &sink)
+                    .await;
+                sink(StreamEvent::TextDelta(decision.reply.clone()));
+            }
+            _ => flush(&sink, &decision.reply, &shown),
+        }
 
         if let Err(e) = self
             .extract_from_log(
@@ -999,16 +1024,25 @@ impl Runtime {
 
         const ASK: &str = "\n\nIs it right? Say why.";
         let reply = format!("{header}{}{ASK}", proposal.candidate);
+        session.push_turn("assistant", &reply);
+        // The key goes to the secrets table, never into the thread's state.
+        let secret = Secret::candidate_key(
+            &proposal.candidate,
+            !flawed,
+            &proposal.key_reason,
+            session.history.len() - 1,
+        );
+        self.store.add_secret(&session.id, &secret)?;
         session.pending_candidate = Some(PendingCandidate {
             part_id: part.id,
             candidate: proposal.candidate,
             key_correct: !flawed,
             key_reason: proposal.key_reason,
+            secret: Some(secret.id),
             targets,
             misconception,
             id: format!("cand-{}", uuid::Uuid::new_v4().simple()),
         });
-        session.push_turn("assistant", &reply);
         Ok(ASK.to_string())
     }
 
@@ -1019,7 +1053,16 @@ impl Runtime {
         files: &[PathBuf],
         sink: StreamSink,
     ) -> Result<TurnOutput> {
-        let pending = session.pending_candidate.take().unwrap();
+        let mut pending = session.pending_candidate.take().unwrap();
+        if let Some(id) = &pending.secret {
+            match self.store.secret(id)? {
+                Some(secret) => {
+                    pending.key_correct = secret.correct();
+                    pending.key_reason = secret.reason().to_string();
+                }
+                None => return Err(anyhow!("the candidate's key is missing")),
+            }
+        }
         let Some(part) = session.map.get(&pending.part_id).cloned() else {
             return Ok(TurnOutput::text(
                 "That candidate's part is no longer on the map.",
@@ -1048,17 +1091,22 @@ impl Runtime {
             models: self.models(session)?,
             ctx: crate::engine::turn_ctx(),
         };
-        let (verdict, shown): (JudgmentVerdict, _) = run_gated_streamed(
+        // The Judge holds the key: its thinking is never shown, and its
+        // feedback only once it confirms the message is a verdict (A2, A6).
+        sink(StreamEvent::Thought(
+            "Judging your verdict against the hidden key; that reasoning stays hidden.\n".into(),
+        ));
+        let verdict: JudgmentVerdict = run_gated(
             self.engine.as_ref(),
             self.store.as_ref(),
             &session.id,
             "judgment",
             &req,
-            sink.clone(),
+            gate::quiet(),
             check_verdict,
-            Some("feedback"),
         )
         .await?;
+        let shown = String::new();
         if !verdict.is_judgment {
             // A question or another step: the candidate keeps waiting.
             session.pending_candidate = Some(pending);
@@ -1427,11 +1475,15 @@ fn render_map_and_pending(session: &Session) -> String {
 }
 
 fn format_history(session: &Session) -> String {
-    if session.history.is_empty() {
+    let start = session.history.len().saturating_sub(12);
+    format_turns(&session.history[start..])
+}
+
+fn format_turns(turns: &[crate::domain::TurnRecord]) -> String {
+    if turns.is_empty() {
         return "(none)".to_string();
     }
-    let start = session.history.len().saturating_sub(12);
-    session.history[start..]
+    turns
         .iter()
         .map(|t| format!("{}: {}", t.role, t.content))
         .collect::<Vec<_>>()
@@ -2020,6 +2072,177 @@ mod tests {
         );
     }
 
+    /// Answers the gate's questions with scripted p(yes); an `Err` entry
+    /// makes the check fail. Every other question goes unanswered.
+    struct GateDecider(Mutex<VecDeque<Option<f64>>>);
+
+    impl Decide for GateDecider {
+        fn decide<'a>(
+            &'a self,
+            input: &'a str,
+            questions: &'a [Question],
+            _prefer: Option<&'a str>,
+        ) -> futures_util::future::BoxFuture<'a, Result<Option<Decision>>> {
+            if !questions[0].name.starts_with('s') || questions[0].name == "step" {
+                return Box::pin(async { Ok(None) });
+            }
+            assert!(input.contains("Draft reply:"));
+            let next = self
+                .0
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("unexpected gate call");
+            Box::pin(async move {
+                let p = next.ok_or_else(|| anyhow!("service down"))?;
+                let mut answers = std::collections::HashMap::new();
+                answers.insert(
+                    "s0".to_string(),
+                    crate::decide::Answer {
+                        choice: "yes".into(),
+                        probability: p,
+                    },
+                );
+                Ok(Some(Decision {
+                    by: "Fake".into(),
+                    answers,
+                }))
+            })
+        }
+    }
+
+    fn log_reply(reply: &str) -> String {
+        format!(r#"{{"intent":"log","reply":"{reply}","map_change":null}}"#)
+    }
+
+    #[tokio::test]
+    async fn the_gate_holds_replies_while_you_judge() {
+        let leak = log_reply("It is wrong: dispatch never falls back.");
+        let general = log_reply("Dispatch maps a name to a handler.");
+        let (rt, _) = runtime(
+            FakeEngine::new(vec![
+                (ReadOnly, S1, ONBOARD_READY),
+                (ReadOnly, S2, MAP),
+                (ReadOnly, S1, &log_reply("Ok.")),
+                (
+                    ReadOnly,
+                    S2,
+                    r#"{"candidate":"Unknown commands fall back to help.","key_reason":"The router has no fallback for unknown names, they are rejected"}"#,
+                ),
+                // Blocked, rewritten, passes.
+                (
+                    ReadOnly,
+                    S2,
+                    r#"{"is_judgment":false,"pass":false,"feedback":""}"#,
+                ),
+                (ReadOnly, S1, &leak),
+                (
+                    ToolAccess::None,
+                    S1,
+                    r#"{"reply":"Think about what happens to a name with no handler."}"#,
+                ),
+                // Blocked twice: the fixed reply.
+                (
+                    ReadOnly,
+                    S2,
+                    r#"{"is_judgment":false,"pass":false,"feedback":""}"#,
+                ),
+                (ReadOnly, S1, &leak),
+                (ToolAccess::None, S1, r#"{"reply":"Still: it is wrong."}"#),
+                // The check errors: withheld.
+                (
+                    ReadOnly,
+                    S2,
+                    r#"{"is_judgment":false,"pass":false,"feedback":""}"#,
+                ),
+                (ReadOnly, S1, &general),
+                // The pre-check catches an echo of the key with no decision.
+                (
+                    ReadOnly,
+                    S2,
+                    r#"{"is_judgment":false,"pass":false,"feedback":""}"#,
+                ),
+                (
+                    ReadOnly,
+                    S1,
+                    &log_reply("Note the router has no fallback for unknown names, so..."),
+                ),
+                (
+                    ToolAccess::None,
+                    S1,
+                    r#"{"reply":"Look at how unknown names are handled."}"#,
+                ),
+                (
+                    ReadOnly,
+                    S2,
+                    r#"{"is_judgment":true,"pass":true,"feedback":"Right: there is no fallback."}"#,
+                ),
+                // No secret any more: replies stream unchecked.
+                (ReadOnly, S1, &general),
+            ]),
+            false,
+        );
+        let rt = rt.with_decider(Arc::new(GateDecider(Mutex::new(
+            vec![Some(0.9), Some(0.1), Some(0.9), Some(0.8), None, Some(0.05)].into(),
+        ))));
+        turn(&rt, "goal").await;
+        turn(&rt, "thinking").await;
+        turn(&rt, "/summary names map to handlers").await;
+        let s = rt.load_session("s").unwrap().unwrap();
+        let raw = serde_json::to_string(&s).unwrap();
+        assert!(
+            !raw.contains("no fallback"),
+            "the key stays out of the thread's state"
+        );
+        let id = s
+            .pending_candidate
+            .as_ref()
+            .unwrap()
+            .secret
+            .clone()
+            .unwrap();
+        assert!(rt.store.secret(&id).unwrap().unwrap().active);
+
+        let out = turn(&rt, "does it fall back?").await;
+        let s = rt.load_session("s").unwrap().unwrap();
+        assert_eq!(
+            s.history.last().unwrap().content,
+            "Think about what happens to a name with no handler."
+        );
+        assert!(out.reply.is_empty());
+
+        turn(&rt, "so is it wrong?").await;
+        let s = rt.load_session("s").unwrap().unwrap();
+        assert_eq!(
+            s.history.last().unwrap().content,
+            crate::secrets::FIXED_REPLY
+        );
+
+        turn(&rt, "what is dispatch?").await;
+        let s = rt.load_session("s").unwrap().unwrap();
+        assert_eq!(
+            s.history.last().unwrap().content,
+            crate::secrets::FIXED_REPLY
+        );
+
+        turn(&rt, "hmm").await;
+        let s = rt.load_session("s").unwrap().unwrap();
+        assert_eq!(
+            s.history.last().unwrap().content,
+            "Look at how unknown names are handled."
+        );
+
+        turn(&rt, "it's wrong, unknown names are rejected").await;
+        assert!(!rt.store.secret(&id).unwrap().unwrap().active);
+        turn(&rt, "/next").await;
+        turn(&rt, "what is dispatch?").await;
+        let s = rt.load_session("s").unwrap().unwrap();
+        assert_eq!(
+            s.history.last().unwrap().content,
+            "Dispatch maps a name to a handler."
+        );
+    }
+
     #[tokio::test]
     async fn chat_drives_the_loop() {
         let (rt, engine) = runtime(
@@ -2112,6 +2335,10 @@ mod tests {
             questions: &'a [Question],
             _prefer: Option<&'a str>,
         ) -> futures_util::future::BoxFuture<'a, Result<Option<Decision>>> {
+            // Only the router's step question is scripted here.
+            if questions[0].name != "step" {
+                return Box::pin(async { Ok(None) });
+            }
             let next = self.0.lock().unwrap().pop_front();
             let offered: Vec<String> = questions[0].options.iter().map(|o| o.0.clone()).collect();
             Box::pin(async move {

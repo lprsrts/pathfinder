@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::domain::Session;
+use crate::secrets::Secret;
 use crate::understanding::{Concept, Event, EventKind, Misconception, NewEvent};
 use crate::validate::Violation;
 
@@ -110,6 +111,18 @@ impl Store {
                 BEGIN SELECT RAISE(ABORT, 'events are append-only'); END;
             CREATE TRIGGER IF NOT EXISTS events_append_only_delete BEFORE DELETE ON events
                 BEGIN SELECT RAISE(ABORT, 'events are append-only'); END;
+            -- What is kept from you until your verdict (theory A6).
+            CREATE TABLE IF NOT EXISTS secrets (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                probe TEXT NOT NULL,
+                opened_at_turn INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_secrets_session ON secrets(session_id, status);
             CREATE TABLE IF NOT EXISTS misconceptions (
                 id TEXT PRIMARY KEY,
                 workspace TEXT NOT NULL,
@@ -407,6 +420,60 @@ impl Store {
         }
         out.sort_by_key(|e| e.id);
         Ok(out)
+    }
+
+    // --- Secrets (theory A6) ---
+
+    pub fn add_secret(&self, session_id: &str, secret: &Secret) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO secrets (id, session_id, kind, payload_json, probe, opened_at_turn) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                secret.id,
+                session_id,
+                secret.kind,
+                serde_json::to_string(&secret.payload)?,
+                secret.probe,
+                secret.opened_at_turn as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn secrets_where(&self, clause: &str, arg: &str) -> Result<Vec<Secret>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT id, kind, payload_json, probe, opened_at_turn, status FROM secrets WHERE {clause} ORDER BY created_at, id"
+        ))?;
+        let rows = stmt.query_map(params![arg], |row| {
+            let payload: String = row.get(2)?;
+            Ok(Secret {
+                id: row.get(0)?,
+                kind: row.get(1)?,
+                payload: serde_json::from_str(&payload).unwrap_or_default(),
+                probe: row.get(3)?,
+                opened_at_turn: row.get::<_, i64>(4)? as usize,
+                active: row.get::<_, String>(5)? == "active",
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn secret(&self, id: &str) -> Result<Option<Secret>> {
+        Ok(self.secrets_where("id = ?1", id)?.into_iter().next())
+    }
+
+    pub fn active_secrets(&self, session_id: &str) -> Result<Vec<Secret>> {
+        self.secrets_where("session_id = ?1 AND status = 'active'", session_id)
+    }
+
+    pub fn retire_secret(&self, id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE secrets SET status = 'retired' WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
     }
 
     pub fn add_misconception(&self, workspace: &str, m: &Misconception) -> Result<()> {

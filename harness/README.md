@@ -91,7 +91,7 @@ With a key in place, Pathfinder lists the provider's current models in Zed's pic
 
 1. Say what you want done. Onboarding settles the goal, then sketches a map of what the task depends on (no size limit).
 2. Work on a part by chatting. Your thinking and the reasons behind your steps are the log; the model replies briefly and may propose map changes. Pathfinder reads what each message means, so plain words drive the loop: "I think I get it: …" explains the part, "I already know this" skips it, "let's move on" goes to the next part, "yes, add it" accepts a map change.
-3. When you explain the part, you're shown a candidate (an approach or result, right or with one real flaw) and say whether it's right and why. That decides whether the part is understood. While it waits you can still ask questions; the reply model can't see the candidate, so it can't vouch for it.
+3. When you explain the part, you're shown a candidate (an approach or result, right or with one real flaw) and say whether it's right and why. That decides whether the part is understood. While it waits you can still ask questions; see [While you judge](#while-you-judge).
 4. You decide what to give the agent: `/handoff` an understood part and review the result, skip a part you already know, or `/delegate` to hand it off without understanding it.
 
 ## What understanding is made of
@@ -107,7 +107,21 @@ Each part rests on one to four core concepts, which the map names (`Rests on:` u
 
 `/why` shows what the current part's status rests on.
 
-## Decision models
+## While you judge
+
+A candidate's key (right or flawed, and why) is kept in the session database's secrets table, never in the thread's state. Only the model that writes the candidate and the Judge read it, and the reasoning of both is never shown. The Judge's feedback appears only once it has confirmed your message is a verdict.
+
+Until you give your verdict, every reply goes through a gate:
+
+1. The reply and its reasoning are held.
+2. A pre-check looks for text copied from the key.
+3. A decision model asks whether the reply, read with the conversation since the candidate appeared, reveals, hints at or confirms the key. It blocks at p ≥ 0.3.
+4. A blocked reply is rewritten once without the candidate. If that is blocked too, or the check fails, you get a fixed reply.
+
+When you give your verdict the key is retired and replies stream again.
+
+With Decisions off, the gate can't run. The reply model then only has the candidate hidden from its history, so it can still work the answer out if you paraphrase the candidate to it.
+
 
 Before an LLM sees a chat message, a decision model can say which step it is (a log entry, an explanation of the part, a skip, a move, a map-change answer, or a verdict on a waiting candidate). Skips and moves then happen without an LLM call, a question about a waiting candidate skips the judge, and log replies get the decision in their prompt. If the decision model is unsure, unset or unreachable, the LLM decides as part of its reply.
 

@@ -731,7 +731,9 @@ fn model_options(choices: &ModelChoices, switches: bool) -> Vec<SessionConfigOpt
                 ],
             )
         }
-        .description("Classify each message before the model replies".to_string())
+        .description(
+            "Classify each message, and check replies while you judge a candidate".to_string(),
+        )
         .category(SessionConfigOptionCategory::ModelConfig),
     );
     if choices.decisions_on && choices.decision_available.len() > 1 {

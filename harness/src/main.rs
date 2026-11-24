@@ -9,6 +9,7 @@ mod domain;
 mod engine;
 mod llm;
 mod runtime;
+mod secrets;
 mod store;
 mod stream;
 mod understanding;

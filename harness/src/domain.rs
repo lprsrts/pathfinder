@@ -315,8 +315,16 @@ impl Map {
 pub struct PendingCandidate {
     pub part_id: String,
     pub candidate: String,
+    /// The key lives in the secrets table (A6), not in the thread's state;
+    /// these are filled from it when the Judge needs them. Older threads
+    /// stored them here and are moved over on load.
+    #[serde(default, skip_serializing)]
     pub key_correct: bool,
+    #[serde(default, skip_serializing)]
     pub key_reason: String,
+    /// The secret holding the key.
+    #[serde(default)]
+    pub secret: Option<String>,
     /// The concepts it checks (A5).
     #[serde(default)]
     pub targets: Vec<String>,
