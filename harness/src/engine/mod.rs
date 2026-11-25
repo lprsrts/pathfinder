@@ -202,12 +202,28 @@ impl EngineRequest {
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+/// Checks a final answer: Ok, or the violations as text for the model.
+pub type FinalCheck<'a> = &'a (dyn Fn(&str) -> std::result::Result<(), String> + Sync);
+
 pub trait Engine: Send + Sync {
     fn run_text<'a>(
         &'a self,
         req: &'a EngineRequest,
         sink: StreamSink,
     ) -> BoxFuture<'a, Result<String>>;
+
+    /// Like `run_text`, with the gate's check on the final answer. An engine
+    /// that owns its loop asks the model to fix a failing answer in the same
+    /// conversation, without redoing its reads; others just run.
+    fn run_checked<'a>(
+        &'a self,
+        req: &'a EngineRequest,
+        sink: StreamSink,
+        check: FinalCheck<'a>,
+    ) -> BoxFuture<'a, Result<String>> {
+        let _ = check;
+        self.run_text(req, sink)
+    }
 }
 
 pub fn extract_json_object(raw: &str) -> &str {
@@ -256,7 +272,7 @@ pub async fn run_gated<T, C>(
 ) -> Result<T>
 where
     T: DeserializeOwned,
-    C: Fn(&T) -> Vec<Violation>,
+    C: Fn(&T) -> Vec<Violation> + Sync,
 {
     run_gated_streamed(engine, store, session_id, kind, base_req, sink, check, None)
         .await
@@ -279,7 +295,7 @@ pub async fn run_gated_streamed<T, C>(
 ) -> Result<(T, String)>
 where
     T: DeserializeOwned,
-    C: Fn(&T) -> Vec<Violation>,
+    C: Fn(&T) -> Vec<Violation> + Sync,
 {
     let mut req = base_req.clone();
     req.stream_text = field.is_some();
@@ -352,7 +368,12 @@ where
 
         let (attempt_sink, mut shown) = field_sink(&seen);
         let attempt_sink = paragraphs(attempt_sink);
-        let raw = engine.run_text(&req, attempt_sink).await?;
+        let final_check = |raw: &str| {
+            evaluate_proposal::<T, _>(raw, &check)
+                .map(|_| ())
+                .map_err(|v| format_violations(&v))
+        };
+        let raw = engine.run_checked(&req, attempt_sink, &final_check).await?;
         remember(&mut seen, &shown);
         let mut outcome = evaluate_proposal::<T, _>(&raw, &check);
 
@@ -469,7 +490,7 @@ fn is_only_invalid_json<T>(outcome: &std::result::Result<T, Vec<Violation>>) -> 
 fn evaluate_proposal<T, C>(raw: &str, check: &C) -> std::result::Result<T, Vec<Violation>>
 where
     T: DeserializeOwned,
-    C: Fn(&T) -> Vec<Violation>,
+    C: Fn(&T) -> Vec<Violation> + Sync,
 {
     let candidate = extract_json_object(raw);
     // Always through `fix_escapes`: LaTeX like `\\frac` is valid JSON (a form

@@ -19,8 +19,8 @@ use crate::auth::Credentials;
 use crate::auth::chatgpt::ChatGptError;
 use crate::config::{ModelEntry, Route};
 use crate::engine::{
-    BoxFuture, CommandOutput, Engine, EngineRequest, EngineTier, Permission, StreamEvent,
-    StreamSink, ToolAccess,
+    BoxFuture, CommandOutput, Engine, EngineRequest, EngineTier, FinalCheck, Permission,
+    StreamEvent, StreamSink, ToolAccess,
 };
 use crate::llm::anthropic::Anthropic;
 use crate::llm::chat::Chat;
@@ -286,13 +286,37 @@ fn read_only_tool(name: &str) -> bool {
     matches!(name, "read" | "view" | "ls" | "glob" | "grep")
 }
 
+/// Times a failing final answer is sent back for fixing in the same
+/// conversation before the gate retries from scratch.
+const MAX_FIXES: usize = 2;
+
 impl Engine for ApiEngine {
     fn run_text<'a>(
         &'a self,
         req: &'a EngineRequest,
         sink: StreamSink,
     ) -> BoxFuture<'a, Result<String>> {
-        Box::pin(async move {
+        Box::pin(self.agent_loop(req, sink, None))
+    }
+
+    fn run_checked<'a>(
+        &'a self,
+        req: &'a EngineRequest,
+        sink: StreamSink,
+        check: FinalCheck<'a>,
+    ) -> BoxFuture<'a, Result<String>> {
+        Box::pin(self.agent_loop(req, sink, Some(check)))
+    }
+}
+
+impl ApiEngine {
+    async fn agent_loop(
+        &self,
+        req: &EngineRequest,
+        sink: StreamSink,
+        check: Option<FinalCheck<'_>>,
+    ) -> Result<String> {
+        {
             let model = req.model();
             let llm = (self.factory)(model)?;
             let specs = match req.tools {
@@ -323,8 +347,10 @@ impl Engine for ApiEngine {
             let steps = max_steps(req);
             let mut seen: Vec<u64> = Vec::new();
             let mut nudged = false;
+            let mut fixes = 0;
 
-            for step in 0..=steps {
+            // Extra rounds beyond the step budget: a nudge and the fixes.
+            for step in 0..=steps + 1 + MAX_FIXES {
                 if req.ctx.cancel.is_cancelled() {
                     bail!("stopped");
                 }
@@ -335,7 +361,10 @@ impl Engine for ApiEngine {
                             .into(),
                     ));
                 }
-                let parts = complete_with_retry(llm.as_ref(), &request, req, &sink).await?;
+                // A fix isn't streamed: the user already saw the answer, and
+                // the gate shows the corrected one if it differs.
+                let parts =
+                    complete_with_retry(llm.as_ref(), &request, req, &sink, fixes == 0).await?;
                 request.messages.push(Message::Assistant(parts.clone()));
 
                 let calls: Vec<_> = parts
@@ -358,6 +387,21 @@ impl Engine for ApiEngine {
                             "Your last reply was empty. Give your final answer now, in the requested format."
                                 .into(),
                         ));
+                        continue;
+                    }
+                    if let Some(check) = check
+                        && fixes < MAX_FIXES
+                        && let Err(report) = check(&text)
+                    {
+                        fixes += 1;
+                        tracing::info!(fixes, "final answer failed the check; fixing in place");
+                        sink(StreamEvent::Thought(
+                            "\n\nThe answer didn't fit the format; fixing it.\n".into(),
+                        ));
+                        request.allow_tools = false;
+                        request.messages.push(Message::User(format!(
+                            "Your final message failed the check:\n{report}\n\nFix every violation and reply with ONLY the corrected output. Keep your content; don't redo the work."
+                        )));
                         continue;
                     }
                     return Ok(text);
@@ -421,8 +465,8 @@ impl Engine for ApiEngine {
                 }
                 prune(&mut request.messages);
             }
-            unreachable!("the final step always returns")
-        })
+            bail!("the model kept going past its step budget")
+        }
     }
 }
 
@@ -700,6 +744,7 @@ async fn complete_with_retry(
     request: &LlmRequest,
     req: &EngineRequest,
     sink: &StreamSink,
+    stream: bool,
 ) -> Result<Vec<Part>> {
     let mut attempt = 0;
     loop {
@@ -709,7 +754,7 @@ async fn complete_with_retry(
         let emitted = AtomicBool::new(false);
         let on_event = |event: LlmEvent| match event {
             LlmEvent::Reasoning(t) => sink(StreamEvent::Thought(t)),
-            LlmEvent::Text(t) if req.stream_text => {
+            LlmEvent::Text(t) if req.stream_text && stream => {
                 emitted.store(true, Ordering::Relaxed);
                 sink(StreamEvent::TextDelta(t))
             }
@@ -1197,6 +1242,45 @@ mod tests {
             "{}",
             out.output
         );
+        fs::remove_dir_all(ws).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_failing_answer_is_fixed_in_the_same_conversation() {
+        let ws = workspace();
+        let (engine, llm) = scripted(vec![
+            Ok(vec![call("1", "read", json!({"path": "Cargo.toml"}))]),
+            Ok(vec![Part::Text("The crate is demo.".into())]),
+            Ok(vec![Part::Text(r#"{"reply":"demo"}"#.into())]),
+        ]);
+        let check = |raw: &str| -> std::result::Result<(), String> {
+            serde_json::from_str::<serde_json::Value>(raw)
+                .map(|_| ())
+                .map_err(|e| format!("- invalid_json: {e}"))
+        };
+        let (sink, log) = recorder();
+        let out = engine
+            .run_checked(&request(ws.clone(), ToolAccess::ReadOnly), sink, &check)
+            .await
+            .unwrap();
+        assert_eq!(out, r#"{"reply":"demo"}"#);
+        let seen = llm.seen.lock().unwrap();
+        // The fix sees the earlier read and the violations, and can't call tools.
+        let fix = &seen[2];
+        assert!(!fix.allow_tools);
+        assert!(matches!(&fix.messages[2], Message::ToolResults(_)));
+        let Message::User(note) = fix.messages.last().unwrap() else {
+            panic!()
+        };
+        assert!(note.contains("invalid_json"));
+        // The fixed answer isn't streamed a second time.
+        let texts = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|l| l.starts_with("text"))
+            .count();
+        assert_eq!(texts, 1);
         fs::remove_dir_all(ws).unwrap();
     }
 }
