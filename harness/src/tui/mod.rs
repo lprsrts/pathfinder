@@ -53,6 +53,10 @@ pub enum AppEvent {
     },
     /// The invite code was tried.
     Enrolled(std::result::Result<(), String>),
+    /// A newer release is out.
+    UpdateAvailable(String),
+    /// A shared thread was sent (or not).
+    Shared(std::result::Result<(), String>),
 }
 
 /// A dialog over the conversation.
@@ -78,6 +82,13 @@ pub enum Modal {
     Help,
     /// Asks once whether to share usage data. `invite` is None on the
     /// first screen and the code being typed on the second.
+    /// Exactly what `/share` would send, before it is sent.
+    Share {
+        thread: pathfinder_schema::SharedThread,
+        lines: Vec<String>,
+        scroll: usize,
+        busy: bool,
+    },
     Consent {
         events: bool,
         threads: bool,
@@ -183,6 +194,14 @@ pub async fn run(rt: Arc<Runtime>, cwd: PathBuf) -> Result<()> {
     emit(UsageEvent::SessionStart {
         surface: pathfinder_schema::Surface::Tui,
     });
+    {
+        let tx = app.tx.clone();
+        tokio::spawn(async move {
+            if let Some(v) = crate::update::available().await {
+                let _ = tx.send(AppEvent::UpdateAvailable(v));
+            }
+        });
+    }
     if crate::telemetry::Consent::load().needs_answer() && !env_says_off() {
         app.modal = Some(Modal::Consent {
             events: false,
@@ -700,6 +719,12 @@ impl App {
             self.status = "Wait for the reply, or Esc to stop it.".into();
             return;
         }
+        if text == "/share" || text.starts_with("/share ") {
+            self.input.clear();
+            self.cursor = 0;
+            self.start_share(text.trim_start_matches("/share").trim());
+            return;
+        }
         if let Some(path) = text.strip_prefix("/attach ") {
             let p = Path::new(path.trim());
             let p = if p.is_absolute() {
@@ -834,6 +859,19 @@ impl App {
                     reply: Some(reply),
                 });
             }
+            AppEvent::Shared(result) => {
+                self.modal = None;
+                self.status = match result {
+                    Ok(()) => "Shared. Thank you!".into(),
+                    Err(e) => format!("Not shared: {e}"),
+                };
+            }
+            AppEvent::UpdateAvailable(version) => {
+                if self.status.is_empty() {
+                    self.status =
+                        format!("Pathfinder {version} is out: quit and run `harness update`.");
+                }
+            }
             AppEvent::Enrolled(result) => {
                 if let Some(Modal::Consent {
                     events,
@@ -959,6 +997,60 @@ impl App {
         };
         self.modal = match modal {
             Modal::Help => None,
+            Modal::Share {
+                thread,
+                lines,
+                scroll,
+                busy,
+            } => {
+                if busy {
+                    return self.modal = Some(Modal::Share {
+                        thread,
+                        lines,
+                        scroll,
+                        busy,
+                    });
+                }
+                let page = 10;
+                let max = lines.len().saturating_sub(1);
+                let scroll = match key.code {
+                    KeyCode::Esc | KeyCode::Char('n') => {
+                        self.status = "Nothing was shared.".into();
+                        return;
+                    }
+                    KeyCode::Enter => {
+                        let tx = self.tx.clone();
+                        let t = thread.clone();
+                        tokio::spawn(async move {
+                            let consent = crate::telemetry::Consent::load();
+                            let r = crate::telemetry::share(&consent, &t)
+                                .await
+                                .map_err(|e| format!("{e:#}"));
+                            let _ = tx.send(AppEvent::Shared(r));
+                        });
+                        used(Feature::Share);
+                        return self.modal = Some(Modal::Share {
+                            thread,
+                            lines,
+                            scroll,
+                            busy: true,
+                        });
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => (scroll + 1).min(max),
+                    KeyCode::Up | KeyCode::Char('k') => scroll.saturating_sub(1),
+                    KeyCode::PageDown | KeyCode::Char(' ') => (scroll + page).min(max),
+                    KeyCode::PageUp => scroll.saturating_sub(page),
+                    KeyCode::Char('g') | KeyCode::Home => 0,
+                    KeyCode::Char('G') | KeyCode::End => max,
+                    _ => scroll,
+                };
+                Some(Modal::Share {
+                    thread,
+                    lines,
+                    scroll,
+                    busy: false,
+                })
+            }
             Modal::Consent {
                 events,
                 threads,
@@ -1222,5 +1314,41 @@ impl App {
                 _ => keep!(Some(code), error, false),
             },
         }
+    }
+}
+
+impl App {
+    /// `/share [note]`: shows exactly what would be sent; Enter sends it.
+    fn start_share(&mut self, note: &str) {
+        let consent = crate::telemetry::Consent::load();
+        if !consent.may_share() {
+            self.status = if consent.enrolled {
+                "Sharing threads is off. `harness data on --threads` turns it on.".into()
+            } else {
+                "Sharing needs an invite code: harness data join <code> --threads".into()
+            };
+            return;
+        }
+        let session = match self.rt.load_session(&self.session.id) {
+            Ok(Some(s)) => s,
+            _ => self.session.clone(),
+        };
+        if session.history.is_empty() {
+            self.status = "This thread is empty; there's nothing to share.".into();
+            return;
+        }
+        let turns: Vec<(String, String)> = session
+            .history
+            .iter()
+            .map(|t| (t.role.clone(), t.content.clone()))
+            .collect();
+        let thread = crate::telemetry::share::thread(&session.id, &turns, &self.cwd, note);
+        let lines = crate::telemetry::share::preview(&thread);
+        self.modal = Some(Modal::Share {
+            thread,
+            lines,
+            scroll: 0,
+            busy: false,
+        });
     }
 }

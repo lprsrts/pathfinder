@@ -766,6 +766,8 @@ fn footer(f: &mut Frame, app: &App, area: Rect) {
             ]
         } else if matches!(app.modal, Some(Modal::Permission { .. })) {
             &["1/y once · 2/a always · 3/n/Esc no", "y · a · n"]
+        } else if matches!(app.modal, Some(Modal::Share { .. })) {
+            &["Paths are shortened to ./ and ~; nothing else is changed"]
         } else if matches!(app.modal, Some(Modal::Consent { .. })) {
             &["Your answer is saved; `harness data` changes it later"]
         } else if app.modal.is_some() {
@@ -898,6 +900,42 @@ fn modal(f: &mut Frame, app: &App, area: Rect) {
             list(f, rect, title, rows, *sel, "Enter picks · Esc goes back");
         }
         Modal::Permission { .. } => {}
+        Modal::Share {
+            lines,
+            scroll,
+            busy,
+            ..
+        } => {
+            let rect = centered(area, 100, area.height.saturating_sub(4));
+            f.render_widget(Clear, rect);
+            let body: Vec<Line> = lines
+                .iter()
+                .skip(*scroll)
+                .map(|l| Line::from(l.clone()))
+                .collect();
+            let hint = if *busy {
+                " Sending… ".to_string()
+            } else {
+                format!(
+                    " ↑↓/Space scroll ({}/{}) · Enter sends exactly this · Esc cancels ",
+                    (*scroll + 1).min(lines.len()),
+                    lines.len()
+                )
+            };
+            f.render_widget(
+                Paragraph::new(body).wrap(Wrap { trim: false }).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(dim())
+                        .title(Span::styled(
+                            " Share this thread with Pathfinder's developer? ",
+                            Style::default().add_modifier(Modifier::BOLD),
+                        ))
+                        .title_bottom(Span::styled(hint, dim())),
+                ),
+                rect,
+            );
+        }
         Modal::Consent {
             events,
             threads,
@@ -931,6 +969,10 @@ fn modal(f: &mut Frame, app: &App, area: Rect) {
                 ("Ctrl+B", "show or hide the plan panel"),
                 ("/attach <file>", "attach a PDF or image (or drop it in)"),
                 ("/why, /map", "your record, the plan"),
+                (
+                    "/share [note]",
+                    "send this thread to the developer (shown first)",
+                ),
                 (
                     "Ctrl+C, Ctrl+D (idle)",
                     "quit; the conversation stays in your terminal",

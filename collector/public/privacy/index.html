@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pathfinder privacy notice</title>
+<style>
+  :root { color-scheme: light dark; --fg: #1d1d1f; --bg: #fff; --muted: #6e6e73; --rule: #e5e5ea; }
+  @media (prefers-color-scheme: dark) { :root { --fg: #f5f5f7; --bg: #111; --muted: #a1a1a6; --rule: #333; } }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  main { max-width: 44rem; margin: 0 auto; padding: 2.5rem 1rem 4rem; }
+  h1 { font-size: 1.7rem; margin: 0 0 .25rem; }
+  h2 { font-size: 1.15rem; margin: 2rem 0 .5rem; }
+  p.meta { color: var(--muted); margin: 0 0 2rem; }
+  table { border-collapse: collapse; width: 100%; font-size: .95rem; }
+  td, th { text-align: left; vertical-align: top; padding: .45rem .5rem .45rem 0; border-bottom: 1px solid var(--rule); }
+  code { font: .9em ui-monospace, SFMono-Regular, Menlo, monospace; }
+</style>
+</head>
+<body>
+<main>
+<h1>Pathfinder privacy notice</h1>
+<p class="meta">Notice version 1 · 25 November 2026</p>
+
+<p>Pathfinder is a study tool that runs on your computer. This notice says what leaves your computer, where it goes, and how to change or erase it. Sharing usage data is optional: Pathfinder works the same if you say no.</p>
+
+<h2>Who is responsible</h2>
+<p>Mehmet Alper Sarıtaş, Karlsruhe, Germany (the developer). Contact: <a href="mailto:CONTACT_EMAIL">CONTACT_EMAIL</a>.</p>
+
+<h2>What is sent, and only if you agree</h2>
+<table>
+<tr><th>What</th><th>When</th><th>Contents</th></tr>
+<tr><td>Usage events</td><td>Only if you tick “Usage events” and joined with an invite code</td><td>Numbers, yes/no flags and names from fixed lists: which step a turn was (planning, a check, a verdict…), how long it took, how many model calls and tool calls of each kind, the model’s name, whether the gate held a reply back and its score, whether a check was answered right or wrong and how many concepts it covered, permission answers, error codes, which app features you use, the app version, your operating system, and the conversation’s language. Each event carries a random install id, a random session id and the time to the minute. <strong>Never</strong> your messages, the model’s answers, file names, folder names, study topics or concept names. <code>harness data show</code> prints exactly what is waiting to be sent.</td></tr>
+<tr><td>Threads you share</td><td>Only if you tick “Threads you choose to share” and then type <code>/share</code> in a thread and confirm after seeing exactly what will be sent</td><td>That one thread as you saw it (your messages and Pathfinder’s), with file paths shortened to your study folder, plus an optional note from you.</td></tr>
+</table>
+
+<h2>The invite code and your name</h2>
+<p>Each invite code is made for one person. The developer keeps a list of which code he gave to whom, so the events from your install can be linked to you by him. The server itself stores only the install id and that label.</p>
+
+<h2>Things that go elsewhere regardless of the above</h2>
+<ul>
+<li><strong>The model.</strong> Your messages and the files you work on go directly from your computer to the model provider you signed in with (for example OpenAI through “Sign in with ChatGPT”), under your own account and that provider’s terms. They do not pass through the developer’s server.</li>
+<li><strong>The shared gate.</strong> If you joined with an invite code and have no TypeSafe key of your own, the check that keeps a candidate’s answer hidden from you runs through the developer’s server: each check sends the candidate, the conversation since it was shown and the draft reply to the server, which forwards them to TypeSafe (the decision service) and returns the answer. The server does not store or log these contents; it only counts how many checks your install made per day, to keep within a daily limit. Set <code>HARNESS_DECISION_PROXY=off</code> to never use the shared gate.</li>
+<li><strong>Update checks.</strong> Once a day the app asks the server whether a newer version exists. That request carries only the app version. Set <code>HARNESS_NO_UPDATE_CHECK=1</code> to turn it off.</li>
+</ul>
+
+<h2>Why, and on what basis</h2>
+<p>To find out what works and what breaks in Pathfinder for people other than its developer, and to improve it. The legal basis is your consent (Art. 6(1)(a) GDPR), given separately for usage events and for sharing threads. The data is not sold, not used for advertising, and not shared with anyone else. If any of it is ever to be used for research or a publication, you will be asked again first.</p>
+
+<h2>Where it is kept, and for how long</h2>
+<p>On the developer’s own server in Germany, reached through Cloudflare (which carries the encrypted connection and sees your IP address, as any web service’s network provider does). The server does not log IP addresses. Usage events are deleted after 12 months. Shared threads are kept until you erase them. The server is backed up daily, encrypted, to Cloudflare R2 storage in Western Europe; backups are kept for up to 12 months and are used only to restore the server after a failure, so data you erase leaves the backups within 12 months.</p>
+
+<h2>Your choices and rights</h2>
+<table>
+<tr><td>See what is queued to be sent</td><td><code>harness data show</code></td></tr>
+<tr><td>See your settings</td><td><code>harness data</code></td></tr>
+<tr><td>Stop sending (withdraw consent)</td><td><code>harness data off</code>: nothing more is sent and the queue is cleared</td></tr>
+<tr><td>Erase everything already sent</td><td><code>harness data delete</code>: the server deletes all events and threads from your install at once</td></tr>
+<tr><td>Turn sharing on again</td><td><code>harness data on --events</code> or <code>--threads</code></td></tr>
+</table>
+<p>You can also ask the developer for a copy of your data, a correction or erasure, by email. Withdrawing consent doesn’t affect what was done before. You have the right to complain to a data protection authority, for example the Landesbeauftragte für den Datenschutz und die Informationsfreiheit Baden-Württemberg.</p>
+
+<h2>Changes</h2>
+<p>If what is collected changes, this notice gets a new version and Pathfinder asks you again before sending anything under it.</p>
+</main>
+</body>
+</html>

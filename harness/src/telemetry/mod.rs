@@ -8,6 +8,7 @@
 //! install is enrolled; `HARNESS_TELEMETRY=off` always wins.
 
 pub mod consent;
+pub mod share;
 mod upload;
 
 use std::path::Path;

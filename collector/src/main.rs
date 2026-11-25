@@ -8,6 +8,8 @@
 //! collector export <dir>          events.jsonl and threads.jsonl
 //! collector stop <name|install>   stop collecting from an install
 //! collector prune                 delete events past retention
+//! collector keygen                make the release signing key (keychain)
+//! collector sign <file>           sign a release manifest
 //! ```
 //!
 //! Settings come from the environment: `COLLECTOR_DB`, `COLLECTOR_PUBLIC`,
@@ -16,6 +18,7 @@
 
 mod api;
 mod db;
+mod release;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -70,6 +73,11 @@ async fn main() -> Result<()> {
             let n = open_db()?.stop(who)?;
             println!("stopped {n} install(s)");
             Ok(())
+        }
+        Some("keygen") => release::keygen(),
+        Some("sign") => {
+            let file = args.get(1).context("usage: collector sign <file>")?;
+            release::sign(std::path::Path::new(file))
         }
         Some("prune") => {
             let n = open_db()?.prune()?;
