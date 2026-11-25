@@ -23,7 +23,10 @@ pub fn render(text: &str, width: u16, base: Style) -> Vec<Line<'static>> {
             }
             if lang.trim() == "mermaid" {
                 for l in mermaid_to_text(&block.join("\n")) {
-                    out.extend(wrap(&inline(&l, base), width));
+                    // Continuations line up under the text, past "- " or "← ".
+                    let lead = l.len() - l.trim_start().len();
+                    let hang = lead + 2;
+                    out.extend(wrap_hanging(&inline(&l, base), width, hang));
                 }
             } else {
                 let code = base.add_modifier(Modifier::DIM);
@@ -56,7 +59,8 @@ pub fn render(text: &str, width: u16, base: Style) -> Vec<Line<'static>> {
             )));
             continue;
         }
-        out.extend(wrap(&inline(line, base), width));
+        let lead = line.len() - trimmed.len();
+        out.extend(wrap_hanging(&inline(line, base), width, lead));
     }
     out
 }
@@ -150,8 +154,8 @@ pub fn wrap_hanging(spans: &[Span<'static>], width: u16, hang: usize) -> Vec<Lin
                 flush(&mut word, &mut current, &mut used, &mut lines);
             }
             word.push(ch);
-            // A single word wider than the line is cut.
-            if word.width() >= width {
+            // A word wider than a continuation line is cut there.
+            if word.width() >= width.saturating_sub(hang).max(1) {
                 flush(&mut word, &mut current, &mut used, &mut lines);
             }
         }
@@ -266,6 +270,16 @@ mod tests {
         assert!(text[1].starts_with("• P is U·I·cos φ"), "{text:?}");
         assert!(text[2].starts_with("  "), "hanging indent: {text:?}");
         assert!(text.contains(&"    ← A".to_string()), "{text:?}");
+        let tree = plain(&render(
+            "```mermaid\nflowchart LR\n    a[\"Alpha\"]\n    b[\"Beta gamma delta epsilon zeta eta\"]\n    a --> b\n    b --> a\n```",
+            20,
+            Style::default(),
+        ));
+        let at = tree.iter().position(|l| l.starts_with("- Beta")).unwrap();
+        assert!(
+            tree[at + 1].starts_with("  ") && !tree[at + 1].starts_with("   "),
+            "{tree:?}"
+        );
         let bold = lines[1]
             .spans
             .iter()
@@ -282,5 +296,17 @@ mod tests {
             let w: usize = l.spans.iter().map(|s| s.content.width()).sum();
             assert!(w <= 24, "{l:?} is {w} wide");
         }
+    }
+
+    #[test]
+    fn long_words_are_cut_without_losing_characters() {
+        let word = "(?i)asynchron|ASM|Schlupf|Kloss|Kippmoment";
+        let lines = wrap_hanging(&[Span::raw(format!("✓ Grep {word}"))], 20, 3);
+        let text = plain(&lines);
+        for l in &text {
+            assert!(l.width() <= 20, "{text:?}");
+        }
+        let joined: String = text.iter().map(|l| l.trim()).collect();
+        assert!(joined.contains(&word.replace(' ', "")), "{text:?}");
     }
 }

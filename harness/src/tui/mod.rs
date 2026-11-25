@@ -104,6 +104,14 @@ pub struct App {
     pub status: String,
     pub last_sent: String,
     pub tick: usize,
+    /// When the running reply started.
+    pub started: Option<std::time::Instant>,
+    /// Conversation lines at the last draw, to hold a scrolled-up view still.
+    pub last_total: usize,
+    /// Scrolled up, and new lines arrived below.
+    pub new_below: bool,
+    /// The plan panel over the conversation, in a window too narrow to dock it.
+    pub side_overlay: bool,
     tx: mpsc::UnboundedSender<AppEvent>,
     pub quit: bool,
 }
@@ -129,6 +137,10 @@ pub async fn run(rt: Arc<Runtime>, cwd: PathBuf) -> Result<()> {
         status: String::new(),
         last_sent: String::new(),
         tick: 0,
+        started: None,
+        last_total: 0,
+        new_below: false,
+        side_overlay: false,
         tx,
         quit: false,
     };
@@ -143,6 +155,9 @@ pub async fn run(rt: Arc<Runtime>, cwd: PathBuf) -> Result<()> {
 
     let mut terminal = ratatui::init();
     crossterm::execute!(std::io::stdout(), EnableBracketedPaste)?;
+    // Alternate scroll: the mouse wheel arrives as ↑/↓, and text selection
+    // stays the terminal's own because the mouse isn't captured.
+    print!("\x1b[?1007h");
     let mut events = EventStream::new();
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(120));
     let result: Result<()> = async {
@@ -169,9 +184,56 @@ pub async fn run(rt: Arc<Runtime>, cwd: PathBuf) -> Result<()> {
     if let Some(cancel) = &app.running {
         cancel.cancel();
     }
+    print!("\x1b[?1007l");
     crossterm::execute!(std::io::stdout(), DisableBracketedPaste).ok();
     ratatui::restore();
+    print_transcript(&app);
     result
+}
+
+/// After quitting, the conversation goes into the terminal's own
+/// scrollback, where it can be searched, selected and copied.
+fn print_transcript(app: &App) {
+    use crossterm::style::{Attribute, Color as C, Print, SetAttribute, SetForegroundColor};
+    use ratatui::style::{Color, Modifier};
+    if app.entries.is_empty() {
+        return;
+    }
+    let width = crossterm::terminal::size().map_or(100, |(w, _)| w).min(120);
+    let mut out = std::io::stdout();
+    for line in view::transcript(app, width) {
+        for span in &line.spans {
+            let color = match span.style.fg {
+                Some(Color::Green) => Some(C::Green),
+                Some(Color::Red) => Some(C::Red),
+                Some(Color::Cyan) => Some(C::Cyan),
+                Some(Color::Yellow) => Some(C::Yellow),
+                Some(Color::Magenta) => Some(C::Magenta),
+                Some(Color::DarkGray) => Some(C::DarkGrey),
+                _ => None,
+            };
+            if let Some(c) = color {
+                let _ = crossterm::queue!(out, SetForegroundColor(c));
+            }
+            let m = span.style.add_modifier;
+            for (flag, attr) in [
+                (Modifier::BOLD, Attribute::Bold),
+                (Modifier::DIM, Attribute::Dim),
+                (Modifier::ITALIC, Attribute::Italic),
+            ] {
+                if m.contains(flag) {
+                    let _ = crossterm::queue!(out, SetAttribute(attr));
+                }
+            }
+            let _ = crossterm::queue!(
+                out,
+                Print(span.content.as_ref()),
+                SetAttribute(Attribute::Reset)
+            );
+        }
+        let _ = crossterm::queue!(out, Print("\r\n"));
+    }
+    let _ = std::io::Write::flush(&mut out);
 }
 
 /// Asks in the terminal before the agent runs a command.
@@ -307,9 +369,17 @@ impl App {
             KeyCode::Char('o') if ctrl => self.open_threads(),
             KeyCode::Char('p') if ctrl => self.modal = Some(Modal::Settings { sel: 0 }),
             KeyCode::Char('t') if ctrl => self.show_thoughts = !self.show_thoughts,
-            KeyCode::Char('b') if ctrl => self.show_side = !self.show_side,
+            KeyCode::Char('b') if ctrl => {
+                let wide = crossterm::terminal::size().is_ok_and(|(w, _)| w >= view::DOCK_FROM);
+                if wide {
+                    self.show_side = !self.show_side;
+                } else {
+                    self.side_overlay = !self.side_overlay;
+                }
+            }
             KeyCode::Char('j') if ctrl => self.insert_char('\n'),
             KeyCode::F(1) => self.modal = Some(Modal::Help),
+            KeyCode::Esc if self.side_overlay => self.side_overlay = false,
             KeyCode::Esc => {
                 if let Some(cancel) = &self.running {
                     cancel.cancel();
@@ -325,10 +395,14 @@ impl App {
             KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 self.scroll = self.scroll.saturating_sub(1)
             }
-            KeyCode::Up if self.input.is_empty() => {
+            KeyCode::Up if alt => {
                 self.input = self.last_sent.clone();
                 self.cursor = self.input.len();
             }
+            // The wheel arrives as ↑/↓; with nothing typed they scroll.
+            KeyCode::Up if self.input.is_empty() => self.scroll += 1,
+            KeyCode::Down if self.input.is_empty() => self.scroll = self.scroll.saturating_sub(1),
+            KeyCode::End if self.input.is_empty() || ctrl => self.scroll = 0,
             KeyCode::Char(c) => self.insert_char(c),
             KeyCode::Backspace => {
                 if let Some((i, _)) = self.input[..self.cursor].char_indices().next_back() {
@@ -451,6 +525,8 @@ impl App {
 
         let cancel = CancellationToken::new();
         self.running = Some(cancel.clone());
+        self.started = Some(std::time::Instant::now());
+        self.tick = 0;
         let tx = self.tx.clone();
         let sink_tx = self.tx.clone();
         let sink: StreamSink = Arc::new(move |ev| {
@@ -623,13 +699,19 @@ impl App {
             Modal::Help => None,
             Modal::Permission { title, reply } => {
                 let answer = match key.code {
-                    KeyCode::Char('y') | KeyCode::Enter => Some(Permission::Once),
-                    KeyCode::Char('a') => Some(Permission::Always),
-                    KeyCode::Char('n') | KeyCode::Esc => Some(Permission::Denied),
+                    KeyCode::Char('y' | '1') | KeyCode::Enter => Some(Permission::Once),
+                    KeyCode::Char('a' | '2') => Some(Permission::Always),
+                    KeyCode::Char('n' | '3') | KeyCode::Esc => Some(Permission::Denied),
                     _ => None,
                 };
                 match (answer, reply) {
                     (Some(a), Some(tx)) => {
+                        let said = match a {
+                            Permission::Denied => "✗ Not allowed",
+                            Permission::Always => "✓ Allowed from now on",
+                            _ => "✓ Allowed once",
+                        };
+                        self.entries.push(Entry::Note(format!("{said}: {title}")));
                         let _ = tx.send(a);
                         None
                     }
