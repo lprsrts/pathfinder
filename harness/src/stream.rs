@@ -62,7 +62,10 @@ pub fn describe_tool(id: String, name: &str, input: &Value, cwd: &Path) -> ToolS
                 num("offset"),
                 num("limit"),
             ) {
-                (Some(pages), _, _) => format!("Read {file} (pages {pages})"),
+                (Some(pages), _, _) if pages.contains(['-', ',']) => {
+                    format!("Read {file} (pages {pages})")
+                }
+                (Some(page), _, _) => format!("Read {file} (page {page})"),
                 (None, Some(o), Some(l)) => {
                     format!("Read {file} (lines {o}–{})", o + l.saturating_sub(1))
                 }
