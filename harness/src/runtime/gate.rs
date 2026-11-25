@@ -12,7 +12,7 @@ use crate::decide::Question;
 use crate::domain::Session;
 use crate::engine::{EngineRequest, EngineTier, StreamEvent, StreamSink, ToolAccess, run_gated};
 use crate::secrets::{
-    BITS_LIMIT, BLOCK_FROM, FIXED_REPLY, PASS_BELOW, Secret, bits_toward, precheck_hit,
+    BLOCK_FROM, FIXED_REPLY, PASS_BELOW, Secret, bits_limit, bits_toward, precheck_hit,
 };
 use crate::validate::Violation;
 
@@ -129,8 +129,9 @@ impl Runtime {
 
     /// The decision check (A6). A score under `PASS_BELOW` passes and one
     /// from `BLOCK_FROM` blocks. In between, the key-blind reader decides:
-    /// the draft is blocked if it moves the reader `BITS_LIMIT` bits or
-    /// more toward the true answer. A reader that fails blocks it.
+    /// the draft is blocked if it moves the reader toward the true answer by
+    /// as many bits as the secret's stakes allow (`bits_limit`). A reader
+    /// that fails blocks it.
     pub(super) async fn check(
         &self,
         session: &Session,
@@ -155,7 +156,7 @@ impl Runtime {
                     }
                 };
                 bits[i] = Some(b);
-                blocked |= b >= BITS_LIMIT;
+                blocked |= b >= bits_limit(secret);
             }
         }
         tracing::debug!(?scores, ?bits, blocked, draft, "gate check");

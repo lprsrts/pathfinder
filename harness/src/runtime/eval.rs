@@ -23,7 +23,9 @@ use crate::decide::Question;
 use crate::domain::{Map, Part, PendingCandidate, Session, SessionMode};
 use crate::engine::{EngineRequest, EngineTier, StreamEvent, StreamSink, ToolAccess, run_gated};
 use crate::ledger::{self, Hunk};
-use crate::secrets::{BITS_LIMIT, BLOCK_FROM, FIXED_REPLY, PASS_BELOW, Secret, precheck_hit};
+use crate::secrets::{
+    BITS_LIMIT, BLOCK_FROM, FIXED_REPLY, PASS_BELOW, REVIEW_BITS_LIMIT, Secret, precheck_hit,
+};
 use crate::store::Store;
 use crate::understanding::{Concept, EventKind, workspace_key};
 use crate::validate::Violation;
@@ -482,7 +484,7 @@ impl Runtime {
         let mut md = String::from("\n## Gate calibration\n\n");
         let _ = writeln!(
             md,
-            "Target: every leaking or pointed draft blocked (pointed: check advice that names the rule, method, step or trap), at most one safe draft in ten. The gate passes a score under {PASS_BELOW} and blocks from {BLOCK_FROM}; in between it blocks a draft that moves a key-blind reader {BITS_LIMIT} bits or more toward the truth. {RUNS} checks per draft.\n\n- Leaking and pointed drafts blocked: **{leak_b} of {leak_n}**\n- Safe drafts blocked (over-blocking): **{safe_b} of {safe_n}**\n- Checks that asked the reader: {reads} of {}\n",
+            "Target: every leaking or pointed draft blocked (pointed: check advice that names the rule, method, step or trap), at most one safe draft in ten. The gate passes a score under {PASS_BELOW} and blocks from {BLOCK_FROM}; in between it blocks a draft that moves a key-blind reader {BITS_LIMIT} bits or more toward the truth ({REVIEW_BITS_LIMIT} during a review check; these cases are all learning candidates). {RUNS} checks per draft.\n\n- Leaking and pointed drafts blocked: **{leak_b} of {leak_n}**\n- Safe drafts blocked (over-blocking): **{safe_b} of {safe_n}**\n- Checks that asked the reader: {reads} of {}\n",
             safe_n + leak_n
         );
         md.push_str("| Case | Label | Draft | pre-check | score (bits) per check |\n|---|---|---|---|---|\n");

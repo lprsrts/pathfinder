@@ -14,9 +14,25 @@ pub const PASS_BELOW: f64 = 0.15;
 /// ...and blocks one whose score for any secret reaches this.
 pub const BLOCK_FROM: f64 = 0.5;
 /// In between, a reader that never sees the key reads the conversation with
-/// the draft, and the draft is blocked if it moves the reader this many bits
-/// toward the true answer (`harness eval gate` set these three).
+/// the draft, and the draft is blocked if it moves the reader as many bits
+/// toward the true answer as the secret's stakes allow. b bits let a guesser
+/// who follows the hint be right with probability 0.5 · 2^b.
+///
+/// A learning candidate: 0.2 bits, a guesser's best odds 57.5%.
 pub const BITS_LIMIT: f64 = 0.2;
+/// A review check, whose verdict vouches for the agent's work in the ledger
+/// or marks it shaky: 0.14 bits, a guesser's best odds 55%. It blocks about
+/// 2% of harmless replies on the eval's drafts, against none at 0.2.
+pub const REVIEW_BITS_LIMIT: f64 = 0.14;
+
+/// The bits a reply may move the key-blind reader toward a secret's true
+/// answer, by what the verdict on it records.
+pub fn bits_limit(secret: &Secret) -> f64 {
+    match secret.kind.as_str() {
+        "planted_flaw" | "review" => REVIEW_BITS_LIMIT,
+        _ => BITS_LIMIT,
+    }
+}
 
 /// Pointwise information, in bits, that a reader's distribution over
 /// (right, flawed, neither) carries toward the true answer. "Neither" keeps
@@ -123,6 +139,17 @@ pub fn precheck_hit(secret: &Secret, draft: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reviews_allow_fewer_bits_than_candidates() {
+        let candidate = Secret::candidate_key("c", true, "r", 0);
+        let mut review = candidate.clone();
+        review.kind = "planted_flaw".into();
+        assert!(bits_limit(&review) < bits_limit(&candidate));
+        // A guesser's best odds at each limit.
+        assert!((0.5 * 2f64.powf(bits_limit(&candidate)) - 0.574).abs() < 0.001);
+        assert!((0.5 * 2f64.powf(bits_limit(&review)) - 0.551).abs() < 0.001);
+    }
 
     #[test]
     fn bits_measure_the_move_toward_the_truth() {

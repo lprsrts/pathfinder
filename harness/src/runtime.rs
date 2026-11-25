@@ -2221,6 +2221,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_review_check_allows_fewer_bits_than_a_candidate() {
+        let (rt, _) = runtime(FakeEngine::new(vec![]), false);
+        // 0.17 bits toward the truth: q = 0.5 · 2^0.17 ≈ 0.5626.
+        let lean = 0.1252;
+        let rt = rt.with_decider(Arc::new(GateDecider(
+            Mutex::new(vec![Some(0.3), Some(0.3)].into()),
+            Mutex::new(vec![[lean, 0.0, 1.0 - lean], [0.0, lean, 1.0 - lean]].into()),
+        )));
+        let session = rt.load_session("s").unwrap().unwrap();
+        let candidate = crate::secrets::Secret::candidate_key("c", true, "why", 0);
+        let mut planted = crate::secrets::Secret::candidate_key("c", false, "the flaw", 0);
+        planted.kind = "planted_flaw".into();
+
+        let c = rt
+            .check(&session, &[candidate], "a reply")
+            .await
+            .unwrap()
+            .unwrap();
+        let bits = c.bits[0].unwrap();
+        assert!((bits - 0.17).abs() < 0.01, "{bits}");
+        assert!(!c.blocked, "a learning candidate allows 0.2 bits");
+
+        let c = rt
+            .check(&session, &[planted], "a reply")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(c.blocked, "a review check allows 0.14 bits");
+    }
+
+    #[tokio::test]
     async fn the_gate_holds_replies_while_you_judge() {
         let leak = log_reply("It is wrong: dispatch never falls back.");
         let general = log_reply("Dispatch maps a name to a handler.");
