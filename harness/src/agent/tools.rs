@@ -28,13 +28,29 @@ pub fn read_only_specs() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
             name: "read".into(),
-            description: "Read a text file in the workspace. Returns numbered lines.".into(),
+            description:
+                "Read a text file in the workspace (numbered lines), or a PDF's text page by page."
+                    .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "File path, relative to the workspace."},
                     "offset": {"type": "integer", "description": "First line to read (1-based)."},
-                    "limit": {"type": "integer", "description": "Number of lines to read."}
+                    "limit": {"type": "integer", "description": "Number of lines to read."},
+                    "pages": {"type": "string", "description": "PDF only: pages to read, e.g. `12` or `3-7` (1-based). Default: the first 20."}
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }),
+        },
+        ToolSpec {
+            name: "view".into(),
+            description: "See pages of a PDF, or an image file, as images: for circuits, diagrams, plots, tables and handwriting that `read` can't show. At most 4 PDF pages per call; use `read` first to find the pages.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "PDF or image (PNG, JPEG, GIF, WebP) path, relative to the workspace."},
+                    "pages": {"type": "string", "description": "PDF only: pages to see, e.g. `3` or `3-5` (1-based, at most 4). Default: 1."}
                 },
                 "required": ["path"],
                 "additionalProperties": false
@@ -269,11 +285,175 @@ fn rel(root: &Path, path: &Path) -> String {
         .to_string()
 }
 
+/// Pages `view` renders at most per call: images are costly.
+const VIEW_MAX_PAGES: usize = 4;
+
+/// `view`: a PDF's pages rendered as PNGs (`pdftoppm`), or an image file,
+/// for the model to see. Returns a line describing them and the images.
+pub fn view(
+    args: &Value,
+    env: &ToolEnv<'_>,
+) -> Result<(String, Vec<crate::llm::Attachment>), String> {
+    use base64::Engine as _;
+    let path = str_arg(args, "path").ok_or("`path` is required")?;
+    let file = confine(env.root, path, false, env.attached)?;
+    let encode = |bytes: Vec<u8>| base64::engine::general_purpose::STANDARD.encode(bytes);
+    match crate::llm::attachable_type(&file) {
+        Some("application/pdf") => {}
+        Some(media_type) => {
+            let bytes = fs::read(&file).map_err(|e| format!("cannot read `{path}`: {e}"))?;
+            return Ok((
+                format!("`{path}`, attached as an image."),
+                vec![crate::llm::Attachment {
+                    name: path.to_string(),
+                    media_type: media_type.into(),
+                    data: encode(bytes),
+                }],
+            ));
+        }
+        None => return Err(format!("`{path}` isn't a PDF or an image; use `read`")),
+    }
+    let spec = str_arg(args, "pages").unwrap_or("1");
+    let (a, b) = spec.split_once('-').unwrap_or((spec, spec));
+    let first: usize = a
+        .trim()
+        .parse()
+        .map_err(|_| format!("bad `pages`: `{spec}`"))?;
+    let last: usize = b
+        .trim()
+        .parse()
+        .map_err(|_| format!("bad `pages`: `{spec}`"))?;
+    let first = first.max(1);
+    if last < first {
+        return Err(format!("bad `pages`: `{spec}`"));
+    }
+    let last = last.min(first + VIEW_MAX_PAGES - 1);
+    let dir =
+        std::env::temp_dir().join(format!("pathfinder-view-{}", uuid::Uuid::new_v4().simple()));
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let out = std::process::Command::new("pdftoppm")
+        .args(["-png", "-r", "110", "-f", &first.to_string(), "-l", &last.to_string()])
+        .arg(&file)
+        .arg(dir.join("page"))
+        .output()
+        .map_err(|_| {
+            format!(
+                "can't render `{path}`: `pdftoppm` isn't installed (`brew install poppler`). Ask the user to attach a screenshot instead."
+            )
+        })?;
+    let mut pages: Vec<PathBuf> = fs::read_dir(&dir)
+        .map(|it| it.flatten().map(|e| e.path()).collect())
+        .unwrap_or_default();
+    pages.sort();
+    let images: Vec<crate::llm::Attachment> = pages
+        .iter()
+        .filter_map(|p| fs::read(p).ok())
+        .zip(first..)
+        .map(|(bytes, n)| crate::llm::Attachment {
+            name: format!("{path} page {n}"),
+            media_type: "image/png".into(),
+            data: encode(bytes),
+        })
+        .collect();
+    fs::remove_dir_all(&dir).ok();
+    if images.is_empty() {
+        let why = String::from_utf8_lossy(&out.stderr);
+        return Err(format!(
+            "`{path}` has no pages {first}–{last}{}",
+            if why.trim().is_empty() {
+                String::new()
+            } else {
+                format!(": {}", why.trim())
+            }
+        ));
+    }
+    let shown = first + images.len() - 1;
+    Ok((
+        format!("`{path}`, pages {first}–{shown}, attached as images."),
+        images,
+    ))
+}
+
+/// Pages a PDF read returns when none are asked for.
+const PDF_DEFAULT_PAGES: usize = 20;
+
+/// A PDF's text by page, through `pdftotext` (poppler). Slides and scripts
+/// are long, so the reader asks for pages.
+fn read_pdf(file: &Path, path: &str, pages: Option<&str>) -> Result<String, String> {
+    let out = std::process::Command::new("pdftotext")
+        .args(["-layout", "-enc", "UTF-8"])
+        .arg(file)
+        .arg("-")
+        .output()
+        .map_err(|_| {
+            format!(
+                "can't read the PDF `{path}`: `pdftotext` isn't installed (`brew install poppler`). Ask the user to attach it instead."
+            )
+        })?;
+    if !out.status.success() {
+        return Err(format!(
+            "can't read the PDF `{path}`: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut all: Vec<&str> = text.split('\u{c}').collect();
+    if all.last().is_some_and(|p| p.trim().is_empty()) {
+        all.pop();
+    }
+    let total = all.len();
+    let (first, last) = match pages {
+        Some(spec) => {
+            let (a, b) = spec.split_once('-').unwrap_or((spec, spec));
+            let a: usize = a
+                .trim()
+                .parse()
+                .map_err(|_| format!("bad `pages`: `{spec}`"))?;
+            let b: usize = b
+                .trim()
+                .parse()
+                .map_err(|_| format!("bad `pages`: `{spec}`"))?;
+            (a.max(1), b.min(total))
+        }
+        None => (1, total.min(PDF_DEFAULT_PAGES)),
+    };
+    if first > last {
+        return Err(format!("`{path}` has {total} pages"));
+    }
+    let mut s = format!("`{path}`: {total} pages, showing {first}–{last}.\n");
+    for (i, page) in all.iter().enumerate().take(last).skip(first - 1) {
+        let block = format!("\n--- page {} ---\n{}\n", i + 1, page.trim_end());
+        if s.len() + block.len() > MAX_READ_BYTES {
+            let _ = writeln!(
+                s,
+                "\n... (stopped at page {i} to stay under {MAX_READ_BYTES} bytes; continue with pages {}-{last})",
+                i + 1
+            );
+            return Ok(s);
+        }
+        s.push_str(&block);
+    }
+    if last < total {
+        let _ = writeln!(
+            s,
+            "\n... ({} more pages; read them with `pages`)",
+            total - last
+        );
+    }
+    Ok(s)
+}
+
 fn read(args: &Value, env: &ToolEnv<'_>) -> Result<String, String> {
     let path = str_arg(args, "path").ok_or("`path` is required")?;
     let file = confine(env.root, path, false, env.attached)?;
     if file.is_dir() {
         return Err(format!("`{path}` is a folder; use `ls` to list it"));
+    }
+    if file
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("pdf"))
+    {
+        return read_pdf(&file, path, str_arg(args, "pages"));
     }
     let bytes = fs::read(&file).map_err(|e| format!("cannot read `{path}`: {e}"))?;
     if bytes.iter().take(8192).any(|b| *b == 0) {
@@ -504,6 +684,63 @@ mod tests {
         );
         assert!(run("bash", &json!({}), &env).is_err());
         fs::remove_dir_all(ws).unwrap();
+    }
+
+    #[test]
+    fn pdfs_are_read_page_by_page() {
+        if std::process::Command::new("pdftotext")
+            .arg("-v")
+            .output()
+            .is_err()
+        {
+            return; // poppler isn't installed here
+        }
+        let ws = workspace();
+        fs::copy(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/two-pages.pdf"),
+            ws.join("slides.pdf"),
+        )
+        .unwrap();
+        let env = ToolEnv {
+            root: &ws,
+            attached: &[],
+        };
+        let all = run("read", &json!({"path": "slides.pdf"}), &env).unwrap();
+        assert!(all.contains("2 pages, showing 1–2"));
+        assert!(all.contains("--- page 1 ---\nSeite eins"));
+        assert!(all.contains("--- page 2 ---\nSeite zwei: Blindleistung"));
+        let second = run("read", &json!({"path": "slides.pdf", "pages": "2"}), &env).unwrap();
+        assert!(!second.contains("Seite eins"));
+        assert!(second.contains("Seite zwei"));
+        assert!(run("read", &json!({"path": "slides.pdf", "pages": "5-6"}), &env).is_err());
+    }
+
+    #[test]
+    fn view_renders_pdf_pages_as_images() {
+        if std::process::Command::new("pdftoppm")
+            .arg("-v")
+            .output()
+            .is_err()
+        {
+            return; // poppler isn't installed here
+        }
+        let ws = workspace();
+        fs::copy(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/two-pages.pdf"),
+            ws.join("slides.pdf"),
+        )
+        .unwrap();
+        let env = ToolEnv {
+            root: &ws,
+            attached: &[],
+        };
+        let (text, images) = view(&json!({"path": "slides.pdf", "pages": "2-9"}), &env).unwrap();
+        assert_eq!(text, "`slides.pdf`, pages 2–2, attached as images.");
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].media_type, "image/png");
+        assert!(images[0].data.starts_with("iVBOR"), "a PNG");
+        assert!(view(&json!({"path": "slides.pdf", "pages": "7"}), &env).is_err());
+        assert!(view(&json!({"path": "src/main.rs"}), &env).is_err());
     }
 
     #[test]

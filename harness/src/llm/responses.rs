@@ -133,17 +133,34 @@ fn input_items(m: &Message) -> Vec<Value> {
                 })),
             })
             .collect(),
-        Message::ToolResults(results) => results
-            .iter()
-            .map(|r| {
-                let output = if r.is_error {
-                    format!("Error: {}", r.content)
-                } else {
-                    r.content.clone()
-                };
-                json!({"type": "function_call_output", "call_id": r.call_id, "output": output})
-            })
-            .collect(),
+        Message::ToolResults(results) => {
+            let mut items: Vec<Value> = results
+                .iter()
+                .map(|r| {
+                    let output = if r.is_error {
+                        format!("Error: {}", r.content)
+                    } else {
+                        r.content.clone()
+                    };
+                    json!({"type": "function_call_output", "call_id": r.call_id, "output": output})
+                })
+                .collect();
+            // Function outputs are text: images a tool returns follow as a
+            // user message the model can see.
+            for r in results.iter().filter(|r| !r.images.is_empty()) {
+                let mut content = vec![json!({
+                    "type": "input_text",
+                    "text": format!("Images returned by tool call {}:", r.call_id),
+                })];
+                content.extend(
+                    r.images
+                        .iter()
+                        .map(|f| json!({"type": "input_image", "image_url": f.data_url()})),
+                );
+                items.push(json!({"role": "user", "content": content}));
+            }
+            items
+        }
     }
 }
 
@@ -328,6 +345,28 @@ mod tests {
     use crate::llm::{ToolResult, ToolSpec};
 
     #[test]
+    fn tool_images_follow_the_outputs_as_a_user_message() {
+        let m = Message::ToolResults(vec![ToolResult {
+            call_id: "c1".into(),
+            content: "pages 1–1".into(),
+            is_error: false,
+            images: vec![crate::llm::Attachment {
+                name: "p1".into(),
+                media_type: "image/png".into(),
+                data: "AAA=".into(),
+            }],
+        }]);
+        let items = input_items(&m);
+        assert_eq!(items[0]["type"], "function_call_output");
+        assert_eq!(items[1]["role"], "user");
+        assert_eq!(items[1]["content"][1]["type"], "input_image");
+        assert_eq!(
+            items[1]["content"][1]["image_url"],
+            "data:image/png;base64,AAA="
+        );
+    }
+
+    #[test]
     fn images_and_pdfs_go_as_input_content() {
         let m = Message::UserWith(
             "Explain these.".into(),
@@ -451,6 +490,7 @@ data: {"type":"response.completed","response":{"id":"resp_1","status":"completed
             call_id: "call_1".into(),
             content: "no such file".into(),
             is_error: true,
+            images: vec![],
         }]));
         let body = request_body(&req);
         assert_eq!(body["input"][1], reasoning);

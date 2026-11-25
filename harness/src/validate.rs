@@ -195,6 +195,8 @@ mod tests {
             goal: None,
             question: false,
             offer_check: false,
+            language: None,
+            check: false,
         };
         assert!(check_onboarding(&asking).is_empty());
 

@@ -38,6 +38,8 @@ pub struct ToolResult {
     pub call_id: String,
     pub content: String,
     pub is_error: bool,
+    /// Images the tool returns for the model to see (`view`).
+    pub images: Vec<Attachment>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

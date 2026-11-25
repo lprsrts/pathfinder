@@ -375,6 +375,14 @@ pub struct Session {
     pub id: String,
     pub cwd: PathBuf,
     pub goal: Option<String>,
+    /// The conversation's language (two-letter code), from onboarding: the
+    /// fixed lines Pathfinder writes itself follow it.
+    #[serde(default)]
+    pub language: Option<String>,
+    /// The task is a quick check of something just explained: no gap
+    /// proposals, just the check.
+    #[serde(default)]
+    pub quick_check: bool,
     pub mode: SessionMode,
     #[serde(default)]
     pub map: Map,
@@ -418,6 +426,8 @@ impl Session {
             id,
             cwd,
             goal: None,
+            language: None,
+            quick_check: false,
             mode: SessionMode::Onboarding,
             map: Map::default(),
             active: None,
@@ -482,6 +492,12 @@ pub struct OnboardingDecision {
     /// offer a check after the answer.
     #[serde(default)]
     pub offer_check: bool,
+    /// The language the user writes in (two-letter code).
+    #[serde(default)]
+    pub language: Option<String>,
+    /// The goal is a quick check of a topic just explained.
+    #[serde(default)]
+    pub check: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

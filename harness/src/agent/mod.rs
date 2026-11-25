@@ -266,6 +266,7 @@ async fn run_call(
         &req.cwd,
     )));
     let full = req.tools == ToolAccess::Full;
+    let mut images = Vec::new();
     let outcome = match call.name.as_str() {
         "edit" | "write" if full => change_file(call, env, req).await.map(|(msg, c)| {
             sink(StreamEvent::ToolUpdate {
@@ -279,6 +280,10 @@ async fn run_call(
             msg
         }),
         "bash" if full => run_command(&id, &call.args, req, sink).await,
+        "view" => tools::view(&call.args, env).map(|(text, found)| {
+            images = found;
+            text
+        }),
         _ => tools::run(&call.name, &call.args, env),
     };
     sink(StreamEvent::ToolEnd {
@@ -293,6 +298,7 @@ async fn run_call(
         call_id: call.id.clone(),
         content,
         is_error,
+        images,
     }
 }
 

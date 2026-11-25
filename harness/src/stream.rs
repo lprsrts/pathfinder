@@ -58,6 +58,15 @@ pub fn describe_tool(id: String, name: &str, input: &Value, cwd: &Path) -> ToolS
             ToolKind::Read,
             format!("Read {}", shown.clone().unwrap_or_default()),
         ),
+        "view" => (
+            ToolKind::Read,
+            match input.get("pages").and_then(|v| v.as_str()) {
+                Some(pages) => {
+                    format!("View {} (pages {pages})", shown.clone().unwrap_or_default())
+                }
+                None => format!("View {}", shown.clone().unwrap_or_default()),
+            },
+        ),
         "edit" | "multiedit" => (
             ToolKind::Edit,
             format!("Edit {}", shown.clone().unwrap_or_default()),

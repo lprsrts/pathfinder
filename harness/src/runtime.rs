@@ -15,6 +15,7 @@ use crate::engine::{
     Engine, EngineRequest, EngineTier, StreamEvent, StreamSink, TierModels, ToolAccess, run_gated,
     run_gated_streamed,
 };
+use crate::i18n;
 use crate::secrets::Secret;
 use crate::store::Store;
 use crate::understanding::EventKind;
@@ -363,13 +364,14 @@ impl Runtime {
         };
         let answer = self.engine.run_text(&req, sink.clone()).await?;
         let told = self.record_told(session, text);
+        let lang = session.language.as_deref();
         let offer = if !told.is_empty() {
             format!(
-                "\n\nTold, not shown: this is {} on your record. Say \"check me\" to make it yours.",
-                told.join(", ")
+                "\n\n{}",
+                i18n::line(lang, i18n::Line::ToldNotShown).replace("{labels}", &told.join(", "))
             )
         } else if offer_check {
-            "\n\nSay \"check me\" if you want to make sure this is yours.".to_string()
+            format!("\n\n{}", i18n::line(lang, i18n::Line::OfferCheck))
         } else {
             String::new()
         };
@@ -428,6 +430,9 @@ impl Runtime {
             Some("reply"),
         )
         .await?;
+        if let Some(lang) = decision.language.as_deref().filter(|l| l.len() == 2) {
+            session.language = Some(lang.to_lowercase());
+        }
         if decision.question && !decision.ready_to_map {
             return self
                 .answer_question(session, text, files, sink, decision.offer_check)
@@ -448,6 +453,7 @@ impl Runtime {
 
         if let Some(goal) = decision.goal.filter(|g| !g.trim().is_empty()) {
             session.goal = Some(goal);
+            session.quick_check = decision.check;
         }
         session.push_turn("assistant", &decision.reply);
         if decision.ready_to_map {
@@ -558,7 +564,7 @@ impl Runtime {
             |c: &MapChange| check_change(c, &current),
         )
         .await?;
-        let reply = render_change(&change, &session.map);
+        let reply = render_change(&change, &session.map, session.language.as_deref());
         session.pending_change = Some(change);
         session.push_turn("assistant", &reply);
         Ok(TurnOutput::text(reply))
@@ -662,7 +668,7 @@ impl Runtime {
         if let Some(change) = &session.pending_change {
             waiting.push_str(&format!(
                 "\n\nMap change waiting for the user's OK:\n{}",
-                render_change(change, &session.map)
+                render_change(change, &session.map, session.language.as_deref())
             ));
         }
         // The waiting candidate is hidden from this call: it may be flawed on
@@ -763,7 +769,10 @@ impl Runtime {
         let mut visible = String::new();
         let mut full = decision.reply;
         if let Some(change) = decision.map_change {
-            let rendered = format!("\n\n{}", render_change(&change, &session.map));
+            let rendered = format!(
+                "\n\n{}",
+                render_change(&change, &session.map, session.language.as_deref())
+            );
             visible.push_str(&rendered);
             full.push_str(&rendered);
             session.pending_change = Some(change);
@@ -887,7 +896,7 @@ impl Runtime {
         match &session.pending_change {
             Some(change) => input.push_str(&format!(
                 "Map change waiting for the user's OK:\n{}\n",
-                render_change(change, &session.map)
+                render_change(change, &session.map, session.language.as_deref())
             )),
             None => input.push_str("No map change is waiting.\n"),
         }
@@ -1083,7 +1092,12 @@ impl Runtime {
             models: self.models(session)?,
             ctx: crate::engine::turn_ctx(),
         };
-        let header = format!("Candidate for **{}**:\n\n", part.title);
+        let lang = session.language.as_deref();
+        let header = format!(
+            "{} **{}**:\n\n",
+            i18n::line(lang, i18n::Line::CandidateFor),
+            part.title
+        );
         // The candidate's reasoning would give away whether (and where) it's
         // flawed, so it's never shown. The header goes right before the
         // candidate's first words, after any files the model reads.
@@ -1120,8 +1134,11 @@ impl Runtime {
         }
         flush(&sink, &proposal.candidate, &shown);
 
-        const ASK: &str = "\n\nIs it right? Say why.";
-        let reply = format!("{header}{}{ASK}", proposal.candidate);
+        let ask = format!(
+            "\n\n{}",
+            i18n::line(session.language.as_deref(), i18n::Line::IsItRight)
+        );
+        let reply = format!("{header}{}{ask}", proposal.candidate);
         session.push_turn("assistant", &reply);
         // The key goes to the secrets table, never into the thread's state.
         let secret = Secret::candidate_key(
@@ -1141,7 +1158,7 @@ impl Runtime {
             misconception,
             id: format!("cand-{}", uuid::Uuid::new_v4().simple()),
         });
-        Ok(ASK.to_string())
+        Ok(ask)
     }
 
     async fn handle_judgment(
@@ -1227,8 +1244,10 @@ impl Runtime {
             None => verdict.pass,
         };
         if verdict.pass && !understood {
-            let next =
-                "\n\nPassed. This part rests on more than that check covered, so one more:\n\n";
+            let next = format!(
+                "\n\n{}\n\n",
+                i18n::line(session.language.as_deref(), i18n::Line::PassedOneMore)
+            );
             session.push_turn("assistant", format!("{}{next}", verdict.feedback));
             sink(StreamEvent::TextDelta(next.to_string()));
             let ask = self.write_candidate(session, &part.id, files, sink).await?;
@@ -1555,7 +1574,7 @@ fn flush(sink: &StreamSink, full: &str, shown: &str) {
 }
 
 /// A part as you start on it. The command hint shows only with the first part.
-fn render_part(part: &Part, hint: bool) -> String {
+fn render_part(part: &Part, hint: bool, lang: Option<&str>) -> String {
     let mut out = format!("**{}** (`{}`)", part.title, part.id);
     if !part.note.trim().is_empty() {
         out.push_str(&format!("\n{}", part.note.trim()));
@@ -1564,9 +1583,7 @@ fn render_part(part: &Part, hint: bool) -> String {
         out.push_str(&format!("\nStatus: {}.", part.status.label()));
     }
     if hint && part.status == PartStatus::Open {
-        out.push_str(
-            "\n\nTalk it through here as you work: your thinking and reasons are the log. When you can explain the whole part, say so and explain it (`/summary`); say if you already know it (`/known`); `/delegate` hands it off without understanding it.",
-        );
+        out.push_str(&format!("\n\n{}", i18n::line(lang, i18n::Line::PartHint)));
     }
     out
 }
@@ -1586,8 +1603,12 @@ fn describe_part(part: &Part) -> String {
 }
 
 /// `+` adds a part, `~` updates one already on the map.
-fn render_change(change: &MapChange, map: &Map) -> String {
-    let mut lines = vec![format!("Proposed map change: {}", change.brief)];
+fn render_change(change: &MapChange, map: &Map, lang: Option<&str>) -> String {
+    let mut lines = vec![format!(
+        "{} {}",
+        i18n::line(lang, i18n::Line::ProposedChange),
+        change.brief
+    )];
     if let Some(goal) = change.goal.as_deref().filter(|g| !g.trim().is_empty()) {
         lines.push(format!("Goal → {goal}"));
     }
@@ -1595,7 +1616,10 @@ fn render_change(change: &MapChange, map: &Map) -> String {
         let deps = if p.depends_on.is_empty() {
             String::new()
         } else {
-            format!(" (needs {})", p.depends_on.join(", "))
+            format!(
+                " ({})",
+                i18n::line(lang, i18n::Line::Needs).replace("{deps}", &p.depends_on.join(", "))
+            )
         };
         let mark = if map.get(&p.id).is_some() { "~" } else { "+" };
         lines.push(format!("{mark} `{}` {}{deps}", p.id, p.title));
@@ -1603,7 +1627,7 @@ fn render_change(change: &MapChange, map: &Map) -> String {
     for id in &change.remove {
         lines.push(format!("- remove `{id}`"));
     }
-    lines.push("`/accept` or `/reject`.".to_string());
+    lines.push(i18n::line(lang, i18n::Line::AcceptReject).to_string());
     lines.join("\n")
 }
 
@@ -1611,7 +1635,11 @@ fn render_map_and_pending(session: &Session) -> String {
     let mut out = session.map.render(session.active.as_deref());
     if let Some(change) = &session.pending_change {
         out.push_str("\n\n");
-        out.push_str(&render_change(change, &session.map));
+        out.push_str(&render_change(
+            change,
+            &session.map,
+            session.language.as_deref(),
+        ));
     }
     out
 }
@@ -1638,7 +1666,9 @@ Onboarding only sets the goal. Right after it, Pathfinder sketches a rough map o
 
 First tell a question from a task. Pathfinder is also the user's everyday assistant:
 - A question or request for information ("what is a phasor?", "explain this slide", "how do I compute the Laplace transform of this?", "what's the capital of Peru?") is not a task: set `question` to true, `ready_to_map` to false, `goal` to null and `reply` to "". Pathfinder answers it directly. Set `offer_check` to true when it's about understanding something (a concept, method, derivation, how or why something works), false for quick lookups, everyday facts, or chit-chat.
-- If the user asks to be checked on, or to properly learn, something from the conversation ("check me", "make sure I get it", "teach me this properly"), that is a task: the goal is understanding that topic.
+- If the user asks to be checked on, or to properly learn, something from the conversation ("check me", "prüf mich", "make sure I get it", "teach me this properly"), that is a task. For a check, set `check` to true; the goal starts with "Check" (in their language: "Prüfen, ...") and names the topic just explained. For properly learning it, the goal is understanding that topic and `check` is false.
+
+Always set `language` to the two-letter code of the language the user writes in (e.g. "de", "en"), and write `goal` and `reply` in that language.
 
 Otherwise it's onboarding for a task. Aim to finish in this turn:
 - If the user has named something to do, build, fix, understand or learn, the goal is clear: set `ready_to_map` to true and write `goal` as one sentence starting with a verb, in their words but not in first person ("Learn how neurons in neural networks work"). Breadth or vagueness ("learn how X works") is fine; the map handles it.
@@ -1650,7 +1680,7 @@ Otherwise it's onboarding for a task. Aim to finish in this turn:
 You get a workspace snapshot. If a file could answer something, read it before writing your JSON, since `reply` ends your turn. Don't read files when the snapshot and the user's words already settle it.
 
 Return ONLY a JSON object:
-{"reply": "...", "ready_to_map": true, "goal": "...", "question": false, "offer_check": false}"#;
+{"reply": "...", "ready_to_map": true, "goal": "...", "question": false, "offer_check": false, "check": false, "language": "en"}"#;
 
 const ANSWER_SYSTEM: &str = r#"You are Pathfinder, the user's assistant, answering a question directly. The user is an electrical engineering and information technology student who also works as a research assistant; questions may be about lectures, exercise sheets, research, or anything else.
 
@@ -1668,6 +1698,7 @@ const MAP_SYSTEM: &str = r#"You sketch the map for Pathfinder: what the task dep
 - `id`: a short descriptive slug the user types in commands: lowercase words joined by hyphens, at most 12 characters (e.g. `weights`, `fwd-pass`, `loss`). Unique. It names what the part is actually about, not a broad field: `colliders`, not `probability`. Users skip parts by their names.
 - Start where the user is: if the goal or conversation says what they already know or don't, shape the parts for that (e.g. include the basics for a newcomer). Keep parts they say they know on the map; they can mark them known themselves.
 - `note`: one line on what the part covers. `brief`: what the map covers, in one or two sentences.
+- A goal that is a check of a topic just explained in the conversation ("Check ...", "Prüfen, ...") gets one part for that topic, two at most: the user explains it and judges a candidate.
 - Never give results away: no answers, computed values or intermediate results (a cutoff frequency, a derivative, "≈ 0.157") in the brief, notes or titles. The user works them out; for an exercise, say what each part is about, not what it comes to.
 - `concepts`: the ideas the parts rest on, the record Pathfinder keeps of what the user has shown they understand. Each has an `id` (a lowercase hyphenated slug naming the idea itself, e.g. `d-separation`, `chain-rule`), a short `label`, and `needs`: the concept ids it builds on. Include a concept the task needs even if no part covers it (a prerequisite the user may lack). Reuse ids of concepts already recorded in this workspace when it's the same idea.
 - Each part lists its 1–4 core `concepts` (ids from `concepts`): what someone must understand to judge an agent's work on that part. Usually one or two.
@@ -2126,6 +2157,29 @@ mod tests {
         "parts":[
         {"id":"route","title":"Command routing","depends_on":[],"concepts":["dispatch","handlers","registry"]},
         {"id":"report","title":"What status reports","depends_on":["route"],"concepts":["status-fields"]}]}"#;
+
+    #[tokio::test]
+    async fn a_quick_check_proposes_no_gaps_and_speaks_german() {
+        let (rt, _) = runtime(
+            FakeEngine::new(vec![
+                (
+                    ReadOnly,
+                    S1,
+                    r#"{"reply":"Prüfen, wie das Routing funktioniert.","ready_to_map":true,"goal":"Prüfen, wie das Routing funktioniert","check":true,"language":"de"}"#,
+                ),
+                (ReadOnly, S2, MAP_CONCEPTS),
+            ]),
+            false,
+        );
+        let out = turn(&rt, "prüf mich").await;
+        let s = rt.load_session("s").unwrap().unwrap();
+        assert!(s.quick_check);
+        assert_eq!(s.language.as_deref(), Some("de"));
+        assert!(s.pending_change.is_none(), "no gap parts in a quick check");
+        assert!(out.reply.contains("Denk hier laut"), "{}", out.reply);
+        assert!(out.reply.contains("Beruht auf: "), "{}", out.reply);
+        assert!(out.reply.contains("(unbekannt)"), "{}", out.reply);
+    }
 
     #[tokio::test]
     async fn understanding_comes_from_evidence_per_concept() {

@@ -93,6 +93,10 @@ Pathfinder is also an everyday assistant. Ask a question with no task ("what is 
 
 Attach slides, exercise sheets, papers or screenshots: images (PNG, JPEG, GIF, WebP) and PDFs are sent to the model as content it can see, on every route, and a screenshot pasted into the chat is saved and attached the same way. Zed can't render LaTeX in the agent panel, so math is written in plain text and Unicode.
 
+Open a folder of course material as the workspace and the model finds things itself: `read` returns a PDF's text page by page (`pages: "3-7"`), and `view` shows it up to four pages as images, for circuits, diagrams and plots that text can't carry. Both use poppler (`brew install poppler`); without it, attach the file instead.
+
+Pathfinder's own lines (the candidate prompt, part hints, map-change proposals, the check offer) follow the conversation's language, German or English; models write everything else in your language. After an answer, "check me" ("prüf mich") starts a quick check of that topic: one part, no prerequisite proposals, just your explanation and a candidate.
+
 ## How a session goes
 
 1. Say what you want done. Onboarding settles the goal, then sketches a map of what the task depends on (no size limit).

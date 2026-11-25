@@ -517,7 +517,9 @@ impl Runtime {
         let Some(part) = session.active_part().cloned() else {
             return String::new();
         };
-        let mut out = render_part(&part, hint);
+        let lang = session.language.clone();
+        let lang = lang.as_deref();
+        let mut out = render_part(&part, hint, lang);
         if part.concepts.is_empty() {
             return out;
         }
@@ -543,11 +545,15 @@ impl Runtime {
                 format!(
                     "{} ({})",
                     label(c),
-                    understanding::state_of(&views, c).label()
+                    crate::i18n::state(lang, understanding::state_of(&views, c))
                 )
             })
             .collect();
-        out.push_str(&format!("\nRests on: {}.", rests.join(", ")));
+        out.push_str(&format!(
+            "\n{}: {}.",
+            crate::i18n::line(lang, crate::i18n::Line::RestsOn),
+            rests.join(", ")
+        ));
 
         let covered: HashSet<String> = session
             .map
@@ -556,6 +562,10 @@ impl Runtime {
             .filter(|p| p.id != part.id && p.status == PartStatus::Open)
             .flat_map(|p| p.concepts.iter().cloned())
             .collect();
+        // A quick check is only the check: no prerequisite parts.
+        if session.quick_check {
+            return out;
+        }
         let gaps: Vec<understanding::Gap> =
             understanding::gaps(&part.concepts, &prerequisites, &views, &covered)
                 .into_iter()
@@ -565,15 +575,21 @@ impl Runtime {
             return out;
         }
         for g in &gaps {
-            let why = match g.state {
-                ConceptState::Claimed => "you claimed to know it, with no evidence yet",
-                ConceptState::Delegated => "you handed it off without understanding it",
-                ConceptState::Shaky => "your last check on it failed",
-                _ => "nothing on the map covers it yet",
-            };
+            use crate::i18n::{Line, line};
+            let why = line(
+                lang,
+                match g.state {
+                    ConceptState::Claimed => Line::GapClaimed,
+                    ConceptState::Delegated => Line::GapDelegated,
+                    ConceptState::Shaky => Line::GapShaky,
+                    _ => Line::GapUncovered,
+                },
+            );
             out.push_str(&format!(
-                "\nIt needs **{}** first: {why}.",
-                label(&g.concept)
+                "\n{}",
+                line(lang, Line::GapNeeds)
+                    .replace("{concept}", &label(&g.concept))
+                    .replace("{why}", why)
             ));
             session.gaps_raised.push(g.concept.clone());
         }
@@ -589,7 +605,8 @@ impl Runtime {
                     ProposedPart {
                         id,
                         title: label(&g.concept),
-                        note: format!("Needed by {}.", part.title),
+                        note: crate::i18n::line(lang, crate::i18n::Line::NeededBy)
+                            .replace("{part}", &part.title),
                         depends_on: vec![],
                         concepts: vec![g.concept.clone()],
                     }
@@ -601,9 +618,9 @@ impl Runtime {
                 .map(|g| label(&g.concept))
                 .collect();
             let change = MapChange {
-                brief: format!(
-                    "Add a small part for {} so this part doesn't rest on it unchecked.",
-                    names.join(" and ")
+                brief: crate::i18n::line(lang, crate::i18n::Line::AddGapParts).replace(
+                    "{names}",
+                    &names.join(crate::i18n::line(lang, crate::i18n::Line::And)),
                 ),
                 goal: None,
                 parts,
@@ -611,7 +628,10 @@ impl Runtime {
                 concepts: vec![],
             };
             if session.map.with_change(&change).is_ok() {
-                out.push_str(&format!("\n\n{}", render_change(&change, &session.map)));
+                out.push_str(&format!(
+                    "\n\n{}",
+                    render_change(&change, &session.map, lang)
+                ));
                 session.pending_change = Some(change);
             }
         }

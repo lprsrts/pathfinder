@@ -95,10 +95,23 @@ fn message_json(m: &Message) -> Value {
             let content: Vec<Value> = results
                 .iter()
                 .map(|r| {
+                    // Images go inside the result, after its text.
+                    let content = if r.images.is_empty() {
+                        json!(r.content)
+                    } else {
+                        let mut blocks = vec![json!({"type": "text", "text": r.content})];
+                        blocks.extend(r.images.iter().map(|f| {
+                            json!({
+                                "type": "image",
+                                "source": {"type": "base64", "media_type": f.media_type, "data": f.data},
+                            })
+                        }));
+                        json!(blocks)
+                    };
                     json!({
                         "type": "tool_result",
                         "tool_use_id": r.call_id,
-                        "content": r.content,
+                        "content": content,
                         "is_error": r.is_error,
                     })
                 })
@@ -281,6 +294,25 @@ mod tests {
     use crate::llm::{ToolResult, ToolSpec};
 
     #[test]
+    fn tool_images_go_inside_the_tool_result() {
+        let m = Message::ToolResults(vec![ToolResult {
+            call_id: "c1".into(),
+            content: "pages 1–1".into(),
+            is_error: false,
+            images: vec![crate::llm::Attachment {
+                name: "p1".into(),
+                media_type: "image/png".into(),
+                data: "AAA=".into(),
+            }],
+        }]);
+        let j = message_json(&m);
+        let content = &j["content"][0]["content"];
+        assert_eq!(content[0]["text"], "pages 1–1");
+        assert_eq!(content[1]["type"], "image");
+        assert_eq!(content[1]["source"]["data"], "AAA=");
+    }
+
+    #[test]
     fn images_and_pdfs_go_as_content_blocks() {
         let m = Message::UserWith(
             "Explain these.".into(),
@@ -417,6 +449,7 @@ data: {"type":"message_stop"}
             call_id: "toolu_1".into(),
             content: "data".into(),
             is_error: false,
+            images: vec![],
         }]));
         req.allow_tools = false;
         let body = request_body(&req);
