@@ -2673,8 +2673,9 @@ mod tests {
         let s = rt.load_session("s").unwrap().unwrap();
         assert_eq!(s.map.get("route").unwrap().status, PartStatus::Understood);
         let why = rt.why(&s);
-        assert!(!why.contains("open misconception"), "{why}");
-        assert!(why.contains("Command registry: shown"), "{why}");
+        assert!(!why.contains("Open misconception"), "{why}");
+        assert!(why.contains("Command registry<br/><small>shown"), "{why}");
+        assert!(why.contains("n_closures --> n_dispatch"), "prerequisites one level down");
     }
 
     #[tokio::test]

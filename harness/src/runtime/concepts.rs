@@ -650,35 +650,75 @@ impl Runtime {
                 part.status.label()
             );
         }
-        let Ok(views) = self.concept_views(session, &part.concepts) else {
+        use crate::domain::{mermaid_id, mermaid_text};
+        use crate::i18n::{Line, line, part_status, state};
+        let lang = session.language.clone();
+        let lang = lang.as_deref();
+        let ws = Self::workspace(session);
+        let prerequisites = self.store.prerequisites(&ws).unwrap_or_default();
+        // The part's concepts, and one level of what they build on.
+        let mut ids: Vec<String> = part.concepts.clone();
+        for c in &part.concepts {
+            for n in prerequisites.get(c).into_iter().flatten() {
+                if !ids.contains(n) {
+                    ids.push(n.clone());
+                }
+            }
+        }
+        let Ok(views) = self.concept_views(session, &ids) else {
             return "Couldn't read the record.".into();
         };
         let labels = self.labels(session);
-        let mut lines = vec![format!("**{}**: {}.", part.title, part.status.label())];
-        for c in &part.concepts {
-            let name = labels.get(c).cloned().unwrap_or_else(|| c.clone());
-            let Some(v) = views.get(c) else {
-                lines.push(format!("- {name}: unknown, no events yet."));
-                continue;
+        let name = |c: &str| labels.get(c).cloned().unwrap_or_else(|| c.to_string());
+        let part_node = format!("part_{}", mermaid_id(&part.id));
+        let mut out = format!(
+            "```mermaid\nflowchart LR\n    {part_node}[\"▶ {}<br/><small>{}</small>\"]\n",
+            mermaid_text(&part.title),
+            mermaid_text(part_status(lang, part.status)),
+        );
+        let mut notes = Vec::new();
+        for c in &ids {
+            let detail = match views.get(c) {
+                Some(v) if v.passes + v.fails > 0 => format!(
+                    "{} · {}",
+                    state(lang, v.state),
+                    line(lang, Line::Checks)
+                        .replace("{passed}", &v.passes.to_string())
+                        .replace("{failed}", &v.fails.to_string())
+                ),
+                Some(v) => state(lang, v.state).to_string(),
+                None => state(lang, ConceptState::Unknown).to_string(),
             };
-            let mut line = format!(
-                "- {name}: {} ({} passed, {} failed checks)",
-                v.state.label(),
-                v.passes,
-                v.fails
-            );
-            for m in &v.open_misconceptions {
-                if let Ok(Some(found)) = self.store.misconception(m) {
-                    line.push_str(&format!("; open misconception: \"{}\"", found.statement));
+            out.push_str(&format!(
+                "    {}[\"{}<br/><small>{}</small>\"]\n",
+                mermaid_id(c),
+                mermaid_text(&name(c)),
+                mermaid_text(&detail),
+            ));
+            if let Some(v) = views.get(c) {
+                for m in &v.open_misconceptions {
+                    if let Ok(Some(found)) = self.store.misconception(m) {
+                        notes.push(
+                            line(lang, Line::OpenMisconception)
+                                .replace("{concept}", &name(c))
+                                .replace("{statement}", &found.statement),
+                        );
+                    }
                 }
             }
-            lines.push(line);
         }
-        lines.push(
-            "Only passed checks count as evidence; a claim never does, and solid understanding cools after 30 days without a fresh check."
-                .into(),
-        );
-        lines.join("\n")
+        for c in &part.concepts {
+            out.push_str(&format!("    {} --> {part_node}\n", mermaid_id(c)));
+            for n in prerequisites.get(c).into_iter().flatten() {
+                out.push_str(&format!("    {} --> {}\n", mermaid_id(n), mermaid_id(c)));
+            }
+        }
+        out.push_str("```");
+        for n in notes {
+            out.push_str(&format!("\n\n{n}"));
+        }
+        out.push_str(&format!("\n\n{}", line(lang, Line::EvidenceNote)));
+        out
     }
 
     /// Most ideas the folder-wide record draws.

@@ -68,6 +68,12 @@ pub enum Line {
     NoRecord,
     /// Under the record: "{shown}", "{told}", "{shaky}".
     RecordSummary,
+    /// Checks on a concept: "{passed}", "{failed}".
+    Checks,
+    /// Under a part's `/why`.
+    EvidenceNote,
+    /// An open misconception: "{concept}", "{statement}".
+    OpenMisconception,
 }
 
 fn german(lang: Option<&str>) -> bool {
@@ -125,6 +131,11 @@ pub fn line(lang: Option<&str>, line: Line) -> &'static str {
             ExamQuestionFor => "Prüfungsfrage zu",
             ExamAnswer => "Deine Antwort?",
             RecordTitle => "**Dein Verlauf in diesem Ordner**",
+            Checks => "{passed} bestanden, {failed} nicht",
+            EvidenceNote => {
+                "Als verstanden zählt nur eine bestandene Prüfung; eine Behauptung nie, und sicheres Verständnis kühlt nach 30 Tagen ohne neue Prüfung ab."
+            }
+            OpenMisconception => "Offenes Missverständnis bei {concept}: „{statement}“",
             ToldOnly => "nur gesagt",
             NoRecord => {
                 "Für diesen Ordner gibt es noch keinen Verlauf: Frag etwas, oder lass dich prüfen."
@@ -179,6 +190,11 @@ pub fn line(lang: Option<&str>, line: Line) -> &'static str {
             ExamQuestionFor => "Question on",
             ExamAnswer => "Your answer?",
             RecordTitle => "**Your record in this folder**",
+            Checks => "{passed} passed, {failed} failed",
+            EvidenceNote => {
+                "Only passed checks count as understanding; a claim never does, and solid understanding cools after 30 days without a fresh check."
+            }
+            OpenMisconception => "Open misconception on {concept}: \"{statement}\"",
             ToldOnly => "told only",
             NoRecord => "No record for this folder yet: ask something, or get tested.",
             RecordSummary => {
