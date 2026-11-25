@@ -19,6 +19,10 @@ pub enum Route {
     Openai,
     /// OpenAI Responses API through Sign in with ChatGPT (plan usage).
     Chatgpt,
+    /// An OpenAI-compatible Chat Completions server from `endpoints`: a
+    /// self-hosted vLLM, Ollama, llama.cpp or LM Studio, or a hosted
+    /// open-model service.
+    Endpoint,
 }
 
 impl Route {
@@ -30,6 +34,7 @@ impl Route {
             Self::Anthropic => "Anthropic API",
             Self::Openai => "OpenAI API",
             Self::Chatgpt => "ChatGPT",
+            Self::Endpoint => "Endpoint",
         }
     }
 
@@ -51,6 +56,7 @@ impl Route {
             Self::Anthropic => "anthropic",
             Self::Openai => "openai",
             Self::Chatgpt => "chatgpt",
+            Self::Endpoint => "endpoint",
         }
     }
 
@@ -66,6 +72,7 @@ impl Route {
             Self::Anthropic => "Anthropic",
             Self::Openai => "OpenAI",
             Self::Chatgpt => "ChatGPT",
+            Self::Endpoint => "your endpoint",
         }
     }
 
@@ -74,7 +81,7 @@ impl Route {
         match self {
             Self::Anthropic => Some("ANTHROPIC_API_KEY"),
             Self::Openai => Some("OPENAI_API_KEY"),
-            Self::Claude | Self::Codex | Self::Chatgpt => None,
+            Self::Claude | Self::Codex | Self::Chatgpt | Self::Endpoint => None,
         }
     }
 }
@@ -92,6 +99,52 @@ pub struct ModelEntry {
     /// Thinking or reasoning effort (e.g. `low`, `high`).
     #[serde(default)]
     pub effort: Option<String>,
+    /// For the `endpoint` route: which entry of `endpoints`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+}
+
+/// An OpenAI-compatible server: `{"id": "lab", "base_url":
+/// "http://gpu-box:8000/v1", "key": "lab-api-key", "models": ["..."]}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Endpoint {
+    /// Short id, used in model ids (`lab:<model>`).
+    pub id: String,
+    /// Picker group name; the id when unset.
+    #[serde(default)]
+    pub label: Option<String>,
+    /// Up to and including `/v1`.
+    pub base_url: String,
+    /// Auth file entry holding the key (`harness auth import <name>` copies
+    /// a keychain item); none for servers without auth.
+    #[serde(default)]
+    pub key: Option<String>,
+    /// Models to offer. Empty: whatever the server lists (`/models`).
+    #[serde(default)]
+    pub models: Vec<String>,
+    /// Fields merged into every request body, for server-specific options
+    /// (on OpenRouter, `{"provider": {"require_parameters": true}}` keeps
+    /// decision requests on providers that return log probabilities).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra: Option<serde_json::Value>,
+}
+
+/// Merges `extra`'s top-level fields into a request body.
+pub fn merge_extra(body: &mut serde_json::Value, extra: Option<&serde_json::Value>) {
+    if let (Some(serde_json::Value::Object(extra)), serde_json::Value::Object(body)) = (extra, body)
+    {
+        for (k, v) in extra {
+            body.insert(k.clone(), v.clone());
+        }
+    }
+}
+
+/// The decision service on an endpoint: a model that returns token log
+/// probabilities, used for the gate and step routing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecisionEndpoint {
+    pub endpoint: String,
+    pub model: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -114,6 +167,16 @@ pub struct Config {
     pub discover: bool,
     #[serde(default = "default_db_path")]
     pub db_path: PathBuf,
+    /// OpenAI-compatible servers (self-hosted or hosted open models).
+    #[serde(default)]
+    pub endpoints: Vec<Endpoint>,
+    /// Decisions from an endpoint's model instead of a hosted service.
+    #[serde(default)]
+    pub decisions: Option<DecisionEndpoint>,
+    /// Only endpoints: no model or decision request leaves for a provider's
+    /// cloud, for on-prem use. Pinned and discovered cloud models are hidden.
+    #[serde(default)]
+    pub local_only: bool,
 }
 
 fn lenient_models<'de, D: Deserializer<'de>>(de: D) -> Result<Vec<ModelEntry>, D::Error> {
@@ -179,6 +242,9 @@ impl Default for Config {
             system2: None,
             discover: true,
             db_path: default_db_path(),
+            endpoints: Vec::new(),
+            decisions: None,
+            local_only: false,
         }
     }
 }
@@ -216,12 +282,52 @@ impl Config {
     /// The picker list: pinned models, then discovered ones not already
     /// pinned.
     pub fn catalog(&self) -> Vec<ModelEntry> {
+        let cache = crate::catalog::ModelCache::load();
         let discovered = if self.discover {
-            crate::catalog::ModelCache::load().entries()
+            cache.entries()
         } else {
             Vec::new()
         };
-        self.merged(discovered)
+        let mut all = self.merged(discovered);
+        all.extend(self.endpoint_entries(&cache));
+        if self.local_only {
+            all.retain(|m| m.route == Route::Endpoint);
+        }
+        all
+    }
+
+    pub fn endpoint(&self, id: &str) -> Option<&Endpoint> {
+        self.endpoints.iter().find(|e| e.id == id)
+    }
+
+    /// Each endpoint's models: the configured list, else what its server
+    /// listed at the last refresh. Ids like `lab:qwen3-32b`.
+    fn endpoint_entries(&self, cache: &crate::catalog::ModelCache) -> Vec<ModelEntry> {
+        self.endpoints
+            .iter()
+            .flat_map(|ep| {
+                let models: Vec<String> = if ep.models.is_empty() {
+                    cache
+                        .providers
+                        .get(&format!("endpoint:{}", ep.id))
+                        .into_iter()
+                        .flatten()
+                        .map(|m| m.id.clone())
+                        .collect()
+                } else {
+                    ep.models.clone()
+                };
+                models.into_iter().map(move |model| ModelEntry {
+                    id: format!("{}:{model}", ep.id),
+                    label: model.clone(),
+                    route: Route::Endpoint,
+                    model,
+                    effort: None,
+                    endpoint: Some(ep.id.clone()),
+                })
+            })
+            .filter(|m| !self.models.iter().any(|p| p.id == m.id))
+            .collect()
     }
 
     fn merged(&self, discovered: Vec<ModelEntry>) -> Vec<ModelEntry> {
@@ -283,6 +389,54 @@ fn pick_from(
 mod tests {
     use super::*;
 
+    #[test]
+    fn endpoints_list_their_models_and_local_only_hides_the_cloud() {
+        let mut cache = crate::catalog::ModelCache::default();
+        cache.providers.insert(
+            "endpoint:lab".into(),
+            vec![crate::catalog::CachedModel {
+                id: "qwen-32b".into(),
+                label: "qwen-32b".into(),
+            }],
+        );
+        let cfg = Config {
+            endpoints: vec![
+                Endpoint {
+                    id: "lab".into(),
+                    label: None,
+                    base_url: "http://gpu-box:8000/v1".into(),
+                    key: None,
+                    models: vec![],
+                    extra: None,
+                },
+                Endpoint {
+                    id: "openrouter".into(),
+                    label: None,
+                    base_url: "https://openrouter.ai/api/v1".into(),
+                    key: Some("openrouter-api-key".into()),
+                    models: vec!["some/open-model".into()],
+                    extra: None,
+                },
+            ],
+            ..Config::default()
+        };
+        let entries = cfg.endpoint_entries(&cache);
+        let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, ["lab:qwen-32b", "openrouter:some/open-model"]);
+        assert_eq!(entries[0].route, Route::Endpoint);
+        assert_eq!(entries[0].endpoint.as_deref(), Some("lab"));
+        assert_eq!(entries[0].model, "qwen-32b");
+
+        let parsed: Config = serde_json::from_str(
+            r#"{"local_only": true, "decisions": {"endpoint": "lab", "model": "small"},
+                "endpoints": [{"id": "lab", "base_url": "http://gpu-box:8000/v1"}]}"#,
+        )
+        .unwrap();
+        assert!(parsed.local_only);
+        assert_eq!(parsed.decisions.as_ref().unwrap().model, "small");
+        assert!(parsed.endpoint("lab").is_some());
+    }
+
     fn entry(id: &str, route: Route) -> ModelEntry {
         ModelEntry {
             id: id.into(),
@@ -290,6 +444,7 @@ mod tests {
             route,
             model: id.into(),
             effort: None,
+            endpoint: None,
         }
     }
 

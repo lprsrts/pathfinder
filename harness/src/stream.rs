@@ -208,6 +208,26 @@ impl FieldStreamer {
                 }
                 b'\\' => {
                     let Some(&esc) = bytes.get(i + 1) else { break };
+                    let rest = &self.buf[i + 1..];
+                    // A LaTeX command could still be arriving: wait for the
+                    // letters to end before deciding.
+                    if matches!(esc, b'b' | b'f' | b'n' | b'r' | b't')
+                        && rest.chars().all(|c| c.is_ascii_alphabetic())
+                        && rest.len() < 12
+                    {
+                        break;
+                    }
+                    let literal = match esc {
+                        b'b' | b'f' | b'n' | b'r' | b't' => latex_command(rest),
+                        b'u' => rest.len() >= 5 && !unicode_escape(rest),
+                        b'"' | b'\\' | b'/' => false,
+                        _ => true,
+                    };
+                    if literal {
+                        out.push('\\');
+                        i += 1;
+                        continue;
+                    }
                     match esc {
                         b'n' => out.push('\n'),
                         b't' => out.push('\t'),
@@ -238,6 +258,30 @@ impl FieldStreamer {
     }
 }
 
+/// LaTeX commands that begin with a JSON escape letter (`\\frac` reads as
+/// form feed + "rac"). Models write them inside JSON strings with a single
+/// backslash; both the stream and the repair step keep them as LaTeX.
+const LATEX_ESCAPED: [&str; 44] = [
+    "beta", "bar", "bf", "boldsymbol", "binom", "big", "bigl", "bigr", "bigg", "begin", "bullet",
+    "bmatrix", "frac", "forall", "flat", "nabla", "neq", "ne", "nu", "not", "newline", "nleq",
+    "ngeq", "rho", "right", "rangle", "rightarrow", "rceil", "rfloor", "theta", "tau", "times",
+    "text", "textbf", "textit", "tan", "tanh", "to", "top", "tilde", "triangle", "tfrac", "neg",
+    "nexists",
+];
+
+/// Whether `rest` (the text after a backslash) starts with a LaTeX command
+/// from `LATEX_ESCAPED`, ending at a non-letter (or at the end, which may
+/// still grow: then it counts once the command is complete).
+pub(crate) fn latex_command(rest: &str) -> bool {
+    let word: String = rest.chars().take_while(|c| c.is_ascii_alphabetic()).collect();
+    LATEX_ESCAPED.contains(&word.as_str())
+}
+
+/// `\\u` with four hex digits after it.
+pub(crate) fn unicode_escape(rest: &str) -> bool {
+    rest.len() >= 5 && rest[1..5].chars().all(|c| c.is_ascii_hexdigit())
+}
+
 /// Decodes `\uXXXX` (and a following low surrogate). None if incomplete.
 fn decode_unicode(s: &str) -> Option<(char, usize)> {
     let hex = |from: usize| u32::from_str_radix(s.get(from..from + 4)?, 16).ok();
@@ -262,6 +306,21 @@ fn decode_unicode(s: &str) -> Option<(char, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn latex_in_a_json_string_streams_as_latex() {
+        // As models write it: single backslashes, some valid JSON escapes.
+        let raw = r#"{"reply": "P = U \cdot I, \frac{1}{2} \theta\nNeu: \u00e4 \underline{x}"}"#;
+        let mut f = FieldStreamer::new("reply");
+        let mut out = String::new();
+        for ch in raw.chars() {
+            out.push_str(&f.push(&ch.to_string()));
+        }
+        assert_eq!(
+            out,
+            "P = U \\cdot I, \\frac{1}{2} \\theta\nNeu: ä \\underline{x}"
+        );
+    }
 
     fn stream_all(field: &str, chunks: &[&str]) -> String {
         let mut s = FieldStreamer::new(field);

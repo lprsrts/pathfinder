@@ -356,14 +356,21 @@ fn auth_methods(terminal: bool) -> Vec<AuthMethod> {
 
 /// True when at least one model is usable. Refreshes the discovered model
 /// cache first when it's empty, otherwise in the background when stale.
+/// Endpoints' model lists, and the cloud providers' unless `local_only`.
+async fn refresh_models(creds: &Credentials) {
+    let cfg = Config::load();
+    let http = reqwest::Client::new();
+    catalog::refresh_endpoints(&cfg, creds, &http).await;
+    if !cfg.local_only {
+        catalog::refresh(creds, &http, &Route::DISCOVERED).await;
+    }
+}
+
 async fn ensure_models(creds: &Arc<Credentials>) -> bool {
     let cache = ModelCache::load();
     if Config::load().catalog().is_empty() {
-        let refreshed = tokio::time::timeout(
-            std::time::Duration::from_secs(20),
-            catalog::refresh(creds, &reqwest::Client::new(), &Route::DISCOVERED),
-        )
-        .await;
+        let refreshed =
+            tokio::time::timeout(std::time::Duration::from_secs(20), refresh_models(creds)).await;
         if refreshed.is_err() {
             warn!("model discovery timed out");
         }
@@ -372,7 +379,7 @@ async fn ensure_models(creds: &Arc<Credentials>) -> bool {
     if cache.is_stale() {
         let creds = creds.clone();
         tokio::spawn(async move {
-            catalog::refresh(&creds, &reqwest::Client::new(), &Route::DISCOVERED).await;
+            refresh_models(&creds).await;
         });
     }
     true
@@ -656,9 +663,13 @@ fn model_options(choices: &ModelChoices, switches: bool) -> Vec<SessionConfigOpt
         return Vec::new();
     }
     let grouped = || -> Vec<SessionConfigSelectGroup> {
-        let mut groups: Vec<(&str, Vec<SessionConfigSelectOption>)> = Vec::new();
+        let mut groups: Vec<(String, Vec<SessionConfigSelectOption>)> = Vec::new();
         for entry in &choices.catalog {
-            let group = entry.route.label();
+            // Endpoint models group under their endpoint's id.
+            let group = entry
+                .endpoint
+                .clone()
+                .unwrap_or_else(|| entry.route.label().to_string());
             let option = SessionConfigSelectOption::new(
                 entry.id.clone(),
                 model_name(entry, &choices.catalog),
@@ -670,7 +681,7 @@ fn model_options(choices: &ModelChoices, switches: bool) -> Vec<SessionConfigOpt
         }
         groups
             .into_iter()
-            .map(|(g, options)| SessionConfigSelectGroup::new(g, g, options))
+            .map(|(g, options)| SessionConfigSelectGroup::new(g.clone(), g, options))
             .collect()
     };
     let effort_name = |level: &str| match level {
@@ -1108,6 +1119,7 @@ mod tests {
             route,
             model: String::new(),
             effort: None,
+            endpoint: None,
         };
         let choices = ModelChoices {
             catalog: vec![
@@ -1142,6 +1154,7 @@ mod tests {
             route: Route::Anthropic,
             model: String::new(),
             effort: None,
+            endpoint: None,
         };
         assert_eq!(model_name(&solo, &[solo.clone()]), "Haiku 5.5");
         // No decision service with a key: no Decisions controls.
@@ -1156,6 +1169,7 @@ mod tests {
             route: Route::Anthropic,
             model: String::new(),
             effort: None,
+            endpoint: None,
         };
         let choices = |on| ModelChoices {
             catalog: vec![entry.clone()],

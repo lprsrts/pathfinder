@@ -23,6 +23,7 @@ use crate::engine::{
     StreamSink, ToolAccess,
 };
 use crate::llm::anthropic::Anthropic;
+use crate::llm::chat::Chat;
 use crate::llm::responses::{Bearer, Responses};
 use crate::llm::{Llm, LlmError, LlmEvent, LlmRequest, Message, Part, ToolResult, text_of};
 use crate::stream::{ToolContent, describe_tool};
@@ -63,6 +64,25 @@ impl ApiEngine {
                         Bearer::ChatGpt(session),
                         base("HARNESS_OPENAI_BASE_URL"),
                     )));
+                }
+                if entry.route == Route::Endpoint {
+                    let cfg = crate::config::Config::load();
+                    let id = entry.endpoint.as_deref().unwrap_or_default();
+                    let ep = cfg
+                        .endpoint(id)
+                        .ok_or_else(|| anyhow::anyhow!("no endpoint `{id}` in the config"))?;
+                    let key = match &ep.key {
+                        Some(name) => Some(creds.stored(name).ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "endpoint `{id}` needs the key `{name}`: run `harness auth import {name}` or `harness auth set {name}`"
+                            )
+                        })?),
+                        None => None,
+                    };
+                    return Ok(Arc::new(
+                        Chat::new(http.clone(), ep.base_url.clone(), key)
+                            .with_extra(ep.extra.clone()),
+                    ));
                 }
                 let key = creds.api_key(entry.route)?;
                 Ok(match entry.route {
@@ -557,6 +577,7 @@ mod tests {
             route: Route::Anthropic,
             model: "claude-sonnet-5-5".into(),
             effort: Some("low".into()),
+            endpoint: None,
         };
         EngineRequest {
             tier: EngineTier::System1,

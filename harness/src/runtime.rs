@@ -1256,12 +1256,15 @@ impl Runtime {
         let next = if understood {
             self.set_status(session, &part.id, PartStatus::Understood, &verdict.feedback)?;
             format!(
-                "\n\n**{}** understood. Say when to move on (`/next`), or `/handoff` if this part has work for the agent.",
-                part.title
+                "\n\n{}",
+                i18n::line(session.language.as_deref(), i18n::Line::Understood)
+                    .replace("{title}", &part.title)
             )
         } else {
-            "\n\nKeep working through it here, then explain the part again for a new candidate."
-                .to_string()
+            format!(
+                "\n\n{}",
+                i18n::line(session.language.as_deref(), i18n::Line::KeepWorking)
+            )
         };
         session.push_turn("assistant", format!("{}{next}", verdict.feedback));
         Ok(TurnOutput::changed(next))
@@ -1766,7 +1769,7 @@ You have the candidate, the hidden key (correct or flawed, and why) and the user
 
 `pass` is true only if their verdict matches the key and their reason does too: for a flawed candidate they name the actual flaw, not a different one; for a correct one they say why it holds, not just that it looks fine.
 
-`feedback`: reveal the key and say what their judgment got right or missed.
+`feedback`: reveal the key and say what their judgment got right or missed, in the language the user writes in.
 
 `misconception`: when they fail because they hold a wrong belief (not just a slip or "don't know"), state that belief in one sentence; otherwise null.
 
@@ -1848,6 +1851,7 @@ mod tests {
             route: crate::config::Route::Anthropic,
             model: id.into(),
             effort: None,
+            endpoint: None,
         };
         Config {
             models: vec![entry("fast"), entry("main")],

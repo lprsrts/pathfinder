@@ -445,12 +445,18 @@ fn fix_escapes(raw: &str) -> String {
             out.push(c);
             continue;
         }
-        match chars.peek() {
-            Some('"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't' | 'u') => {
-                out.push(c);
-                out.push(chars.next().unwrap());
-            }
-            _ => out.push_str("\\\\"),
+        let rest: String = chars.clone().collect();
+        let keep = match chars.peek() {
+            Some('"' | '\\' | '/') => true,
+            Some('b' | 'f' | 'n' | 'r' | 't') => !crate::stream::latex_command(&rest),
+            Some('u') => crate::stream::unicode_escape(&rest),
+            _ => false,
+        };
+        if keep {
+            out.push(c);
+            out.push(chars.next().unwrap());
+        } else {
+            out.push_str("\\\\");
         }
     }
     out
@@ -466,8 +472,10 @@ where
     C: Fn(&T) -> Vec<Violation>,
 {
     let candidate = extract_json_object(raw);
-    let parsed: T = serde_json::from_str(candidate)
-        .or_else(|err| serde_json::from_str(&fix_escapes(candidate)).map_err(|_| err))
+    // Always through `fix_escapes`: LaTeX like `\\frac` is valid JSON (a form
+    // feed) but means LaTeX, and the streamed text reads it that way too.
+    let parsed: T = serde_json::from_str(&fix_escapes(candidate))
+        .or_else(|_| serde_json::from_str(candidate))
         .map_err(|err| {
             vec![Violation::new(
                 "invalid_json",
@@ -492,6 +500,16 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn fix_escapes_keeps_latex_and_real_escapes() {
+        let raw = r#"{"reply": "\frac{a}{b} \cdot \nabla\nZeile \u00e4 \underline{y} \\ok"}"#;
+        let v: serde_json::Value = serde_json::from_str(&fix_escapes(raw)).unwrap();
+        assert_eq!(
+            v["reply"],
+            "\\frac{a}{b} \\cdot \\nabla\nZeile ä \\underline{y} \\ok"
+        );
+    }
 
     #[test]
     fn extracts_json_from_fenced_block() {

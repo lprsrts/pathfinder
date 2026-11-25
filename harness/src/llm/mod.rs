@@ -4,6 +4,7 @@
 //! replayed verbatim on the next turn.
 
 pub mod anthropic;
+pub mod chat;
 pub mod responses;
 pub mod sse;
 

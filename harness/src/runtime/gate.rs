@@ -12,7 +12,7 @@ use crate::decide::Question;
 use crate::domain::Session;
 use crate::engine::{EngineRequest, EngineTier, StreamEvent, StreamSink, ToolAccess, run_gated};
 use crate::secrets::{
-    BLOCK_FROM, FIXED_REPLY, PASS_BELOW, Secret, bits_limit, bits_toward, precheck_hit,
+    BLOCK_FROM, PASS_BELOW, Secret, bits_limit, bits_toward, precheck_hit,
 };
 use crate::validate::Violation;
 
@@ -254,7 +254,7 @@ impl Runtime {
             Ok(Some(true)) => true,
             Err(e) => {
                 tracing::warn!("the gate's check failed; withholding the reply: {e:#}");
-                return FIXED_REPLY.to_string();
+                return fixed_reply(session);
             }
         };
         debug_assert!(blocked);
@@ -265,15 +265,15 @@ impl Runtime {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!("rewriting a held reply: {e:#}");
-                return FIXED_REPLY.to_string();
+                return fixed_reply(session);
             }
         };
         match self.leaks(session, secrets, &rewritten).await {
             Ok(None) | Ok(Some(false)) => rewritten,
-            Ok(Some(true)) => FIXED_REPLY.to_string(),
+            Ok(Some(true)) => fixed_reply(session),
             Err(e) => {
                 tracing::warn!("the gate's check failed; withholding the reply: {e:#}");
-                FIXED_REPLY.to_string()
+                fixed_reply(session)
             }
         }
     }
@@ -355,6 +355,11 @@ impl Runtime {
             p.secret = Some(secret.id);
         }
     }
+}
+
+/// The fixed reply in the conversation's language.
+fn fixed_reply(session: &Session) -> String {
+    crate::i18n::line(session.language.as_deref(), crate::i18n::Line::FixedReply).to_string()
 }
 
 /// A sink that shows nothing: for models that hold a secret or whose

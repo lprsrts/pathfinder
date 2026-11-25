@@ -185,6 +185,16 @@ impl Credentials {
             .map(|v| (v, KeySource::File))
     }
 
+    /// A key stored under `name` in the auth file (an endpoint's key).
+    pub fn stored(&self, name: &str) -> Option<String> {
+        self.store
+            .get(name)
+            .ok()
+            .flatten()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    }
+
     pub fn set_named(&self, name: &str, key: &str) -> Result<()> {
         self.store.set(name, key)
     }

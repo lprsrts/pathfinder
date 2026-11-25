@@ -915,6 +915,7 @@ mod tests {
                 route: crate::config::Route::Anthropic,
                 model: id.into(),
                 effort: None,
+                endpoint: None,
             };
             crate::config::Config {
                 models: vec![entry("fast"), entry("main")],

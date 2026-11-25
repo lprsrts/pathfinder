@@ -39,6 +39,7 @@ Pathfinder uses a fast model (System 1: onboarding, log replies) and a stronger 
 | `openai` | Pathfinder's own agent, OpenAI Responses API | API key (see below) |
 | `claude` | Claude Code CLI (`claude -p`) | the CLI's own login |
 | `codex` | Codex CLI (`codex exec`) | the CLI's own login |
+| `endpoint` | Pathfinder's own agent, OpenAI-compatible Chat Completions: a self-hosted vLLM, Ollama, llama.cpp or LM Studio server, or a hosted open-model service | optional key (see [Self-hosted and open models](#self-hosted-and-open-models)) |
 
 On the API routes Pathfinder runs its own tool loop and streams the model's thinking and tool calls into Zed. Conversation turns can read, list, find and search the workspace. Agent work (`/handoff`, `/delegate`) can also edit and write files, shown as diffs and written through Zed so they appear in its Review Changes view (keep or reject each change), and run commands: Zed asks you first (Allow, Always allow for that program, or Deny) and runs each one in its terminal, so you watch it. The agent says what it's about to do before each step, and the stop button ends the run. File tools stay inside the workspace and never write to `.git`; commands run as you, unsandboxed, which is why each one asks.
 
@@ -86,6 +87,32 @@ With a key in place, Pathfinder lists the provider's current models in Zed's pic
 - `model` is the provider's model id (or the CLI's model name; empty uses its default). `effort` is the reasoning effort (`low`, `medium`, `high`, ...).
 - On the CLI routes, agent work may edit files and run shell commands in the workspace: Codex in its `workspace-write` sandbox, Claude Code with its sandbox enabled.
 - Binaries: `claude_bin`, `codex_bin` (or `HARNESS_CLAUDE_BIN`, `HARNESS_CODEX_BIN`). `HARNESS_DB_PATH` moves the session database.
+
+### Self-hosted and open models
+
+Pathfinder can run entirely on models you host, for example a GPU server at an institute, with nothing sent to a model company. Each server is an **endpoint** in `config.json`:
+
+```json
+{
+  "endpoints": [
+    { "id": "lab", "base_url": "http://gpu-box:8000/v1", "models": ["qwen3.8-27b", "gemma-3-27b-it"] }
+  ],
+  "decisions": { "endpoint": "lab", "model": "gemma-3-27b-it" },
+  "system1": "lab:gemma-3-27b-it",
+  "system2": "lab:qwen3.8-27b",
+  "local_only": true
+}
+```
+
+- `base_url` goes up to and including `/v1`. Leave `models` out to offer whatever the server lists (`/models`, refreshed with `harness models --refresh`).
+- `key` names an auth file entry for servers that need one: `harness auth set <name>`, or `harness auth import <name>` to copy a keychain item. No `key`, no auth header.
+- `extra` is merged into every request, for server-specific options. On OpenRouter, `{"provider": {"require_parameters": true}}` keeps requests on providers that honour log probabilities.
+- `decisions` runs the decision service (the gate and step routing) on an endpoint model through **token log probabilities**: each question becomes a one-letter answer, and the letters' probabilities are its distribution. The server must return `logprobs` (vLLM, llama.cpp and many hosted services do), and the model should answer without thinking first. A server that returns none makes the check fail, so the gate withholds the reply rather than guessing.
+- `local_only` hides every other route and every hosted decision service, and stops model discovery from contacting them: on-prem means nothing leaves.
+
+Images reach endpoint models that see them (`view` and attachments). PDFs don't go to these servers as files; the model reads them with `read` and `view`. Pathfinder and each person's understanding record stay on their own machine; the server only answers requests.
+
+How good the loop is depends on the models. With 27B-class open models it works end to end (answers grounded in slides, candidates with one real flaw, the gate holding against a paraphrased question, verdicts judged right), but they make more factual slips than the large hosted models and sometimes write LaTeX, which Zed shows as source. In testing, an 8B decision model read an explanation of the whole part as an ordinary note, while a 27B one got it right, so don't go too small. Run `harness eval` against the models before relying on them.
 
 ## Just asking
 

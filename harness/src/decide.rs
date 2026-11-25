@@ -7,6 +7,12 @@
 //! - Gemini Decision 1 (`POST /v1beta/decisions`, `gemini-decision-1`)
 //! - TypeSafe Jev (`POST /v1/systemone`, `jev-1.14.0`)
 //!
+//! A fourth, `local`, uses a model on one of your endpoints (`decisions` in
+//! the config): each question becomes a one-letter answer whose token log
+//! probabilities give the distribution. It needs a server that returns log
+//! probabilities (vLLM, llama.cpp, many hosted services) and a model that
+//! doesn't think before answering.
+//!
 //! Pathfinder only asks choice questions.
 
 use std::collections::HashMap;
@@ -78,11 +84,18 @@ pub enum Provider {
     Openai,
     Gemini,
     Typesafe,
+    /// A model on one of your endpoints, through log probabilities.
+    Local,
 }
 
 impl Provider {
-    /// Auto order: fastest and cheapest first.
-    pub const ALL: [Provider; 3] = [Provider::Typesafe, Provider::Openai, Provider::Gemini];
+    /// Auto order: your own endpoint first, then fastest and cheapest.
+    pub const ALL: [Provider; 4] = [
+        Provider::Local,
+        Provider::Typesafe,
+        Provider::Openai,
+        Provider::Gemini,
+    ];
 
     /// Used in `harness auth set <id>` and `HARNESS_DECISION`.
     pub fn id(self) -> &'static str {
@@ -90,6 +103,7 @@ impl Provider {
             Self::Openai => "openai",
             Self::Gemini => "gemini",
             Self::Typesafe => "typesafe",
+            Self::Local => "local",
         }
     }
 
@@ -102,6 +116,7 @@ impl Provider {
             Self::Openai => "OpenAI Decisions (gpt-6-luna)",
             Self::Gemini => "Gemini Decision 1",
             Self::Typesafe => "TypeSafe Jev",
+            Self::Local => "Local decisions",
         }
     }
 
@@ -111,6 +126,7 @@ impl Provider {
             Self::Openai => "OpenAI",
             Self::Gemini => "Gemini",
             Self::Typesafe => "Jev",
+            Self::Local => "Local",
         }
     }
 
@@ -120,6 +136,7 @@ impl Provider {
             Self::Openai => "gpt-6-luna",
             Self::Gemini => "gemini-decision-1",
             Self::Typesafe => "jev-1.14.0",
+            Self::Local => "your endpoint's model",
         }
     }
 
@@ -129,6 +146,7 @@ impl Provider {
             Self::Openai => "openai-api-key",
             Self::Gemini => "gemini-api-key",
             Self::Typesafe => "typesafe-api-key",
+            Self::Local => "",
         }
     }
 
@@ -137,6 +155,7 @@ impl Provider {
             Self::Openai => "OPENAI_API_KEY",
             Self::Gemini => "GEMINI_API_KEY",
             Self::Typesafe => "TYPESAFE_API_KEY",
+            Self::Local => "",
         }
     }
 
@@ -148,6 +167,7 @@ impl Provider {
                 "https://generativelanguage.googleapis.com/v1beta",
             ),
             Self::Typesafe => ("HARNESS_TYPESAFE_BASE_URL", "https://api.typesafe.ai/v1"),
+            Self::Local => ("", ""),
         };
         env::var(var)
             .ok()
@@ -173,6 +193,7 @@ impl Provider {
                     })).collect::<Vec<_>>(),
                 }),
             ),
+            Self::Local => (String::new(), Value::Null),
             Self::Gemini | Self::Typesafe => {
                 let mut qs = Map::new();
                 for q in questions {
@@ -290,10 +311,18 @@ impl SystemDecider {
             "" | "auto" => Provider::ALL.to_vec(),
             "off" => return Ok(None),
             id => vec![Provider::from_id(id).ok_or_else(|| {
-                anyhow!("HARNESS_DECISION={id}: use openai, gemini, typesafe or off")
+                anyhow!("HARNESS_DECISION={id}: use local, openai, gemini, typesafe or off")
             })?],
         };
+        let cfg = crate::config::Config::load();
         Ok(candidates.into_iter().find_map(|p| {
+            if p == Provider::Local {
+                return cfg.decisions.is_some().then(|| (p, String::new()));
+            }
+            // On-prem: no hosted decision service, ever.
+            if cfg.local_only {
+                return None;
+            }
             self.creds
                 .named_key(p.key_name(), p.key_env())
                 .map(|(k, _)| (p, k))
@@ -312,7 +341,11 @@ impl Decide for SystemDecider {
             let Some((provider, key)) = self.pick(prefer)? else {
                 return Ok(None);
             };
-            let answers = call(&self.http, provider, &key, input, questions).await?;
+            let answers = if provider == Provider::Local {
+                local::decide(&self.http, &self.creds, input, questions).await?
+            } else {
+                call(&self.http, provider, &key, input, questions).await?
+            };
             Ok(Some(Decision {
                 by: provider.label().to_string(),
                 answers,
@@ -321,10 +354,171 @@ impl Decide for SystemDecider {
     }
 
     fn available(&self) -> Vec<Provider> {
+        let cfg = crate::config::Config::load();
         Provider::ALL
             .into_iter()
-            .filter(|p| self.creds.named_key(p.key_name(), p.key_env()).is_some())
+            .filter(|p| match p {
+                Provider::Local => cfg.decisions.is_some(),
+                _ if cfg.local_only => false,
+                _ => self.creds.named_key(p.key_name(), p.key_env()).is_some(),
+            })
             .collect()
+    }
+}
+
+/// Decisions from a model on your endpoint, through log probabilities.
+pub mod local {
+    use std::collections::HashMap;
+
+    use anyhow::{Context, Result, anyhow, bail};
+    use futures_util::future::try_join_all;
+    use serde_json::{Value, json};
+
+    use super::{Answer, Question};
+    use crate::auth::Credentials;
+
+    /// Answers every question at once, one request each.
+    pub async fn decide(
+        http: &reqwest::Client,
+        creds: &Credentials,
+        input: &str,
+        questions: &[Question],
+    ) -> Result<HashMap<String, Answer>> {
+        let cfg = crate::config::Config::load();
+        let d = cfg
+            .decisions
+            .clone()
+            .context("no `decisions` in the config")?;
+        let ep = cfg.endpoint(&d.endpoint).ok_or_else(|| {
+            anyhow!(
+                "`decisions` names endpoint `{}`, which isn't configured",
+                d.endpoint
+            )
+        })?;
+        let key = ep.key.as_deref().and_then(|k| creds.stored(k));
+        let answers = try_join_all(questions.iter().map(|q| {
+            ask(
+                http,
+                &ep.base_url,
+                key.as_deref(),
+                ep.extra.as_ref(),
+                &d.model,
+                input,
+                q,
+            )
+        }))
+        .await?;
+        Ok(questions
+            .iter()
+            .map(|q| q.name.clone())
+            .zip(answers)
+            .collect())
+    }
+
+    fn letter(i: usize) -> char {
+        (b'A' + i as u8) as char
+    }
+
+    /// The prompt for one question: options as letters, one letter back.
+    pub fn prompt(input: &str, q: &Question) -> String {
+        let options: Vec<String> = q
+            .options
+            .iter()
+            .enumerate()
+            .map(|(i, (v, d))| format!("{}) {v}: {d}", letter(i)))
+            .collect();
+        format!(
+            "{input}\n\n---\nQuestion: {}\n\nOptions:\n{}\n\nAnswer with the letter of the best option only.",
+            q.instructions,
+            options.join("\n")
+        )
+    }
+
+    /// The distribution over options from the first token's log
+    /// probabilities: tokens that are an option's letter (spacing and
+    /// case aside) add up, then it is normalised over the options.
+    pub fn distribution(body: &Value, n: usize) -> Option<Vec<f64>> {
+        let top = body
+            .pointer("/choices/0/logprobs/content/0/top_logprobs")?
+            .as_array()?;
+        let mut p = vec![0.0; n];
+        for t in top {
+            let token = t["token"].as_str().unwrap_or_default();
+            let token = token
+                .trim()
+                .trim_start_matches('(')
+                .trim_end_matches([')', '.', ':']);
+            let mut chars = token.chars();
+            let (Some(c), None) = (chars.next(), chars.next()) else {
+                continue;
+            };
+            let i = (c.to_ascii_uppercase() as u8).wrapping_sub(b'A') as usize;
+            if i < n {
+                p[i] += t["logprob"].as_f64().unwrap_or(f64::NEG_INFINITY).exp();
+            }
+        }
+        let total: f64 = p.iter().sum();
+        (total > 0.0).then(|| p.into_iter().map(|x| x / total).collect())
+    }
+
+    pub(crate) async fn ask(
+        http: &reqwest::Client,
+        base_url: &str,
+        key: Option<&str>,
+        extra: Option<&Value>,
+        model: &str,
+        input: &str,
+        q: &Question,
+    ) -> Result<Answer> {
+        if q.options.is_empty() || q.options.len() > 26 {
+            bail!("question `{}` needs 1 to 26 options", q.name);
+        }
+        let mut body = json!({
+            "model": model,
+            "messages": [
+                {"role": "system", "content": "You classify carefully. Reply with exactly one letter."},
+                {"role": "user", "content": prompt(input, q)},
+            ],
+            "max_tokens": 1,
+            "temperature": 0,
+            "logprobs": true,
+            "top_logprobs": 20,
+        });
+        crate::config::merge_extra(&mut body, extra);
+        let mut req = http
+            .post(format!(
+                "{}/chat/completions",
+                base_url.trim_end_matches('/')
+            ))
+            .timeout(std::time::Duration::from_secs(60))
+            .json(&body);
+        if let Some(key) = key {
+            req = req.bearer_auth(key);
+        }
+        let resp = req.send().await.context("local decision request")?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            let snippet: String = text.chars().take(300).collect();
+            bail!("the decision endpoint returned {status}: {snippet}");
+        }
+        let value: Value =
+            serde_json::from_str(&text).context("decision endpoint returned non-JSON")?;
+        let dist = distribution(&value, q.options.len()).ok_or_else(|| {
+            anyhow!(
+                "the decision endpoint returned no usable log probabilities for `{model}`: use a server that supports `logprobs` and a model that answers without thinking first"
+            )
+        })?;
+        let (best, p) = dist
+            .iter()
+            .copied()
+            .enumerate()
+            .fold((0, f64::MIN), |a, b| if b.1 > a.1 { b } else { a });
+        Ok(Answer {
+            choice: q.options[best].0.clone(),
+            probability: p,
+            all: q.options.iter().map(|(v, _)| v.clone()).zip(dist).collect(),
+        })
     }
 }
 
@@ -360,6 +554,68 @@ pub async fn call(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_distribution_sums_letter_tokens() {
+        let body = json!({"choices": [{"logprobs": {"content": [{"top_logprobs": [
+            {"token": "B", "logprob": (0.6f64).ln()},
+            {"token": " b", "logprob": (0.1f64).ln()},
+            {"token": "(A", "logprob": (0.2f64).ln()},
+            {"token": "Yes", "logprob": (0.1f64).ln()},
+        ]}]}}]});
+        let d = local::distribution(&body, 2).unwrap();
+        assert!((d[0] - 0.2 / 0.9).abs() < 1e-9);
+        assert!((d[1] - 0.7 / 0.9).abs() < 1e-9);
+        assert!(local::distribution(&json!({"choices": [{}]}), 2).is_none());
+        let p = local::prompt("The draft.", &q()[0]);
+        assert!(p.contains("A) log:") && p.contains("B) known:"), "{p}");
+    }
+
+    #[tokio::test]
+    async fn local_decisions_come_from_log_probabilities() {
+        let reply = json!({"choices": [{"message": {"content": "B"}, "logprobs": {"content": [
+            {"token": "B", "logprob": -0.1, "top_logprobs": [
+                {"token": "B", "logprob": (0.8f64).ln()},
+                {"token": "A", "logprob": (0.2f64).ln()},
+            ]}
+        ]}}]})
+        .to_string();
+        let (url, captured) = crate::llm::testing::serve_once("200 OK", &reply).await;
+        let a = local::ask(
+            &reqwest::Client::new(),
+            &url,
+            None,
+            None,
+            "small",
+            "The draft.",
+            &q()[0],
+        )
+        .await
+        .unwrap();
+        assert_eq!(a.choice, "known");
+        assert!((a.probability - 0.8).abs() < 1e-9);
+        assert!((a.p("log", 2) - 0.2).abs() < 1e-9);
+        let c = captured.lock().unwrap();
+        let body = &c.as_ref().unwrap().body;
+        assert_eq!(body["max_tokens"], 1);
+        assert_eq!(body["logprobs"], true);
+
+        // No log probabilities: an error, so the gate fails closed.
+        let plain = json!({"choices": [{"message": {"content": "B"}}]}).to_string();
+        let (url, _) = crate::llm::testing::serve_once("200 OK", &plain).await;
+        let err = local::ask(
+            &reqwest::Client::new(),
+            &url,
+            None,
+            None,
+            "small",
+            "x",
+            &q()[0],
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("log probabilities"));
+    }
 
     fn q() -> Vec<Question> {
         vec![Question {

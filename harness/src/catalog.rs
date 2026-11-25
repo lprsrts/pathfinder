@@ -85,6 +85,7 @@ impl ModelCache {
                         route,
                         model: m.id.clone(),
                         effort: None,
+                        endpoint: None,
                     })
             })
             .collect()
@@ -218,6 +219,37 @@ fn keep(route: Route, id: &str) -> bool {
             (gpt5_plus || o_series) && !is_dated(id) && !SKIP.iter().any(|s| id.contains(s))
         }
         _ => false,
+    }
+}
+
+/// Refreshes the model lists of endpoints that don't pin theirs, under
+/// `endpoint:<id>`. An endpoint that can't be reached keeps its last list.
+pub async fn refresh_endpoints(
+    cfg: &crate::config::Config,
+    creds: &Credentials,
+    http: &reqwest::Client,
+) {
+    let mut cache = ModelCache::load();
+    for ep in cfg.endpoints.iter().filter(|e| e.models.is_empty()) {
+        let key = ep.key.as_deref().and_then(|k| creds.stored(k));
+        match crate::llm::chat::list_models(http, &ep.base_url, key.as_deref()).await {
+            Ok(models) => {
+                cache.providers.insert(
+                    format!("endpoint:{}", ep.id),
+                    models
+                        .into_iter()
+                        .map(|id| CachedModel {
+                            label: id.clone(),
+                            id,
+                        })
+                        .collect(),
+                );
+            }
+            Err(e) => tracing::warn!("endpoint `{}`: {e:#}", ep.id),
+        }
+    }
+    if let Err(e) = cache.save() {
+        tracing::warn!("{e:#}");
     }
 }
 

@@ -39,6 +39,12 @@ pub enum Line {
     AcceptReject,
     /// A proposed part's dependencies: "{deps}".
     Needs,
+    /// The gate's reply when a draft can't be shown.
+    FixedReply,
+    /// A part judged understood: "{title}".
+    Understood,
+    /// A failed check.
+    KeepWorking,
 }
 
 fn german(lang: Option<&str>) -> bool {
@@ -76,6 +82,15 @@ pub fn line(lang: Option<&str>, line: Line) -> &'static str {
             ProposedChange => "Vorgeschlagene Kartenänderung:",
             AcceptReject => "`/accept` oder `/reject`.",
             Needs => "braucht {deps}",
+            FixedReply => {
+                "Genau das beurteilst du gerade, deshalb kann ich es vor deinem Urteil nicht klären. Gib dein Urteil mit Begründung ab; was richtig oder falsch war, siehst du danach."
+            }
+            Understood => {
+                "**{title}** verstanden. Sag, wenn es weitergehen soll (`/next`), oder `/handoff`, wenn dieser Teil Arbeit für den Agenten hat."
+            }
+            KeepWorking => {
+                "Arbeite es hier weiter durch und erklär den Teil dann noch einmal für einen neuen Kandidaten."
+            }
         }
     } else {
         match line {
@@ -105,6 +120,13 @@ pub fn line(lang: Option<&str>, line: Line) -> &'static str {
             ProposedChange => "Proposed map change:",
             AcceptReject => "`/accept` or `/reject`.",
             Needs => "needs {deps}",
+            FixedReply => crate::secrets::FIXED_REPLY,
+            Understood => {
+                "**{title}** understood. Say when to move on (`/next`), or `/handoff` if this part has work for the agent."
+            }
+            KeepWorking => {
+                "Keep working through it here, then explain the part again for a new candidate."
+            }
         }
     }
 }

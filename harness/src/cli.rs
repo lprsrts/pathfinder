@@ -50,6 +50,32 @@ pub async fn auth(args: &[String]) -> Result<()> {
             }
             Some(other) => bail!("to remove a {other} key use `harness auth remove {other}`"),
         },
+        // An endpoint's key, by the name its config entry gives.
+        Some(cmd @ ("set" | "import" | "remove"))
+            if endpoint_key(positional.get(1).copied()).is_some() =>
+        {
+            let name = endpoint_key(positional.get(1).copied()).unwrap();
+            match cmd {
+                "import" if creds.import_named(&name)? => {
+                    println!("Copied the {name} keychain item into Pathfinder's auth file.")
+                }
+                "import" => println!("No {name} keychain item found."),
+                "remove" if creds.remove_named(&name)? => println!("Removed {name}."),
+                "remove" => println!("Pathfinder has no stored {name}."),
+                _ => {
+                    let key = if flag("--stdin") || !io::stdin().is_terminal() {
+                        let mut line = String::new();
+                        io::stdin().lock().read_line(&mut line)?;
+                        line
+                    } else {
+                        rpassword::prompt_password(format!("Paste the key for {name} (hidden): "))?
+                    };
+                    creds.set_named(&name, key.trim())?;
+                    println!("Saved {name}.");
+                }
+            }
+            Ok(())
+        }
         Some("set") => match decision_only(positional.get(1).copied()) {
             Some(p) => set_decision(&creds, p, flag("--stdin")).await,
             None => set(&creds, positional.get(1).copied(), flag("--stdin")).await,
@@ -101,17 +127,13 @@ pub async fn auth(args: &[String]) -> Result<()> {
 }
 
 pub async fn models(args: &[String]) -> Result<()> {
-    let cache = if args.iter().any(|a| a == "--refresh") {
-        catalog::refresh(
-            &Credentials::system(),
-            &reqwest::Client::new(),
-            &Route::DISCOVERED,
-        )
-        .await
-    } else {
-        ModelCache::load()
-    };
-    let entries = cache.entries();
+    if args.iter().any(|a| a == "--refresh") {
+        let creds = Credentials::system();
+        let http = reqwest::Client::new();
+        catalog::refresh(&creds, &http, &Route::DISCOVERED).await;
+        catalog::refresh_endpoints(&crate::config::Config::load(), &creds, &http).await;
+    }
+    let entries = crate::config::Config::load().catalog();
     if entries.is_empty() {
         println!(
             "No models discovered yet. Add a key with `harness auth set`, or run `harness models --refresh`."
@@ -123,10 +145,20 @@ pub async fn models(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// The key name of a configured endpoint, when `name` is one.
+fn endpoint_key(name: Option<&str>) -> Option<String> {
+    let name = name?;
+    crate::config::Config::load()
+        .endpoints
+        .iter()
+        .filter_map(|e| e.key.clone())
+        .find(|k| k == name)
+}
+
 /// Decision services whose key isn't also a model route's (OpenAI's is).
 fn decision_only(name: Option<&str>) -> Option<Provider> {
     name.and_then(Provider::from_id)
-        .filter(|p| *p != Provider::Openai)
+        .filter(|p| !matches!(p, Provider::Openai | Provider::Local))
 }
 
 async fn set_decision(creds: &Credentials, p: Provider, from_stdin: bool) -> Result<()> {
@@ -292,22 +324,52 @@ fn status(creds: &Credentials) -> Result<()> {
             ),
         }
     }
+    let cfg = crate::config::Config::load();
+    for ep in &cfg.endpoints {
+        let key = match &ep.key {
+            None => "no key".to_string(),
+            Some(name) => match creds.stored(name) {
+                Some(k) => format!("key {}", mask(&k)),
+                None => format!("missing key `{name}` (`harness auth import {name}`)"),
+            },
+        };
+        println!("{:<10} {} ({key})", ep.id, ep.base_url);
+    }
+    if cfg.local_only {
+        println!(
+            "{:<10} only endpoints: no cloud models or decision services",
+            "Local only"
+        );
+    }
     let decision = Provider::ALL.into_iter().find_map(|p| {
+        if p == Provider::Local {
+            return None;
+        }
         creds
             .named_key(p.key_name(), p.key_env())
             .map(|(_, s)| (p, s))
     });
-    match decision {
-        Some((p, source)) => println!(
-            "{:<10} {} (key from {})",
-            "Decisions",
-            p.label(),
-            source.describe()
+    match (&cfg.decisions, decision) {
+        (Some(d), _) => println!(
+            "{:<10} {} on endpoint `{}` (log probabilities)",
+            "Decisions", d.model, d.endpoint
         ),
-        None => println!(
-            "{:<10} none (`harness auth set gemini` or `typesafe`, or an OpenAI key)",
+        (None, _) if cfg.local_only => println!(
+            "{:<10} none: set `decisions` to an endpoint model",
             "Decisions"
         ),
+        (None, decision) => match decision {
+            Some((p, source)) => println!(
+                "{:<10} {} (key from {})",
+                "Decisions",
+                p.label(),
+                source.describe()
+            ),
+            None => println!(
+                "{:<10} none (`harness auth set gemini` or `typesafe`, or an OpenAI key)",
+                "Decisions"
+            ),
+        },
     }
     let cache = ModelCache::load();
     println!("\n{} models discovered.", cache.entries().len());
