@@ -190,7 +190,6 @@ fn side_panel(f: &mut Frame, app: &App, area: Rect) {
             )],
             width,
         ));
-        let _ = p;
     }
     if !s.map.parts.is_empty() {
         lines.push(Line::default());
