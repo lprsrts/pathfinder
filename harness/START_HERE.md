@@ -1,51 +1,53 @@
 # Start here
 
-Pathfinder makes sure you understand what you work on. Ask it anything, and when something matters, let it check you.
+Pathfinder is your assistant for study and research, with one difference: it knows the difference between being told something and understanding it, and keeps an honest record of which is which.
 
 ## Open it
 
 1. **Quit and reopen Zed** once, so it starts the newly installed Pathfinder.
-2. **Open your course folder** as the project, e.g. `~/dev/academic/kit/lectures/eet`. Pathfinder can then find and read your slides, scripts and exercise sheets by itself.
-3. Open the agent panel and start a **new Pathfinder thread** (one thread per topic or exercise keeps things clear).
+2. **Open the folder you're working in** as the project: a course (`~/dev/academic/kit/lectures/eet`), your papers (`~/dev/academic/kit/literature`) or your code (`~/dev/academic/kit/fusion-gmbp`). Pathfinder finds and reads the slides, scripts, exercise sheets, PDFs and code there by itself, figures included.
+3. Open the agent panel and start a **new Pathfinder thread**, one per topic or exercise.
 
-## Three ways to use it
+## Use it like any assistant
 
-**Ask.** Type a question in German or English and get a full answer from your material:
+Just ask, in German or English. It answers from your material:
 
-> Wie funktioniert ein Transformator? Erklär es mir anhand der IEH-Folien.
+- "Ich check nicht, warum die Asynchronmaschine Schlupf braucht."
+- "Wie kommt man im ETI-Skript auf M = k·Φ·I_A?"
+- "Was muss ich aus FuB-Foliensatz 4 fürs Tutorium wirklich können?"
+- "Gib mir die Lösung für Aufgabe 1a aus dem IEH-Übungsskript."
+- "Explain Runnalls' KL-based mixture reduction." / "Wo im Code wird die Reduktion gemacht?"
 
-Nothing is recorded as understood. You were told, not shown.
+**Paste a screenshot or a photo** (a slide, a sheet, your handwritten solution) or **attach a PDF** to any message. Show your own work and ask "stimmt das so?": it reviews it step by step and says exactly where it goes wrong.
 
-**Check yourself.** After an answer, say **„prüf mich“** (or "check me"). You explain the topic in your own words, then Pathfinder shows you a *candidate*, a short worked answer that is either right or has exactly one real mistake, and you say whether it's right and why. Pass and it counts as understood. While you judge, you can still ask questions; Pathfinder won't give the answer away.
+Answers count as *told*, not as understood.
 
-**Work an exercise.** Point it at the exercise and say you want to do it yourself:
+## Where understanding comes from
 
-> Ich will Aufgabe 1 aus dem IEH-Übungsskript selbst lösen. Hilf mir, ohne die Lösung zu verraten.
+You don't need to ask for a check. It comes at the moments that matter:
 
-It splits the exercise into parts and gives hints, never the result. Think out loud as you work; when you can explain a part, say so (or `/summary …`) and get a candidate for it. Ask about figures ("Was ist in Abbildung 1a zu sehen?"): it opens the page and looks.
+- **When you say you've got it** ("ok, macht Sinn", "verstehe", "got it"), Pathfinder shows one short *candidate*: a worked explanation that is either right or has exactly one real mistake. Say whether it's right and why. If you'd rather move on, just ask your next question; nothing is recorded then.
+- **When you want to be tested** ("frag mich ab", "frag mich wie ein Prüfer zum Transformator ab"), it runs an **exam simulation**: open questions one at a time, the way an oral examiner asks them. Answer as you would in the exam. Each answer is graded with feedback on what was missing from your explanation, then the next question follows. Say "genug" to stop.
+- **When you want to solve an exercise yourself** ("Ich will Aufgabe 1 selbst lösen, hilf mir ohne die Lösung"), it splits the exercise into parts and gives hints, never the result. Think out loud as you work; when you can explain a part, say so and get a candidate for it.
 
-You can also **paste a screenshot** or **attach a PDF** (a photo of a sheet, a slide) to any message.
+Passing a candidate or an exam question is what puts an idea on your record as shown. `/why` shows, per idea, what you've shown, claimed or only been told.
 
-## Commands you'll actually use
+## Commands, if you want them
 
 | Command | What it does |
 |---|---|
-| `/summary <your explanation>` | Explain the current part; a candidate follows |
-| `/next` | Move to the next part |
-| `/known` | Skip a part you already know (recorded as your claim, not as shown) |
-| `/why` | What you've shown, claimed or only been told, per idea |
-| `/delegate` | Hand a part to the agent without understanding it (recorded as such) |
-| `/accept`, `/reject` | Answer a proposed map change. Pathfinder proposes a small extra part when something a part rests on is missing or only claimed. |
-
-Plain words work too: "weiter", "das kann ich schon", "ich glaube, ich hab's: …".
+| `/why` | Your record per idea: shown, claimed, told |
+| `/summary <your explanation>` | In an exercise: explain the current part; a candidate follows |
+| `/next`, `/known` | In an exercise: next part; skip a part you know (recorded as your claim) |
+| `/accept`, `/reject` | Answer a proposed extra part for something a part rests on |
 
 ## Models
 
-The toolbar at the top of the thread picks the models. Your defaults are **Haiku** (fast) and **Opus** (main) through Claude Code. Broad answers take 30 to 60 seconds there. Your **ChatGPT** plan is also listed (e.g. GPT-6 Luna fast, GPT-6.2 Sol main) and was quicker in testing, 13 to 30 seconds. Pick per thread.
+The toolbar at the top of the thread picks the models. Your defaults are **Haiku** (fast) and **Opus** (main) through Claude Code: thorough, 20 to 70 seconds per answer. Your **ChatGPT** models (GPT-6 Luna, GPT-6.2 Sol) were often quicker in testing. Pick per thread.
 
 ## If something's off
 
 - **Math looks like `\frac{…}`:** Zed can't render LaTeX; ask again for plain text.
-- **"I can't see the file":** make sure the folder is open as the project, or attach the file.
-- **No models in the picker:** `harness auth status` in a terminal shows what's signed in.
-- Anything else: note what you typed and what you saw; that's what gets fixed next.
+- **"I can't see the file":** open the folder as the project, or attach the file.
+- **No models in the picker:** run `harness auth status` in a terminal.
+- Anything else: note what you typed and what you saw.

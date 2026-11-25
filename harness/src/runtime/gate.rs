@@ -11,9 +11,7 @@ use super::{Runtime, format_turns};
 use crate::decide::Question;
 use crate::domain::Session;
 use crate::engine::{EngineRequest, EngineTier, StreamEvent, StreamSink, ToolAccess, run_gated};
-use crate::secrets::{
-    BLOCK_FROM, PASS_BELOW, Secret, bits_limit, bits_toward, precheck_hit,
-};
+use crate::secrets::{BLOCK_FROM, PASS_BELOW, Secret, bits_limit, bits_toward, precheck_hit};
 use crate::validate::Violation;
 
 #[derive(Debug, Deserialize)]

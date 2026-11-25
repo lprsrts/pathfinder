@@ -43,8 +43,9 @@ fn require_text(out: &mut Vec<Violation>, value: &str, field: &str) {
 
 pub fn check_onboarding(d: &OnboardingDecision) -> Vec<Violation> {
     let mut out = Vec::new();
-    // A question's answer comes from its own call.
-    if !(d.question && !d.ready_to_map) {
+    // A question's answer comes from its own call; a quick check shows no
+    // goal sentence.
+    if !(d.question && !d.ready_to_map) && !d.check && !d.exam {
         require_text(&mut out, &d.reply, "reply");
     }
     if d.ready_to_map && d.goal.as_deref().is_none_or(|g| g.trim().is_empty()) {
@@ -197,6 +198,7 @@ mod tests {
             offer_check: false,
             language: None,
             check: false,
+            exam: false,
         };
         assert!(check_onboarding(&asking).is_empty());
 

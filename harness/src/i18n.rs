@@ -17,8 +17,6 @@ pub enum Line {
     PartHint,
     /// Before the concepts a part rests on.
     RestsOn,
-    /// After an answer to a question about understanding something.
-    OfferCheck,
     /// After an answer that names concepts on the record: "{labels}".
     ToldNotShown,
     /// A gap under the part: "{concept}", "{why}".
@@ -54,6 +52,14 @@ pub enum Line {
     RecordedKnown,
     /// A part delegated: "{title}".
     Delegated,
+    /// Before a quick check's candidate.
+    QuickCheckLead,
+    /// Before an exam's first question.
+    ExamLead,
+    /// Before an exam question: "Question on **{title}**:".
+    ExamQuestionFor,
+    /// After an exam question.
+    ExamAnswer,
 }
 
 fn german(lang: Option<&str>) -> bool {
@@ -74,10 +80,7 @@ pub fn line(lang: Option<&str>, line: Line) -> &'static str {
                 "Denk hier laut, während du arbeitest: deine Überlegungen und Gründe sind das Protokoll. Wenn du den ganzen Teil erklären kannst, sag es und erklär ihn (`/summary`); sag, wenn du ihn schon kannst (`/known`); `/delegate` gibt ihn ab, ohne ihn zu verstehen."
             }
             RestsOn => "Beruht auf",
-            OfferCheck => "Sag „prüf mich“, wenn du sicher sein willst, dass du das kannst.",
-            ToldNotShown => {
-                "Gesagt, nicht gezeigt: Das ist {labels} in deinem Verlauf. Sag „prüf mich“, um es dir zu eigen zu machen."
-            }
+            ToldNotShown => "Gesagt, nicht gezeigt: {labels} steht damit in deinem Verlauf.",
             GapNeeds => "Zuerst braucht es **{concept}**: {why}.",
             GapClaimed => "du hast angegeben, es zu können, aber noch nicht gezeigt",
             GapDelegated => "du hast es abgegeben, ohne es zu verstehen",
@@ -107,6 +110,12 @@ pub fn line(lang: Option<&str>, line: Line) -> &'static str {
             NoChangeWaiting => "Es wartet keine Kartenänderung.",
             RecordedKnown => "**{title}** als schon bekannt vermerkt.",
             Delegated => "**{title}** ohne Verständnis abgegeben; nicht geprüft.",
+            QuickCheckLead => "Dann kurz zum Festigen:",
+            ExamLead => {
+                "Prüfungssimulation: eine Frage nach der anderen. Antworte so, wie du es in der Prüfung erklären würdest; mit „genug“ hörst du auf."
+            }
+            ExamQuestionFor => "Prüfungsfrage zu",
+            ExamAnswer => "Deine Antwort?",
         }
     } else {
         match line {
@@ -119,10 +128,7 @@ pub fn line(lang: Option<&str>, line: Line) -> &'static str {
                 "Talk it through here as you work: your thinking and reasons are the log. When you can explain the whole part, say so and explain it (`/summary`); say if you already know it (`/known`); `/delegate` hands it off without understanding it."
             }
             RestsOn => "Rests on",
-            OfferCheck => "Say \"check me\" if you want to make sure this is yours.",
-            ToldNotShown => {
-                "Told, not shown: this is {labels} on your record. Say \"check me\" to make it yours."
-            }
+            ToldNotShown => "Told, not shown: {labels} is on your record as told.",
             GapNeeds => "It needs **{concept}** first: {why}.",
             GapClaimed => "you claimed to know it, with no evidence yet",
             GapDelegated => "you handed it off without understanding it",
@@ -150,6 +156,12 @@ pub fn line(lang: Option<&str>, line: Line) -> &'static str {
             NoChangeWaiting => "No map change is waiting.",
             RecordedKnown => "**{title}** recorded as already known.",
             Delegated => "**{title}** handed off without understanding; not reviewed.",
+            QuickCheckLead => "Then a quick one to make it stick:",
+            ExamLead => {
+                "Exam practice, one question at a time. Answer the way you would in the exam; say \"enough\" to stop."
+            }
+            ExamQuestionFor => "Question on",
+            ExamAnswer => "Your answer?",
         }
     }
 }

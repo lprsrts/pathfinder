@@ -383,6 +383,10 @@ pub struct Session {
     /// proposals, just the check.
     #[serde(default)]
     pub quick_check: bool,
+    /// An exam: open questions on the map's parts, one at a time, each
+    /// answer graded, until the user stops.
+    #[serde(default)]
+    pub exam: bool,
     pub mode: SessionMode,
     #[serde(default)]
     pub map: Map,
@@ -428,6 +432,7 @@ impl Session {
             goal: None,
             language: None,
             quick_check: false,
+            exam: false,
             mode: SessionMode::Onboarding,
             map: Map::default(),
             active: None,
@@ -498,6 +503,9 @@ pub struct OnboardingDecision {
     /// The goal is a quick check of a topic just explained.
     #[serde(default)]
     pub check: bool,
+    /// The user asked to be examined: open questions, one at a time.
+    #[serde(default)]
+    pub exam: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

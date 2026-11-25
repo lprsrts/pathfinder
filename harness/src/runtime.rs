@@ -371,15 +371,16 @@ impl Runtime {
         let answer = self.engine.run_text(&req, sink.clone()).await?;
         let told = self.record_told(session, text);
         let lang = session.language.as_deref();
-        let offer = if !told.is_empty() {
+        // Being told is recorded, never counted; a check comes when the user
+        // says they've understood or asks to be tested.
+        let _ = offer_check;
+        let offer = if told.is_empty() {
+            String::new()
+        } else {
             format!(
                 "\n\n{}",
                 i18n::line(lang, i18n::Line::ToldNotShown).replace("{labels}", &told.join(", "))
             )
-        } else if offer_check {
-            format!("\n\n{}", i18n::line(lang, i18n::Line::OfferCheck))
-        } else {
-            String::new()
         };
         sink(StreamEvent::TextDelta(offer.clone()));
         session.push_turn("assistant", &format!("{answer}{offer}"));
@@ -455,13 +456,19 @@ impl Runtime {
             session.push_turn("assistant", &reply);
             return Ok(TurnOutput::text(String::new()));
         }
-        flush(&sink, &decision.reply, "");
+        let quiet = decision.check || decision.exam;
+        if !quiet {
+            flush(&sink, &decision.reply, "");
+        }
 
         if let Some(goal) = decision.goal.filter(|g| !g.trim().is_empty()) {
             session.goal = Some(goal);
-            session.quick_check = decision.check;
+            session.quick_check = decision.check && !decision.exam;
+            session.exam = decision.exam;
         }
-        session.push_turn("assistant", &decision.reply);
+        if !quiet {
+            session.push_turn("assistant", &decision.reply);
+        }
         if decision.ready_to_map {
             sink(StreamEvent::TextDelta("\n\n".to_string()));
             return self.build_map(session, files, sink).await;
@@ -495,18 +502,26 @@ impl Runtime {
             models: self.models(session)?,
             ctx: crate::engine::turn_ctx(),
         };
+        // A quick check shows no map: its candidate follows at once.
+        let quick = session.quick_check || session.exam;
         let (proposal, shown): (MapProposal, _) = run_gated_streamed(
             self.engine.as_ref(),
             self.store.as_ref(),
             &session.id,
             "map",
             &req,
-            sink.clone(),
+            if quick {
+                gate::held(&sink)
+            } else {
+                sink.clone()
+            },
             check_map,
             Some("brief"),
         )
         .await?;
-        flush(&sink, &proposal.brief, &shown);
+        if !quick {
+            flush(&sink, &proposal.brief, &shown);
+        }
 
         session.map = proposal.to_map();
         session.active = None;
@@ -520,6 +535,27 @@ impl Runtime {
             tracing::warn!("registering the map's concepts: {e:#}");
         }
         session.advance();
+
+        if quick && let Some(part_id) = session.active.clone() {
+            let lead = format!(
+                "{}\n\n",
+                i18n::line(
+                    session.language.as_deref(),
+                    if session.exam {
+                        i18n::Line::ExamLead
+                    } else {
+                        i18n::Line::QuickCheckLead
+                    }
+                )
+            );
+            sink(StreamEvent::TextDelta(lead.clone()));
+            session.push_turn("assistant", lead.trim());
+            let ask = self.write_candidate(session, &part_id, files, sink).await?;
+            return Ok(TurnOutput {
+                reply: ask,
+                plan_changed: true,
+            });
+        }
 
         // The map itself shows in Zed's plan panel (and on `/map`).
         let rest = self.enter_part(session, true);
@@ -816,6 +852,13 @@ impl Runtime {
             Some((step, _, _)) if step == VERDICT => {
                 self.handle_judgment(session, text, files, sink).await
             }
+            Some((_, _, _))
+                if (session.quick_check || session.exam) && session.pending_candidate.is_some() =>
+            {
+                // Not a verdict on the quick check: the judge decides whether
+                // it is one, and drops the check if not.
+                self.handle_judgment(session, text, files, sink).await
+            }
             Some((step, _, by)) if step == "log" => {
                 self.handle_log(session, text, files, sink, Some(&by)).await
             }
@@ -1095,21 +1138,40 @@ impl Runtime {
             targets = t.concepts;
             misconception = m.map(|m| m.id);
         }
+        let exam = session.exam;
+        let what = if exam {
+            let asked = exam_questions_asked(session);
+            format!(
+                "Ask one exam question.{}",
+                if asked.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " Already asked (ask something else):\n- {}",
+                        asked.join("\n- ")
+                    )
+                }
+            )
+        } else if flawed {
+            "Make this candidate FLAWED: exactly one real flaw.".to_string()
+        } else {
+            "Make this candidate CORRECT.".to_string()
+        };
         let req = EngineRequest {
             tier: EngineTier::System2,
             tools: ToolAccess::ReadOnly,
             cwd: session.cwd.clone(),
-            system_prompt: CANDIDATE_SYSTEM.to_string(),
+            system_prompt: if exam {
+                EXAM_QUESTION_SYSTEM
+            } else {
+                CANDIDATE_SYSTEM
+            }
+            .to_string(),
             prompt: format!(
-                "Goal: {}\n\nMap (`▶` is this part; parts after it in `needs` order may be new to the user):\n{}\n\n{}{checks}\n\nMake this candidate {}.\n\nRead any files you need first, then respond with JSON only.",
+                "Goal: {}\n\nMap (`▶` is this part; parts after it in `needs` order may be new to the user):\n{}\n\n{}{checks}\n\n{what}\n\nRead any files you need first, then respond with JSON only.",
                 session.goal.as_deref().unwrap_or("(session goal)"),
                 session.map.render(Some(&part.id)),
                 describe_part(&part),
-                if flawed {
-                    "FLAWED: exactly one real flaw"
-                } else {
-                    "CORRECT"
-                }
             ),
             files: files.to_vec(),
             stream_text: false,
@@ -1119,7 +1181,14 @@ impl Runtime {
         let lang = session.language.as_deref();
         let header = format!(
             "{} **{}**:\n\n",
-            i18n::line(lang, i18n::Line::CandidateFor),
+            i18n::line(
+                lang,
+                if exam {
+                    i18n::Line::ExamQuestionFor
+                } else {
+                    i18n::Line::CandidateFor
+                }
+            ),
             part.title
         );
         // The candidate's reasoning would give away whether (and where) it's
@@ -1160,17 +1229,33 @@ impl Runtime {
 
         let ask = format!(
             "\n\n{}",
-            i18n::line(session.language.as_deref(), i18n::Line::IsItRight)
+            i18n::line(
+                session.language.as_deref(),
+                if exam {
+                    i18n::Line::ExamAnswer
+                } else {
+                    i18n::Line::IsItRight
+                }
+            )
         );
         let reply = format!("{header}{}{ask}", proposal.candidate);
         session.push_turn("assistant", &reply);
         // The key goes to the secrets table, never into the thread's state.
-        let secret = Secret::candidate_key(
-            &proposal.candidate,
-            !flawed,
-            &proposal.key_reason,
-            session.history.len() - 1,
-        );
+        let secret = if exam {
+            flawed = false;
+            Secret::exam_key(
+                &proposal.candidate,
+                &proposal.key_reason,
+                session.history.len() - 1,
+            )
+        } else {
+            Secret::candidate_key(
+                &proposal.candidate,
+                !flawed,
+                &proposal.key_reason,
+                session.history.len() - 1,
+            )
+        };
         self.store.add_secret(&session.id, &secret)?;
         session.pending_candidate = Some(PendingCandidate {
             part_id: part.id,
@@ -1209,12 +1294,13 @@ impl Runtime {
         };
         session.push_turn("user", judgment);
 
-        let req = EngineRequest {
-            tier: EngineTier::System2,
-            tools: ToolAccess::ReadOnly,
-            cwd: session.cwd.clone(),
-            system_prompt: JUDGE_SYSTEM.to_string(),
-            prompt: format!(
+        let prompt = if session.exam {
+            format!(
+                "Part: {}\n\nExam question:\n{}\n\nHidden key, the points a good answer contains: {}\n\nUser's answer: {judgment}\n\nRespond with JSON only.",
+                part.title, pending.candidate, pending.key_reason,
+            )
+        } else {
+            format!(
                 "Part: {}\n\nCandidate:\n{}\n\nHidden key: the candidate is {}. {}\n\nUser's judgment: {judgment}\n\nRespond with JSON only.",
                 part.title,
                 pending.candidate,
@@ -1224,7 +1310,19 @@ impl Runtime {
                     "FLAWED"
                 },
                 pending.key_reason,
-            ),
+            )
+        };
+        let req = EngineRequest {
+            tier: EngineTier::System2,
+            tools: ToolAccess::ReadOnly,
+            cwd: session.cwd.clone(),
+            system_prompt: if session.exam {
+                EXAM_JUDGE_SYSTEM
+            } else {
+                JUDGE_SYSTEM
+            }
+            .to_string(),
+            prompt,
             files: files.to_vec(),
             stream_text: false,
             models: self.models(session)?,
@@ -1247,9 +1345,17 @@ impl Runtime {
         .await?;
         let shown = String::new();
         if !verdict.is_judgment {
+            session.history.pop();
+            // A quick check left unanswered: drop it, nothing recorded, and
+            // answer the message as chat.
+            if session.quick_check || session.exam {
+                end_quick_check(session);
+                return self
+                    .handle_opening(session, judgment, files, sink, true)
+                    .await;
+            }
             // A question or another step: the candidate keeps waiting.
             session.pending_candidate = Some(pending);
-            session.history.pop();
             return self.handle_log(session, judgment, files, sink, None).await;
         }
         flush(&sink, &verdict.feedback, &shown);
@@ -1267,6 +1373,32 @@ impl Runtime {
             Some(s) => s == crate::understanding::UnderstandingStatus::Understood,
             None => verdict.pass,
         };
+        // An exam goes on: the next question, on the next part.
+        if session.exam {
+            if understood {
+                self.set_status(session, &part.id, PartStatus::Understood, &verdict.feedback)?;
+            }
+            session.push_turn("assistant", &verdict.feedback);
+            let ids: Vec<String> = session.map.parts.iter().map(|p| p.id.clone()).collect();
+            let at = ids.iter().position(|id| *id == part.id).unwrap_or(0);
+            let next_id = ids[(at + 1) % ids.len().max(1)].clone();
+            session.active = Some(next_id.clone());
+            sink(StreamEvent::TextDelta("\n\n".into()));
+            let ask = self.write_candidate(session, &next_id, files, sink).await?;
+            return Ok(TurnOutput {
+                reply: ask,
+                plan_changed: true,
+            });
+        }
+        // A quick check is one candidate: record it and go back to chat.
+        if session.quick_check {
+            if understood {
+                self.set_status(session, &part.id, PartStatus::Understood, &verdict.feedback)?;
+            }
+            session.push_turn("assistant", &verdict.feedback);
+            end_quick_check(session);
+            return Ok(TurnOutput::changed(String::new()));
+        }
         if verdict.pass && !understood {
             let next = format!(
                 "\n\n{}\n\n",
@@ -1569,14 +1701,53 @@ impl Runtime {
     fn after_resolution(&self, session: &mut Session, lead: String) -> TurnOutput {
         let reply = match session.advance() {
             Some(_) => format!("{lead}\n\n{}", self.enter_part(session, false)),
-            None if session.mode == SessionMode::Done => {
-                format!("{lead}\n\nEvery part is resolved.")
-            }
+            None if session.mode == SessionMode::Done => format!(
+                "{lead}\n\n{}",
+                i18n::line(session.language.as_deref(), i18n::Line::AllResolved)
+            ),
             None => lead,
         };
         session.push_turn("assistant", &reply);
         TurnOutput::changed(reply)
     }
+}
+
+/// Back to plain chat after a quick check: the evidence stays in the record.
+fn end_quick_check(session: &mut Session) {
+    session.map = Map::default();
+    session.active = None;
+    session.pending_candidate = None;
+    session.pending_change = None;
+    session.goal = None;
+    session.quick_check = false;
+    session.exam = false;
+    session.mode = SessionMode::Onboarding;
+}
+
+/// The exam questions shown so far in this exam, so the next one differs.
+fn exam_questions_asked(session: &Session) -> Vec<String> {
+    session
+        .pending_candidate
+        .iter()
+        .map(|p| p.candidate.clone())
+        .chain(
+            session
+                .history
+                .iter()
+                .filter(|t| t.role == "assistant")
+                .filter(|t| {
+                    [Some("de"), None].iter().any(|lang| {
+                        t.content
+                            .starts_with(i18n::line(*lang, i18n::Line::ExamQuestionFor))
+                    })
+                })
+                .filter_map(|t| {
+                    let (_, q) = t.content.split_once("**:\n\n")?;
+                    let q = q.rsplit_once("\n\n").map_or(q, |(q, _)| q);
+                    Some(q.trim().to_string())
+                }),
+        )
+        .collect()
 }
 
 /// The decision model's step for a verdict on a waiting candidate.
@@ -1693,9 +1864,11 @@ const ONBOARDING_SYSTEM: &str = r#"You run onboarding for Pathfinder, a harness 
 
 Onboarding only sets the goal. Right after it, Pathfinder sketches a rough map of what the task depends on. The map has no size limit and grows and changes during the work, so scope, depth and details are settled there, not here. Do not plan, teach or do the task.
 
-First tell a question from a task. Pathfinder is also the user's everyday assistant:
-- A question or request for information ("what is a phasor?", "explain this slide", "how do I compute the Laplace transform of this?", "what's the capital of Peru?") is not a task: set `question` to true, `ready_to_map` to false, `goal` to null and `reply` to "". Pathfinder answers it directly. Set `offer_check` to true when it's about understanding something (a concept, method, derivation, how or why something works), false for quick lookups, everyday facts, or chit-chat.
-- If the user asks to be checked on, or to properly learn, something from the conversation ("check me", "prüf mich", "make sure I get it", "teach me this properly"), that is a task. For a check, set `check` to true; the goal starts with "Check" (in their language: "Prüfen, ...") and names the topic just explained. For properly learning it, the goal is understanding that topic and `check` is false.
+First decide what kind of message this is. Pathfinder is above all the user's everyday assistant; most messages are questions, and answering is the default:
+- A question or request (set `question` true, `ready_to_map` false, `goal` null, `reply` ""): anything they want answered, explained, summarised or looked up ("what is a phasor?", "explain this slide", "how do I derive this?", "what do I need to know from slide set 4?", "give me the solution to exercise 1a", "what's the capital of Peru?"). Also their own work shown for review ("I solved exercise 2, is this right?", a photo of their solution): Pathfinder reviews it. Asking for a solution is a question, not a task: the user decides. Set `offer_check` to true when it's about understanding something, false for lookups and chit-chat.
+- A quick check (`check` and `ready_to_map` true): the user says they've understood what was just explained ("ok, macht Sinn", "verstehe", "jetzt hab ich's", "got it", "makes sense"). The goal starts with "Check" (in their language: "Prüfen, ...") and names the topic just explained, narrowly. A bare "danke"/"thanks" is chit-chat, a question with `offer_check` false.
+- An exam (`exam` and `ready_to_map` true): they ask to be quizzed, tested or examined on a topic ("frag mich ab", "quiz me", "test me", "frag mich wie ein Prüfer zum Transformator ab", "mündliche Prüfung üben"). The goal starts with "Examine" (in their language: "Abfragen, ...") and names the topic: the one they name, else the one just discussed.
+- A task (`ready_to_map` true, `check` and `exam` false): only when they want to work through something themselves ("I want to solve exercise 1 myself, help me without giving it away", "ich will das Kapitel richtig lernen") or want work done in the workspace (build, fix, change something). Not for questions about a topic, however big.
 
 Always set `language` to the two-letter code of the language the user writes in (e.g. "de", "en"), and write `goal` and `reply` in that language.
 
@@ -1709,11 +1882,12 @@ Otherwise it's onboarding for a task. Aim to finish in this turn:
 You get a workspace snapshot. If a file could answer something, read it before writing your JSON, since `reply` ends your turn. Don't read files when the snapshot and the user's words already settle it.
 
 Return ONLY a JSON object:
-{"reply": "...", "ready_to_map": true, "goal": "...", "question": false, "offer_check": false, "check": false, "language": "en"}"#;
+{"reply": "...", "ready_to_map": true, "goal": "...", "question": false, "offer_check": false, "check": false, "exam": false, "language": "en"}"#;
 
 const ANSWER_SYSTEM: &str = r#"You are Pathfinder, the user's assistant, answering a question directly. The user is an electrical engineering and information technology student who also works as a research assistant; questions may be about lectures, exercise sheets, research, or anything else.
 
 - Answer what they asked, correctly, like a strong tutor or colleague, at the depth they asked for. For a calculation or derivation, go step by step and keep every step. For a concept, give the idea, the precise statement and a short example if it helps. For a broad topic ("how does a transformer work?"), give the core idea and the few relations that matter most, in a screen or two, then name in one line what you could go into next; don't write the whole chapter.
+- When they show their own work (a solution, a derivation, code), review it like a tutor marking it: go through it step by step, say which steps are right, and for each mistake say where it is, what's wrong and which principle fixes it. Give the corrected result only after that, briefly.
 - Read attached files (slides, exercise sheets, papers, screenshots) and workspace files when they bear on the question. If the question is about a figure, diagram, slide or page, open it and look at it before answering; never say you can't see a file that is attached or in the workspace.
 - Write math as plain text or Unicode (Z = R + jωL, F(s) = ∫₀^∞ f(t)·e^(−st) dt, ∇·E = ρ/ε₀), never LaTeX: the chat can't render it.
 - Reply in the language the user writes in.
@@ -1788,6 +1962,26 @@ You are told whether to make it correct or flawed. A flawed candidate contains e
 
 Return ONLY a JSON object:
 {"candidate": "...", "key_reason": "..."}"#;
+
+const EXAM_QUESTION_SYSTEM: &str = r#"You are an examiner in an oral exam, asking about one part of a topic. Ask one question the way a good examiner would: open, so that the answer needs an explanation in the student's own words (why something holds, how a solution path goes, what happens if something changes, how two ideas connect), not a number or a definition to recite. One question, one or two sentences, answerable in a few minutes of talking. Stay within this part and what it rests on; use the course material in the workspace when it helps you ask what the course actually teaches. Write in the user's language; math as plain text or Unicode, never LaTeX.
+
+`candidate`: the question. `key_reason`: hidden from the user until they answer: the points a good answer contains, and the mistakes to watch for.
+
+Return ONLY a JSON object:
+{"candidate": "...", "key_reason": "..."}"#;
+
+const EXAM_JUDGE_SYSTEM: &str = r#"You are the examiner grading an answer in an oral exam. You have the question, the hidden key (the points a good answer contains) and the student's answer.
+
+If the message isn't an attempt to answer (a question back, a request to stop or to move on, "I don't know what you mean"), set `is_judgment` to false and `feedback` to "". "I don't know" is an answer: it fails.
+
+`pass` is true when the answer gets the substance right in the student's own words: the key points that matter are there and the reasoning holds. It doesn't need to be complete or polished; a wrong statement or a missing core idea fails it.
+
+`feedback`, in the user's language, as a fair examiner would give it after the answer: what was good, what was missing or wrong and why, then the answer a strong student would have given, in a few sentences. Math as plain text or Unicode, never LaTeX.
+
+`misconception`: a wrong belief the answer plainly states, in one sentence, else null.
+
+Return ONLY a JSON object:
+{"is_judgment": true, "pass": false, "feedback": "...", "misconception": null}"#;
 
 const JUDGE_SYSTEM: &str = r#"Decide whether the user's judgment of a candidate shows they could judge an agent's work on this part.
 
@@ -2189,26 +2383,204 @@ mod tests {
         {"id":"report","title":"What status reports","depends_on":["route"],"concepts":["status-fields"]}]}"#;
 
     #[tokio::test]
-    async fn a_quick_check_proposes_no_gaps_and_speaks_german() {
+    async fn an_exam_asks_grades_and_goes_on_until_stopped() {
+        let (rt, engine) = runtime(
+            FakeEngine::new(vec![
+                (
+                    ReadOnly,
+                    S1,
+                    r#"{"reply":"","ready_to_map":true,"goal":"Abfragen: Routing","exam":true,"language":"de"}"#,
+                ),
+                (ReadOnly, S2, MAP_CONCEPTS),
+                (
+                    ReadOnly,
+                    S2,
+                    r#"{"candidate":"Warum schlägt der Router Namen nach, statt sie zu probieren?","key_reason":"Nachschlagen ist O(1); Probieren hängt von der Reihenfolge ab."}"#,
+                ),
+                (
+                    ReadOnly,
+                    S2,
+                    r#"{"is_judgment":true,"pass":false,"feedback":"Nicht ganz: es geht um Nachschlagen in O(1)."}"#,
+                ),
+                (
+                    ReadOnly,
+                    S2,
+                    r#"{"candidate":"Was zeigt der Statusbericht an?","key_reason":"Die Statusfelder."}"#,
+                ),
+                // "genug" isn't an answer: the exam ends and chat goes on.
+                (
+                    ReadOnly,
+                    S2,
+                    r#"{"is_judgment":false,"pass":false,"feedback":""}"#,
+                ),
+                (
+                    ReadOnly,
+                    S1,
+                    r#"{"reply":"Gern, bis später.","ready_to_map":false,"question":true,"language":"de"}"#,
+                ),
+                (ReadOnly, S2, "Gern, bis später."),
+            ]),
+            false,
+        );
+        let out = turn(&rt, "frag mich wie ein Prüfer zum Routing ab").await;
+        let s = rt.load_session("s").unwrap().unwrap();
+        assert!(s.exam && s.pending_candidate.is_some());
+        assert!(out.reply.contains("Deine Antwort?"), "{}", out.reply);
+        let shown: Vec<&str> = s.history.iter().map(|t| t.content.as_str()).collect();
+        assert!(
+            shown.iter().any(|t| t.starts_with("Prüfungssimulation")),
+            "{shown:?}"
+        );
+        assert!(
+            shown.iter().any(|t| t.starts_with("Prüfungsfrage zu **")),
+            "{shown:?}"
+        );
+
+        turn(&rt, "Weil es schneller ist.").await;
+        let s = rt.load_session("s").unwrap().unwrap();
+        assert!(s.exam, "the exam goes on");
+        assert_eq!(
+            s.pending_candidate.as_ref().unwrap().candidate,
+            "Was zeigt der Statusbericht an?"
+        );
+        let prompt = engine.prompts.lock().unwrap().last().cloned().unwrap();
+        assert!(
+            prompt.contains("Already asked") && prompt.contains("Warum schlägt der Router"),
+            "the next question knows the last one"
+        );
+        let ws = crate::understanding::workspace_key(&s.cwd);
+        let ids: Vec<String> = ["dispatch", "handlers", "registry"]
+            .map(String::from)
+            .to_vec();
+        let events = rt.store.events(&ws, &ids).unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| e.kind == crate::understanding::EventKind::Fail),
+            "a wrong answer is on the record"
+        );
+
+        turn(&rt, "genug").await;
+        let s = rt.load_session("s").unwrap().unwrap();
+        assert!(!s.exam && s.pending_candidate.is_none());
+        assert_eq!(s.mode, SessionMode::Onboarding);
+    }
+
+    #[tokio::test]
+    async fn an_ignored_quick_check_is_dropped_without_a_record() {
         let (rt, _) = runtime(
             FakeEngine::new(vec![
                 (
                     ReadOnly,
                     S1,
-                    r#"{"reply":"Prüfen, wie das Routing funktioniert.","ready_to_map":true,"goal":"Prüfen, wie das Routing funktioniert","check":true,"language":"de"}"#,
+                    r#"{"reply":"","ready_to_map":true,"goal":"Check routing","check":true,"language":"en"}"#,
                 ),
                 (ReadOnly, S2, MAP_CONCEPTS),
+                (ReadOnly, S2, r#"{"candidate":"c","key_reason":"r"}"#),
+                // Not a verdict: the check is dropped, the question answered.
+                (
+                    ReadOnly,
+                    S2,
+                    r#"{"is_judgment":false,"pass":false,"feedback":""}"#,
+                ),
+                (
+                    ReadOnly,
+                    S1,
+                    r#"{"reply":"","ready_to_map":false,"question":true,"language":"en"}"#,
+                ),
+                (ReadOnly, S2, "A DAG has no cycles."),
             ]),
             false,
         );
-        let out = turn(&rt, "prüf mich").await;
+        turn(&rt, "got it").await;
+        turn(&rt, "unrelated: what is a DAG?").await;
+        let s = rt.load_session("s").unwrap().unwrap();
+        assert_eq!(s.mode, SessionMode::Onboarding);
+        assert!(s.pending_candidate.is_none() && !s.quick_check);
+        assert_eq!(s.history.last().unwrap().content, "A DAG has no cycles.");
+        let ws = crate::understanding::workspace_key(&s.cwd);
+        let ids: Vec<String> = ["dispatch", "handlers", "registry"]
+            .map(String::from)
+            .to_vec();
+        let events = rt.store.events(&ws, &ids).unwrap();
+        assert!(
+            !events.iter().any(|e| matches!(
+                e.kind,
+                crate::understanding::EventKind::Pass | crate::understanding::EventKind::Fail
+            )),
+            "no verdict, no evidence"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_claim_of_understanding_gets_one_candidate_then_chat_goes_on() {
+        let (rt, _) = runtime(
+            FakeEngine::new(vec![
+                (
+                    ReadOnly,
+                    S1,
+                    r#"{"reply":"","ready_to_map":true,"goal":"Prüfen, wie das Routing funktioniert","check":true,"language":"de"}"#,
+                ),
+                (ReadOnly, S2, MAP_CONCEPTS),
+                (
+                    ReadOnly,
+                    S2,
+                    r#"{"candidate":"Namen werden der Reihe nach probiert.","key_reason":"Es wird nachgeschlagen, nicht probiert."}"#,
+                ),
+                (
+                    ReadOnly,
+                    S2,
+                    r#"{"is_judgment":true,"pass":true,"feedback":"Richtig: nachgeschlagen."}"#,
+                ),
+                // Back in chat: the next question is answered.
+                (
+                    ReadOnly,
+                    S1,
+                    r#"{"reply":"","ready_to_map":false,"goal":null,"question":true,"offer_check":true,"language":"de"}"#,
+                ),
+                (ReadOnly, S2, "Ein Handler ist eine Funktion."),
+            ]),
+            false,
+        );
+        let out = turn(&rt, "ok, macht Sinn").await;
         let s = rt.load_session("s").unwrap().unwrap();
         assert!(s.quick_check);
-        assert_eq!(s.language.as_deref(), Some("de"));
+        assert!(s.pending_candidate.is_some(), "a candidate at once");
         assert!(s.pending_change.is_none(), "no gap parts in a quick check");
-        assert!(out.reply.contains("Denk hier laut"), "{}", out.reply);
-        assert!(out.reply.contains("Beruht auf: "), "{}", out.reply);
-        assert!(out.reply.contains("(unbekannt)"), "{}", out.reply);
+        assert!(out.reply.contains("Stimmt das?"), "{}", out.reply);
+        let shown: Vec<&str> = s.history.iter().map(|t| t.content.as_str()).collect();
+        assert!(shown.contains(&"Dann kurz zum Festigen:"), "{shown:?}");
+        assert!(
+            !shown.iter().any(|t| t.contains("Denk hier laut")),
+            "no part card or hints in a quick check"
+        );
+
+        turn(&rt, "Falsch, es wird nachgeschlagen.").await;
+        let s = rt.load_session("s").unwrap().unwrap();
+        assert_eq!(s.mode, SessionMode::Onboarding, "back to chat");
+        assert!(s.map.parts.is_empty() && s.goal.is_none() && !s.quick_check);
+        assert_eq!(
+            s.history.last().unwrap().content,
+            "Richtig: nachgeschlagen."
+        );
+        let ws = crate::understanding::workspace_key(&s.cwd);
+        let events = rt
+            .store
+            .events(&ws, &["dispatch".to_string(), "handlers".to_string()])
+            .unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| e.kind == crate::understanding::EventKind::Pass),
+            "the pass is on the record"
+        );
+
+        turn(&rt, "Was ist ein Handler?").await;
+        let s = rt.load_session("s").unwrap().unwrap();
+        assert_eq!(
+            s.history.last().unwrap().content,
+            "Ein Handler ist eine Funktion."
+        );
     }
 
     #[tokio::test]
@@ -2437,7 +2809,10 @@ mod tests {
         assert!(s.goal.is_none());
         let last = &s.history.last().unwrap().content;
         assert!(last.starts_with("A phasor is a complex number"));
-        assert!(last.contains("Told, not shown: this is Phasors"), "{last}");
+        assert!(
+            last.contains("Told, not shown: Phasors is on your record"),
+            "{last}"
+        );
         let events = rt.store.events(&ws, &["phasors".to_string()]).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind, crate::understanding::EventKind::Told);

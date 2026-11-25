@@ -139,6 +139,11 @@ impl CliEngine {
             cmd.args(["--effort", effort]);
         }
         cmd.args(["--system-prompt", &req.system_prompt]);
+        // Attached files (a pasted screenshot, a PDF from elsewhere) may lie
+        // outside the workspace: let Claude Code read their folders.
+        for dir in attachment_dirs(&req.files, &req.cwd) {
+            cmd.arg("--add-dir").arg(dir);
+        }
         match req.tools {
             ToolAccess::None => {
                 cmd.args(["--tools", ""]);
@@ -223,6 +228,14 @@ impl CliEngine {
             ]);
         if !model.model.is_empty() {
             cmd.args(["-m", &model.model]);
+        }
+        // Images go to Codex as images; other files are listed in the prompt.
+        for f in req
+            .files
+            .iter()
+            .filter(|f| crate::llm::attachable_type(f).is_some_and(|t| t.starts_with("image/")))
+        {
+            cmd.arg("-i").arg(f);
         }
         if let Some(effort) = model.effort.as_deref().filter(|e| !e.is_empty()) {
             cmd.args(["-c", &format!("model_reasoning_effort=\"{effort}\"")]);
@@ -499,11 +512,36 @@ fn process_codex_event(
     }
 }
 
+/// Folders of attached files outside `cwd`, once each.
+fn attachment_dirs(files: &[std::path::PathBuf], cwd: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+    for f in files {
+        let Some(dir) = f.parent() else { continue };
+        let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+        if !dir.starts_with(&cwd) && !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    dirs
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
+
+    #[test]
+    fn attachments_outside_the_workspace_get_their_folder_added() {
+        let ws = std::env::temp_dir().join(format!("pf-ws-{}", uuid::Uuid::new_v4().simple()));
+        let out = std::env::temp_dir().join(format!("pf-out-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&out).unwrap();
+        let files = vec![ws.join("a.pdf"), out.join("x.png"), out.join("y.png")];
+        let dirs = attachment_dirs(&files, &ws);
+        assert_eq!(dirs, vec![out.canonicalize().unwrap()]);
+    }
 
     fn recording_sink() -> (StreamSink, Arc<Mutex<Vec<String>>>) {
         let events = Arc::new(Mutex::new(Vec::new()));

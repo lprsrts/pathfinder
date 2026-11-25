@@ -262,10 +262,49 @@ impl FieldStreamer {
 /// form feed + "rac"). Models write them inside JSON strings with a single
 /// backslash; both the stream and the repair step keep them as LaTeX.
 const LATEX_ESCAPED: [&str; 44] = [
-    "beta", "bar", "bf", "boldsymbol", "binom", "big", "bigl", "bigr", "bigg", "begin", "bullet",
-    "bmatrix", "frac", "forall", "flat", "nabla", "neq", "ne", "nu", "not", "newline", "nleq",
-    "ngeq", "rho", "right", "rangle", "rightarrow", "rceil", "rfloor", "theta", "tau", "times",
-    "text", "textbf", "textit", "tan", "tanh", "to", "top", "tilde", "triangle", "tfrac", "neg",
+    "beta",
+    "bar",
+    "bf",
+    "boldsymbol",
+    "binom",
+    "big",
+    "bigl",
+    "bigr",
+    "bigg",
+    "begin",
+    "bullet",
+    "bmatrix",
+    "frac",
+    "forall",
+    "flat",
+    "nabla",
+    "neq",
+    "ne",
+    "nu",
+    "not",
+    "newline",
+    "nleq",
+    "ngeq",
+    "rho",
+    "right",
+    "rangle",
+    "rightarrow",
+    "rceil",
+    "rfloor",
+    "theta",
+    "tau",
+    "times",
+    "text",
+    "textbf",
+    "textit",
+    "tan",
+    "tanh",
+    "to",
+    "top",
+    "tilde",
+    "triangle",
+    "tfrac",
+    "neg",
     "nexists",
 ];
 
@@ -273,7 +312,10 @@ const LATEX_ESCAPED: [&str; 44] = [
 /// from `LATEX_ESCAPED`, ending at a non-letter (or at the end, which may
 /// still grow: then it counts once the command is complete).
 pub(crate) fn latex_command(rest: &str) -> bool {
-    let word: String = rest.chars().take_while(|c| c.is_ascii_alphabetic()).collect();
+    let word: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphabetic())
+        .collect();
     LATEX_ESCAPED.contains(&word.as_str())
 }
 

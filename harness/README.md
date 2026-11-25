@@ -118,13 +118,13 @@ How good the loop is depends on the models. With 27B-class open models it works 
 
 ## Just asking
 
-Pathfinder is also an everyday assistant. Ask a question with no task ("what is a phasor?", "explain this slide", "what's the capital of Peru?") and the main model answers it in full, in your language, reading any attached files. Nothing is mapped and nothing counts as understood: if the question names an idea already on your record, Pathfinder logs that you were told about it (`told`, which never raises its state) and says so. For questions about understanding something, not quick lookups, it offers a check: say "check me" and the topic becomes a learning task. Questions also work in a thread whose task is finished.
+Pathfinder is also an everyday assistant. Questions are answered in full by the main model, in your language, from the workspace and any attached files: concepts, derivations, slide summaries, exercise solutions when you ask for them, and reviews of your own work ("I solved it, is this right?"), which go through it step by step. Nothing is mapped and nothing counts as understood: if the question names an idea already on your record, Pathfinder logs that you were told about it (`told`, which never raises its state). Checks come at natural moments, never on a magic phrase: when you say you've understood ("ok, makes sense", "verstehe"), one candidate follows straight away, and asking anything else instead drops it with nothing recorded; when you ask to be tested ("quiz me", "frag mich wie ein Prüfer ab"), an exam simulation asks open questions one at a time, grades each answer like an oral examiner and goes on until you say "enough". Answers and verdicts go on the record per idea. Questions also work in a thread whose task is finished.
 
 Attach slides, exercise sheets, papers or screenshots: images (PNG, JPEG, GIF, WebP) and PDFs are sent to the model as content it can see, on every route, and a screenshot pasted into the chat is saved and attached the same way. Zed can't render LaTeX in the agent panel, so math is written in plain text and Unicode.
 
 Open a folder of course material as the workspace and the model finds things itself: `read` returns a PDF's text page by page (`pages: "3-7"`), and `view` shows it up to four pages as images, for circuits, diagrams and plots that text can't carry. Both use poppler (`brew install poppler`); without it, attach the file instead.
 
-Pathfinder's own lines (the candidate prompt, part hints, map-change proposals, the check offer) follow the conversation's language, German or English; models write everything else in your language. After an answer, "check me" ("prüf mich") starts a quick check of that topic: one part, no prerequisite proposals, just your explanation and a candidate.
+Pathfinder's own lines (the candidate prompt, part hints, map-change proposals, exam questions) follow the conversation's language, German or English; models write everything else in your language.
 
 ## How a session goes
 

@@ -89,6 +89,20 @@ impl Secret {
         }
     }
 
+    /// An exam question's key: the points a good answer contains.
+    pub fn exam_key(question: &str, key_points: &str, opened_at_turn: usize) -> Self {
+        Self {
+            id: format!("sec-{}", uuid::Uuid::new_v4().simple()),
+            kind: "exam_key".into(),
+            payload: json!({"candidate": question, "correct": true, "reason": key_points}),
+            probe: format!(
+                "the answer to the exam question: any of the points a good answer contains, or a judgment of the user's answer. (Key points: {key_points})"
+            ),
+            opened_at_turn,
+            active: true,
+        }
+    }
+
     pub fn candidate(&self) -> &str {
         self.payload["candidate"].as_str().unwrap_or_default()
     }
