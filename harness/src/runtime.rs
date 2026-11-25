@@ -2149,7 +2149,9 @@ mod tests {
 
     /// Answers the gate's questions with scripted p(yes); an `Err` entry
     /// makes the check fail. Every other question goes unanswered.
-    struct GateDecider(Mutex<VecDeque<Option<f64>>>);
+    /// The gate's scores in order, and the reader's (right, flawed,
+    /// neither) answers in order; an empty reader queue says "neither".
+    struct GateDecider(Mutex<VecDeque<Option<f64>>>, Mutex<VecDeque<[f64; 3]>>);
 
     impl Decide for GateDecider {
         fn decide<'a>(
@@ -2158,6 +2160,33 @@ mod tests {
             questions: &'a [Question],
             _prefer: Option<&'a str>,
         ) -> futures_util::future::BoxFuture<'a, Result<Option<Decision>>> {
+            if questions[0].name == "verdict" {
+                let [right, flawed, neither] = self
+                    .1
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or([0.0, 0.0, 1.0]);
+                return Box::pin(async move {
+                    let mut all = std::collections::HashMap::new();
+                    all.insert("right".to_string(), right);
+                    all.insert("flawed".to_string(), flawed);
+                    all.insert("neither".to_string(), neither);
+                    let mut answers = std::collections::HashMap::new();
+                    answers.insert(
+                        "verdict".to_string(),
+                        crate::decide::Answer {
+                            choice: "neither".into(),
+                            probability: neither,
+                            all,
+                        },
+                    );
+                    Ok(Some(Decision {
+                        by: "Fake".into(),
+                        answers,
+                    }))
+                });
+            }
             if !questions[0].name.starts_with('s') || questions[0].name == "step" {
                 return Box::pin(async { Ok(None) });
             }
@@ -2248,13 +2277,25 @@ mod tests {
                     S1,
                     r#"{"reply":"Look at how unknown names are handled."}"#,
                 ),
-                // Under the threshold: shown as drafted.
+                // In the band, the reader learns nothing: shown as drafted.
                 (
                     ReadOnly,
                     S2,
                     r#"{"is_judgment":false,"pass":false,"feedback":""}"#,
                 ),
                 (ReadOnly, S1, &general),
+                // In the band, the reader learns it's right: rewritten.
+                (
+                    ReadOnly,
+                    S2,
+                    r#"{"is_judgment":false,"pass":false,"feedback":""}"#,
+                ),
+                (ReadOnly, S1, &general),
+                (
+                    ToolAccess::None,
+                    S1,
+                    r#"{"reply":"A handler is the function a name maps to."}"#,
+                ),
                 (
                     ReadOnly,
                     S2,
@@ -2265,18 +2306,25 @@ mod tests {
             ]),
             false,
         );
-        let rt = rt.with_decider(Arc::new(GateDecider(Mutex::new(
-            vec![
-                Some(0.9),
-                Some(0.1),
-                Some(0.9),
-                Some(0.8),
-                None,
-                Some(0.05),
-                Some(0.25),
-            ]
-            .into(),
-        ))));
+        let rt = rt.with_decider(Arc::new(GateDecider(
+            Mutex::new(
+                vec![
+                    Some(0.9),
+                    Some(0.1),
+                    Some(0.9),
+                    Some(0.8),
+                    None,
+                    Some(0.05),
+                    Some(0.25),
+                    Some(0.3),
+                    Some(0.1),
+                ]
+                .into(),
+            ),
+            // In the band, the reader decides: it sees nothing, then a reply
+            // that tells it the (correct) candidate is right.
+            Mutex::new(vec![[0.0, 0.0, 1.0], [0.9, 0.0, 0.1]].into()),
+        )));
         turn(&rt, "goal").await;
         turn(&rt, "thinking").await;
         turn(&rt, "/summary names map to handlers").await;
@@ -2332,6 +2380,13 @@ mod tests {
         );
         let prompt = engine.prompts.lock().unwrap().last().cloned().unwrap();
         assert!(prompt.contains(gate::NARROW), "asked to answer narrowly");
+
+        turn(&rt, "and what is a route?").await;
+        let s = rt.load_session("s").unwrap().unwrap();
+        assert_eq!(
+            s.history.last().unwrap().content,
+            "A handler is the function a name maps to."
+        );
 
         turn(&rt, "it's wrong, unknown names are rejected").await;
         assert!(!rt.store.secret(&id).unwrap().unwrap().active);

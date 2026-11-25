@@ -8,8 +8,29 @@ use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-/// The gate blocks a draft when any secret's probe reaches this (A6).
-pub const LEAK_THRESHOLD: f64 = 0.3;
+/// The gate passes a draft whose leak score for every secret is under
+/// this (A6)...
+pub const PASS_BELOW: f64 = 0.15;
+/// ...and blocks one whose score for any secret reaches this.
+pub const BLOCK_FROM: f64 = 0.5;
+/// In between, a reader that never sees the key reads the conversation with
+/// the draft, and the draft is blocked if it moves the reader this many bits
+/// toward the true answer (`harness eval gate` set these three).
+pub const BITS_LIMIT: f64 = 0.2;
+
+/// Pointwise information, in bits, that a reader's distribution over
+/// (right, flawed, neither) carries toward the true answer. "Neither" keeps
+/// the even prior; one bit means the reader is certain of the truth, and a
+/// negative value means it leans the wrong way.
+pub fn bits_toward(dist: [f64; 3], correct: bool) -> f64 {
+    let [right, flawed, neither] = dist;
+    let total = right + flawed + neither;
+    if total <= 0.0 {
+        return 0.0;
+    }
+    let q = ((if correct { right } else { flawed }) + 0.5 * neither) / total;
+    (q.clamp(1e-6, 1.0 - 1e-6) / 0.5).log2()
+}
 
 /// Shown when a draft fails the gate twice, or the check itself fails.
 pub const FIXED_REPLY: &str = "That's what you're judging right now, so I can't settle it before your verdict. Give your verdict with your reasons; what was right or wrong is shown afterwards.";
@@ -102,6 +123,16 @@ pub fn precheck_hit(secret: &Secret, draft: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bits_measure_the_move_toward_the_truth() {
+        assert!(bits_toward([0.0, 0.0, 1.0], true).abs() < 1e-9);
+        assert!((bits_toward([1.0, 0.0, 0.0], true) - 1.0).abs() < 1e-3);
+        assert!(bits_toward([1.0, 0.0, 0.0], false) < -10.0);
+        // 0.3 on the true answer, the rest undecided: q = 0.65.
+        let b = bits_toward([0.0, 0.3, 0.7], false);
+        assert!((b - (0.65f64 / 0.5).log2()).abs() < 1e-9);
+    }
 
     #[test]
     fn precheck_catches_echoes_of_the_key_only() {

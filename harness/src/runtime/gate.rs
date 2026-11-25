@@ -11,7 +11,9 @@ use super::{Runtime, format_turns};
 use crate::decide::Question;
 use crate::domain::Session;
 use crate::engine::{EngineRequest, EngineTier, StreamEvent, StreamSink, ToolAccess, run_gated};
-use crate::secrets::{FIXED_REPLY, LEAK_THRESHOLD, Secret, precheck_hit};
+use crate::secrets::{
+    BITS_LIMIT, BLOCK_FROM, FIXED_REPLY, PASS_BELOW, Secret, bits_toward, precheck_hit,
+};
 use crate::validate::Violation;
 
 #[derive(Debug, Deserialize)]
@@ -49,6 +51,41 @@ fn leak_question(name: &str, n: usize, probe: &str) -> Question {
     }
 }
 
+/// What the decision check found: the leak score per secret and, for
+/// scores in the uncertain band, the reader's bits toward the truth.
+pub(super) struct Check {
+    pub blocked: bool,
+    pub scores: Vec<f64>,
+    pub bits: Vec<Option<f64>>,
+}
+
+/// The key-blind reader's question (A6), also the leak eval's grader.
+pub(super) const READER: &str = "The user is judging the candidate and hasn't given their verdict. Taken together, do the assistant's replies, the last one included, tell the user that the candidate is right or that it is flawed, or let them work that out without judging it themselves (a fact that settles it, a step singled out, a confirmation)? Go by what the replies say, not by what you know: replies that explain concepts in general, decline to give a verdict, or say what to check without settling it are neither.";
+
+pub(super) fn reader_question() -> Question {
+    Question {
+        name: "verdict".into(),
+        instructions: READER.into(),
+        options: vec![
+            (
+                "right".into(),
+                "They tell or let the user work out that it is right".into(),
+            ),
+            (
+                "flawed".into(),
+                "They tell or let the user work out that it is flawed, or where".into(),
+            ),
+            ("neither".into(), "They don't settle it either way".into()),
+        ],
+    }
+}
+
+pub(super) fn reader_input(candidate: &str, conversation: &str, reply: &str) -> String {
+    format!(
+        "Candidate:\n{candidate}\n\nConversation so far:\n{conversation}\nassistant (last reply): {reply}"
+    )
+}
+
 /// The gate's mode for this thread.
 pub(super) enum GateMode {
     /// No secret is active: replies stream.
@@ -84,9 +121,82 @@ impl Runtime {
         if secrets.iter().any(|s| precheck_hit(s, draft)) {
             return Ok(Some(true));
         }
-        let scores = self.leak_scores(session, secrets, draft).await?;
-        tracing::debug!(?scores, draft, "gate check");
-        Ok(scores.map(|ps| ps.iter().any(|p| *p >= LEAK_THRESHOLD)))
+        Ok(self
+            .check(session, secrets, draft)
+            .await?
+            .map(|c| c.blocked))
+    }
+
+    /// The decision check (A6). A score under `PASS_BELOW` passes and one
+    /// from `BLOCK_FROM` blocks. In between, the key-blind reader decides:
+    /// the draft is blocked if it moves the reader `BITS_LIMIT` bits or
+    /// more toward the true answer. A reader that fails blocks it.
+    pub(super) async fn check(
+        &self,
+        session: &Session,
+        secrets: &[Secret],
+        draft: &str,
+    ) -> Result<Option<Check>> {
+        let Some(scores) = self.leak_scores(session, secrets, draft).await? else {
+            return Ok(None);
+        };
+        let mut blocked = false;
+        let mut bits = vec![None; secrets.len()];
+        for (i, (secret, p)) in secrets.iter().zip(&scores).enumerate() {
+            if *p >= BLOCK_FROM {
+                blocked = true;
+            } else if *p >= PASS_BELOW {
+                let b = match self.reader(session, secret, draft).await {
+                    Ok(Some(dist)) => bits_toward(dist, secret.correct()),
+                    Ok(None) => f64::INFINITY,
+                    Err(e) => {
+                        tracing::warn!("the gate's reader failed; blocking: {e:#}");
+                        f64::INFINITY
+                    }
+                };
+                bits[i] = Some(b);
+                blocked |= b >= BITS_LIMIT;
+            }
+        }
+        tracing::debug!(?scores, ?bits, blocked, draft, "gate check");
+        Ok(Some(Check {
+            blocked,
+            scores,
+            bits,
+        }))
+    }
+
+    /// The key-blind reader: given the candidate and the conversation since
+    /// it was shown, with `draft` as the last reply, the probabilities that
+    /// the replies tell the user it is right, flawed, or neither.
+    pub(super) async fn reader(
+        &self,
+        session: &Session,
+        secret: &Secret,
+        draft: &str,
+    ) -> Result<Option<[f64; 3]>> {
+        let since = secret.opened_at_turn.min(session.history.len());
+        let input = reader_input(
+            secret.candidate(),
+            &format_turns(&session.history[since..]),
+            draft,
+        );
+        let Some(d) = self
+            .decider
+            .decide(
+                &input,
+                &[reader_question()],
+                session.decision_model.as_deref(),
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        let a = d
+            .answers
+            .get("verdict")
+            .ok_or_else(|| anyhow!("the gate's reader gave no answer"))?;
+        Ok(Some([a.p("right", 3), a.p("flawed", 3), a.p("neither", 3)]))
     }
 
     /// One decision request with a question per secret: the probability
