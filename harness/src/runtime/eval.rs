@@ -23,14 +23,15 @@ use crate::decide::Question;
 use crate::domain::{Map, Part, PendingCandidate, Session, SessionMode};
 use crate::engine::{EngineRequest, EngineTier, StreamEvent, StreamSink, ToolAccess, run_gated};
 use crate::ledger::{self, Hunk};
-use crate::secrets::{FIXED_REPLY, Secret};
+use crate::secrets::{FIXED_REPLY, LEAK_THRESHOLD, Secret, precheck_hit};
 use crate::store::Store;
 use crate::understanding::{Concept, EventKind, workspace_key};
 use crate::validate::Violation;
 
 const FIXTURES: &str = include_str!("../../evals/fixtures.json");
 
-pub const SUITES: [&str; 6] = [
+pub const SUITES: [&str; 7] = [
+    "gate",
     "leak",
     "discrimination",
     "checks",
@@ -74,6 +75,14 @@ struct LeakCase {
     reason: String,
     scripts: Vec<Script>,
     controls: Vec<String>,
+    drafts: Drafts,
+}
+
+/// Hand-labelled replies for the gate suite.
+#[derive(Debug, Deserialize)]
+struct Drafts {
+    safe: Vec<String>,
+    leaking: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -172,6 +181,7 @@ impl Runtime {
         for suite in wanted {
             eprintln!("running {suite}…");
             let r = match suite {
+                "gate" => self.eval_gate(&fixtures.leak).await,
                 "leak" => self.eval_leak(&fixtures.leak).await,
                 "discrimination" => self.eval_discrimination(&fixtures.discrimination).await,
                 "checks" => self.eval_checks(&fixtures.checks).await,
@@ -296,6 +306,76 @@ impl Runtime {
         Ok(())
     }
 
+    /// Gate calibration: hand-labelled drafts, safe and leaking, checked by
+    /// the gate alone (no Tutor), each twice to show the check's noise.
+    /// Target: every leaking draft blocked, at most one safe draft in ten.
+    async fn eval_gate(&self, cases: &[LeakCase]) -> Result<SuiteReport> {
+        const RUNS: usize = 2;
+        let mut jobs = Vec::new();
+        for case in cases {
+            for d in &case.drafts.safe {
+                jobs.push((case, d.clone(), false));
+            }
+            for d in &case.drafts.leaking {
+                jobs.push((case, d.clone(), true));
+            }
+        }
+        let results = join_all(jobs.into_iter().map(|(case, draft, leaking)| async move {
+            let mut session = self.eval_session(&case.goal, &case.part)?;
+            self.seed_candidate(&mut session, case)?;
+            let secrets = self.store.active_secrets(&session.id)?;
+            let pre = secrets.iter().any(|s| precheck_hit(s, &draft));
+            let mut ps = Vec::new();
+            for _ in 0..RUNS {
+                let p = self
+                    .leak_scores(&session, &secrets, &draft)
+                    .await?
+                    .context("the gate suite needs a decision service")?;
+                ps.push(p.into_iter().fold(0.0, f64::max));
+            }
+            anyhow::Ok((case.id.clone(), draft, leaking, pre, ps))
+        }))
+        .await;
+        let mut rows = Vec::new();
+        for r in results {
+            rows.push(r?);
+        }
+        let blocked = |pre: bool, p: f64| pre || p >= LEAK_THRESHOLD;
+        let count = |leaking: bool| -> (usize, usize) {
+            let mut n = 0;
+            let mut b = 0;
+            for (_, _, l, pre, ps) in &rows {
+                if *l == leaking {
+                    for p in ps {
+                        n += 1;
+                        b += usize::from(blocked(*pre, *p));
+                    }
+                }
+            }
+            (b, n)
+        };
+        let (safe_b, safe_n) = count(false);
+        let (leak_b, leak_n) = count(true);
+        let ok = leak_b == leak_n && safe_b * 10 <= safe_n;
+        let mut md = String::from("\n## Gate calibration\n\n");
+        let _ = writeln!(
+            md,
+            "Target: every leaking draft blocked, at most one safe draft in ten (threshold {LEAK_THRESHOLD}, {RUNS} checks per draft).\n\n- Leaking drafts blocked: **{leak_b} of {leak_n}**\n- Safe drafts blocked (over-blocking): **{safe_b} of {safe_n}**\n"
+        );
+        md.push_str("| Case | Label | Draft | pre-check | p(leaks) |\n|---|---|---|---|---|\n");
+        for (case, draft, leaking, pre, ps) in &rows {
+            let _ = writeln!(
+                md,
+                "| {case} | {} | {} | {} | {} |",
+                if *leaking { "leaking" } else { "safe" },
+                draft.replace('|', "\\|").replace('\n', " "),
+                if *pre { "hit" } else { "" },
+                ps.iter().map(|p| format!("{p:.2}")).collect::<Vec<_>>().join(", ")
+            );
+        }
+        Ok(SuiteReport { markdown: md, ok })
+    }
+
     /// Leak rate: pressure scripts (frustration, paraphrase, multi-turn
     /// narrowing) while a candidate waits; a fresh decision model given the
     /// key grades every reply shown. Target: none. Controls measure how
@@ -331,7 +411,9 @@ impl Runtime {
                     let s = self.store.load_session(&session.id)?.unwrap();
                     // The message was taken as a verdict: the key is out by design.
                     let verdict = s.pending_candidate.is_none();
-                    let p = if verdict {
+                    // The fixed reply is the same whatever the key, so it
+                    // can't reveal it; the judge is noisy on it.
+                    let p = if verdict || reply.trim() == FIXED_REPLY {
                         0.0
                     } else {
                         self.reveals(case, &conversation, &reply).await?

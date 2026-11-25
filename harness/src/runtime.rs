@@ -601,6 +601,12 @@ impl Runtime {
             );
         }
 
+        // While a secret is active the reply is held for the gate (A6),
+        // thinking included: it may re-derive what the candidate tests.
+        let gate = self.gate_mode(session);
+        if matches!(gate, gate::GateMode::Checked(_)) {
+            waiting.push_str(&format!("\n\n{}", gate::NARROW));
+        }
         let req = EngineRequest {
             tier: EngineTier::System1,
             tools: ToolAccess::ReadOnly,
@@ -621,9 +627,6 @@ impl Runtime {
         };
         let current = session.map.clone();
         let change_waiting = session.pending_change.is_some();
-        // While a secret is active the reply is held for the gate (A6),
-        // thinking included: it may re-derive what the candidate tests.
-        let gate = self.gate_mode(session);
         let reply_sink = match &gate {
             gate::GateMode::Checked(_) => {
                 sink(StreamEvent::Thought(
@@ -2183,7 +2186,7 @@ mod tests {
     async fn the_gate_holds_replies_while_you_judge() {
         let leak = log_reply("It is wrong: dispatch never falls back.");
         let general = log_reply("Dispatch maps a name to a handler.");
-        let (rt, _) = runtime(
+        let (rt, engine) = runtime(
             FakeEngine::new(vec![
                 (ReadOnly, S1, ONBOARD_READY),
                 (ReadOnly, S2, MAP),
@@ -2236,6 +2239,13 @@ mod tests {
                     S1,
                     r#"{"reply":"Look at how unknown names are handled."}"#,
                 ),
+                // Under the threshold: shown as drafted.
+                (
+                    ReadOnly,
+                    S2,
+                    r#"{"is_judgment":false,"pass":false,"feedback":""}"#,
+                ),
+                (ReadOnly, S1, &general),
                 (
                     ReadOnly,
                     S2,
@@ -2247,7 +2257,16 @@ mod tests {
             false,
         );
         let rt = rt.with_decider(Arc::new(GateDecider(Mutex::new(
-            vec![Some(0.9), Some(0.1), Some(0.9), Some(0.8), None, Some(0.05)].into(),
+            vec![
+                Some(0.9),
+                Some(0.1),
+                Some(0.9),
+                Some(0.8),
+                None,
+                Some(0.05),
+                Some(0.25),
+            ]
+            .into(),
         ))));
         turn(&rt, "goal").await;
         turn(&rt, "thinking").await;
@@ -2296,6 +2315,15 @@ mod tests {
             "Look at how unknown names are handled."
         );
 
+        turn(&rt, "what is a handler?").await;
+        let s = rt.load_session("s").unwrap().unwrap();
+        assert_eq!(
+            s.history.last().unwrap().content,
+            "Dispatch maps a name to a handler."
+        );
+        let prompt = engine.prompts.lock().unwrap().last().cloned().unwrap();
+        assert!(prompt.contains(gate::NARROW), "asked to answer narrowly");
+
         turn(&rt, "it's wrong, unknown names are rejected").await;
         assert!(!rt.store.secret(&id).unwrap().unwrap().active);
         turn(&rt, "/next").await;
@@ -2305,6 +2333,8 @@ mod tests {
             s.history.last().unwrap().content,
             "Dispatch maps a name to a handler."
         );
+        let prompt = engine.prompts.lock().unwrap().last().cloned().unwrap();
+        assert!(!prompt.contains(gate::NARROW));
     }
 
     #[tokio::test]

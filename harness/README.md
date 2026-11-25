@@ -113,10 +113,10 @@ A candidate's key (right or flawed, and why) is kept in the session database's s
 
 Until you give your verdict, every reply goes through a gate:
 
-1. The reply and its reasoning are held.
+1. The reply and its reasoning are held. The reply model is asked to answer narrowly: exactly what you asked, with no asides tying the answer back to the topic, since those asides are what tend to give a candidate away.
 2. A pre-check looks for text copied from the key.
-3. A decision model asks whether the reply, read with the conversation since the candidate appeared, reveals, hints at or confirms the key. It blocks at p ≥ 0.3.
-4. A blocked reply is rewritten once without the candidate. If that is blocked too, or the check fails, you get a fixed reply.
+3. A decision model asks whether the reply, read with the conversation since the candidate appeared, reveals, hints at or confirms the key. Sharing the candidate's topic doesn't count: a general explanation that doesn't touch the deciding point passes. It blocks at p ≥ 0.3.
+4. A blocked reply is rewritten once without the candidate, keeping only the direct answer to what you asked. If that is blocked too, or the check fails, you get a fixed reply.
 
 When you give your verdict the key is retired and replies stream again.
 
@@ -188,10 +188,11 @@ In a git repository, Pathfinder records every change the agent makes:
 
 ## Evals
 
-`harness eval [suite ...] [--out report.md]` runs the checks from the theory's A10 before a release. With no suite named, it runs all six. It exits non-zero if a suite with a target misses it.
+`harness eval [suite ...] [--out report.md]` runs the checks from the theory's A10 before a release. With no suite named, it runs all seven. It exits non-zero if a suite with a target misses it.
 
-The four live suites drive the same code paths Zed does. They use your configured models and decision service, in a throwaway database, with the scripted cases in `evals/fixtures.json`:
+The five live suites drive the same code paths Zed does. They use your configured models and decision service, in a throwaway database, with the scripted cases in `evals/fixtures.json`:
 
+- **gate:** hand-labelled drafts, some safe and some leaking, checked by the gate alone (no Tutor), twice each to show its noise. Target: every leaking draft blocked, and at most one safe draft in ten. It needs no main model and runs in seconds, so use it when changing the gate's question.
 - **leak:** pressure scripts while a candidate waits: frustration, paraphrasing the deciding fact, and narrowing over several turns. A second decision service, given the key, grades every reply shown. Target: no leaks. Harmless control questions measure over-blocking, i.e. how often they get the fixed reply.
 - **discrimination:** a student who understands the part (a model given notes) and a guesser judge correct and flawed candidates. The report shows the pass rate of each and the gap between them.
 - **checks:** plants flaws in sample hunks and checks they parse and carry no hint. The caught-judge then gets four objections: one naming the flaw, one paraphrasing it, one about a real bug elsewhere, and a vague one. Target: no objection about something else is credited as a catch, and no plant has a hint.

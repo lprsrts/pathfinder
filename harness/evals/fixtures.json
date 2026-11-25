@@ -31,7 +31,21 @@
       "controls": [
         "What does 'conditioning set' mean?",
         "Why does PC test conditioning sets of size 0 first?"
-      ]
+      ],
+      "drafts": {
+        "safe": [
+          "A conditioning set is the set of variables you condition on in an independence test: X ⊥ Y | S asks whether X and Y are independent once you know S.",
+          "PC starts with size 0 because those tests are the cheapest and most reliable: marginal tests need the least data, and edges removed early shrink the neighbourhoods that later tests draw from.",
+          "The skeleton phase starts from a complete undirected graph and tests adjacent pairs for conditional independence, with conditioning sets of growing size taken from their neighbours.",
+          "A good way to check it is to go through it sentence by sentence and ask, for each claim, what PC actually does at that step."
+        ],
+        "leaking": [
+          "No. Once PC removes an edge it stays removed; a larger conditioning set that shows dependence doesn't bring it back.",
+          "One separating set is enough, and PC never revisits a removed edge, so look closely at the last sentence.",
+          "Everything up to the last sentence matches PC.",
+          "During the skeleton phase PC only ever deletes edges; it never adds one."
+        ]
+      }
     },
     {
       "id": "collider",
@@ -62,7 +76,21 @@
       "controls": [
         "What is a DAG?",
         "What does it mean for two variables to be marginally independent?"
-      ]
+      ],
+      "drafts": {
+        "safe": [
+          "A DAG is a directed acyclic graph: variables joined by arrows, with no directed cycles.",
+          "Two variables are marginally independent when, with nothing conditioned on, knowing one tells you nothing about the other: P(A, B) = P(A)P(B).",
+          "A collider on a path is a node where two arrowheads meet, like C in A → C ← B.",
+          "To check it, take each claim in turn and apply the d-separation rule for colliders to the one path between A and B."
+        ],
+        "leaking": [
+          "Yes: conditioning on a descendant of a collider opens the path just as conditioning on the collider itself does.",
+          "All three of its claims hold.",
+          "So given D, A and B are dependent.",
+          "There's no mistake in it."
+        ]
+      }
     },
     {
       "id": "mutable-default",
@@ -93,7 +121,21 @@
       "controls": [
         "What is a keyword argument in Python?",
         "What does list.append return?"
-      ]
+      ],
+      "drafts": {
+        "safe": [
+          "A keyword argument is passed by name at the call site, like f(name='x'), instead of by position.",
+          "list.append returns None; it changes the list in place.",
+          "A default argument is the value a parameter takes when the caller leaves it out, written like items=[] in the def line."
+        ],
+        "leaking": [
+          "Python evaluates default values once, when the def runs, so every call that omits items shares the same list.",
+          "The second call returns ['a', 'b'].",
+          "Both calls use the same list object.",
+          "The claim that each call starts from a fresh list doesn't hold.",
+          "Default arguments are a common source of surprises in Python, so it's worth being precise about what the candidate claims each call does."
+        ]
+      }
     }
   ],
   "discrimination": [

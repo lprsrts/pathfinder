@@ -22,10 +22,29 @@ struct Rewrite {
 
 const REWRITE_SYSTEM: &str = r#"The user is judging a candidate (a proposed approach or result, or an agent's change under review) and hasn't given their verdict yet. Your draft reply to their latest message was held back because it judges the candidate, hints at whether or where it is right or wrong, or settles the point it tests.
 
-Rewrite it without any of that. Keep what is still useful: general explanations of the concepts, definitions, how to think about such a question, what to check. Don't say the candidate is right or wrong, don't point at a step, line or number in it, and don't give the fact that decides it. Don't mention that anything was held back. Math as plain text, never LaTeX.
+Rewrite it without any of that. Answer only what the user literally asked, as a general explanation or definition, and stop. Cut every sentence that links the answer to the task, the part, the candidate or a related idea ("which is where X comes in", "that's what matters when ..."), and every consequence or example the user didn't ask for. Don't say the candidate is right or wrong, don't point at a step, line or number in it, and don't give the fact that decides it. Don't mention that anything was held back. Math as plain text, never LaTeX.
 
 Return ONLY a JSON object:
 {"reply": "..."}"#;
+
+/// Added to the Tutor's prompt while the gate checks its replies: asides
+/// that tie a general answer back to the topic are what settle a candidate.
+pub(super) const NARROW: &str = "Something is being judged right now, so answer narrowly: reply to exactly what the user asked and stop. Don't add asides that tie your answer to the task, the part or a related idea (\"which is where X comes in\", \"that's what matters when ...\"), and don't add consequences, edge cases or examples they didn't ask for.";
+
+const LEAK_OPTION: &str = "yes";
+
+fn leak_question(name: &str, n: usize, probe: &str) -> Question {
+    Question {
+        name: name.to_string(),
+        instructions: format!(
+            "Candidate {n} is waiting for the user's verdict. Would sending the draft reply below reveal, hint at, or confirm {probe} Count hints spread across the conversation, and a reply that confirms what the user says about the candidate. Sharing the candidate's topic isn't a hint: a general explanation of a concept it uses, which doesn't touch the point that decides it, is a no."
+        ),
+        options: vec![
+            (LEAK_OPTION.into(), "It reveals, hints at or confirms it".into()),
+            ("no".into(), "It doesn't".into()),
+        ],
+    }
+}
 
 /// The gate's mode for this thread.
 pub(super) enum GateMode {
@@ -50,9 +69,9 @@ impl Runtime {
         }
     }
 
-    /// Whether `draft` leaks any secret: the pre-check, then one decision
-    /// request with a predicate per secret. `Ok(None)`: no decision service
-    /// answered, so the thread is in masked mode.
+    /// Whether `draft` leaks any secret: the pre-check, then the decision
+    /// check. `Ok(None)`: no decision service answered, so the thread is in
+    /// masked mode.
     async fn leaks(
         &self,
         session: &Session,
@@ -62,24 +81,26 @@ impl Runtime {
         if secrets.iter().any(|s| precheck_hit(s, draft)) {
             return Ok(Some(true));
         }
+        let scores = self.leak_scores(session, secrets, draft).await?;
+        tracing::debug!(?scores, draft, "gate check");
+        Ok(scores.map(|ps| ps.iter().any(|p| *p >= LEAK_THRESHOLD)))
+    }
+
+    /// One decision request with a question per secret: the probability
+    /// that sending `draft` settles it.
+    pub(super) async fn leak_scores(
+        &self,
+        session: &Session,
+        secrets: &[Secret],
+        draft: &str,
+    ) -> Result<Option<Vec<f64>>> {
         let since = secrets.iter().map(|s| s.opened_at_turn).min().unwrap_or(0);
         let turns = format_turns(&session.history[since.min(session.history.len())..]);
         let mut input = format!("Conversation since the candidate was shown:\n{turns}\n");
         let mut questions = Vec::new();
         for (i, s) in secrets.iter().enumerate() {
             input.push_str(&format!("\nCandidate {}:\n{}\n", i + 1, s.candidate()));
-            questions.push(Question {
-                name: format!("s{i}"),
-                instructions: format!(
-                    "Candidate {} is waiting for the user's verdict. Would sending the draft reply below reveal, hint at, or confirm {} Count hints spread across the conversation, and a reply that confirms what the user says about the candidate.",
-                    i + 1,
-                    s.probe
-                ),
-                options: vec![
-                    ("yes".into(), "It reveals, hints at or confirms it".into()),
-                    ("no".into(), "It doesn't".into()),
-                ],
-            });
+            questions.push(leak_question(&format!("s{i}"), i + 1, &s.probe));
         }
         input.push_str(&format!("\nDraft reply:\n{draft}"));
         let Some(decision) = self
@@ -89,21 +110,19 @@ impl Runtime {
         else {
             return Ok(None);
         };
+        let mut out = Vec::new();
         for q in &questions {
             let a = decision
                 .answers
                 .get(&q.name)
                 .ok_or_else(|| anyhow!("the gate got no answer for {}", q.name))?;
-            let p_yes = if a.choice == "yes" {
+            out.push(if a.choice == LEAK_OPTION {
                 a.probability
             } else {
                 1.0 - a.probability
-            };
-            if p_yes >= LEAK_THRESHOLD {
-                return Ok(Some(true));
-            }
+            });
         }
-        Ok(Some(false))
+        Ok(Some(out))
     }
 
     /// The reply you may see: the draft if it passes, a rewrite if that
