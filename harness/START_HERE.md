@@ -38,7 +38,8 @@ Passing a candidate or an exam question is what puts an idea on your record as s
 
 | Command | What it does |
 |---|---|
-| `/why` | Your record per idea: shown, claimed, told |
+| `/why` | Your record as a diagram: every idea you've touched here and whether you've shown it, claimed it or were only told |
+| `/map` | In an exercise or exam: its parts as a diagram |
 | `/summary <your explanation>` | In an exercise: explain the current part; a candidate follows |
 | `/next`, `/known` | In an exercise: next part; skip a part you know (recorded as your claim) |
 | `/accept`, `/reject` | Answer a proposed extra part for something a part rests on |

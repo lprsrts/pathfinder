@@ -307,6 +307,39 @@ impl Map {
         lines.join("\n")
     }
 
+    /// The map as a Mermaid flowchart for the user (Zed renders it): parts
+    /// with their status, an arrow from each part to the parts that need it,
+    /// the active part marked. `status` names a status in the user's
+    /// language.
+    pub fn mermaid(&self, active: Option<&str>, status: impl Fn(PartStatus) -> String) -> String {
+        let mut out = String::from("```mermaid\nflowchart TD\n");
+        for part in &self.parts {
+            let mark = if Some(part.id.as_str()) == active {
+                "▶ "
+            } else {
+                ""
+            };
+            out.push_str(&format!(
+                "    {}[\"{mark}{}<br/><small>{} · {}</small>\"]\n",
+                mermaid_id(&part.id),
+                mermaid_text(&part.title),
+                mermaid_text(&part.id),
+                mermaid_text(&status(part.status)),
+            ));
+        }
+        for part in &self.parts {
+            for dep in &part.depends_on {
+                out.push_str(&format!(
+                    "    {} --> {}\n",
+                    mermaid_id(dep),
+                    mermaid_id(&part.id)
+                ));
+            }
+        }
+        out.push_str("```");
+        out
+    }
+
     /// Applies a proposed change (§3) and validates the result.
     pub fn with_change(&self, change: &MapChange) -> Result<Map, String> {
         let mut map = self.clone();
@@ -653,6 +686,37 @@ fn yes() -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_map_draws_as_mermaid() {
+        let mut a = Part::new(
+            "fwd-pass".into(),
+            "Forward \"pass\"".into(),
+            String::new(),
+            vec![],
+        );
+        a.status = PartStatus::Understood;
+        let b = Part::new(
+            "loss".into(),
+            "Loss".into(),
+            String::new(),
+            vec!["fwd-pass".into()],
+        );
+        let map = Map { parts: vec![a, b] };
+        let m = map.mermaid(Some("loss"), |s| s.label().to_string());
+        assert!(m.starts_with("```mermaid\nflowchart TD\n") && m.ends_with("```"));
+        assert!(
+            m.contains(
+                "n_fwd_pass[\"Forward #quot;pass#quot;<br/><small>fwd-pass · understood</small>\"]"
+            ),
+            "{m}"
+        );
+        assert!(
+            m.contains("n_loss[\"▶ Loss<br/><small>loss · open</small>\"]"),
+            "{m}"
+        );
+        assert!(m.contains("n_fwd_pass --> n_loss"), "{m}");
+    }
+
     fn part(id: &str, deps: &[&str], status: PartStatus) -> Part {
         let mut p = Part::new(
             id.into(),
@@ -803,4 +867,18 @@ mod tests {
         };
         assert!(m.with_change(&cycle).is_err());
     }
+}
+
+/// A Mermaid node id: letters, digits and underscores only.
+pub fn mermaid_id(id: &str) -> String {
+    let body: String = id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    format!("n_{body}")
+}
+
+/// Text inside a quoted Mermaid label.
+pub fn mermaid_text(text: &str) -> String {
+    text.replace('"', "#quot;").replace(['\n', '\r'], " ")
 }

@@ -60,6 +60,14 @@ pub enum Line {
     ExamQuestionFor,
     /// After an exam question.
     ExamAnswer,
+    /// Heading of the folder-wide record.
+    RecordTitle,
+    /// A concept you were only told about.
+    ToldOnly,
+    /// The folder has no record yet.
+    NoRecord,
+    /// Under the record: "{shown}", "{told}", "{shaky}".
+    RecordSummary,
 }
 
 fn german(lang: Option<&str>) -> bool {
@@ -116,6 +124,14 @@ pub fn line(lang: Option<&str>, line: Line) -> &'static str {
             }
             ExamQuestionFor => "Prüfungsfrage zu",
             ExamAnswer => "Deine Antwort?",
+            RecordTitle => "**Dein Verlauf in diesem Ordner**",
+            ToldOnly => "nur gesagt",
+            NoRecord => {
+                "Für diesen Ordner gibt es noch keinen Verlauf: Frag etwas, oder lass dich prüfen."
+            }
+            RecordSummary => {
+                "Gezeigt: {shown} · nur gesagt: {told} · wackelig: {shaky}. Als verstanden zählt nur eine bestandene Prüfung; eine Behauptung nie, und sicheres Verständnis kühlt nach 30 Tagen ohne neue Prüfung ab."
+            }
         }
     } else {
         match line {
@@ -162,7 +178,29 @@ pub fn line(lang: Option<&str>, line: Line) -> &'static str {
             }
             ExamQuestionFor => "Question on",
             ExamAnswer => "Your answer?",
+            RecordTitle => "**Your record in this folder**",
+            ToldOnly => "told only",
+            NoRecord => "No record for this folder yet: ask something, or get tested.",
+            RecordSummary => {
+                "Shown: {shown} · told only: {told} · shaky: {shaky}. Only passed checks count as understanding; a claim never does, and solid understanding cools after 30 days without a fresh check."
+            }
         }
+    }
+}
+
+/// A part status's name in `lang`.
+pub fn part_status(lang: Option<&str>, s: crate::domain::PartStatus) -> &'static str {
+    use crate::domain::PartStatus::*;
+    if !german(lang) {
+        return s.label();
+    }
+    match s {
+        Open => "offen",
+        Understood => "verstanden",
+        InReview => "Ergebnis zur Prüfung",
+        Done => "erledigt",
+        Known => "als bekannt angegeben",
+        Delegated => "abgegeben",
     }
 }
 

@@ -264,6 +264,6 @@ Shortcuts for the same steps, and the only way to run the agent:
 - `/replan [what changed]` — ask for a map change
 - `/next` — move to the next unresolved part
 - `/focus <id>` — switch to any part; also takes its number in the plan (`/focus 3`) or the start of its id (`/focus fwd`)
-- `/map` — show the map
-- `/why` — what the current part's status rests on: each concept's state, checks and open misconceptions
+- `/map` — show the map as a diagram (parts, their status, what needs what)
+- `/why` — in a task: what the current part's status rests on, each concept's state, checks and open misconceptions; otherwise your record for this folder as a diagram: every idea you've touched, shown, claimed or only been told, linked by what builds on what
 - `/coverage` — how much of the agent's work in this repository you can vouch for

@@ -641,7 +641,7 @@ impl Runtime {
     /// `/why`: what the active part's status rests on.
     pub(super) fn why(&self, session: &Session) -> String {
         let Some(part) = session.active_part() else {
-            return "No part is active.".into();
+            return self.folder_record(session);
         };
         if part.concepts.is_empty() {
             return format!(
@@ -679,6 +679,83 @@ impl Runtime {
                 .into(),
         );
         lines.join("\n")
+    }
+
+    /// Most ideas the folder-wide record draws.
+    const RECORD_MAX: usize = 40;
+
+    /// The folder's record outside a task: every idea with any event, its
+    /// state (or "told only"), linked by what builds on what, as Mermaid.
+    pub(super) fn folder_record(&self, session: &Session) -> String {
+        use crate::i18n::{Line, line, state};
+        let lang = session.language.as_deref();
+        let ws = Self::workspace(session);
+        let concepts = self.store.concepts(&ws).unwrap_or_default();
+        let ids: Vec<String> = concepts.iter().map(|c| c.id.clone()).collect();
+        let events = self.store.events(&ws, &ids).unwrap_or_default();
+        let views = self.concept_views(session, &ids).unwrap_or_default();
+        // Ideas with any event, most recently active first.
+        let mut active: Vec<(&Concept, i64, bool)> = concepts
+            .iter()
+            .filter_map(|c| {
+                let mine: Vec<&crate::understanding::Event> =
+                    events.iter().filter(|e| e.concept == c.id).collect();
+                let last = mine.iter().map(|e| e.id).max()?;
+                let told = mine.iter().any(|e| e.kind == EventKind::Told);
+                Some((c, last, told))
+            })
+            .collect();
+        if active.is_empty() {
+            return line(lang, Line::NoRecord).to_string();
+        }
+        active.sort_by(|a, b| b.1.cmp(&a.1));
+        active.truncate(Self::RECORD_MAX);
+        let shown_ids: HashSet<&str> = active.iter().map(|(c, ..)| c.id.as_str()).collect();
+        let (mut shown, mut told_only, mut shaky) = (0, 0, 0);
+        let mut out = format!(
+            "{}\n\n```mermaid\nflowchart LR\n",
+            line(lang, Line::RecordTitle)
+        );
+        for (c, _, told) in &active {
+            let st = understanding::state_of(&views, &c.id);
+            let name = if st == ConceptState::Unknown && *told {
+                told_only += 1;
+                line(lang, Line::ToldOnly).to_string()
+            } else {
+                if st.has_evidence() {
+                    shown += 1;
+                }
+                if st == ConceptState::Shaky {
+                    shaky += 1;
+                }
+                state(lang, st).to_string()
+            };
+            out.push_str(&format!(
+                "    {}[\"{}<br/><small>{}</small>\"]\n",
+                crate::domain::mermaid_id(&c.id),
+                crate::domain::mermaid_text(&c.label),
+                crate::domain::mermaid_text(&name),
+            ));
+        }
+        for (concept, needs) in self.store.prerequisites(&ws).unwrap_or_default() {
+            for n in needs {
+                if shown_ids.contains(concept.as_str()) && shown_ids.contains(n.as_str()) {
+                    out.push_str(&format!(
+                        "    {} --> {}\n",
+                        crate::domain::mermaid_id(&n),
+                        crate::domain::mermaid_id(&concept)
+                    ));
+                }
+            }
+        }
+        out.push_str("```\n\n");
+        out.push_str(
+            &line(lang, Line::RecordSummary)
+                .replace("{shown}", &shown.to_string())
+                .replace("{told}", &told_only.to_string())
+                .replace("{shaky}", &shaky.to_string()),
+        );
+        out
     }
 }
 

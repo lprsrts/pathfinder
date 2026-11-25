@@ -1832,7 +1832,14 @@ fn render_change(change: &MapChange, map: &Map, lang: Option<&str>) -> String {
 }
 
 fn render_map_and_pending(session: &Session) -> String {
-    let mut out = session.map.render(session.active.as_deref());
+    let lang = session.language.as_deref();
+    let mut out = if session.map.parts.is_empty() {
+        session.map.render(None)
+    } else {
+        session.map.mermaid(session.active.as_deref(), |s| {
+            i18n::part_status(lang, s).to_string()
+        })
+    };
     if let Some(change) = &session.pending_change {
         out.push_str("\n\n");
         out.push_str(&render_change(
@@ -2821,6 +2828,13 @@ mod tests {
             crate::understanding::state_of(&views, "phasors"),
             crate::understanding::ConceptState::Unknown,
             "being told is not understanding"
+        );
+
+        let record = turn(&rt, "/why").await.reply;
+        assert!(record.contains("```mermaid"), "{record}");
+        assert!(
+            record.contains("Phasors<br/><small>told only</small>"),
+            "{record}"
         );
 
         turn(&rt, "What's the capital of Peru?").await;
