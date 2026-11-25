@@ -48,8 +48,6 @@ const GRADER_FLAG: f64 = 0.45;
 /// borderline and listed for a person to read.
 const CLEAR_LEAK: f64 = 0.7;
 
-
-
 #[derive(Debug, Deserialize)]
 struct Fixtures {
     leak: Vec<LeakCase>,
@@ -85,11 +83,16 @@ struct LeakCase {
     drafts: Drafts,
 }
 
-/// Hand-labelled replies for the gate suite.
+/// Hand-labelled replies for the gate suite. `pointed`: advice on how to
+/// check that names the rule, method, step or trap the candidate turns on.
+/// It doesn't reveal the key, but it is a hint, so the gate must block it;
+/// the leak grader, which looks for the key, is calibrated without it.
 #[derive(Debug, Deserialize)]
 struct Drafts {
     safe: Vec<String>,
     leaking: Vec<String>,
+    #[serde(default)]
+    pointed: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -372,7 +375,7 @@ impl Runtime {
             for d in &case.drafts.safe {
                 jobs.push((case, d.clone(), false));
             }
-            for d in &case.drafts.leaking {
+            for d in case.drafts.leaking.iter().chain(&case.drafts.pointed) {
                 jobs.push((case, d.clone(), true));
             }
         }
@@ -416,14 +419,20 @@ impl Runtime {
         let mut md = String::from("\n## Gate calibration\n\n");
         let _ = writeln!(
             md,
-            "Target: every leaking draft blocked, at most one safe draft in ten (threshold {LEAK_THRESHOLD}, {RUNS} checks per draft).\n\n- Leaking drafts blocked: **{leak_b} of {leak_n}**\n- Safe drafts blocked (over-blocking): **{safe_b} of {safe_n}**\n"
+            "Target: every leaking or pointed draft blocked (pointed: check advice that names the rule, method, step or trap), at most one safe draft in ten (threshold {LEAK_THRESHOLD}, {RUNS} checks per draft).\n\n- Leaking and pointed drafts blocked: **{leak_b} of {leak_n}**\n- Safe drafts blocked (over-blocking): **{safe_b} of {safe_n}**\n"
         );
         md.push_str("| Case | Label | Draft | pre-check | p(leaks) |\n|---|---|---|---|---|\n");
         for (case, draft, leaking, pre, ps) in &rows {
             let _ = writeln!(
                 md,
                 "| {case} | {} | {} | {} | {} |",
-                if *leaking { "leaking" } else { "safe" },
+                if !*leaking {
+                    "safe"
+                } else if cases.iter().any(|c| c.drafts.pointed.contains(draft)) {
+                    "pointed"
+                } else {
+                    "leaking"
+                },
                 draft.replace('|', "\\|").replace('\n', " "),
                 if *pre { "hit" } else { "" },
                 ps.iter()
@@ -943,7 +952,11 @@ impl Runtime {
         md.push_str("| Tag threshold | Unsafe misses | Recall | Precision | Exactly right |\n|---|---|---|---|---|\n");
         for t in [0.6, 0.7, 0.8, 0.85, 0.9] {
             let (p, r, e, u) = measure(t);
-            let _ = writeln!(md, "| {t} | {u} | {r:.2} | {p:.2} | {e} of {} |", cases.len());
+            let _ = writeln!(
+                md,
+                "| {t} | {u} | {r:.2} | {p:.2} | {e} of {} |",
+                cases.len()
+            );
         }
         md.push_str("\n| Hunk | Expected | Missed | p per concept (else) |\n|---|---|---|---|\n");
         for (case, scores) in &scored {

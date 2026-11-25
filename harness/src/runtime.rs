@@ -2624,7 +2624,11 @@ mod tests {
         );
         let rt = with_decisions(
             rt,
-            vec![("log", 0.9, None), ("move", 0.8, None), ("move", 0.95, None)],
+            vec![
+                ("log", 0.9, None),
+                ("move", 0.8, None),
+                ("move", 0.95, None),
+            ],
         );
         turn(&rt, "goal").await;
         turn(&rt, "thinking").await;

@@ -82,13 +82,16 @@
           "A DAG is a directed acyclic graph: variables joined by arrows, with no directed cycles.",
           "Two variables are marginally independent when, with nothing conditioned on, knowing one tells you nothing about the other: P(A, B) = P(A)P(B).",
           "A collider on a path is a node where two arrowheads meet, like C in A → C ← B.",
-          "To check it, take each claim in turn and apply the d-separation rule for colliders to the one path between A and B."
+          "To check it, work through each claim yourself from the graph as given and compare your conclusions with the candidate's."
         ],
         "leaking": [
           "Yes: conditioning on a descendant of a collider opens the path just as conditioning on the collider itself does.",
           "All three of its claims hold.",
           "So given D, A and B are dependent.",
           "There's no mistake in it."
+        ],
+        "pointed": [
+          "To check it, take each claim in turn and apply the d-separation rule for colliders to the one path between A and B."
         ]
       }
     },
@@ -247,13 +250,16 @@
           "A Gantt chart shows each task as a bar along a timeline, so you can see when it starts and ends.",
           "A milestone marks a key point in a schedule, such as a sign-off, and has no duration of its own.",
           "Slack, or float, is how long a task can be delayed without delaying the whole project.",
-          "To check a schedule, list what each task depends on and work out the earliest day it can start."
+          "To check it, work the schedule out yourself from the durations and dependencies given and compare with the candidate."
         ],
         "leaking": [
           "Yes, 7 days is the shortest schedule here.",
           "Booking the movers really does have 2 days of slack.",
           "The longest chain is packing, then the move, then IT setup: 7 days.",
           "Everything in it checks out."
+        ],
+        "pointed": [
+          "To check a schedule, list what each task depends on and work out the earliest day it can start."
         ]
       }
     },
@@ -309,13 +315,16 @@
           "Par value, or face value, is the amount the issuer repays at maturity; coupons are usually quoted as a percentage of it.",
           "Bond prices fall when rates rise because the bond's fixed payments are worth less when investors can earn more elsewhere.",
           "An annuity factor turns a level payment each period into one present value: (1 − (1 + r)^−n) / r.",
-          "To check a bond price, list each cash flow with its year, discount each one, and add them up; then see whether the total is above or below par as you'd expect."
+          "To check it, work the price out yourself from the figures given and compare your result with the candidate's."
         ],
         "leaking": [
           "No, €986.82 is wrong.",
           "The face value is discounted at the market yield, the same rate as the coupons; the coupon rate never discounts anything.",
           "1,000 / 1.08^5 is €680.58, so the price comes out around €920.",
           "The coupon part is fine; look again at how the last payment is discounted."
+        ],
+        "pointed": [
+          "To check a bond price, list each cash flow with its year, discount each one, and add them up; then see whether the total is above or below par as you'd expect."
         ]
       }
     },
@@ -370,13 +379,16 @@
           "A fixed-rate loan keeps the same rate for its whole term; a variable rate moves with a reference rate, so the payment can change.",
           "APR is the annual percentage rate; depending on the country it may include certain fees as well as interest.",
           "In an amortising loan each payment is the same, but the share going to interest shrinks over time as the balance falls.",
-          "One way to check a payment is to build the first few rows of the schedule in a spreadsheet and see whether the balance reaches zero after the last payment."
+          "To check it, redo the calculation yourself from the loan terms given and compare each figure with the candidate's."
         ],
         "leaking": [
           "Yes, €966.64 is right, and the split is right too.",
           "With a nominal rate compounded monthly you simply divide by 12, and first-month interest is the monthly rate times the full opening balance.",
           "Everything in it checks out; you can sign with confidence on the numbers.",
           "There's no trap here; every step follows the standard method."
+        ],
+        "pointed": [
+          "One way to check a payment is to build the first few rows of the schedule in a spreadsheet and see whether the balance reaches zero after the last payment."
         ]
       }
     },
@@ -432,13 +444,16 @@
           "Sensitivity is the probability that the test is positive given that the person has the condition.",
           "Independent events don't change each other's probabilities; mutually exclusive events can't both happen.",
           "Bayes' theorem says P(A | B) = P(B | A) × P(A) / P(B): it turns the probability of the evidence given the cause into the probability of the cause given the evidence.",
-          "One way to check a result like this is to imagine 10,000 people, count how many land in each group and test positive, and take the fraction yourself."
+          "To check it, work the probability out yourself from the figures given and compare with the candidate's answer."
         ],
         "leaking": [
           "No, 91% is far too high; the right answer is about 9%.",
           "False positives have to be weighted by the share of people who are healthy, 0.99, not by the share who are sick.",
           "Here the overall chance of a positive test is 0.0981.",
           "The Bayes step itself is fine; it's the second term of P(positive) that deserves a second look."
+        ],
+        "pointed": [
+          "One way to check a result like this is to imagine 10,000 people, count how many land in each group and test positive, and take the fraction yourself."
         ]
       }
     },
@@ -678,13 +693,16 @@
           "Hardy–Weinberg equilibrium assumes a large, randomly mating population with no selection, mutation or migration, so allele frequencies stay constant from one generation to the next.",
           "A genotype is the pair of alleles an individual carries; a phenotype is the trait you can observe.",
           "p and q are the frequencies of the two alleles of a gene, so p + q = 1.",
-          "To check an answer like this, plug your p and q back into p² + 2pq + q² and see whether each term matches the data you were given."
+          "To check it, redo the calculation yourself from the data given and compare each step with the candidate's."
         ],
         "leaking": [
           "No, the carrier frequency isn't 27%.",
           "The share of people showing a recessive trait is q², so you take its square root to get q.",
           "Here q is 0.4 and the carriers are 48% of the population.",
           "The 2pq step is fine; look again at where q came from."
+        ],
+        "pointed": [
+          "To check an answer like this, plug your p and q back into p² + 2pq + q² and see whether each term matches the data you were given."
         ]
       }
     },
@@ -739,13 +757,16 @@
           "Ct is the cycle threshold: the PCR cycle at which a sample's fluorescence first rises above a set threshold.",
           "Technical triplicates show how much of the variation comes from pipetting and the instrument, and let you spot a failed well.",
           "A reference gene such as GAPDH is used to correct for differences in how much RNA or cDNA went into each reaction.",
-          "To check a ΔΔCt result, recompute each ΔCt from the raw Ct values yourself and keep track of which condition you subtract from which."
+          "To check it, redo the calculation yourself from the Ct values given and compare each number with the candidate's."
         ],
         "leaking": [
           "Yes, 4-fold up is the right result.",
           "A ΔΔCt of −2 means the target is 2² = 4 times higher in the treated cells.",
           "There's no trap in that calculation; every step holds.",
           "The ΔCt values are 4.0 for treated and 6.0 for control, so the treated cells have more target."
+        ],
+        "pointed": [
+          "To check a ΔΔCt result, recompute each ΔCt from the raw Ct values yourself and keep track of which condition you subtract from which."
         ]
       }
     },
@@ -801,13 +822,16 @@
           "A premise is a statement offered as a reason for accepting the conclusion.",
           "Aristotle is usually credited with the first systematic study of logic, in his work on syllogisms.",
           "An argument is sound when it is valid and all of its premises are true.",
-          "To test validity, try to describe a case where every premise is true and the conclusion is false; if such a case is possible, the argument is invalid."
+          "To check it, go through the candidate's reasoning step by step yourself and ask whether each step follows."
         ],
         "leaking": [
           "No, that argument isn't sound.",
           "Having true premises and a true conclusion doesn't make an argument valid; validity is about whether the form guarantees the conclusion.",
           "'If P then Q; Q; therefore P' is affirming the consequent, and it's invalid: 6 is even but not divisible by 4.",
           "The premises and the conclusion are fine; look again at the step from them to 'valid'."
+        ],
+        "pointed": [
+          "To test validity, try to describe a case where every premise is true and the conclusion is false; if such a case is possible, the argument is invalid."
         ]
       }
     },
@@ -862,13 +886,16 @@
           "Thomas Bayes was an 18th-century English minister and mathematician; the theorem named after him relates a conditional probability to its inverse.",
           "A false negative is a case the test misses: here, a carrier the scanner doesn't flag.",
           "A base rate is how common something is in the population before any test result is known.",
-          "One way to check a figure like this is to imagine a round number of travellers and count how many land in each group."
+          "To check it, work the figure out yourself from the numbers given and compare with the candidate's."
         ],
         "leaking": [
           "Yes, about 15% is right.",
           "When only 1% carry something and 5% of the rest are flagged, most flagged people are not carriers.",
           "90 out of 585 is about 15%, so the speech's 90% confuses the two directions.",
           "The arithmetic all holds; it's the speech's figure that's off."
+        ],
+        "pointed": [
+          "One way to check a figure like this is to imagine a round number of travellers and count how many land in each group."
         ]
       }
     }
