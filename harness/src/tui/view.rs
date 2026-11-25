@@ -88,12 +88,120 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
 }
 
+/// Reading and searching, as opposed to changing files or running commands.
+fn exploring(title: &str) -> bool {
+    ["Read ", "View ", "List", "Grep", "Glob", "Find"]
+        .iter()
+        .any(|p| title.starts_with(p))
+}
+
+/// Runs of two or more reads and searches with nothing shown between them:
+/// (first entry, all entries in the run).
+fn tool_groups(app: &App) -> Vec<(usize, Vec<usize>)> {
+    let is_exploring = |e: &Entry| matches!(e, Entry::Tool { title, .. } if exploring(title));
+    let mut groups = Vec::new();
+    let mut i = 0;
+    while i < app.entries.len() {
+        if !is_exploring(&app.entries[i]) {
+            i += 1;
+            continue;
+        }
+        let mut members = vec![i];
+        let mut k = i + 1;
+        while k < app.entries.len() {
+            match &app.entries[k] {
+                e if is_exploring(e) => members.push(k),
+                Entry::Thought(_) if !app.show_thoughts => {}
+                Entry::Text(t) if t.trim().is_empty() => {}
+                _ => break,
+            }
+            k += 1;
+        }
+        if members.len() >= 2 {
+            groups.push((i, members));
+        }
+        i = k;
+    }
+    groups
+}
+
+/// One line for a run of reads and searches: "Read 3 files, 2 searches".
+fn group_line(app: &App, members: &[usize], width: u16) -> Vec<Line<'static>> {
+    let mut files = std::collections::BTreeSet::new();
+    let (mut searches, mut lists, mut failed) = (0, 0, 0);
+    let mut running = None;
+    for &i in members {
+        let Entry::Tool { title, ok, .. } = &app.entries[i] else {
+            continue;
+        };
+        if let Some(rest) = title
+            .strip_prefix("Read ")
+            .or_else(|| title.strip_prefix("View "))
+        {
+            files.insert(rest.split(" (").next().unwrap_or(rest).to_string());
+        } else if title.starts_with("List") {
+            lists += 1;
+        } else {
+            searches += 1;
+        }
+        match ok {
+            None => running = Some(title.clone()),
+            Some(false) => failed += 1,
+            Some(true) => {}
+        }
+    }
+    let plural =
+        |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+    let mut parts = Vec::new();
+    if !files.is_empty() {
+        parts.push(format!("read {}", plural(files.len(), "file", "files")));
+    }
+    if searches > 0 {
+        parts.push(plural(searches, "search", "searches"));
+    }
+    if lists > 0 {
+        parts.push(format!("listed {}", plural(lists, "folder", "folders")));
+    }
+    let mut text = parts.join(", ");
+    if let Some(first) = text.get(..1) {
+        text = first.to_uppercase() + &text[1..];
+    }
+    let (mark, color) = if running.is_some() {
+        ("●", Color::Cyan)
+    } else {
+        ("✓", Color::Green)
+    };
+    let mut spans = vec![
+        Span::styled(format!("{mark} "), Style::default().fg(color)),
+        Span::styled(text, dim()),
+    ];
+    if failed > 0 {
+        spans.push(Span::styled(format!(" ({failed} failed)"), dim()));
+    }
+    if let Some(now) = running {
+        spans.push(Span::styled(format!(" · {now}"), dim()));
+    }
+    markdown::wrap_hanging(&spans, width, 2)
+}
+
 /// The conversation's lines at `width`, oldest first.
 pub fn transcript(app: &App, width: u16) -> Vec<Line<'static>> {
     let body = width.saturating_sub(2);
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut prev: Option<&Entry> = None;
-    for entry in &app.entries {
+    // Reads and searches in a row collapse to one line; Ctrl+E shows each.
+    let mut group_at = std::collections::HashMap::new();
+    let mut folded = std::collections::HashSet::new();
+    if !app.show_tools {
+        for (first, members) in tool_groups(app) {
+            folded.extend(members.iter().skip(1).copied());
+            group_at.insert(first, members);
+        }
+    }
+    for (index, entry) in app.entries.iter().enumerate() {
+        if folded.contains(&index) {
+            continue;
+        }
         // One blank line between items; tools and thoughts in a run stay together.
         let quiet = |e: &Entry| matches!(e, Entry::Tool { .. } | Entry::Thought(_));
         let together = prev.is_some_and(|p| quiet(p) && quiet(entry));
@@ -145,6 +253,9 @@ pub fn transcript(app: &App, width: u16) -> Vec<Line<'static>> {
                         ));
                     }
                 }
+            }
+            Entry::Tool { .. } if group_at.contains_key(&index) => {
+                lines.extend(group_line(app, &group_at[&index], width));
             }
             Entry::Tool {
                 title, ok, detail, ..
@@ -752,6 +863,7 @@ fn modal(f: &mut Frame, app: &App, area: Rect) {
                 ("Ctrl+O", "open an earlier thread here"),
                 ("Ctrl+P", "models, decisions, checks"),
                 ("Ctrl+T", "show or hide thinking"),
+                ("Ctrl+E", "show each read and search, or group them"),
                 ("Ctrl+B", "show or hide the plan panel"),
                 ("/attach <file>", "attach a PDF or image (or drop it in)"),
                 ("/why, /map", "your record, the plan"),

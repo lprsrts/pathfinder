@@ -100,6 +100,8 @@ pub struct App {
     /// Lines scrolled up from the bottom; 0 follows new output.
     pub scroll: usize,
     pub show_thoughts: bool,
+    /// Every tool line, instead of runs of reads and searches as one line.
+    pub show_tools: bool,
     pub show_side: bool,
     pub modal: Option<Modal>,
     pub status: String,
@@ -135,6 +137,7 @@ pub async fn run(rt: Arc<Runtime>, cwd: PathBuf) -> Result<()> {
         running: None,
         scroll: 0,
         show_thoughts: false,
+        show_tools: false,
         show_side: true,
         modal: None,
         status: String::new(),
@@ -373,6 +376,7 @@ impl App {
             KeyCode::Char('o') if ctrl => self.open_threads(),
             KeyCode::Char('p') if ctrl => self.modal = Some(Modal::Settings { sel: 0 }),
             KeyCode::Char('t') if ctrl => self.show_thoughts = !self.show_thoughts,
+            KeyCode::Char('e') if ctrl => self.show_tools = !self.show_tools,
             KeyCode::Char('b') if ctrl => {
                 let wide = crossterm::terminal::size().is_ok_and(|(w, _)| w >= view::DOCK_FROM);
                 if wide {
