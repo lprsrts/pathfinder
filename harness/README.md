@@ -1,6 +1,6 @@
 # harness
 
-Human-in-the-loop pathfinder over ACP (built for Zed, backed by `pi` + SQLite).
+Pathfinder makes sure you understand the work you do with AI: it answers, checks you, and keeps an honest record of what you understood. It runs in Zed over ACP, on your ChatGPT plan, API keys, Claude Code, Codex or your own model server.
 
 **New here? Read [START_HERE.md](START_HERE.md) first.**
 
