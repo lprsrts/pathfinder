@@ -597,7 +597,7 @@ impl Runtime {
         if let Some(pending) = &session.pending_candidate {
             history = history.replace(&pending.candidate, CANDIDATE_HIDDEN);
             waiting.push_str(
-                "\n\nA candidate for this part is waiting for the user's verdict; it's hidden from you, so you don't know whether it's right. Never say it is right or wrong, or that any detail of it is. Answer questions about the general concepts only. If they ask about the candidate itself (a claim, step or number in it, or whether it's right), say that's what they're judging. Don't mention that it's hidden from you.",
+                "\n\nA candidate for this part is waiting for the user's verdict; it's hidden from you, so you don't know whether it's right. Never say it is right or wrong, or that any detail of it is. Answer questions about the general concepts only. If they ask about the candidate itself (a claim, step or number in it, or whether it's right), say that's what they're judging. Don't mention that it's hidden from you. A message that asks about the candidate is `log`, even if they add that they want to move on; `move` or `known` only when they ask to leave it unjudged and ask nothing about it.",
             );
         }
 
@@ -770,6 +770,11 @@ impl Runtime {
             ));
         }
         if session.pending_candidate.is_some() {
+            for (step, text) in steps.iter_mut() {
+                if step == "move" || step == "known" {
+                    text.push_str(" Only when they ask to leave the waiting candidate unjudged and ask nothing about it; a message that asks about the candidate is `log` or a verdict, even if they add that they want to move on.");
+                }
+            }
             steps.push((VERDICT.into(), "They give their verdict on the waiting candidate: whether it's right, ideally why (\"I don't know\" counts).".into()));
         }
         let mut questions = vec![Question {
@@ -848,12 +853,14 @@ impl Runtime {
         if step.probability < DECISION_THRESHOLD {
             return None;
         }
-        // While a candidate waits, only a confident "log" skips the judge; the
-        // judge sends anything that isn't a verdict back to chat anyway.
+        tracing::debug!(step = %step.choice, p = step.probability, text, "decided step");
+        // While a candidate waits, only a confident "log", move or skip
+        // passes the judge: a move or skip drops the candidate, and the judge
+        // sends anything that isn't a verdict back to chat anyway.
         let mut choice = step.choice.clone();
         if session.pending_candidate.is_some()
-            && choice == "log"
-            && step.probability < CONFIDENT_LOG
+            && matches!(choice.as_str(), "log" | "move" | "known")
+            && step.probability < CONFIDENT_STEP
         {
             choice = VERDICT.to_string();
         }
@@ -1453,8 +1460,9 @@ impl Runtime {
 /// The decision model's step for a verdict on a waiting candidate.
 const VERDICT: &str = "verdict";
 
-/// While a candidate waits, a "log" needs this much to skip the judge.
-const CONFIDENT_LOG: f64 = 0.9;
+/// While a candidate waits, a log, move or skip needs this much to skip
+/// the judge.
+const CONFIDENT_STEP: f64 = 0.9;
 
 /// Below this, the decision model's step is ignored and the LLM decides.
 const DECISION_THRESHOLD: f64 = 0.6;
@@ -2586,6 +2594,54 @@ mod tests {
         turn(&rt, "go back to routing").await;
         let s = rt.load_session("s").unwrap().unwrap();
         assert_eq!(s.active.as_deref(), Some("route"));
+    }
+
+    #[tokio::test]
+    async fn only_a_clear_move_drops_a_waiting_candidate() {
+        let (rt, _) = runtime(
+            FakeEngine::new(vec![
+                (ReadOnly, S1, ONBOARD_READY),
+                (ReadOnly, S2, MAP),
+                (
+                    ReadOnly,
+                    S1,
+                    r#"{"intent":"log","reply":"Ok.","map_change":null}"#,
+                ),
+                (ReadOnly, S2, r#"{"candidate":"z = 99","key_reason":"r"}"#),
+                // An unsure move goes to the judge, which hands it back to chat.
+                (
+                    ReadOnly,
+                    S2,
+                    r#"{"is_judgment":false,"pass":false,"feedback":""}"#,
+                ),
+                (
+                    ReadOnly,
+                    S1,
+                    r#"{"intent":"log","reply":"That's what you're judging.","map_change":null}"#,
+                ),
+            ]),
+            false,
+        );
+        let rt = with_decisions(
+            rt,
+            vec![("log", 0.9, None), ("move", 0.8, None), ("move", 0.95, None)],
+        );
+        turn(&rt, "goal").await;
+        turn(&rt, "thinking").await;
+        turn(&rt, "/summary names map to handlers").await;
+        turn(&rt, "is it right? I just want to move on").await;
+        let s = rt.load_session("s").unwrap().unwrap();
+        assert!(s.pending_candidate.is_some(), "the candidate keeps waiting");
+        assert_eq!(s.active.as_deref(), Some("route"));
+        assert_eq!(
+            s.history.last().unwrap().content,
+            "That's what you're judging."
+        );
+
+        turn(&rt, "skip it, next part").await;
+        let s = rt.load_session("s").unwrap().unwrap();
+        assert!(s.pending_candidate.is_none());
+        assert_eq!(s.active.as_deref(), Some("report"));
     }
 
     #[tokio::test]
