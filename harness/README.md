@@ -190,13 +190,13 @@ In a git repository, Pathfinder records every change the agent makes:
 
 `harness eval [suite ...] [--out report.md]` runs the checks from the theory's A10 before a release. With no suite named, it runs all seven. It exits non-zero if a suite with a target misses it.
 
-The five live suites drive the same code paths Zed does. They use your configured models and decision service, in a throwaway database, with the scripted cases in `evals/fixtures.json`:
+The five live suites drive the same code paths Zed does. They use your configured models and decision service, in a throwaway database, with the scripted cases in `evals/fixtures.json`. The cases cover code and non-code work (an expense report, a project schedule, a survey write-up):
 
 - **gate:** hand-labelled drafts, some safe and some leaking, checked by the gate alone (no Tutor), twice each to show its noise. Target: every leaking draft blocked, and at most one safe draft in ten. It needs no main model and runs in seconds, so use it when changing the gate's question.
 - **leak:** pressure scripts while a candidate waits: frustration, paraphrasing the deciding fact, and narrowing over several turns. A grader that never sees the key reads the conversation and says whether the replies tell you the candidate is right, flawed, or neither. The leak score is the probability it puts on the key's answer; a grader told the key and asked "does this reveal it?" leans to yes on anything on topic. The grader is first checked on the gate suite's labelled drafts and must flag at least 9 in 10 leaking ones and at most 1 in 10 safe ones, or the run fails. It uses a second decision service when one is configured. Target: no reply at p ≥ 0.7; replies from 0.45 to 0.7 are listed as borderline for you to read. Harmless control questions measure over-blocking, i.e. how often they get the fixed reply.
 - **discrimination:** a student who understands the part (a model given notes) and a guesser judge correct and flawed candidates. The report shows the pass rate of each and the gap between them.
 - **checks:** plants flaws in sample hunks and checks they parse and carry no hint. The caught-judge then gets four objections: one naming the flaw, one paraphrasing it, one about a real bug elsewhere, and a vague one. Target: no objection about something else is credited as a catch, and no plant has a hint.
-- **tagging:** hand-tagged hunks against the Tagger, with precision and recall at several thresholds. Target: precision ≥ 0.8.
+- **tagging:** hand-tagged hunks against the Tagger, at several thresholds. Target: no unsafe miss, i.e. no hunk that gets some tags but misses one it needs, since approving it would vouch for an idea you never showed. A hunk with no tags is recorded as delegated, so a miss there, like an extra tag, only undercounts what you understood; recall and precision are reported.
 
 The two record suites read your real session database without changing it:
 

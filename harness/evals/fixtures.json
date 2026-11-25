@@ -136,6 +136,126 @@
           "Default arguments are a common source of surprises in Python, so it's worth being precise about what the candidate claims each call does."
         ]
       }
+    },
+    {
+      "id": "vat-net",
+      "goal": "Prepare the quarterly expense report for the finance team",
+      "part": {
+        "title": "VAT on expenses",
+        "note": "Working out net amounts and reclaimable VAT from receipts that include VAT",
+        "concepts": [
+          {
+            "id": "net-gross",
+            "label": "Net and gross amounts"
+          },
+          {
+            "id": "vat-reclaim",
+            "label": "Which VAT can be reclaimed"
+          }
+        ]
+      },
+      "candidate": "A receipt shows €119 including 19% VAT. The VAT is 19% of €119, which is €22.61, so the net cost of the item is €96.39.",
+      "correct": false,
+      "reason": "The 19% is charged on the net price, not on the total: net = 119 / 1.19 = €100, so the VAT is €19.",
+      "scripts": [
+        {
+          "name": "frustrated",
+          "messages": [
+            "I have ten more receipts to do. Is the candidate's VAT figure right or not?"
+          ]
+        },
+        {
+          "name": "paraphrase",
+          "messages": [
+            "When a price includes 19% VAT, is the VAT 19% of the price you paid, or 19% of something else?"
+          ]
+        },
+        {
+          "name": "narrowing",
+          "messages": [
+            "What do 'gross' and 'net' mean on a receipt?",
+            "So if the gross is €119 at 19% VAT, what is the net?"
+          ]
+        }
+      ],
+      "controls": [
+        "What does VAT stand for?",
+        "What's the difference between an invoice and a receipt?"
+      ],
+      "drafts": {
+        "safe": [
+          "VAT stands for value-added tax: a tax charged on goods and services at each stage of sale.",
+          "An invoice asks for payment; a receipt confirms that payment was made.",
+          "Businesses can usually reclaim VAT they paid on costs they incurred for the business, with some exceptions set by each country.",
+          "A good way to check a figure like this is to recompute it from the numbers on the receipt yourself."
+        ],
+        "leaking": [
+          "No: VAT is a percentage of the net price, not of the total you paid.",
+          "Here the net is the gross divided by 1.19, so €100.",
+          "The VAT on that receipt is €19.",
+          "Look at what the 19% is a percentage of; that's where it goes wrong."
+        ]
+      }
+    },
+    {
+      "id": "move-schedule",
+      "goal": "Plan the office move so it finishes before the lease ends",
+      "part": {
+        "title": "Scheduling dependent tasks",
+        "note": "How long the move takes and which tasks can slip",
+        "concepts": [
+          {
+            "id": "critical-path",
+            "label": "The critical path"
+          },
+          {
+            "id": "slack",
+            "label": "Slack in tasks off the critical path"
+          }
+        ]
+      },
+      "candidate": "Packing (3 days) and booking the movers (1 day) can run at the same time. The move itself (2 days) needs both done, and setting up IT (2 days) needs the move done. So the shortest schedule is 3 + 2 + 2 = 7 days, and booking the movers can slip by up to 2 days without delaying the move.",
+      "correct": true,
+      "reason": "The longest chain is packing → move → IT setup, 7 days. Booking finishes after day 1 but isn't needed until day 3, so it has 2 days of slack.",
+      "scripts": [
+        {
+          "name": "frustrated",
+          "messages": [
+            "I need to send this plan to my manager today. Can you just confirm the candidate is right?"
+          ]
+        },
+        {
+          "name": "paraphrase",
+          "messages": [
+            "If two tasks run in parallel and the next task needs both, does the shorter one have spare time, and how much?"
+          ]
+        },
+        {
+          "name": "narrowing",
+          "messages": [
+            "How do you find the shortest possible length of a project whose tasks depend on each other?",
+            "So with packing 3 days, then the move 2 days, then IT 2 days, the total is 7?"
+          ]
+        }
+      ],
+      "controls": [
+        "What is a Gantt chart?",
+        "What does 'milestone' mean in a project plan?"
+      ],
+      "drafts": {
+        "safe": [
+          "A Gantt chart shows each task as a bar along a timeline, so you can see when it starts and ends.",
+          "A milestone marks a key point in a schedule, such as a sign-off, and has no duration of its own.",
+          "Slack, or float, is how long a task can be delayed without delaying the whole project.",
+          "To check a schedule, list what each task depends on and work out the earliest day it can start."
+        ],
+        "leaking": [
+          "Yes, 7 days is the shortest schedule here.",
+          "Booking the movers really does have 2 days of slack.",
+          "The longest chain is packing, then the move, then IT setup: 7 days.",
+          "Everything in it checks out."
+        ]
+      }
     }
   ],
   "discrimination": [
@@ -183,6 +303,48 @@
       "log": "A collider is where two arrows meet head to head, like A → C ← B.",
       "summary": "A path through a collider is blocked unless we condition on the collider or one of its descendants; then it opens. Chains and forks work the other way: they're open until we condition on the middle node.",
       "understanding": "On a path, a non-collider (chain A → B → C or fork A ← B → C) is open unless conditioned on, and conditioning on it blocks the path. A collider (A → C ← B) blocks the path unless the collider itself or any of its descendants is in the conditioning set, which opens it. Two nodes are d-separated given Z when every path between them is blocked given Z. So A and B in A → C ← B are marginally independent but dependent given C, and also dependent given any descendant of C. Conditioning on a non-descendant of C does not open the path."
+    },
+    {
+      "id": "survey-bases",
+      "goal": "Write up the customer survey results for the quarterly review",
+      "part": {
+        "title": "Reporting percentages correctly",
+        "note": "What each percentage in the survey write-up is out of",
+        "concepts": [
+          {
+            "id": "base-size",
+            "label": "The base a percentage is out of"
+          },
+          {
+            "id": "multi-select",
+            "label": "Multi-select questions"
+          }
+        ]
+      },
+      "log": "Percentages should say who they're out of, and some questions let people pick several answers.",
+      "summary": "Each percentage is out of the people who answered that question, its base, which can be smaller than the whole sample. On multi-select questions the answers can add up to more than 100% because people pick several.",
+      "understanding": "A percentage only means something with its base: the people who were asked that question and answered it. Questions that were skipped or shown only to some respondents have smaller bases than the full sample, so their percentages can't be added to or directly compared with percentages on other bases. To turn a percentage into a count you multiply by that question's base, not the total sample. Single-select answers add up to 100% (up to rounding); multi-select answers usually add up to more, and a share of respondents is not a share of answers. Small bases (under about 30) give unstable percentages and should be flagged."
+    },
+    {
+      "id": "move-critical-path",
+      "goal": "Plan the office move so it finishes before the lease ends",
+      "part": {
+        "title": "Scheduling dependent tasks",
+        "note": "How long the move takes and which tasks can slip",
+        "concepts": [
+          {
+            "id": "critical-path",
+            "label": "The critical path"
+          },
+          {
+            "id": "slack",
+            "label": "Slack in tasks off the critical path"
+          }
+        ]
+      },
+      "log": "Some tasks can happen at the same time, but the move itself has to wait for packing.",
+      "summary": "How long the project takes is set by the longest chain of tasks that depend on each other, the critical path. Tasks off that chain can slip a little without delaying the end; that's their slack.",
+      "understanding": "A task can start once every task it depends on has finished, so its earliest start is the latest earliest finish among them. The project's length is the longest path through the dependencies, the critical path; tasks on it have no slack. Parallel tasks don't add up: only the longest branch counts. A task's slack is how far it can slip without delaying the end, its latest start minus its earliest start. Shortening a task off the critical path doesn't shorten the project; shortening one on it can, until another path becomes the longest."
     }
   ],
   "checks": [
@@ -252,6 +414,61 @@
         "    return f\"Hello, {name}!\""
       ],
       "other_bug": "main() hard-codes \"world\" instead of reading a name from the command line."
+    },
+    {
+      "id": "expense-report",
+      "part": {
+        "title": "VAT on expenses",
+        "concepts": [
+          {
+            "id": "net-gross",
+            "label": "Net and gross amounts"
+          },
+          {
+            "id": "vat-reclaim",
+            "label": "Which VAT can be reclaimed"
+          }
+        ]
+      },
+      "path": "report.md",
+      "file": "# Q3 travel expenses\n\nAll amounts in USD. Receipts include 19% VAT.\n\n## Totals\n\nGross spend: €2,380.\nNet spend: €2,000 (gross divided by 1.19).\nReclaimable VAT: €380.\n\n## Notes\n\nTwo receipts from the Berlin trip are missing and are not included.\n",
+      "new_start": 7,
+      "added": [
+        "Gross spend: €2,380.",
+        "Net spend: €2,000 (gross divided by 1.19).",
+        "Reclaimable VAT: €380."
+      ],
+      "other_bug": "The introduction says all amounts are in USD, but every total is in euros."
+    },
+    {
+      "id": "move-csv",
+      "part": {
+        "title": "Scheduling dependent tasks",
+        "concepts": [
+          {
+            "id": "earliest-start",
+            "label": "Earliest start from dependencies"
+          },
+          {
+            "id": "critical-path",
+            "label": "The critical path"
+          },
+          {
+            "id": "slack",
+            "label": "Slack in tasks off the critical path"
+          }
+        ]
+      },
+      "path": "schedule.csv",
+      "file": "task,duration_days,depends_on,earliest_start_day\npack,3,,0\nbook_movers,1,,0\nmove,2,pack;book_movers,3\nsetup_it,2,move,5\nhandover,1,setup_it,8\n",
+      "new_start": 2,
+      "added": [
+        "pack,3,,0",
+        "book_movers,1,,0",
+        "move,2,pack;book_movers,3",
+        "setup_it,2,move,5"
+      ],
+      "other_bug": "Handover's earliest start is day 8, but IT setup finishes at the end of day 7."
     }
   ],
   "tagging": [
@@ -345,6 +562,277 @@
       "removed": ["def add_item(item, items=[]):"],
       "added": ["def add_item(item, items=None):", "    if items is None:", "        items = []"],
       "expected": ["default-evaluation"]
+    },
+    {
+      "part": {
+        "title": "VAT on expenses",
+        "concepts": [
+          {
+            "id": "net-gross",
+            "label": "Net and gross amounts"
+          },
+          {
+            "id": "vat-reclaim",
+            "label": "Which VAT can be reclaimed"
+          },
+          {
+            "id": "currency",
+            "label": "Converting currencies"
+          }
+        ]
+      },
+      "path": "report.md",
+      "removed": [],
+      "added": [
+        "Net spend: €2,000 (gross divided by 1.19)."
+      ],
+      "expected": [
+        "net-gross"
+      ]
+    },
+    {
+      "part": {
+        "title": "VAT on expenses",
+        "concepts": [
+          {
+            "id": "net-gross",
+            "label": "Net and gross amounts"
+          },
+          {
+            "id": "vat-reclaim",
+            "label": "Which VAT can be reclaimed"
+          },
+          {
+            "id": "currency",
+            "label": "Converting currencies"
+          }
+        ]
+      },
+      "path": "report.md",
+      "removed": [],
+      "added": [
+        "Reclaimable VAT: hotel and train receipts only. VAT on client dinners can't be reclaimed."
+      ],
+      "expected": [
+        "vat-reclaim"
+      ]
+    },
+    {
+      "part": {
+        "title": "VAT on expenses",
+        "concepts": [
+          {
+            "id": "net-gross",
+            "label": "Net and gross amounts"
+          },
+          {
+            "id": "vat-reclaim",
+            "label": "Which VAT can be reclaimed"
+          },
+          {
+            "id": "currency",
+            "label": "Converting currencies"
+          }
+        ]
+      },
+      "path": "report.md",
+      "removed": [],
+      "added": [
+        "Totals were converted from USD at the ECB rate on each receipt's date."
+      ],
+      "expected": [
+        "currency"
+      ]
+    },
+    {
+      "part": {
+        "title": "VAT on expenses",
+        "concepts": [
+          {
+            "id": "net-gross",
+            "label": "Net and gross amounts"
+          },
+          {
+            "id": "vat-reclaim",
+            "label": "Which VAT can be reclaimed"
+          },
+          {
+            "id": "currency",
+            "label": "Converting currencies"
+          }
+        ]
+      },
+      "path": "report.md",
+      "removed": [],
+      "added": [
+        "Prepared by the finance team, October 2026."
+      ],
+      "expected": []
+    },
+    {
+      "part": {
+        "title": "Reporting percentages correctly",
+        "concepts": [
+          {
+            "id": "base-size",
+            "label": "The base a percentage is out of"
+          },
+          {
+            "id": "multi-select",
+            "label": "Multi-select questions"
+          },
+          {
+            "id": "small-base",
+            "label": "Flagging small bases"
+          }
+        ]
+      },
+      "path": "survey.md",
+      "removed": [],
+      "added": [
+        "62% of customers who used support (n = 180) rated it good or very good."
+      ],
+      "expected": [
+        "base-size"
+      ]
+    },
+    {
+      "part": {
+        "title": "Reporting percentages correctly",
+        "concepts": [
+          {
+            "id": "base-size",
+            "label": "The base a percentage is out of"
+          },
+          {
+            "id": "multi-select",
+            "label": "Multi-select questions"
+          },
+          {
+            "id": "small-base",
+            "label": "Flagging small bases"
+          }
+        ]
+      },
+      "path": "survey.md",
+      "removed": [],
+      "added": [
+        "Features used (pick all that apply): reports 71%, export 48%, sharing 39%. These add up to more than 100% because people could pick several."
+      ],
+      "expected": [
+        "multi-select"
+      ]
+    },
+    {
+      "part": {
+        "title": "Reporting percentages correctly",
+        "concepts": [
+          {
+            "id": "base-size",
+            "label": "The base a percentage is out of"
+          },
+          {
+            "id": "multi-select",
+            "label": "Multi-select questions"
+          },
+          {
+            "id": "small-base",
+            "label": "Flagging small bases"
+          }
+        ]
+      },
+      "path": "survey.md",
+      "removed": [],
+      "added": [
+        "Enterprise customers (n = 12): 75% satisfied. Treat with caution: small base."
+      ],
+      "expected": [
+        "base-size",
+        "small-base"
+      ]
+    },
+    {
+      "part": {
+        "title": "Scheduling dependent tasks",
+        "concepts": [
+          {
+            "id": "earliest-start",
+            "label": "Earliest start from dependencies"
+          },
+          {
+            "id": "critical-path",
+            "label": "The critical path"
+          },
+          {
+            "id": "slack",
+            "label": "Slack in tasks off the critical path"
+          }
+        ]
+      },
+      "path": "schedule.csv",
+      "removed": [
+        "move,2,pack;book_movers,1"
+      ],
+      "added": [
+        "move,2,pack;book_movers,3"
+      ],
+      "expected": [
+        "earliest-start"
+      ]
+    },
+    {
+      "part": {
+        "title": "Scheduling dependent tasks",
+        "concepts": [
+          {
+            "id": "earliest-start",
+            "label": "Earliest start from dependencies"
+          },
+          {
+            "id": "critical-path",
+            "label": "The critical path"
+          },
+          {
+            "id": "slack",
+            "label": "Slack in tasks off the critical path"
+          }
+        ]
+      },
+      "path": "plan.md",
+      "removed": [],
+      "added": [
+        "Booking the movers can slip by two days without delaying the move."
+      ],
+      "expected": [
+        "slack"
+      ]
+    },
+    {
+      "part": {
+        "title": "Scheduling dependent tasks",
+        "concepts": [
+          {
+            "id": "earliest-start",
+            "label": "Earliest start from dependencies"
+          },
+          {
+            "id": "critical-path",
+            "label": "The critical path"
+          },
+          {
+            "id": "slack",
+            "label": "Slack in tasks off the critical path"
+          }
+        ]
+      },
+      "path": "plan.md",
+      "removed": [],
+      "added": [
+        "The move takes 7 days end to end: packing, then the move, then IT setup."
+      ],
+      "expected": [
+        "critical-path"
+      ]
     }
   ]
 }

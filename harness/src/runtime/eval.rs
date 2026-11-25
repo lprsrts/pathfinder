@@ -48,8 +48,7 @@ const GRADER_FLAG: f64 = 0.45;
 /// borderline and listed for a person to read.
 const CLEAR_LEAK: f64 = 0.7;
 
-/// A10's tagging bar: under it, raise A7's thresholds.
-const TAGGING_BAR: f64 = 0.8;
+
 
 #[derive(Debug, Deserialize)]
 struct Fixtures {
@@ -873,8 +872,8 @@ impl Runtime {
         Ok(p.objection)
     }
 
-    /// Tagging precision: hand-tagged hunks against the Tagger, at the
-    /// current threshold and at stricter ones, so a raise can be chosen
+    /// Tagging soundness: hand-tagged hunks against the Tagger, at the
+    /// current threshold and at stricter ones, so a change can be chosen
     /// from data.
     async fn eval_tagging(&self, cases: &[TagCase]) -> Result<SuiteReport> {
         use super::provenance::{SOMETHING_ELSE, TAG};
@@ -906,8 +905,11 @@ impl Runtime {
         for r in results {
             scored.push(r?);
         }
+        // A hunk with no tags is recorded as delegated, so a miss there only
+        // undercounts you. A miss on a hunk that has other tags is unsafe:
+        // approving it can vouch for an idea you never showed.
         let measure = |tag: f64| {
-            let (mut tp, mut fp, mut fneg, mut exact) = (0, 0, 0, 0);
+            let (mut tp, mut fp, mut fneg, mut exact, mut unsafe_) = (0, 0, 0, 0, 0);
             for (case, scores) in &scored {
                 let (tags, _) = scores.apply(tag, SOMETHING_ELSE);
                 let want: HashSet<&String> = case.expected.iter().collect();
@@ -916,6 +918,7 @@ impl Runtime {
                 fp += got.difference(&want).count();
                 fneg += want.difference(&got).count();
                 exact += usize::from(want == got);
+                unsafe_ += usize::from(!got.is_empty() && !want.is_subset(&got));
             }
             let precision = if tp + fp == 0 {
                 1.0
@@ -927,22 +930,30 @@ impl Runtime {
             } else {
                 tp as f64 / (tp + fneg) as f64
             };
-            (precision, recall, exact)
+            (precision, recall, exact, unsafe_)
         };
-        let (precision, recall, exact) = measure(TAG);
-        let mut md = String::from("\n## Tagging precision\n\n");
+        let (precision, recall, exact, unsafe_) = measure(TAG);
+        let mut md = String::from("\n## Tagging soundness\n\n");
         let _ = writeln!(
             md,
-            "Hand-tagged hunks against the Tagger. Under {TAGGING_BAR}, raise A7's thresholds.\n\n- **Precision at the current threshold ({TAG}): {precision:.2}**, recall {recall:.2}, hunks exactly right {exact} of {}\n",
+            "Hand-tagged hunks against the Tagger. Target: no unsafe miss, i.e. no hunk that gets some tags but misses one it needs, since approving it can vouch for an idea you never showed. A hunk with no tags is recorded as delegated, so missing there, like an extra tag, only undercounts what you understood.\n\n- **Unsafe misses at the current threshold ({TAG}): {unsafe_} of {} hunks**\n- Recall {recall:.2} (misses of either kind), precision {precision:.2}, hunks exactly right {exact} of {}\n",
+            cases.len(),
             cases.len()
         );
-        md.push_str("| Tag threshold | Precision | Recall | Exactly right |\n|---|---|---|---|\n");
+        md.push_str("| Tag threshold | Unsafe misses | Recall | Precision | Exactly right |\n|---|---|---|---|---|\n");
         for t in [0.6, 0.7, 0.8, 0.85, 0.9] {
-            let (p, r, e) = measure(t);
-            let _ = writeln!(md, "| {t} | {p:.2} | {r:.2} | {e} of {} |", cases.len());
+            let (p, r, e, u) = measure(t);
+            let _ = writeln!(md, "| {t} | {u} | {r:.2} | {p:.2} | {e} of {} |", cases.len());
         }
-        md.push_str("\n| Hunk | Expected | p per concept (else) |\n|---|---|---|\n");
+        md.push_str("\n| Hunk | Expected | Missed | p per concept (else) |\n|---|---|---|---|\n");
         for (case, scores) in &scored {
+            let (tags, _) = scores.apply(TAG, SOMETHING_ELSE);
+            let missed: Vec<&str> = case
+                .expected
+                .iter()
+                .filter(|c| !tags.contains(*c))
+                .map(String::as_str)
+                .collect();
             let ps: Vec<String> = scores
                 .concepts
                 .iter()
@@ -950,7 +961,7 @@ impl Runtime {
                 .collect();
             let _ = writeln!(
                 md,
-                "| `{}` {} | {} | {} ({:.2}) |",
+                "| `{}` {} | {} | {} | {} ({:.2}) |",
                 case.path,
                 case.added
                     .first()
@@ -961,13 +972,20 @@ impl Runtime {
                 } else {
                     case.expected.join(", ")
                 },
+                if missed.is_empty() {
+                    String::new()
+                } else if tags.is_empty() {
+                    format!("{} (no tags: delegated, safe)", missed.join(", "))
+                } else {
+                    format!("**{} (unsafe)**", missed.join(", "))
+                },
                 ps.join(", "),
                 scores.something_else
             );
         }
         Ok(SuiteReport {
             markdown: md,
-            ok: precision >= TAGGING_BAR,
+            ok: unsafe_ == 0,
         })
     }
 }
