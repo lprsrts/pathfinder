@@ -52,7 +52,13 @@ fi
 rm -rf "$dist"
 mkdir -p "$out/$version"
 
-# One universal binary for Apple silicon and Intel.
+# One universal binary for Apple silicon and Intel. Use rustup's toolchain
+# (a Homebrew Rust earlier on PATH has no cross targets).
+if command -v rustup >/dev/null; then
+    toolchain_bin="$(dirname "$(rustup which rustc)")"
+    export PATH="$toolchain_bin:$PATH"
+    rustup target add aarch64-apple-darwin x86_64-apple-darwin >/dev/null
+fi
 for target in aarch64-apple-darwin x86_64-apple-darwin; do
     (cd "$root/harness" && cargo build --release --locked --target "$target")
 done
