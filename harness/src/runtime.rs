@@ -326,8 +326,14 @@ impl Runtime {
             "/why" => Ok(TurnOutput::text(self.why(session))),
             "/coverage" => Ok(TurnOutput::text(self.coverage_report(session))),
             "/reject" => Ok(match session.pending_change.take() {
-                Some(_) => TurnOutput::text("Map change rejected."),
-                None => TurnOutput::text("No map change is waiting."),
+                Some(_) => TurnOutput::text(i18n::line(
+                    session.language.as_deref(),
+                    i18n::Line::ChangeRejected,
+                )),
+                None => TurnOutput::text(i18n::line(
+                    session.language.as_deref(),
+                    i18n::Line::NoChangeWaiting,
+                )),
             }),
             "/replan" => self.handle_replan(session, arg, files, sink).await,
             "/next" => Ok(self.handle_next(session)),
@@ -572,7 +578,10 @@ impl Runtime {
 
     async fn handle_accept(&self, session: &mut Session) -> Result<TurnOutput> {
         let Some(change) = session.pending_change.take() else {
-            return Ok(TurnOutput::text("No map change is waiting."));
+            return Ok(TurnOutput::text(i18n::line(
+                session.language.as_deref(),
+                i18n::Line::NoChangeWaiting,
+            )));
         };
         match session.map.with_change(&change) {
             Ok(map) => {
@@ -596,7 +605,10 @@ impl Runtime {
                 } else if session.mode == SessionMode::Done && !session.map.all_resolved() {
                     session.advance();
                 }
-                Ok(TurnOutput::changed("Map updated."))
+                Ok(TurnOutput::changed(i18n::line(
+                    session.language.as_deref(),
+                    i18n::Line::MapUpdated,
+                )))
             }
             Err(e) => Ok(TurnOutput::text(format!(
                 "That change no longer fits the map ({e}). Dropped it."
@@ -615,9 +627,15 @@ impl Runtime {
             }
             None if session.map.all_resolved() => {
                 session.advance();
-                TurnOutput::changed("Every part is resolved.")
+                TurnOutput::changed(i18n::line(
+                    session.language.as_deref(),
+                    i18n::Line::AllResolved,
+                ))
             }
-            None => TurnOutput::text("No other unresolved part."),
+            None => TurnOutput::text(i18n::line(
+                session.language.as_deref(),
+                i18n::Line::NoOtherPart,
+            )),
         }
     }
 
@@ -987,8 +1005,14 @@ impl Runtime {
             }),
             Intent::Accept => self.handle_accept(session).await,
             Intent::Reject => Ok(match session.pending_change.take() {
-                Some(_) => TurnOutput::text("Map change rejected."),
-                None => TurnOutput::text("No map change is waiting."),
+                Some(_) => TurnOutput::text(i18n::line(
+                    session.language.as_deref(),
+                    i18n::Line::ChangeRejected,
+                )),
+                None => TurnOutput::text(i18n::line(
+                    session.language.as_deref(),
+                    i18n::Line::NoChangeWaiting,
+                )),
             }),
             Intent::Replan => self.handle_replan(session, text, files, sink).await,
             Intent::Log => unreachable!("log entries are answered in handle_log"),
@@ -1288,7 +1312,8 @@ impl Runtime {
         session.pending_candidate = None;
         self.set_status(session, &part.id, PartStatus::Known, "claimed by the user")?;
         self.record_skip(session, &part.id, EventKind::Claim);
-        let lead = format!("**{}** recorded as already known.", part.title);
+        let lead = i18n::line(session.language.as_deref(), i18n::Line::RecordedKnown)
+            .replace("{title}", &part.title);
         let target = then
             .filter(|q| !q.is_empty() && *q != "next")
             .and_then(|q| session.map.resolve(q).ok())
@@ -1343,8 +1368,9 @@ impl Runtime {
         Ok(self.after_resolution(
             session,
             format!(
-                "\n\n**{}** handed off without understanding; not reviewed.",
-                part.title
+                "\n\n{}",
+                i18n::line(session.language.as_deref(), i18n::Line::Delegated)
+                    .replace("{title}", &part.title)
             ),
         ))
     }
@@ -1687,8 +1713,8 @@ Return ONLY a JSON object:
 
 const ANSWER_SYSTEM: &str = r#"You are Pathfinder, the user's assistant, answering a question directly. The user is an electrical engineering and information technology student who also works as a research assistant; questions may be about lectures, exercise sheets, research, or anything else.
 
-- Answer what they asked, completely and correctly, like a strong tutor or colleague. For a calculation or derivation, go step by step and keep every step; for a concept, give the idea, then the precise statement, then a short example if it helps.
-- Read attached files (slides, exercise sheets, papers, screenshots) and workspace files when they bear on the question.
+- Answer what they asked, correctly, like a strong tutor or colleague, at the depth they asked for. For a calculation or derivation, go step by step and keep every step. For a concept, give the idea, the precise statement and a short example if it helps. For a broad topic ("how does a transformer work?"), give the core idea and the few relations that matter most, in a screen or two, then name in one line what you could go into next; don't write the whole chapter.
+- Read attached files (slides, exercise sheets, papers, screenshots) and workspace files when they bear on the question. If the question is about a figure, diagram, slide or page, open it and look at it before answering; never say you can't see a file that is attached or in the workspace.
 - Write math as plain text or Unicode (Z = R + jωL, F(s) = ∫₀^∞ f(t)·e^(−st) dt, ∇·E = ρ/ε₀), never LaTeX: the chat can't render it.
 - Reply in the language the user writes in.
 - Don't offer to check their understanding or ask follow-up questions unless the question is ambiguous; Pathfinder adds that itself."#;
@@ -1745,7 +1771,7 @@ For `log`, also record what the message is about, without judging it:
 - In `misconception`, `concept` is likewise a concept id from the lists when one fits.
 - `misconception`: only if the message plainly states a wrong belief (not a question, not a guess they're testing): `{"concept": id or name, "statement": the belief in one sentence}`. Otherwise null. A separate check confirms it; it never changes what you reply.
 
-Call `read` before writing your JSON if a file matters: `reply` ends your turn.
+Call `read` before writing your JSON if a file matters: `reply` ends your turn. If they ask about a figure, diagram, slide or page, open the file and look at that page first (with `view`, or your file tool for PDFs and images); never say you can't see a file that is attached or in the workspace.
 
 Return ONLY a JSON object:
 {"intent": "log", "part": null, "reply": "...", "map_change": null, "concepts": [], "misconception": null}

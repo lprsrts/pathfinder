@@ -2,6 +2,8 @@
 
 Human-in-the-loop pathfinder over ACP (built for Zed, backed by `pi` + SQLite).
 
+**New here? Read [START_HERE.md](START_HERE.md) first.**
+
 ## Build and install
 
 The harness is developed with itself, so Zed runs an installed copy rather than `target/`. Work-in-progress builds never replace the tool you are using; install a build only once it passes:

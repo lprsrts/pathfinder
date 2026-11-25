@@ -45,6 +45,15 @@ pub enum Line {
     Understood,
     /// A failed check.
     KeepWorking,
+    AllResolved,
+    NoOtherPart,
+    MapUpdated,
+    ChangeRejected,
+    NoChangeWaiting,
+    /// A part skipped as known: "{title}".
+    RecordedKnown,
+    /// A part delegated: "{title}".
+    Delegated,
 }
 
 fn german(lang: Option<&str>) -> bool {
@@ -91,6 +100,13 @@ pub fn line(lang: Option<&str>, line: Line) -> &'static str {
             KeepWorking => {
                 "Arbeite es hier weiter durch und erklär den Teil dann noch einmal für einen neuen Kandidaten."
             }
+            AllResolved => "Alle Teile sind erledigt.",
+            NoOtherPart => "Kein weiterer offener Teil.",
+            MapUpdated => "Karte aktualisiert.",
+            ChangeRejected => "Kartenänderung abgelehnt.",
+            NoChangeWaiting => "Es wartet keine Kartenänderung.",
+            RecordedKnown => "**{title}** als schon bekannt vermerkt.",
+            Delegated => "**{title}** ohne Verständnis abgegeben; nicht geprüft.",
         }
     } else {
         match line {
@@ -127,6 +143,13 @@ pub fn line(lang: Option<&str>, line: Line) -> &'static str {
             KeepWorking => {
                 "Keep working through it here, then explain the part again for a new candidate."
             }
+            AllResolved => "Every part is resolved.",
+            NoOtherPart => "No other unresolved part.",
+            MapUpdated => "Map updated.",
+            ChangeRejected => "Map change rejected.",
+            NoChangeWaiting => "No map change is waiting.",
+            RecordedKnown => "**{title}** recorded as already known.",
+            Delegated => "**{title}** handed off without understanding; not reviewed.",
         }
     }
 }
