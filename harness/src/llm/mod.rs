@@ -223,6 +223,9 @@ async fn status_error(resp: Response) -> LlmError {
 
 /// Sends a streaming request and feeds each SSE event to `on_event`
 /// (event name, data). `on_event` returns true to stop reading.
+const FIRST_EVENT_TIMEOUT: Duration = Duration::from_secs(300);
+const IDLE_TIMEOUT: Duration = Duration::from_secs(150);
+
 async fn send_sse(
     builder: RequestBuilder,
     cancel: &CancellationToken,
@@ -238,11 +241,25 @@ async fn send_sse(
     }
     let mut parser = SseParser::default();
     let mut body = resp.bytes_stream();
+    let mut first = true;
     loop {
+        // A stalled stream is retried rather than waited on forever. The
+        // first event can take long while a reasoning model thinks.
+        let wait = if first {
+            FIRST_EVENT_TIMEOUT
+        } else {
+            IDLE_TIMEOUT
+        };
         let chunk = tokio::select! {
             _ = cancel.cancelled() => return Err(LlmError::Cancelled),
-            c = body.next() => c,
+            c = tokio::time::timeout(wait, body.next()) => match c {
+                Ok(c) => c,
+                Err(_) => return Err(LlmError::Network(format!(
+                    "the stream stalled: nothing for {}s", wait.as_secs()
+                ))),
+            },
         };
+        first = false;
         let Some(chunk) = chunk else { break };
         let chunk = chunk.map_err(|e| LlmError::Network(e.to_string()))?;
         for event in parser.push(&chunk) {
@@ -257,6 +274,23 @@ async fn send_sse(
         }
     }
     Ok(())
+}
+
+/// Key of the stand-in arguments for a tool call whose JSON didn't parse
+/// (cut off by the output limit, or malformed): the agent tells the model
+/// instead of failing the run.
+pub const INVALID_ARGS: &str = "__invalid_arguments";
+
+/// A tool call's arguments, or a stand-in naming what was wrong with them.
+pub fn parse_args(raw: &str) -> serde_json::Value {
+    let raw = if raw.trim().is_empty() { "{}" } else { raw };
+    match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(v) if v.is_object() => v,
+        Ok(_) => serde_json::json!({ INVALID_ARGS: "the arguments must be a JSON object" }),
+        Err(e) => {
+            serde_json::json!({ INVALID_ARGS: format!("{e} (received {} characters)", raw.len()) })
+        }
+    }
 }
 
 /// The concatenated text of an assistant message.

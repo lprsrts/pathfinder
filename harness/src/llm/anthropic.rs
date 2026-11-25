@@ -249,13 +249,7 @@ impl StreamState {
                     ),
                     Block::Opaque(v) => Part::Opaque(v),
                     Block::ToolUse { id, name, json } => {
-                        let args = if json.trim().is_empty() {
-                            json!({})
-                        } else {
-                            serde_json::from_str(&json).map_err(|e| {
-                                LlmError::Protocol(format!("bad tool input for {name}: {e}"))
-                            })?
-                        };
+                        let args = crate::llm::parse_args(&json);
                         Part::ToolCall(ToolCall { id, name, args })
                     }
                 })

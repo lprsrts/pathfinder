@@ -276,10 +276,7 @@ impl StreamState {
                 Some("function_call") => {
                     let name = tool_name(&item);
                     let raw = item["arguments"].as_str().unwrap_or("{}");
-                    let args = serde_json::from_str(if raw.trim().is_empty() { "{}" } else { raw })
-                        .map_err(|e| {
-                            LlmError::Protocol(format!("bad arguments for {name}: {e}"))
-                        })?;
+                    let args = crate::llm::parse_args(raw);
                     parts.push(Part::ToolCall(ToolCall {
                         id: item["call_id"].as_str().unwrap_or_default().to_string(),
                         name,

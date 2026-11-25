@@ -14,7 +14,10 @@ use super::confine::confine;
 use crate::llm::ToolSpec;
 
 const MAX_READ_LINES: usize = 2000;
-const MAX_READ_BYTES: usize = 256 * 1024;
+/// Under the agent's 50 KB cap on tool output, so the "continue at" note
+/// at the end of a long read is never cut off.
+const MAX_READ_BYTES: usize = 46 * 1024;
+const MAX_LINE_CHARS: usize = 2000;
 const MAX_LIST: usize = 500;
 const MAX_MATCHES: usize = 200;
 const MAX_GREP_FILE: u64 = 1024 * 1024;
@@ -84,7 +87,7 @@ pub fn read_only_specs() -> Vec<ToolSpec> {
         ToolSpec {
             name: "grep".into(),
             description:
-                "Search file contents with a regular expression. Returns `path:line: text` matches."
+                "Search file contents with a regular expression, PDFs included. Returns `path:line: text` matches, or `file.pdf p.N: text` for a PDF's page N (read it with `pages`)."
                     .into(),
             parameters: json!({
                 "type": "object",
@@ -107,7 +110,7 @@ pub fn full_specs() -> Vec<ToolSpec> {
     specs.extend([
         ToolSpec {
             name: "edit".into(),
-            description: "Replace exact text in a workspace file. `old_string` must appear exactly once unless `replace_all` is true; include enough surrounding lines to make it unique. Read the file first.".into(),
+            description: "Replace text in a workspace file. Read the file first. `old_string` must appear exactly once unless `replace_all` is true; include enough surrounding lines to make it unique. Copy it from the file without the line-number prefix `read` shows. Typographic quotes, dashes and trailing spaces are matched loosely when there is exactly one such match.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -173,6 +176,7 @@ pub fn apply_change(
     path: &str,
     old: Option<&str>,
 ) -> Result<(String, String), String> {
+    let mut note = None;
     let new = match name {
         "write" => args
             .get("content")
@@ -186,30 +190,20 @@ pub fn apply_change(
                 .get("old_string")
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
-                .ok_or("`old_string` is required")?;
+                .ok_or(
+                    "`old_string` is required; to create or replace a whole file, use `write`",
+                )?;
             let to = args.get("new_string").and_then(Value::as_str).unwrap_or("");
             let all = args
                 .get("replace_all")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            match text.matches(from).count() {
-                0 => {
-                    return Err(format!(
-                        "`old_string` was not found in {path}; read the file and copy the text exactly"
-                    ));
-                }
-                n if n > 1 && !all => {
-                    return Err(format!(
-                        "`old_string` appears {n} times in {path}; add surrounding lines to make it unique, or set `replace_all`"
-                    ));
-                }
-                _ => {}
+            if from == to {
+                return Err("`old_string` and `new_string` are the same; nothing to change".into());
             }
-            if all {
-                text.replace(from, to)
-            } else {
-                text.replacen(from, to, 1)
-            }
+            let edited = edit_text(text, from, to, all, path)?;
+            note = edited.1;
+            edited.0
         }
         other => return Err(format!("`{other}` doesn't change files")),
     };
@@ -217,9 +211,191 @@ pub fn apply_change(
     let message = match (old, name) {
         (None, _) => format!("Created {path} ({lines} lines)."),
         (Some(_), "write") => format!("Replaced {path} ({lines} lines)."),
-        _ => format!("Edited {path}."),
+        _ => match note {
+            Some(how) => format!("Edited {path} ({how}; check the result)."),
+            None => format!("Edited {path}."),
+        },
     };
     Ok((message, new))
+}
+
+/// Typographic characters PDFs and word processors put in text, mapped to
+/// what a model types.
+fn plain_char(c: char) -> char {
+    match c {
+        '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' | '\u{2032}' => '\'',
+        '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{201F}' | '\u{2033}' | '\u{00AB}'
+        | '\u{00BB}' => '"',
+        '\u{2010}'..='\u{2015}' | '\u{2212}' => '-',
+        '\u{00A0}' | '\u{2002}'..='\u{200A}' | '\u{202F}' | '\u{205F}' | '\u{3000}' => ' ',
+        c => c,
+    }
+}
+
+fn plain(s: &str) -> String {
+    s.chars().map(plain_char).collect()
+}
+
+/// Byte ranges in `text` where `from` matches: exactly, else with
+/// typographic characters made plain, else line by line ignoring trailing
+/// whitespace. Returns the ranges and how they matched (None: exactly).
+fn find_matches(text: &str, from: &str) -> (Vec<std::ops::Range<usize>>, Option<&'static str>) {
+    let exact: Vec<_> = text
+        .match_indices(from)
+        .map(|(i, m)| i..i + m.len())
+        .collect();
+    if !exact.is_empty() {
+        return (exact, None);
+    }
+    // Same characters one to one, so char positions carry over.
+    let starts: Vec<usize> = text
+        .char_indices()
+        .map(|(i, _)| i)
+        .chain([text.len()])
+        .collect();
+    let flat: Vec<char> = text.chars().map(plain_char).collect();
+    let want: Vec<char> = from.chars().map(plain_char).collect();
+    if !want.is_empty() && want.len() <= flat.len() {
+        let hits: Vec<_> = (0..=flat.len() - want.len())
+            .filter(|&i| flat[i..i + want.len()] == want[..])
+            .map(|i| starts[i]..starts[i + want.len()])
+            .collect();
+        if !hits.is_empty() {
+            return (
+                hits,
+                Some("matched after making quotes, dashes and spaces plain"),
+            );
+        }
+    }
+    // Whole lines, ignoring trailing whitespace.
+    let want: Vec<String> = from
+        .trim_end_matches('\n')
+        .lines()
+        .map(|l| plain(l.trim_end()))
+        .collect();
+    let mut lines = Vec::new();
+    let mut at = 0;
+    for l in text.split_inclusive('\n') {
+        lines.push((at, l));
+        at += l.len();
+    }
+    let mut hits = Vec::new();
+    if !want.is_empty() {
+        for i in 0..lines.len().saturating_sub(want.len() - 1) {
+            let window = &lines[i..i + want.len()];
+            if window
+                .iter()
+                .zip(&want)
+                .all(|((_, l), w)| plain(l.trim_end()) == *w)
+            {
+                let (start, _) = window[0];
+                let (last_at, last) = window[want.len() - 1];
+                // Keep the last line's newline unless `old_string` had one.
+                let end = last_at + last.trim_end_matches(['\n', '\r']).len();
+                let end = if from.ends_with('\n') {
+                    last_at + last.len()
+                } else {
+                    end
+                };
+                hits.push(start..end);
+            }
+        }
+    }
+    (hits, Some("matched ignoring trailing whitespace"))
+}
+
+/// The lines of `text` closest to `from`, numbered like `read`, to show
+/// the model where its edit missed.
+fn closest_lines(text: &str, from: &str) -> Option<String> {
+    let want: Vec<String> = from
+        .lines()
+        .map(|l| plain(l.trim()))
+        .filter(|l| !l.is_empty())
+        .collect();
+    let lines: Vec<&str> = text.lines().collect();
+    if want.is_empty() || lines.is_empty() {
+        return None;
+    }
+    let score = |i: usize| {
+        want.iter()
+            .filter(|w| {
+                lines[i..(i + want.len() + 2).min(lines.len())]
+                    .iter()
+                    .any(|l| plain(l.trim()) == **w)
+            })
+            .count()
+    };
+    let (best, hits) = (0..lines.len())
+        .map(|i| (i, score(i)))
+        .max_by_key(|&(i, s)| (s, usize::MAX - i))?;
+    if hits == 0 {
+        return None;
+    }
+    let first = best.saturating_sub(2);
+    let mut out = String::new();
+    for (n, l) in lines.iter().enumerate().skip(first).take(12) {
+        let _ = writeln!(out, "{:>6}\t{l}", n + 1);
+    }
+    Some(out)
+}
+
+/// Applies one `edit` to `text`: the new text, and a note when the match
+/// was loose. Line endings follow the file.
+fn edit_text(
+    text: &str,
+    from: &str,
+    to: &str,
+    all: bool,
+    path: &str,
+) -> Result<(String, Option<String>), String> {
+    let crlf = text.contains("\r\n");
+    let view = if crlf {
+        text.replace("\r\n", "\n")
+    } else {
+        text.to_string()
+    };
+    let from = from.replace("\r\n", "\n");
+    let to = to.replace("\r\n", "\n");
+    let (hits, how) = find_matches(&view, &from);
+    match hits.len() {
+        0 => {
+            if !to.trim().is_empty() && view.contains(to.as_str()) {
+                return Err(format!(
+                    "`old_string` was not found in {path}, but `new_string` is already there: the edit may already be applied. Read the file to check."
+                ));
+            }
+            let mut msg = format!(
+                "`old_string` was not found in {path}. Read the file and copy the text exactly, without the line-number prefix."
+            );
+            if let Some(near) = closest_lines(&view, &from) {
+                let _ = write!(msg, " The closest lines:\n{near}");
+            }
+            return Err(msg);
+        }
+        n if n > 1 && !all => {
+            return Err(format!(
+                "`old_string` appears {n} times in {path}; add surrounding lines to make it unique, or set `replace_all`"
+            ));
+        }
+        n if n > 1 && how.is_some() => {
+            return Err(format!(
+                "`old_string` only matches loosely, {n} times in {path}; copy it exactly from the file"
+            ));
+        }
+        _ => {}
+    }
+    let mut out = String::with_capacity(view.len() + to.len());
+    let mut at = 0;
+    for r in &hits {
+        out.push_str(&view[at..r.start]);
+        out.push_str(&to);
+        at = r.end;
+    }
+    out.push_str(&view[at..]);
+    if crlf {
+        out = out.replace('\n', "\r\n");
+    }
+    Ok((out, how.map(str::to_string)))
 }
 
 /// Reads a file to change; None when it doesn't exist yet.
@@ -267,7 +443,21 @@ pub fn run(name: &str, args: &Value, env: &ToolEnv<'_>) -> Result<String, String
         "ls" => ls(args, env),
         "glob" => glob(args, env),
         "grep" => grep(args, env),
-        other => Err(format!("unknown tool `{other}`")),
+        "edit" | "write" | "bash" => Err(format!(
+            "`{name}` isn't available in this step, which only reads; answer with what you found"
+        )),
+        other => {
+            let known = [
+                "read", "view", "ls", "glob", "grep", "edit", "write", "bash",
+            ];
+            let near = known
+                .iter()
+                .find(|k| other.to_lowercase().contains(*k) || k.contains(&other.to_lowercase()));
+            Err(match near {
+                Some(k) => format!("unknown tool `{other}`; did you mean `{k}`?"),
+                None => format!("unknown tool `{other}`; the tools are {}", known.join(", ")),
+            })
+        }
     }
 }
 
@@ -297,6 +487,9 @@ pub fn view(
     use base64::Engine as _;
     let path = str_arg(args, "path").ok_or("`path` is required")?;
     let file = confine(env.root, path, false, env.attached)?;
+    if !file.exists() {
+        return Err(not_found(path, env));
+    }
     let encode = |bytes: Vec<u8>| base64::engine::general_purpose::STANDARD.encode(bytes);
     match crate::llm::attachable_type(&file) {
         Some("application/pdf") => {}
@@ -374,12 +567,23 @@ pub fn view(
     ))
 }
 
-/// Pages a PDF read returns when none are asked for.
-const PDF_DEFAULT_PAGES: usize = 20;
-
-/// A PDF's text by page, through `pdftotext` (poppler). Slides and scripts
-/// are long, so the reader asks for pages.
-fn read_pdf(file: &Path, path: &str, pages: Option<&str>) -> Result<String, String> {
+/// A PDF's text, one entry per page, through `pdftotext` (poppler); cached
+/// by path and modification time, since grep and read come back to the
+/// same slides often.
+fn pdf_pages(file: &Path, path: &str) -> Result<std::sync::Arc<Vec<String>>, String> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    type Cache = Mutex<HashMap<PathBuf, (std::time::SystemTime, Arc<Vec<String>>)>>;
+    static CACHE: OnceLock<Cache> = OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    let mtime = fs::metadata(file)
+        .and_then(|m| m.modified())
+        .map_err(|e| format!("cannot read `{path}`: {e}"))?;
+    if let Some((t, pages)) = cache.lock().unwrap().get(file)
+        && *t == mtime
+    {
+        return Ok(pages.clone());
+    }
     let out = std::process::Command::new("pdftotext")
         .args(["-layout", "-enc", "UTF-8"])
         .arg(file)
@@ -397,10 +601,25 @@ fn read_pdf(file: &Path, path: &str, pages: Option<&str>) -> Result<String, Stri
         ));
     }
     let text = String::from_utf8_lossy(&out.stdout);
-    let mut all: Vec<&str> = text.split('\u{c}').collect();
-    if all.last().is_some_and(|p| p.trim().is_empty()) {
-        all.pop();
+    let mut pages: Vec<String> = text.split('\u{c}').map(str::to_string).collect();
+    if pages.last().is_some_and(|p| p.trim().is_empty()) {
+        pages.pop();
     }
+    let pages = Arc::new(pages);
+    cache
+        .lock()
+        .unwrap()
+        .insert(file.to_path_buf(), (mtime, pages.clone()));
+    Ok(pages)
+}
+
+/// Pages a PDF read returns when none are asked for.
+const PDF_DEFAULT_PAGES: usize = 20;
+
+/// A PDF's text by page, through `pdftotext` (poppler). Slides and scripts
+/// are long, so the reader asks for pages.
+fn read_pdf(file: &Path, path: &str, pages: Option<&str>) -> Result<String, String> {
+    let all = pdf_pages(file, path)?;
     let total = all.len();
     let (first, last) = match pages {
         Some(spec) => {
@@ -443,9 +662,54 @@ fn read_pdf(file: &Path, path: &str, pages: Option<&str>) -> Result<String, Stri
     Ok(s)
 }
 
+/// "No such file", with the workspace's files of a similar name.
+fn not_found(path: &str, env: &ToolEnv<'_>) -> String {
+    let want = Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    let stem = want
+        .rsplit_once('.')
+        .map_or(want.as_str(), |(s, _)| s)
+        .to_string();
+    let mut near: Vec<(u8, String)> = Vec::new();
+    for entry in WalkBuilder::new(env.root).build().flatten().take(20_000) {
+        let name = entry.file_name().to_string_lossy().to_lowercase();
+        let rank = if name == want {
+            0
+        } else if stem.len() >= 3 && name.contains(&stem) {
+            1
+        } else if name.len() >= 4
+            && want.contains(name.rsplit_once('.').map_or(name.as_str(), |(s, _)| s))
+        {
+            2
+        } else {
+            continue;
+        };
+        near.push((rank, rel(env.root, entry.path())));
+    }
+    near.sort();
+    near.dedup();
+    let mut msg = format!("`{path}` doesn't exist.");
+    if near.is_empty() {
+        msg.push_str(" Use `glob` or `ls` to find the file.");
+    } else {
+        let names: Vec<String> = near
+            .into_iter()
+            .take(4)
+            .map(|(_, p)| format!("`{p}`"))
+            .collect();
+        let _ = write!(msg, " Did you mean {}?", names.join(", "));
+    }
+    msg
+}
+
 fn read(args: &Value, env: &ToolEnv<'_>) -> Result<String, String> {
     let path = str_arg(args, "path").ok_or("`path` is required")?;
     let file = confine(env.root, path, false, env.attached)?;
+    if !file.exists() {
+        return Err(not_found(path, env));
+    }
     if file.is_dir() {
         return Err(format!("`{path}` is a folder; use `ls` to list it"));
     }
@@ -472,12 +736,25 @@ fn read(args: &Value, env: &ToolEnv<'_>) -> Result<String, String> {
         .unwrap_or(MAX_READ_LINES)
         .min(MAX_READ_LINES);
     let total = text.lines().count();
+    if total > 0 && offset > total {
+        return Err(format!(
+            "offset {offset} is past the end: `{path}` has {total} lines"
+        ));
+    }
     let mut out = String::new();
     for (i, line) in text.lines().enumerate().skip(offset - 1).take(limit) {
+        let line: std::borrow::Cow<str> = if line.chars().count() > MAX_LINE_CHARS {
+            let cut: String = line.chars().take(MAX_LINE_CHARS).collect();
+            format!("{cut} … (line cut at {MAX_LINE_CHARS} characters)").into()
+        } else {
+            line.into()
+        };
         if out.len() + line.len() > MAX_READ_BYTES {
             let _ = writeln!(
                 out,
-                "... (stopped at {MAX_READ_BYTES} bytes; use offset to continue)"
+                "... (stopped to stay under {} KB; continue with offset {})",
+                MAX_READ_BYTES / 1024,
+                i + 1
             );
             return Ok(out);
         }
@@ -581,19 +858,50 @@ fn grep(args: &Value, env: &ToolEnv<'_>) -> Result<String, String> {
     };
     let base = confine(env.root, str_arg(args, "path").unwrap_or("."), false, &[])?;
     let mut hits = Vec::new();
+    let mut skipped = 0;
     'files: for entry in WalkBuilder::new(&base)
         .sort_by_file_name(Ord::cmp)
         .build()
         .flatten()
     {
         let path = entry.path();
-        if !path.is_file() || entry.metadata().map(|m| m.len()).unwrap_or(0) > MAX_GREP_FILE {
+        if !path.is_file() {
+            continue;
+        }
+        let is_pdf = path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("pdf"));
+        if !is_pdf && entry.metadata().map(|m| m.len()).unwrap_or(0) > MAX_GREP_FILE {
+            skipped += 1;
             continue;
         }
         if let Some(m) = &only {
-            if !m.is_match(path.file_name().unwrap_or_default()) && !m.is_match(path) {
+            let relative = path.strip_prefix(&base).unwrap_or(path);
+            if !m.is_match(path.file_name().unwrap_or_default()) && !m.is_match(relative) {
                 continue;
             }
+        }
+        if path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("pdf"))
+        {
+            let shown = rel(env.root, path);
+            let Ok(pages) = pdf_pages(path, &shown) else {
+                continue;
+            };
+            for (n, page) in pages.iter().enumerate() {
+                for line in page.lines().filter(|l| re.is_match(l)) {
+                    let line: String = line.trim().chars().take(300).collect();
+                    hits.push(format!("{shown} p.{}: {line}", n + 1));
+                    if hits.len() >= MAX_MATCHES {
+                        hits.push(format!(
+                            "... (stopped at {MAX_MATCHES} matches; narrow the pattern or `path`)"
+                        ));
+                        break 'files;
+                    }
+                }
+            }
+            continue;
         }
         let Ok(bytes) = fs::read(path) else { continue };
         if bytes.iter().take(8192).any(|b| *b == 0) {
@@ -609,17 +917,23 @@ fn grep(args: &Value, env: &ToolEnv<'_>) -> Result<String, String> {
                     line.trim_end()
                 ));
                 if hits.len() >= MAX_MATCHES {
-                    hits.push(format!("... (stopped at {MAX_MATCHES} matches)"));
+                    hits.push(format!(
+                        "... (stopped at {MAX_MATCHES} matches; narrow the pattern or `path`)"
+                    ));
                     break 'files;
                 }
             }
         }
     }
-    Ok(if hits.is_empty() {
+    let mut out = if hits.is_empty() {
         "No matches.".to_string()
     } else {
         hits.join("\n")
-    })
+    };
+    if skipped > 0 {
+        let _ = write!(out, "\n({skipped} files over 1 MB were not searched)");
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -805,5 +1119,58 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn edits_match_typography_and_crlf_and_explain_misses() {
+        let text = "Sei \u{201E}U\u{201C} die Spannung \u{2013} in V.\r\nZeile zwei  \r\nEnde\r\n";
+        // Plain quotes and dash in old_string still find the typographic ones.
+        let (out, note) = edit_text(
+            text,
+            "Sei \"U\" die Spannung - in V.",
+            "Sei U die Spannung in V.",
+            false,
+            "f",
+        )
+        .unwrap();
+        assert!(out.starts_with("Sei U die Spannung in V.\r\n"), "{out:?}");
+        assert!(note.is_some());
+        // Multi-line old_string with LF and no trailing spaces, on a CRLF file.
+        let (out, _) = edit_text(text, "Zeile zwei\nEnde", "Zwei\nSchluss", false, "f").unwrap();
+        assert!(out.ends_with("Zwei\r\nSchluss\r\n"), "{out:?}");
+        // A miss shows the closest lines; an applied edit is recognised.
+        let err = edit_text(
+            "a\nb\nfn main() {\n}\n",
+            "fn  main() {\nfoo",
+            "x",
+            false,
+            "f",
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("closest lines") || err.contains("not found"),
+            "{err}"
+        );
+        let err = edit_text("let x = 2;\n", "let x = 1;", "let x = 2;", false, "f").unwrap_err();
+        assert!(err.contains("already"), "{err}");
+    }
+
+    #[test]
+    fn missing_files_suggest_near_names_and_reads_stop_with_an_offset() {
+        let ws = workspace();
+        let env = ToolEnv {
+            root: &ws,
+            attached: &[],
+        };
+        let err = read(&json!({"path": "main.rs"}), &env).unwrap_err();
+        assert!(err.contains("src/main.rs"), "{err}");
+        let err = read(&json!({"path": "Cargo.toml", "offset": 99}), &env).unwrap_err();
+        assert!(err.contains("past the end"), "{err}");
+        let err = run("edit", &json!({}), &env).unwrap_err();
+        assert!(err.contains("only reads"), "{err}");
+        // A relative glob filter on grep matches paths under the search root.
+        let out = grep(&json!({"pattern": "println", "glob": "src/**/*.rs"}), &env).unwrap();
+        assert!(out.contains("src/main.rs:2"), "{out}");
+        fs::remove_dir_all(ws).unwrap();
     }
 }

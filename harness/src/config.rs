@@ -38,6 +38,19 @@ impl Route {
         }
     }
 
+    /// Order for picking a default: the own harness first (plan usage, then
+    /// your own servers, then API keys), the external CLIs last.
+    pub fn preference(self) -> u8 {
+        match self {
+            Self::Chatgpt => 0,
+            Self::Endpoint => 1,
+            Self::Anthropic => 2,
+            Self::Openai => 3,
+            Self::Claude => 4,
+            Self::Codex => 5,
+        }
+    }
+
     pub fn is_cli(self) -> bool {
         matches!(self, Self::Claude | Self::Codex)
     }
@@ -368,19 +381,35 @@ fn pick_from(
     let find = |id: &str| catalog.iter().find(|m| m.id == id).cloned();
     let default = if system2 { &cfg.system2 } else { &cfg.system1 };
     let hints: &[&str] = if system2 { &MAIN_HINTS } else { &FAST_HINTS };
+    // Pathfinder's own harness before the CLIs: within each route in this
+    // order, the first model a hint names.
+    let mut routes: Vec<Route> = catalog.iter().map(|m| m.route).collect();
+    routes.sort_by_key(|r| r.preference());
+    routes.dedup();
     choice
         .and_then(find)
         .or_else(|| default.as_deref().and_then(find))
         .or_else(|| {
-            hints
-                .iter()
-                .find_map(|h| catalog.iter().find(|m| m.model.contains(h)).cloned())
+            routes.iter().find_map(|route| {
+                hints.iter().find_map(|h| {
+                    catalog
+                        .iter()
+                        .find(|m| m.route == *route && m.model.contains(h))
+                        .cloned()
+                })
+            })
         })
         .or_else(|| {
-            if system2 {
-                catalog.last().cloned()
+            let own: Vec<&ModelEntry> = catalog.iter().filter(|m| !m.route.is_cli()).collect();
+            let pool = if own.is_empty() {
+                catalog.iter().collect()
             } else {
-                catalog.first().cloned()
+                own
+            };
+            if system2 {
+                pool.last().map(|m| (*m).clone())
+            } else {
+                pool.first().map(|m| (*m).clone())
             }
         })
 }
@@ -487,6 +516,27 @@ mod tests {
     }
 
     #[test]
+    fn defaults_prefer_the_own_harness_and_plan_usage() {
+        let m = |id: &str, model: &str, route| ModelEntry {
+            model: model.into(),
+            ..entry(id, route)
+        };
+        let cfg = Config {
+            models: vec![
+                m("claude-haiku", "haiku", Route::Claude),
+                m("claude-opus", "opus", Route::Claude),
+                m("anthropic:haiku", "claude-haiku-5-5", Route::Anthropic),
+                m("chatgpt:sol", "gpt-6.2-sol", Route::Chatgpt),
+                m("chatgpt:luna", "gpt-6-luna", Route::Chatgpt),
+            ],
+            discover: false,
+            ..Config::default()
+        };
+        assert_eq!(cfg.pick(None, false).unwrap().id, "chatgpt:luna");
+        assert_eq!(cfg.pick(None, true).unwrap().id, "chatgpt:sol");
+    }
+
+    #[test]
     fn pick_prefers_session_then_default_then_position() {
         let cfg = Config {
             models: vec![
@@ -501,7 +551,8 @@ mod tests {
         assert_eq!(cfg.pick(Some("c"), false).unwrap().id, "c");
         assert_eq!(cfg.pick(Some("gone"), false).unwrap().id, "b");
         assert_eq!(cfg.pick(None, false).unwrap().id, "b");
-        assert_eq!(cfg.pick(None, true).unwrap().id, "c");
+        // No main default: the own harness before the CLIs.
+        assert_eq!(cfg.pick(None, true).unwrap().id, "b");
         let empty = Config {
             discover: false,
             ..Config::default()

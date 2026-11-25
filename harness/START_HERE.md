@@ -48,7 +48,7 @@ Passing a candidate or an exam question is what puts an idea on your record as s
 
 ## Models
 
-The toolbar at the top of the thread picks the models. Your defaults are **Haiku** (fast) and **Opus** (main) through Claude Code: thorough, 20 to 70 seconds per answer. Your **ChatGPT** models (GPT-6 Luna, GPT-6.2 Sol) were often quicker in testing. Pick per thread.
+The toolbar at the top of the thread picks the models. Your defaults are **GPT-6 Luna** (fast) and **GPT-6.2 Sol** (main) on Pathfinder's own agent, through your ChatGPT plan: about 30 seconds for an answer from your slides. **Claude** models run on the same agent with your Anthropic API key (billed per use), or through Claude Code (slower, opt-in). Pick per thread; `Ctrl+P` in the terminal app.
 
 ## If something's off
 

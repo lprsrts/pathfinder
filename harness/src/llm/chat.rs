@@ -210,13 +210,7 @@ impl StreamState {
             parts.push(Part::Text(self.text));
         }
         for (i, c) in self.calls {
-            let raw = if c.arguments.trim().is_empty() {
-                "{}"
-            } else {
-                c.arguments.as_str()
-            };
-            let args = serde_json::from_str(raw)
-                .map_err(|e| LlmError::Protocol(format!("bad arguments for {}: {e}", c.name)))?;
+            let args = crate::llm::parse_args(&c.arguments);
             parts.push(Part::ToolCall(ToolCall {
                 id: if c.id.is_empty() {
                     format!("call_{i}")

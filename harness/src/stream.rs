@@ -54,10 +54,22 @@ pub fn describe_tool(id: String, name: &str, input: &Value, cwd: &Path) -> ToolS
 
     let lower = name.to_ascii_lowercase();
     let (kind, title) = match lower.as_str() {
-        "read" => (
-            ToolKind::Read,
-            format!("Read {}", shown.clone().unwrap_or_default()),
-        ),
+        "read" => (ToolKind::Read, {
+            let file = shown.clone().unwrap_or_default();
+            let num = |k: &str| input.get(k).and_then(Value::as_u64);
+            match (
+                input.get("pages").and_then(Value::as_str),
+                num("offset"),
+                num("limit"),
+            ) {
+                (Some(pages), _, _) => format!("Read {file} (pages {pages})"),
+                (None, Some(o), Some(l)) => {
+                    format!("Read {file} (lines {o}–{})", o + l.saturating_sub(1))
+                }
+                (None, Some(o), None) => format!("Read {file} (from line {o})"),
+                _ => format!("Read {file}"),
+            }
+        }),
         "view" => (
             ToolKind::Read,
             match input.get("pages").and_then(|v| v.as_str()) {
