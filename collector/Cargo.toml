@@ -1,0 +1,29 @@
+[package]
+name = "pathfinder-collector"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+description = "Receives Pathfinder usage events from consenting installs, serves releases, and forwards gate checks"
+
+[[bin]]
+name = "collector"
+path = "src/main.rs"
+
+[dependencies]
+pathfinder-schema = { path = "../schema" }
+anyhow = "1"
+axum = "0.8"
+tower-http = { version = "0.6", features = ["fs", "limit"] }
+tokio = { version = "1", features = ["full"] }
+rusqlite = { version = "0.43.0", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+rand = "0.9"
+reqwest = { version = "0.13", features = ["json"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
