@@ -284,9 +284,10 @@ impl Runtime {
                         .await?
                 }
                 SessionMode::Working => self.handle_chat(&mut session, text, files, sink).await?,
-                SessionMode::Done => TurnOutput::text(
-                    "Every part is resolved. `/replan <what changed>` to extend the map, or start a new session.",
-                ),
+                SessionMode::Done => {
+                    self.handle_opening(&mut session, text, files, sink, false)
+                        .await?
+                }
             }
         };
 
@@ -336,12 +337,67 @@ impl Runtime {
 
     // --- §3 Onboarding and the map ---
 
+    /// Answers a question directly with the main model, records it as told
+    /// (never as understood) on the concepts it names, and offers a check.
+    async fn answer_question(
+        &self,
+        session: &mut Session,
+        text: &str,
+        files: &[PathBuf],
+        sink: StreamSink,
+        offer_check: bool,
+    ) -> Result<TurnOutput> {
+        let req = EngineRequest {
+            tier: EngineTier::System2,
+            tools: ToolAccess::ReadOnly,
+            cwd: session.cwd.clone(),
+            system_prompt: ANSWER_SYSTEM.to_string(),
+            prompt: format!(
+                "Conversation so far:\n{}\n\nAnswer the latest message.",
+                format_history(session)
+            ),
+            files: files.to_vec(),
+            stream_text: true,
+            models: self.models(session)?,
+            ctx: crate::engine::turn_ctx(),
+        };
+        let answer = self.engine.run_text(&req, sink.clone()).await?;
+        let told = self.record_told(session, text);
+        let offer = if !told.is_empty() {
+            format!(
+                "\n\nTold, not shown: this is {} on your record. Say \"check me\" to make it yours.",
+                told.join(", ")
+            )
+        } else if offer_check {
+            "\n\nSay \"check me\" if you want to make sure this is yours.".to_string()
+        } else {
+            String::new()
+        };
+        sink(StreamEvent::TextDelta(offer.clone()));
+        session.push_turn("assistant", &format!("{answer}{offer}"));
+        Ok(TurnOutput::text(String::new()))
+    }
+
     async fn handle_onboarding(
         &self,
         session: &mut Session,
         text: &str,
         files: &[PathBuf],
         sink: StreamSink,
+    ) -> Result<TurnOutput> {
+        self.handle_opening(session, text, files, sink, true).await
+    }
+
+    /// A message with no map to work on: a question gets answered; a task
+    /// starts onboarding, or with `allow_task` false (a finished thread)
+    /// is pointed to a new thread.
+    async fn handle_opening(
+        &self,
+        session: &mut Session,
+        text: &str,
+        files: &[PathBuf],
+        sink: StreamSink,
+        allow_task: bool,
     ) -> Result<TurnOutput> {
         session.push_turn("user", text);
         let snapshot = WorkspaceSnapshot::scan(&session.cwd).render();
@@ -359,18 +415,36 @@ impl Runtime {
             models: self.models(session)?,
             ctx: crate::engine::turn_ctx(),
         };
-        let (decision, shown): (OnboardingDecision, _) = run_gated_streamed(
+        let (decision, _): (OnboardingDecision, _) = run_gated_streamed(
             self.engine.as_ref(),
             self.store.as_ref(),
             &session.id,
             "onboarding",
             &req,
-            sink.clone(),
+            // Held: a question's answer comes from its own call, and the
+            // fast model sometimes answers here too.
+            gate::held(&sink),
             check_onboarding,
             Some("reply"),
         )
         .await?;
-        flush(&sink, &decision.reply, &shown);
+        if decision.question && !decision.ready_to_map {
+            return self
+                .answer_question(session, text, files, sink, decision.offer_check)
+                .await;
+        }
+        if !allow_task {
+            let goal = decision.goal.unwrap_or_default();
+            let reply = if goal.trim().is_empty() {
+                decision.reply
+            } else {
+                format!("This thread's task is done. Start a new thread for: {goal}")
+            };
+            flush(&sink, &reply, "");
+            session.push_turn("assistant", &reply);
+            return Ok(TurnOutput::text(String::new()));
+        }
+        flush(&sink, &decision.reply, "");
 
         if let Some(goal) = decision.goal.filter(|g| !g.trim().is_empty()) {
             session.goal = Some(goal);
@@ -1562,7 +1636,11 @@ const ONBOARDING_SYSTEM: &str = r#"You run onboarding for Pathfinder, a harness 
 
 Onboarding only sets the goal. Right after it, Pathfinder sketches a rough map of what the task depends on. The map has no size limit and grows and changes during the work, so scope, depth and details are settled there, not here. Do not plan, teach or do the task.
 
-Aim to finish in this turn:
+First tell a question from a task. Pathfinder is also the user's everyday assistant:
+- A question or request for information ("what is a phasor?", "explain this slide", "how do I compute the Laplace transform of this?", "what's the capital of Peru?") is not a task: set `question` to true, `ready_to_map` to false, `goal` to null and `reply` to "". Pathfinder answers it directly. Set `offer_check` to true when it's about understanding something (a concept, method, derivation, how or why something works), false for quick lookups, everyday facts, or chit-chat.
+- If the user asks to be checked on, or to properly learn, something from the conversation ("check me", "make sure I get it", "teach me this properly"), that is a task: the goal is understanding that topic.
+
+Otherwise it's onboarding for a task. Aim to finish in this turn:
 - If the user has named something to do, build, fix, understand or learn, the goal is clear: set `ready_to_map` to true and write `goal` as one sentence starting with a verb, in their words but not in first person ("Learn how neurons in neural networks work"). Breadth or vagueness ("learn how X works") is fine; the map handles it.
 - Ask one short question only when you can't tell what the task is at all (e.g. "orient yourself", "help me with my thesis"). If the workspace has content, ground it: say in one sentence what the workspace is (from the snapshot and any files worth reading, such as a README), then ask what they want to do there. If it's empty, just ask. Never ask the user to confirm, choose a scope, or say what they want to be able to explain.
 - If the user says what they already know or don't ("I'm new to this", "I know the basics"), keep it in `goal` (e.g. "... starting from the basics").
@@ -1572,7 +1650,15 @@ Aim to finish in this turn:
 You get a workspace snapshot. If a file could answer something, read it before writing your JSON, since `reply` ends your turn. Don't read files when the snapshot and the user's words already settle it.
 
 Return ONLY a JSON object:
-{"reply": "...", "ready_to_map": true, "goal": "..."}"#;
+{"reply": "...", "ready_to_map": true, "goal": "...", "question": false, "offer_check": false}"#;
+
+const ANSWER_SYSTEM: &str = r#"You are Pathfinder, the user's assistant, answering a question directly. The user is an electrical engineering and information technology student who also works as a research assistant; questions may be about lectures, exercise sheets, research, or anything else.
+
+- Answer what they asked, completely and correctly, like a strong tutor or colleague. For a calculation or derivation, go step by step and keep every step; for a concept, give the idea, then the precise statement, then a short example if it helps.
+- Read attached files (slides, exercise sheets, papers, screenshots) and workspace files when they bear on the question.
+- Write math as plain text or Unicode (Z = R + jωL, F(s) = ∫₀^∞ f(t)·e^(−st) dt, ∇·E = ρ/ε₀), never LaTeX: the chat can't render it.
+- Reply in the language the user writes in.
+- Don't offer to check their understanding or ask follow-up questions unless the question is ambiguous; Pathfinder adds that itself."#;
 
 const MAP_SYSTEM: &str = r#"You sketch the map for Pathfinder: what the task depends on.
 
@@ -1582,6 +1668,7 @@ const MAP_SYSTEM: &str = r#"You sketch the map for Pathfinder: what the task dep
 - `id`: a short descriptive slug the user types in commands: lowercase words joined by hyphens, at most 12 characters (e.g. `weights`, `fwd-pass`, `loss`). Unique. It names what the part is actually about, not a broad field: `colliders`, not `probability`. Users skip parts by their names.
 - Start where the user is: if the goal or conversation says what they already know or don't, shape the parts for that (e.g. include the basics for a newcomer). Keep parts they say they know on the map; they can mark them known themselves.
 - `note`: one line on what the part covers. `brief`: what the map covers, in one or two sentences.
+- Never give results away: no answers, computed values or intermediate results (a cutoff frequency, a derivative, "≈ 0.157") in the brief, notes or titles. The user works them out; for an exercise, say what each part is about, not what it comes to.
 - `concepts`: the ideas the parts rest on, the record Pathfinder keeps of what the user has shown they understand. Each has an `id` (a lowercase hyphenated slug naming the idea itself, e.g. `d-separation`, `chain-rule`), a short `label`, and `needs`: the concept ids it builds on. Include a concept the task needs even if no part covers it (a prerequisite the user may lack). Reuse ids of concepts already recorded in this workspace when it's the same idea.
 - Each part lists its 1–4 core `concepts` (ids from `concepts`): what someone must understand to judge an agent's work on that part. Usually one or two.
 
@@ -1996,9 +2083,11 @@ mod tests {
             shown_after_repair("What should it show?").await,
             "What should it show?"
         );
+        // Onboarding replies are held until the decision is final, so only
+        // the repaired reply is shown.
         assert_eq!(
             shown_after_repair("Which status fields?").await,
-            "What should it show?\n\nWhich status fields?"
+            "Which status fields?"
         );
     }
 
@@ -2218,6 +2307,80 @@ mod tests {
 
     fn log_reply(reply: &str) -> String {
         format!(r#"{{"intent":"log","reply":"{reply}","map_change":null}}"#)
+    }
+
+    #[tokio::test]
+    async fn a_question_is_answered_without_a_task() {
+        const QUESTION: &str =
+            r#"{"reply":"","ready_to_map":false,"goal":null,"question":true,"offer_check":true}"#;
+        let (rt, engine) = runtime(
+            FakeEngine::new(vec![
+                (ReadOnly, S1, QUESTION),
+                (ReadOnly, S2, "A phasor is a complex number for a sinusoid."),
+                (
+                    ReadOnly,
+                    S1,
+                    r#"{"reply":"","ready_to_map":false,"goal":null,"question":true,"offer_check":false}"#,
+                ),
+                (ReadOnly, S2, "Lima."),
+                // "check me" is a task: onboarding sets the goal and maps it.
+                (
+                    ReadOnly,
+                    S1,
+                    r#"{"reply":"Understand phasors.","ready_to_map":true,"goal":"Understand phasors"}"#,
+                ),
+                (ReadOnly, S2, MAP),
+            ]),
+            false,
+        );
+        let session = rt.load_session("s").unwrap().unwrap();
+        let ws = crate::understanding::workspace_key(&session.cwd);
+        rt.store
+            .upsert_concept(
+                &ws,
+                &crate::understanding::Concept {
+                    id: "phasors".into(),
+                    label: "Phasors".into(),
+                    aliases: vec![],
+                    created_by: "map".into(),
+                },
+            )
+            .unwrap();
+
+        turn(&rt, "Can you explain phasors?").await;
+        let s = rt.load_session("s").unwrap().unwrap();
+        assert_eq!(s.mode, SessionMode::Onboarding, "no task was started");
+        assert!(s.goal.is_none());
+        let last = &s.history.last().unwrap().content;
+        assert!(last.starts_with("A phasor is a complex number"));
+        assert!(last.contains("Told, not shown: this is Phasors"), "{last}");
+        let events = rt.store.events(&ws, &["phasors".to_string()]).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, crate::understanding::EventKind::Told);
+        let views = rt.concept_views(&s, &["phasors".to_string()]).unwrap();
+        assert_eq!(
+            crate::understanding::state_of(&views, "phasors"),
+            crate::understanding::ConceptState::Unknown,
+            "being told is not understanding"
+        );
+
+        turn(&rt, "What's the capital of Peru?").await;
+        let s = rt.load_session("s").unwrap().unwrap();
+        assert_eq!(
+            s.history.last().unwrap().content,
+            "Lima.",
+            "no offer on a lookup"
+        );
+        let prompt = engine.prompts.lock().unwrap().last().cloned().unwrap();
+        assert!(
+            prompt.contains("Can you explain phasors?"),
+            "answers see the conversation"
+        );
+
+        turn(&rt, "check me on phasors").await;
+        let s = rt.load_session("s").unwrap().unwrap();
+        assert_eq!(s.goal.as_deref(), Some("Understand phasors"));
+        assert_eq!(s.mode, SessionMode::Working);
     }
 
     #[tokio::test]

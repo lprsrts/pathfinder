@@ -87,6 +87,12 @@ With a key in place, Pathfinder lists the provider's current models in Zed's pic
 - On the CLI routes, agent work may edit files and run shell commands in the workspace: Codex in its `workspace-write` sandbox, Claude Code with its sandbox enabled.
 - Binaries: `claude_bin`, `codex_bin` (or `HARNESS_CLAUDE_BIN`, `HARNESS_CODEX_BIN`). `HARNESS_DB_PATH` moves the session database.
 
+## Just asking
+
+Pathfinder is also an everyday assistant. Ask a question with no task ("what is a phasor?", "explain this slide", "what's the capital of Peru?") and the main model answers it in full, in your language, reading any attached files. Nothing is mapped and nothing counts as understood: if the question names an idea already on your record, Pathfinder logs that you were told about it (`told`, which never raises its state) and says so. For questions about understanding something, not quick lookups, it offers a check: say "check me" and the topic becomes a learning task. Questions also work in a thread whose task is finished.
+
+Attach slides, exercise sheets, papers or screenshots: images (PNG, JPEG, GIF, WebP) and PDFs are sent to the model as content it can see, on every route, and a screenshot pasted into the chat is saved and attached the same way. Zed can't render LaTeX in the agent panel, so math is written in plain text and Unicode.
+
 ## How a session goes
 
 1. Say what you want done. Onboarding settles the goal, then sketches a map of what the task depends on (no size limit).

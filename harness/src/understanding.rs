@@ -74,6 +74,9 @@ pub enum EventKind {
     ReviewOk,
     ReviewMissed,
     User,
+    /// You were told about it (a question answered outside a check). It
+    /// never counts as understanding.
+    Told,
 }
 
 impl EventKind {
@@ -89,6 +92,7 @@ impl EventKind {
             Self::ReviewOk => "review_ok",
             Self::ReviewMissed => "review_missed",
             Self::User => "user",
+            Self::Told => "told",
         }
     }
 
@@ -104,6 +108,7 @@ impl EventKind {
             "review_ok" => Self::ReviewOk,
             "review_missed" => Self::ReviewMissed,
             "user" => Self::User,
+            "told" => Self::Told,
             _ => return None,
         })
     }
@@ -425,6 +430,22 @@ fn tokens(text: &str) -> HashSet<String> {
     text.split(|c: char| !c.is_alphanumeric())
         .filter(|w| w.chars().count() >= 3)
         .map(str::to_lowercase)
+        .collect()
+}
+
+/// The concepts a question is plainly about: every word of the label (or
+/// of an alias) appears in it. Stricter than `lexical_candidates`, since a
+/// question shares stray words with many concepts.
+pub fn named_in<'a>(text: &str, concepts: &'a [Concept]) -> Vec<&'a Concept> {
+    let have = tokens(text);
+    concepts
+        .iter()
+        .filter(|c| {
+            std::iter::once(&c.label).chain(&c.aliases).any(|name| {
+                let want = tokens(name);
+                !want.is_empty() && want.is_subset(&have)
+            })
+        })
         .collect()
 }
 

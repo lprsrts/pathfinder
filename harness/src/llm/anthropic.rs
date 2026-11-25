@@ -64,6 +64,19 @@ pub fn request_body(req: &LlmRequest) -> Value {
 fn message_json(m: &Message) -> Value {
     match m {
         Message::User(text) => json!({"role": "user", "content": [{"type": "text", "text": text}]}),
+        Message::UserWith(text, files) => {
+            let mut content: Vec<Value> = files
+                .iter()
+                .map(|f| {
+                    json!({
+                        "type": if f.is_image() { "image" } else { "document" },
+                        "source": {"type": "base64", "media_type": f.media_type, "data": f.data},
+                    })
+                })
+                .collect();
+            content.push(json!({"type": "text", "text": text}));
+            json!({"role": "user", "content": content})
+        }
         Message::Assistant(parts) => {
             let content: Vec<Value> = parts
                 .iter()
@@ -266,6 +279,31 @@ mod tests {
     use super::*;
     use crate::llm::testing::serve_once;
     use crate::llm::{ToolResult, ToolSpec};
+
+    #[test]
+    fn images_and_pdfs_go_as_content_blocks() {
+        let m = Message::UserWith(
+            "Explain these.".into(),
+            vec![
+                crate::llm::Attachment {
+                    name: "slide.png".into(),
+                    media_type: "image/png".into(),
+                    data: "AAA=".into(),
+                },
+                crate::llm::Attachment {
+                    name: "sheet.pdf".into(),
+                    media_type: "application/pdf".into(),
+                    data: "BBB=".into(),
+                },
+            ],
+        );
+        let j = message_json(&m);
+        assert_eq!(j["content"][0]["type"], "image");
+        assert_eq!(j["content"][0]["source"]["media_type"], "image/png");
+        assert_eq!(j["content"][1]["type"], "document");
+        assert_eq!(j["content"][1]["source"]["data"], "BBB=");
+        assert_eq!(j["content"][2]["text"], "Explain these.");
+    }
 
     const STREAM: &str = r#"event: message_start
 data: {"type":"message_start","message":{"id":"msg_1","role":"assistant","content":[]}}

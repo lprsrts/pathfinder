@@ -35,6 +35,24 @@ impl Runtime {
         Ok(understanding::views(&events, understanding::now()))
     }
 
+    /// Records `told` on the concepts a question plainly names and returns
+    /// their labels.
+    pub(super) fn record_told(&self, session: &Session, text: &str) -> Vec<String> {
+        let concepts = self
+            .store
+            .concepts(&Self::workspace(session))
+            .unwrap_or_default();
+        let named = crate::understanding::named_in(text, &concepts);
+        self.append_events(
+            session,
+            named
+                .iter()
+                .map(|c| NewEvent::new(&c.id, EventKind::Told))
+                .collect(),
+        );
+        named.iter().map(|c| c.label.clone()).collect()
+    }
+
     pub(super) fn append_events(&self, session: &Session, events: Vec<NewEvent>) {
         if events.is_empty() {
             return;

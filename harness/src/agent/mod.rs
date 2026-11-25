@@ -92,13 +92,36 @@ fn max_steps(req: &EngineRequest) -> usize {
     }
 }
 
-/// The first user message: the prompt plus small attached files inlined.
-fn first_message(req: &EngineRequest) -> String {
+/// Largest image or PDF sent to the model as content (the providers' own
+/// limits are around 20–32 MB per request).
+const MAX_ATTACHMENT: u64 = 20 * 1024 * 1024;
+
+/// The first user message: the prompt, small text files inlined, and
+/// images and PDFs sent as content the model can see.
+fn first_message(req: &EngineRequest) -> Message {
+    use base64::Engine as _;
     let mut text = req.prompt.clone();
+    let mut attachments = Vec::new();
     for file in &req.files {
         let Ok(meta) = std::fs::metadata(file) else {
             continue;
         };
+        if let Some(media_type) = crate::llm::attachable_type(file)
+            && meta.len() <= MAX_ATTACHMENT
+            && let Ok(bytes) = std::fs::read(file)
+        {
+            let name = file
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "file".into());
+            let _ = write!(text, "\n\n(Attached: {name})");
+            attachments.push(crate::llm::Attachment {
+                name,
+                media_type: media_type.into(),
+                data: base64::engine::general_purpose::STANDARD.encode(bytes),
+            });
+            continue;
+        }
         if meta.len() <= MAX_ATTACHED_INLINE {
             if let Ok(content) = std::fs::read_to_string(file) {
                 let _ = write!(
@@ -115,7 +138,11 @@ fn first_message(req: &EngineRequest) -> String {
             file.display()
         );
     }
-    text
+    if attachments.is_empty() {
+        Message::User(text)
+    } else {
+        Message::UserWith(text, attachments)
+    }
 }
 
 fn cap(mut s: String) -> String {
@@ -149,7 +176,7 @@ impl Engine for ApiEngine {
             let mut request = LlmRequest {
                 model: model.model.clone(),
                 instructions: format!("{}{}", req.system_prompt, PROTOCOL_NOTE),
-                messages: vec![Message::User(first_message(req))],
+                messages: vec![first_message(req)],
                 tools: specs,
                 // Unset effort follows the tier: quick for System 1.
                 effort: model.effort.clone().or_else(|| {

@@ -49,9 +49,45 @@ pub enum Part {
     Opaque(Value),
 }
 
+/// A file sent to the model as content: an image or a PDF.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Attachment {
+    pub name: String,
+    /// `image/png`, `image/jpeg`, `image/gif`, `image/webp` or
+    /// `application/pdf`.
+    pub media_type: String,
+    /// Base64 of the file's bytes.
+    pub data: String,
+}
+
+impl Attachment {
+    pub fn is_image(&self) -> bool {
+        self.media_type.starts_with("image/")
+    }
+
+    pub fn data_url(&self) -> String {
+        format!("data:{};base64,{}", self.media_type, self.data)
+    }
+}
+
+/// The media type Pathfinder sends a file as, by extension.
+pub fn attachable_type(path: &std::path::Path) -> Option<&'static str> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    Some(match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "pdf" => "application/pdf",
+        _ => return None,
+    })
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Message {
     User(String),
+    /// A user message with images or PDFs.
+    UserWith(String, Vec<Attachment>),
     Assistant(Vec<Part>),
     ToolResults(Vec<ToolResult>),
 }

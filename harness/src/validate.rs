@@ -43,7 +43,10 @@ fn require_text(out: &mut Vec<Violation>, value: &str, field: &str) {
 
 pub fn check_onboarding(d: &OnboardingDecision) -> Vec<Violation> {
     let mut out = Vec::new();
-    require_text(&mut out, &d.reply, "reply");
+    // A question's answer comes from its own call.
+    if !(d.question && !d.ready_to_map) {
+        require_text(&mut out, &d.reply, "reply");
+    }
     if d.ready_to_map && d.goal.as_deref().is_none_or(|g| g.trim().is_empty()) {
         out.push(Violation::new(
             "missing_goal",
@@ -190,8 +193,23 @@ mod tests {
             reply: "What should it report?".into(),
             ready_to_map: false,
             goal: None,
+            question: false,
+            offer_check: false,
         };
         assert!(check_onboarding(&asking).is_empty());
+
+        // A question's answer comes later, so its reply may be empty.
+        let question = OnboardingDecision {
+            reply: String::new(),
+            question: true,
+            ..asking.clone()
+        };
+        assert!(check_onboarding(&question).is_empty());
+        let empty = OnboardingDecision {
+            question: false,
+            ..question
+        };
+        assert!(!check_onboarding(&empty).is_empty());
 
         let ready_without_goal = OnboardingDecision {
             ready_to_map: true,

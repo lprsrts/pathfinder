@@ -101,6 +101,20 @@ fn request_body_for(req: &LlmRequest, chatgpt: bool) -> Value {
 fn input_items(m: &Message) -> Vec<Value> {
     match m {
         Message::User(text) => vec![json!({"role": "user", "content": text})],
+        Message::UserWith(text, files) => {
+            let mut content: Vec<Value> = files
+                .iter()
+                .map(|f| {
+                    if f.is_image() {
+                        json!({"type": "input_image", "image_url": f.data_url()})
+                    } else {
+                        json!({"type": "input_file", "filename": f.name, "file_data": f.data_url()})
+                    }
+                })
+                .collect();
+            content.push(json!({"type": "input_text", "text": text}));
+            vec![json!({"role": "user", "content": content})]
+        }
         Message::Assistant(parts) => parts
             .iter()
             .filter_map(|p| match p {
@@ -312,6 +326,33 @@ mod tests {
     use super::*;
     use crate::llm::testing::serve_once;
     use crate::llm::{ToolResult, ToolSpec};
+
+    #[test]
+    fn images_and_pdfs_go_as_input_content() {
+        let m = Message::UserWith(
+            "Explain these.".into(),
+            vec![
+                crate::llm::Attachment {
+                    name: "slide.png".into(),
+                    media_type: "image/png".into(),
+                    data: "AAA=".into(),
+                },
+                crate::llm::Attachment {
+                    name: "sheet.pdf".into(),
+                    media_type: "application/pdf".into(),
+                    data: "BBB=".into(),
+                },
+            ],
+        );
+        let items = input_items(&m);
+        let c = &items[0]["content"];
+        assert_eq!(c[0]["type"], "input_image");
+        assert_eq!(c[0]["image_url"], "data:image/png;base64,AAA=");
+        assert_eq!(c[1]["type"], "input_file");
+        assert_eq!(c[1]["filename"], "sheet.pdf");
+        assert_eq!(c[1]["file_data"], "data:application/pdf;base64,BBB=");
+        assert_eq!(c[2]["type"], "input_text");
+    }
 
     const STREAM: &str = r#"event: response.created
 data: {"type":"response.created","response":{"id":"resp_1"}}

@@ -469,11 +469,19 @@ impl Session {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct OnboardingDecision {
+    #[serde(default)]
     pub reply: String,
     #[serde(default)]
     pub ready_to_map: bool,
     #[serde(default)]
     pub goal: Option<String>,
+    /// A question to answer, not a task: Pathfinder answers it directly.
+    #[serde(default)]
+    pub question: bool,
+    /// The question is about understanding something, not a quick lookup:
+    /// offer a check after the answer.
+    #[serde(default)]
+    pub offer_check: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

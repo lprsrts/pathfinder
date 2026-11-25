@@ -79,7 +79,9 @@ pub async fn run_stdio(runtime: Arc<Runtime>, creds: Arc<Credentials>) -> Result
                     .store(fs_caps.write_text_file, Ordering::Relaxed);
                 let capabilities = AgentCapabilities::new()
                     .load_session(true)
-                    .prompt_capabilities(PromptCapabilities::new().embedded_context(true));
+                    .prompt_capabilities(
+                        PromptCapabilities::new().embedded_context(true).image(true),
+                    );
                 let resp = InitializeResponse::new(req.protocol_version)
                     .agent_capabilities(capabilities)
                     .auth_methods(auth_methods(req.client_capabilities.auth.terminal))
@@ -985,15 +987,25 @@ fn extract_turn_input(blocks: &[ContentBlock]) -> TurnInput {
                     text_parts.push(format!("File `{}`:\n{}", tr.uri, tr.text));
                 }
                 EmbeddedResourceResource::BlobResourceContents(br) => {
-                    if let Some(path) = file_uri_to_path(&br.uri) {
+                    if let Some(path) = file_uri_to_path(&br.uri)
+                        .filter(|p| p.exists())
+                        .or_else(|| save_pasted(&br.blob, br.mime_type.as_deref().unwrap_or("")))
+                    {
                         files.push(path);
                     }
                 }
                 _ => {}
             },
             ContentBlock::Image(img) => {
-                if let Some(uri) = img.uri.as_deref().and_then(file_uri_to_path) {
-                    files.push(uri);
+                // A pasted screenshot arrives as data, with no file behind it.
+                if let Some(path) = img
+                    .uri
+                    .as_deref()
+                    .and_then(file_uri_to_path)
+                    .filter(|p| p.exists())
+                    .or_else(|| save_pasted(&img.data, &img.mime_type))
+                {
+                    files.push(path);
                 }
             }
             _ => {}
@@ -1004,6 +1016,28 @@ fn extract_turn_input(blocks: &[ContentBlock]) -> TurnInput {
         text: text_parts.join("\n\n"),
         files,
     }
+}
+
+/// Saves pasted base64 content (a screenshot, a dropped PDF) to a file so
+/// it can be attached like any other: images and PDFs only.
+fn save_pasted(data: &str, mime_type: &str) -> Option<PathBuf> {
+    use base64::Engine as _;
+    let ext = match mime_type {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "application/pdf" => "pdf",
+        _ => return None,
+    };
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data.trim())
+        .ok()?;
+    let dir = std::env::temp_dir().join("pathfinder-pasted");
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join(format!("pasted-{}.{ext}", uuid::Uuid::new_v4().simple()));
+    std::fs::write(&path, bytes).ok()?;
+    Some(path)
 }
 
 fn file_uri_to_path(uri: &str) -> Option<PathBuf> {
@@ -1044,6 +1078,27 @@ mod tests {
     use super::*;
     use crate::config::{ModelEntry, Route};
     use crate::decide::Provider;
+
+    #[test]
+    fn a_pasted_screenshot_becomes_an_attached_file() {
+        use agent_client_protocol::v1::schema::{ImageContent, TextContent};
+        use base64::Engine as _;
+        let png = b"\x89PNG\r\n\x1a\nfake";
+        let data = base64::engine::general_purpose::STANDARD.encode(png);
+        let input = extract_turn_input(&[
+            ContentBlock::Text(TextContent::new("what does this slide say?")),
+            ContentBlock::Image(ImageContent::new(data, "image/png")),
+        ]);
+        assert_eq!(input.text, "what does this slide say?");
+        assert_eq!(input.files.len(), 1);
+        assert_eq!(input.files[0].extension().unwrap(), "png");
+        assert_eq!(std::fs::read(&input.files[0]).unwrap(), png);
+        std::fs::remove_file(&input.files[0]).ok();
+        // Anything else pasted as data is ignored, not saved.
+        let other =
+            extract_turn_input(&[ContentBlock::Image(ImageContent::new("eA==", "image/tiff"))]);
+        assert!(other.files.is_empty());
+    }
 
     #[test]
     fn picker_names_are_short_and_name_the_route_only_when_needed() {
