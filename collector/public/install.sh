@@ -4,12 +4,28 @@
 #
 # It downloads the newest release for this computer, checks it against the
 # release manifest (and, on a Mac, that Apple's notarised signature is
-# Pathfinder's), and puts `harness` in ~/.local/bin. Nothing else changes.
+# Pathfinder's), and puts `harness` in a folder for your own programs:
+# PATHFINDER_BIN_DIR if set, else XDG_BIN_HOME, else ~/.local/bin.
+# Nothing else changes.
 set -eu
 
 BASE="${PATHFINDER_URL:-https://pathfinder.lprsrts.com}"
-DEST="${PATHFINDER_BIN_DIR:-$HOME/.local/bin}"
 TEAM_ID="N75CG6NPP4"
+
+case "${XDG_BIN_HOME:-}" in
+    /*) xdg_bin="$XDG_BIN_HOME" ;;
+    *) xdg_bin="" ;;
+esac
+if [ -n "${PATHFINDER_BIN_DIR:-}" ]; then
+    DEST="$PATHFINDER_BIN_DIR"
+elif [ -n "$xdg_bin" ]; then
+    DEST="$xdg_bin"
+elif [ -n "${HOME:-}" ]; then
+    DEST="$HOME/.local/bin"
+else
+    echo "HOME isn't set; say where to install with PATHFINDER_BIN_DIR=/some/folder." >&2
+    exit 1
+fi
 
 case "$(uname -s)/$(uname -m)" in
     Darwin/*) target=universal-apple-darwin ;;
@@ -68,11 +84,26 @@ mv "$tmp/harness" "$DEST/harness"
 echo "Installed: $DEST/harness ($version)"
 
 case ":$PATH:" in
-    *":$DEST:"*) ;;
+    *":$DEST:"*)
+        found="$(command -v harness 2>/dev/null || true)"
+        if [ -n "$found" ] && [ "$found" != "$DEST/harness" ]; then
+            echo
+            echo "Note: another harness comes first on your PATH ($found)."
+            echo "Remove it, or run Pathfinder as $DEST/harness."
+        fi
+        ;;
     *)
         echo
-        echo "$DEST isn't on your PATH yet. Add it, e.g. for zsh:"
-        echo "  echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.zshrc && exec zsh"
+        echo "$DEST isn't on your PATH yet. To add it:"
+        case "$(basename "${SHELL:-sh}")" in
+            zsh) echo "  echo 'export PATH=\"$DEST:\$PATH\"' >> \"${ZDOTDIR:-${HOME:-\$HOME}}/.zshrc\" && exec zsh" ;;
+            bash)
+                if [ "$(uname -s)" = Darwin ]; then rc="${HOME:-\$HOME}/.bash_profile"; else rc="${HOME:-\$HOME}/.bashrc"; fi
+                echo "  echo 'export PATH=\"$DEST:\$PATH\"' >> \"$rc\" && exec bash"
+                ;;
+            fish) echo "  fish_add_path \"$DEST\"" ;;
+            *) echo "  echo 'export PATH=\"$DEST:\$PATH\"' >> \"${HOME:-\$HOME}/.profile\"  (then log in again)" ;;
+        esac
         ;;
 esac
 

@@ -17,7 +17,9 @@ const PREFERENCES_POLICY: &str = include_str!("seatbelt_preferences.sbpl");
 /// Folders under the home folder that hold credentials: hidden from
 /// sandboxed commands, which could otherwise read keys into the
 /// conversation.
-const HIDDEN: [&str; 11] = [
+/// Pathfinder's own config folder (with its secrets) is added wherever it
+/// resolves to: [`crate::paths::secret_dirs`].
+const HIDDEN: [&str; 10] = [
     ".ssh",
     ".gnupg",
     ".aws",
@@ -26,7 +28,6 @@ const HIDDEN: [&str; 11] = [
     ".docker",
     ".password-store",
     ".netrc",
-    ".config/harness",
     ".config/gh",
     "Library/Keychains",
 ];
@@ -103,7 +104,17 @@ pub fn secret_env_names() -> Vec<String> {
 }
 
 fn home() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    crate::paths::home()
+}
+
+/// Every credential folder, as absolute paths.
+fn hidden() -> Vec<PathBuf> {
+    let mut all: Vec<PathBuf> = home()
+        .into_iter()
+        .flat_map(|h| HIDDEN.iter().map(move |d| h.join(d)))
+        .collect();
+    all.extend(crate::paths::secret_dirs());
+    all
 }
 
 /// The real path, as the kernel sees it (`/var` is `/private/var`); the
@@ -128,10 +139,9 @@ pub fn seatbelt_profile(policy: &Policy) -> String {
     profile.push('\n');
 
     // Reads: everything but the credential folders.
-    let hidden: Vec<String> = home()
-        .into_iter()
-        .flat_map(|h| HIDDEN.iter().map(move |d| real(&h.join(d))))
-        .map(|p| format!("(require-not (subpath {}))", sb_string(&p)))
+    let hidden: Vec<String> = hidden()
+        .iter()
+        .map(|p| format!("(require-not (subpath {}))", sb_string(&real(p))))
         .collect();
     profile.push_str(&format!(
         "\n; Reads anywhere except where credentials live.\n(allow file-read* (require-all (subpath \"/\") {}))\n",
@@ -214,14 +224,11 @@ pub fn wrap(kind: &Kind, policy: &Policy, command: &str) -> Vec<String> {
                     argv.extend(["--ro-bind".into(), s(&p), s(&p)]);
                 }
             }
-            if let Some(h) = home() {
-                for d in HIDDEN {
-                    let p = h.join(d);
-                    if p.is_dir() {
-                        argv.extend(["--tmpfs".into(), s(&p)]);
-                    } else if p.is_file() {
-                        argv.extend(["--ro-bind".into(), "/dev/null".into(), s(&p)]);
-                    }
+            for p in hidden() {
+                if p.is_dir() {
+                    argv.extend(["--tmpfs".into(), s(&p)]);
+                } else if p.is_file() {
+                    argv.extend(["--ro-bind".into(), "/dev/null".into(), s(&p)]);
                 }
             }
             if !policy.network {
@@ -316,6 +323,24 @@ mod tests {
         let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
         text.push_str(&String::from_utf8_lossy(&out.stderr));
         (out.status.success(), text)
+    }
+
+    #[test]
+    fn pathfinders_secrets_are_hidden_wherever_they_live() {
+        let profile = seatbelt_profile(&Policy {
+            workspace: PathBuf::from("/tmp/ws"),
+            network: false,
+        });
+        for dir in crate::paths::secret_dirs() {
+            assert!(
+                profile.contains(&sb_string(&real(&dir))),
+                "{} isn't hidden",
+                dir.display()
+            );
+        }
+        // Both conventions, so another environment can't expose them.
+        assert!(profile.contains("Application Support/com.lprsrts.pathfinder") || !cfg!(target_os = "macos"));
+        assert!(profile.contains(".config/harness"));
     }
 
     #[test]

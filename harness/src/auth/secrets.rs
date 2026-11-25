@@ -1,4 +1,4 @@
-//! Where secrets live: `~/.config/harness/auth.json`, readable only by you,
+//! Where secrets live: `auth.json` in the config folder ([`crate::paths`]), readable only by you,
 //! like Codex's `auth.json`. A plain file instead of the OS keychain, because
 //! macOS asks again after every rebuild of an unsigned binary. Memory in tests.
 

@@ -6,20 +6,36 @@ use std::path::Path;
 use pathfinder_schema::SharedThread;
 use serde_json::json;
 
-/// Replaces the working folder with `.` and the home folder with `~`.
+/// Replaces the working folder with `.` and the home folder with `~`,
+/// each as given and as the system resolves it (`/var` is `/private/var`
+/// on macOS; a symlinked home).
 pub fn scrub_paths(text: &str, cwd: &Path) -> String {
     let mut out = text.to_string();
-    let cwd = cwd.display().to_string();
-    if cwd.len() > 1 {
-        out = out.replace(&format!("{cwd}/"), "./").replace(&cwd, ".");
+    for cwd in spellings(cwd) {
+        if cwd.len() > 1 {
+            out = out.replace(&format!("{cwd}/"), "./").replace(&cwd, ".");
+        }
     }
-    if let Some(home) = std::env::var_os("HOME") {
-        let home = home.to_string_lossy().to_string();
-        if home.len() > 1 {
-            out = out.replace(&home, "~");
+    if let Some(home) = crate::paths::home() {
+        for home in spellings(&home) {
+            if home.len() > 1 {
+                out = out.replace(&home, "~");
+            }
         }
     }
     out
+}
+
+/// A path as given and as resolved, longest first (so a resolved path
+/// that contains the given one is replaced whole).
+fn spellings(p: &Path) -> Vec<String> {
+    let mut all = vec![p.display().to_string()];
+    if let Ok(real) = p.canonicalize() {
+        all.push(real.display().to_string());
+    }
+    all.sort_by_key(|s| std::cmp::Reverse(s.len()));
+    all.dedup();
+    all
 }
 
 /// The thread to send: (role, text) pairs, paths scrubbed.

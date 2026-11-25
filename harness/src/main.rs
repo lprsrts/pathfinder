@@ -10,6 +10,7 @@ mod engine;
 mod i18n;
 mod ledger;
 mod llm;
+mod paths;
 mod runtime;
 mod secrets;
 mod store;
@@ -116,6 +117,10 @@ async fn main() -> Result<()> {
         Some("auth") => cli::auth(&args[1..]).await,
         Some("data") => cli::data(&args[1..]).await,
         Some("update") => update::run(&args[1..]).await,
+        Some("paths") => {
+            paths::print();
+            Ok(())
+        }
         Some("models") => cli::models(&args[1..]).await,
         Some("coverage") => cli::coverage(&args[1..]),
         Some("eval") => {
@@ -162,7 +167,7 @@ async fn main() -> Result<()> {
         }
         _ => {
             eprintln!(
-                "harness {} — human-in-the-loop pathfinder over ACP\n\nUsage:\n  harness tui [folder]       Pathfinder in the terminal, in a folder (default: here)\n  harness acp                Run the ACP server over stdio (for Zed)\n  harness auth [status|set|remove|import]   Manage API keys\n  harness models [--refresh] List discovered models\n  harness data [status|show|join|on|off|delete]   Usage data you share (off unless you join)\n  harness update [--check]   Install the newest release\n  harness coverage [--export] [path]   Understanding coverage of the agent's changes\n  harness eval [suite ...] [--out FILE]   Run the A10 evals (leak, discrimination, checks, tagging, evidence, coverage)\n  harness --version          Print version",
+                "harness {} — human-in-the-loop pathfinder over ACP\n\nUsage:\n  harness tui [folder]       Pathfinder in the terminal, in a folder (default: here)\n  harness acp                Run the ACP server over stdio (for Zed)\n  harness auth [status|set|remove|import]   Manage API keys\n  harness models [--refresh] List discovered models\n  harness data [status|show|join|on|off|delete]   Usage data you share (off unless you join)\n  harness update [--check]   Install the newest release\n  harness paths              Where settings, secrets and data are kept\n  harness coverage [--export] [path]   Understanding coverage of the agent's changes\n  harness eval [suite ...] [--out FILE]   Run the A10 evals (leak, discrimination, checks, tagging, evidence, coverage)\n  harness --version          Print version",
                 env!("CARGO_PKG_VERSION")
             );
             Ok(())

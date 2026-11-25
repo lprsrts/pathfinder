@@ -17,18 +17,31 @@ Installed binary: `~/.local/bin/harness`. Start a new Pathfinder thread in Zed t
 
 ## Connect in Zed
 
-Add to `~/.config/zed/settings.json`:
+Add to Zed's settings (`zed: open settings`), with the path `which harness` prints:
 
 ```json
 {
   "agent_servers": {
     "Pathfinder": {
-      "command": "/Users/alper/.local/bin/harness",
+      "command": "/Users/you/.local/bin/harness",
       "args": ["acp"]
     }
   }
 }
 ```
+
+Zed doesn't start Pathfinder from your shell, so it doesn't see variables set in your shell's startup files. If you set `HARNESS_HOME` or `XDG_CONFIG_HOME`/`XDG_DATA_HOME` there, add them under `"env": { … }` in that entry too, so Zed and the terminal use the same settings.
+
+## Where files live
+
+`harness paths` shows the folders. For each kind of file (settings and secrets, the database, state, the model cache), Pathfinder uses the first of:
+
+1. `HARNESS_HOME`, everything in one folder.
+2. The XDG variable (`XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`, `XDG_CACHE_HOME`), on any system, if it's an absolute path.
+3. A folder that already exists, the platform's place first, then the XDG default, so updating never loses settings.
+4. The platform's own place: `~/Library/Application Support/com.lprsrts.pathfinder` (and `~/Library/Caches/…`) on macOS, `%APPDATA%\Pathfinder` on Windows, and `~/.config/harness`, `~/.local/share/harness` and so on elsewhere.
+
+Without `HOME`, the account's home folder comes from the system.
 
 ## Models and routes
 
@@ -47,7 +60,7 @@ Pathfinder uses a fast model (System 1: onboarding, log replies) and a stronger 
 
 On the own-agent routes Pathfinder runs its own tool loop and streams the model's thinking and tool calls into Zed. Conversation turns can read, list, find and search the workspace. Agent work (`/handoff`, `/delegate`) can also edit and write files, shown as diffs and written through Zed so they appear in its Review Changes view (keep or reject each change), and run commands in Zed's terminal, so you watch them. The agent says what it's about to do before each step, and the stop button ends the run. File tools stay inside the workspace and never write to `.git`.
 
-**Commands run in a sandbox** (macOS Seatbelt, or bubblewrap on Linux when `bwrap` is installed). Inside it a command can read files, write only in the workspace (not `.git` or `.pathfinder`) and the temp folders, has no network, can't read credential folders (`~/.ssh`, `~/.aws`, `~/.gnupg`, Keychains, `~/.config/harness`, `~/.config/gh` and similar), and runs without environment variables whose names look like secrets (`*KEY*`, `*TOKEN*`, `*SECRET*`, `*PASSWORD*`). Sandboxed commands run without asking. When a command needs the internet (installing packages) or must leave the sandbox (`git commit`, writing elsewhere), the agent says so with a reason and you're asked first: Allow, Always allow for that program and kind of access, or Deny. When a sandboxed command fails in a way that looks like the sandbox stopped it, the agent is told how to ask. Without a sandbox (other platforms, `bwrap` missing, or `HARNESS_NO_SANDBOX=1`), every command asks. To be asked before every command anyway, set `"ask_every_command": true` in the config. The macOS policy is adapted from OpenAI Codex (Apache-2.0; see NOTICE).
+**Commands run in a sandbox** (macOS Seatbelt, or bubblewrap on Linux when `bwrap` is installed). Inside it a command can read files, write only in the workspace (not `.git` or `.pathfinder`) and the temp folders, has no network, can't read credential folders (`~/.ssh`, `~/.aws`, `~/.gnupg`, Keychains, Pathfinder's own config folder wherever it is, `~/.config/gh` and similar), and runs without environment variables whose names look like secrets (`*KEY*`, `*TOKEN*`, `*SECRET*`, `*PASSWORD*`). Sandboxed commands run without asking. When a command needs the internet (installing packages) or must leave the sandbox (`git commit`, writing elsewhere), the agent says so with a reason and you're asked first: Allow, Always allow for that program and kind of access, or Deny. When a sandboxed command fails in a way that looks like the sandbox stopped it, the agent is told how to ask. Without a sandbox (other platforms, `bwrap` missing, or `HARNESS_NO_SANDBOX=1`), every command asks. To be asked before every command anyway, set `"ask_every_command": true` in the config. The macOS policy is adapted from OpenAI Codex (Apache-2.0; see NOTICE).
 
 How the loop behaves, borrowing what Codex, Claude Code, opencode, Crush and Gemini CLI do:
 
@@ -72,7 +85,7 @@ Claude and Gemini subscriptions can't be used this way: their providers don't al
 harness auth set anthropic     # or: harness auth set openai
 ```
 
-The key is checked with the provider, then stored in `~/.config/harness/auth.json`, a file only you can read (mode 0600), the same way Codex and other CLIs keep credentials. When no model is available, Zed shows an **Add an API key** button that runs the same command in a terminal. Other commands:
+The key is checked with the provider, then stored in `auth.json` in the config folder (`harness paths`), a file only you can read (mode 0600), the same way Codex and other CLIs keep credentials. When no model is available, Zed shows an **Add an API key** button that runs the same command in a terminal. Other commands:
 
 - `harness auth status` shows which keys are available and where they come from.
 - `harness auth remove <provider>` deletes Pathfinder's stored key.
@@ -82,7 +95,7 @@ Keys are looked up in this order: `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`, then t
 
 ### Choosing models
 
-With a key in place, Pathfinder lists the provider's current models in Zed's pickers by itself (cached for a day; `harness models --refresh` updates now). To pin your own list or defaults, use `~/.config/harness/config.json`. They appear, grouped by route, in the two model pickers of Zed's agent panel; `system1`/`system2` are the defaults for new sessions. The file is re-read on every turn, so edits apply without restarting Zed.
+With a key in place, Pathfinder lists the provider's current models in Zed's pickers by itself (cached for a day; `harness models --refresh` updates now). To pin your own list or defaults, use `config.json` in the config folder (`harness paths`). They appear, grouped by route, in the two model pickers of Zed's agent panel; `system1`/`system2` are the defaults for new sessions. The file is re-read on every turn, so edits apply without restarting Zed.
 
 ```json
 {

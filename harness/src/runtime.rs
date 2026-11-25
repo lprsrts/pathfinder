@@ -118,8 +118,8 @@ pub enum OptionValue {
     Bool(bool),
 }
 
-pub const NO_MODEL: &str =
-    "No model is configured. Add models to `~/.config/harness/config.json` (see the README).";
+pub const NO_MODEL: &str = "No model is configured. Add an API key (`harness auth set`) or sign in \
+     (`harness auth login chatgpt`), or list models in config.json (`harness paths` shows where).";
 
 impl Runtime {
     pub fn new(store: Arc<Store>, engine: Arc<dyn Engine>) -> Self {

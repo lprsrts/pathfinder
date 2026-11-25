@@ -1,4 +1,4 @@
-//! What you agreed to: `~/.config/harness/telemetry.json`. The install
+//! What you agreed to: `telemetry.json` in the config folder. The install
 //! token sits with the other secrets in `auth.json`.
 
 use std::fs;

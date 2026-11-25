@@ -223,31 +223,12 @@ fn default_codex_bin() -> String {
     "codex".to_string()
 }
 
-fn home_dir() -> PathBuf {
-    env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-}
-
-fn default_config_path() -> PathBuf {
-    match env::var_os("XDG_CONFIG_HOME") {
-        Some(xdg) => PathBuf::from(xdg).join("harness").join("config.json"),
-        None => home_dir()
-            .join(".config")
-            .join("harness")
-            .join("config.json"),
-    }
+pub fn default_config_path() -> PathBuf {
+    crate::paths::config_dir().join("config.json")
 }
 
 fn default_db_path() -> PathBuf {
-    match env::var_os("XDG_DATA_HOME") {
-        Some(xdg) => PathBuf::from(xdg).join("harness").join("harness.sqlite"),
-        None => home_dir()
-            .join(".local")
-            .join("share")
-            .join("harness")
-            .join("harness.sqlite"),
-    }
+    crate::paths::data_dir().join("harness.sqlite")
 }
 
 impl Default for Config {

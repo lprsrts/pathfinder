@@ -3,7 +3,6 @@
 //! callback; the first sign-in registers "Pathfinder" as a dynamic client.
 //! See https://developers.openai.com/siwc/token-sharing-open-source/sign-in
 
-use std::env;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -143,15 +142,7 @@ fn pkce_challenge(verifier: &str) -> String {
 }
 
 pub(crate) fn config_dir() -> PathBuf {
-    env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            env::var_os("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join(".config")
-        })
-        .join("harness")
+    crate::paths::config_dir()
 }
 
 /// Stable per-install id sent as `ext_agent_host_id`. Not a secret.
@@ -171,17 +162,7 @@ fn host_id(config_dir: &std::path::Path) -> Result<String> {
 }
 
 fn default_lock_path() -> PathBuf {
-    env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            env::var_os("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join(".local")
-                .join("state")
-        })
-        .join("harness")
-        .join("chatgpt.lock")
+    crate::paths::state_dir().join("chatgpt.lock")
 }
 
 pub struct ChatGpt {

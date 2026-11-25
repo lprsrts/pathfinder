@@ -38,15 +38,7 @@ fn now() -> u64 {
 }
 
 pub fn cache_path() -> PathBuf {
-    let base = env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            env::var_os("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join(".cache")
-        });
-    base.join("harness").join("models.json")
+    crate::paths::cache_dir().join("models.json")
 }
 
 impl ModelCache {

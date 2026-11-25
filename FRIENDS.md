@@ -8,7 +8,9 @@ Pathfinder makes sure you understand the work you do with AI. It answers, checks
 curl -fsSL https://pathfinder.lprsrts.com/install.sh | sh
 ```
 
-This installs one program, `harness`, into `~/.local/bin`. It is signed and notarised by Apple. If the script says that folder isn't on your PATH, run the line it prints.
+This installs one program, `harness`, into `~/.local/bin` (or `$XDG_BIN_HOME`, or wherever `PATHFINDER_BIN_DIR` says). It is signed and notarised by Apple. If the script says that folder isn't on your PATH, run the line it prints for your shell.
+
+Pathfinder keeps its settings where your system expects them; `harness paths` shows where.
 
 ## Start
 

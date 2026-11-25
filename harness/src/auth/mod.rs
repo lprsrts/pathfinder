@@ -1,7 +1,7 @@
 //! API keys for the provider routes and the ChatGPT session.
 //!
 //! Lookup order: environment variable, then Pathfinder's auth file
-//! (`~/.config/harness/auth.json`, mode 0600). `harness auth import` copies
+//! (`auth.json` in the config folder, mode 0600). `harness auth import` copies
 //! an existing `<provider>-api-key` macOS keychain item into the file once;
 //! nothing else touches the keychain, so there are no prompts.
 
@@ -93,7 +93,7 @@ fn read_macos_keychain(service: &str) -> Result<Option<String>> {
 }
 
 impl Credentials {
-    /// `~/.config/harness/auth.json`.
+    /// `auth.json` in the config folder ([`crate::paths`]).
     pub fn system() -> Self {
         let store: Arc<dyn SecretStore> =
             Arc::new(FileStore::new(chatgpt::config_dir().join("auth.json")));
