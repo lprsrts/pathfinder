@@ -5,6 +5,7 @@
 //! errors, sends a fixed reply instead (fail closed).
 
 use anyhow::{Result, anyhow};
+use pathfinder_schema::GateOutcome;
 use serde::Deserialize;
 
 use super::{Runtime, format_turns};
@@ -116,13 +117,24 @@ impl Runtime {
         secrets: &[Secret],
         draft: &str,
     ) -> Result<Option<bool>> {
+        Ok(self.leaks_scored(session, secrets, draft).await?.0)
+    }
+
+    /// `leaks`, with the highest decision score (None after a pre-check
+    /// hit or with no decision service).
+    async fn leaks_scored(
+        &self,
+        session: &Session,
+        secrets: &[Secret],
+        draft: &str,
+    ) -> Result<(Option<bool>, Option<f64>)> {
         if secrets.iter().any(|s| precheck_hit(s, draft)) {
-            return Ok(Some(true));
+            return Ok((Some(true), None));
         }
-        Ok(self
-            .check(session, secrets, draft)
-            .await?
-            .map(|c| c.blocked))
+        Ok(match self.check(session, secrets, draft).await? {
+            Some(c) => (Some(c.blocked), c.scores.iter().copied().reduce(f64::max)),
+            None => (None, None),
+        })
     }
 
     /// The decision check (A6). A score under `PASS_BELOW` passes and one
@@ -247,12 +259,30 @@ impl Runtime {
         draft: String,
         sink: &StreamSink,
     ) -> String {
-        let blocked = match self.leaks(session, secrets, &draft).await {
-            Ok(None) | Ok(Some(false)) => return draft,
-            Ok(Some(true)) => true,
+        let (reply, score, outcome) = self
+            .gate_reply_inner(session, secrets, message, draft, sink)
+            .await;
+        crate::telemetry::emit(pathfinder_schema::Event::Gate {
+            score: score.map(|s| s.clamp(0.0, 1.0)),
+            outcome,
+        });
+        reply
+    }
+
+    async fn gate_reply_inner(
+        &self,
+        session: &Session,
+        secrets: &[Secret],
+        message: &str,
+        draft: String,
+        sink: &StreamSink,
+    ) -> (String, Option<f64>, GateOutcome) {
+        let (blocked, score) = match self.leaks_scored(session, secrets, &draft).await {
+            Ok((None | Some(false), score)) => return (draft, score, GateOutcome::Passed),
+            Ok((Some(true), score)) => (true, score),
             Err(e) => {
                 tracing::warn!("the gate's check failed; withholding the reply: {e:#}");
-                return fixed_reply(session);
+                return (fixed_reply(session), None, GateOutcome::Failed);
             }
         };
         debug_assert!(blocked);
@@ -263,15 +293,15 @@ impl Runtime {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!("rewriting a held reply: {e:#}");
-                return fixed_reply(session);
+                return (fixed_reply(session), score, GateOutcome::Failed);
             }
         };
         match self.leaks(session, secrets, &rewritten).await {
-            Ok(None) | Ok(Some(false)) => rewritten,
-            Ok(Some(true)) => fixed_reply(session),
+            Ok(None) | Ok(Some(false)) => (rewritten, score, GateOutcome::Rewritten),
+            Ok(Some(true)) => (fixed_reply(session), score, GateOutcome::Fixed),
             Err(e) => {
                 tracing::warn!("the gate's check failed; withholding the reply: {e:#}");
-                fixed_reply(session)
+                (fixed_reply(session), score, GateOutcome::Failed)
             }
         }
     }

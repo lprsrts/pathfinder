@@ -896,6 +896,21 @@ fn modal(f: &mut Frame, app: &App, area: Rect) {
             list(f, rect, title, rows, *sel, "Enter picks · Esc goes back");
         }
         Modal::Permission { .. } => {}
+        Modal::Consent {
+            events,
+            threads,
+            invite,
+            error,
+            busy,
+        } => consent(
+            f,
+            area,
+            *events,
+            *threads,
+            invite.as_deref(),
+            error.as_deref(),
+            *busy,
+        ),
         Modal::Help => {
             let keys = [
                 ("Enter", "send"),
@@ -949,4 +964,79 @@ fn modal(f: &mut Frame, app: &App, area: Rect) {
             );
         }
     }
+}
+
+/// The one-time question about usage data.
+fn consent(
+    f: &mut Frame,
+    area: Rect,
+    events: bool,
+    threads: bool,
+    invite: Option<&str>,
+    error: Option<&str>,
+    busy: bool,
+) {
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    let tick = |on: bool| if on { "[x]" } else { "[ ]" };
+    let mut lines: Vec<Line> = vec![
+        Line::from("Pathfinder can send usage data to its developer, to see what works and what"),
+        Line::from("breaks for people other than him. Nothing is sent unless you say yes here"),
+        Line::from("and have an invite code."),
+        Line::default(),
+        Line::from(vec![Span::styled(
+            format!("{} e  Usage events", tick(events)),
+            bold,
+        )]),
+        Line::from("       Counts and timings: which steps you use, how long replies take,"),
+        Line::from("       whether a reply was held back, checks as right or wrong. Never your"),
+        Line::from("       messages, files, folder names or study topics."),
+        Line::from(vec![Span::styled(
+            format!("{} t  Threads you choose to share", tick(threads)),
+            bold,
+        )]),
+        Line::from("       Only when you type /share in a thread, after seeing exactly what goes."),
+        Line::default(),
+        Line::from("Kept on his server in Germany for up to 12 months. Change it any time with"),
+        Line::from("`harness data off`; erase everything with `harness data delete`."),
+        Line::from(Span::styled(
+            format!("Full notice: {}", crate::telemetry::consent::NOTICE_URL),
+            dim(),
+        )),
+        Line::default(),
+    ];
+    let hint = match invite {
+        None => {
+            if events || threads {
+                "e, t toggle · Enter continues · Esc: no, nothing is shared"
+            } else {
+                "e, t toggle · Enter or Esc: no, nothing is shared"
+            }
+        }
+        Some(code) => {
+            lines.push(Line::from(vec![
+                Span::styled("Invite code: ", bold),
+                Span::raw(code.to_string()),
+                Span::styled(if busy { "  checking…" } else { "▏" }, dim()),
+            ]));
+            "Enter joins · Esc saves your answer and joins later"
+        }
+    };
+    if let Some(e) = error {
+        lines.push(Line::from(Span::styled(
+            e.to_string(),
+            Style::default().fg(ratatui::style::Color::Red),
+        )));
+    }
+    let rect = centered(area, 82, lines.len() as u16 + 2);
+    f.render_widget(Clear, rect);
+    f.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(dim())
+                .title(Span::styled(" Help improve Pathfinder? ", bold))
+                .title_bottom(Span::styled(format!(" {hint} "), dim())),
+        ),
+        rect,
+    );
 }

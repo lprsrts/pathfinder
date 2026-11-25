@@ -403,3 +403,116 @@ pub fn coverage(args: &[String]) -> Result<()> {
     }
     Ok(())
 }
+
+/// `harness data`: what Pathfinder may send, and changing it.
+pub async fn data(args: &[String]) -> Result<()> {
+    use crate::telemetry::{self, Consent, Outbox, consent};
+    let has = |flag: &str| args.iter().any(|a| a == flag);
+    let cfg = crate::config::Config::load();
+    let mut consent = Consent::load();
+    match args.first().map(String::as_str) {
+        None | Some("status") => {
+            let outbox = Outbox::open(&cfg.db_path)?;
+            let yes = |b: bool| if b { "yes" } else { "no" };
+            println!("Usage events (no message text): {}", yes(consent.events));
+            println!("Sharing threads you choose:     {}", yes(consent.threads));
+            println!(
+                "Enrolled:                       {}",
+                if consent.enrolled {
+                    format!("yes, at {}", telemetry::collector_url())
+                } else {
+                    "no".into()
+                }
+            );
+            if std::env::var("HARNESS_TELEMETRY").is_ok_and(|v| v.trim() == "off") {
+                println!("HARNESS_TELEMETRY=off: nothing is collected in this shell.");
+            }
+            println!("Waiting to be sent:             {} events", outbox.count()?);
+            println!(
+                "\n`harness data show` prints them. Notice: {}",
+                consent::NOTICE_URL
+            );
+            Ok(())
+        }
+        Some("show") => {
+            let outbox = Outbox::open(&cfg.db_path)?;
+            let rows = outbox.peek(usize::MAX)?;
+            if rows.is_empty() {
+                println!("Nothing is waiting to be sent.");
+            }
+            for row in rows {
+                println!("{row}");
+            }
+            Ok(())
+        }
+        Some("join") => {
+            let invite = args
+                .get(1)
+                .filter(|a| !a.starts_with("--"))
+                .context("usage: harness data join <invite code> [--events] [--threads]")?;
+            if !has("--events") && !has("--threads") {
+                bail!(
+                    "say what you agree to: --events (usage events, no message text), \
+                     --threads (sharing threads you choose), or both. Read the notice first: {}",
+                    consent::NOTICE_URL
+                );
+            }
+            consent.events = has("--events");
+            consent.threads = has("--threads");
+            telemetry::enroll(invite, &mut consent).await?;
+            println!(
+                "Enrolled. Thank you! `harness data` shows what is collected; `harness data off` stops it."
+            );
+            Ok(())
+        }
+        Some("on") => {
+            let (events, threads) = match (has("--events"), has("--threads")) {
+                (false, false) => (true, true),
+                pick => pick,
+            };
+            consent.events |= events;
+            consent.threads |= threads;
+            consent.stamp();
+            consent.save()?;
+            if !consent.enrolled {
+                println!(
+                    "Saved. Nothing is sent until you join with an invite code: harness data join <code> …"
+                );
+                return Ok(());
+            }
+            telemetry::set_remote_consent(&consent).await?;
+            println!("Saved.");
+            Ok(())
+        }
+        Some("off") => {
+            consent.events = false;
+            consent.threads = false;
+            consent.stamp();
+            consent.save()?;
+            Outbox::open(&cfg.db_path)?.clear()?;
+            if let Err(e) = telemetry::set_remote_consent(&consent).await {
+                eprintln!(
+                    "Stopped here, but couldn't tell the collector ({e:#}). Nothing more is sent."
+                );
+            } else {
+                println!("Stopped. Nothing more is sent, and the queue is cleared.");
+            }
+            println!("To erase what was already sent: harness data delete");
+            Ok(())
+        }
+        Some("delete") => {
+            telemetry::delete_remote(&consent).await?;
+            Outbox::open(&cfg.db_path)?.clear()?;
+            consent.forget()?;
+            consent.stamp();
+            consent.save()?;
+            println!(
+                "Erased: the collector deleted everything from this install, and this install forgot its token."
+            );
+            Ok(())
+        }
+        Some(other) => {
+            bail!("unknown `harness data {other}`: use status, show, join, on, off or delete")
+        }
+    }
+}

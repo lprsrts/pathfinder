@@ -289,24 +289,96 @@ impl Runtime {
         self.migrate_pending_key(&mut session);
         let text = input.text.trim();
         let files = &input.files;
+
+        // Usage events: what kind of turn, how long, which tools (by kind).
+        let started = std::time::Instant::now();
+        let had_candidate = session.pending_candidate.is_some();
+        let tools = Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::<
+            pathfinder_schema::Tool,
+            u32,
+        >::new()));
+        let sink: StreamSink = {
+            let tools = tools.clone();
+            let inner = sink;
+            Arc::new(move |event: StreamEvent| {
+                if let StreamEvent::ToolStart(t) = &event {
+                    *tools.lock().unwrap().entry(tool_kind(t.kind)).or_default() += 1;
+                }
+                inner(event)
+            })
+        };
+        let (output, counters) = crate::telemetry::with_turn_counters(self.dispatch_turn(
+            &mut session,
+            text,
+            files,
+            sink,
+        ))
+        .await;
+        if crate::telemetry::enabled() {
+            crate::telemetry::set_locale(session.language.as_deref().unwrap_or(""));
+            let (route, model) = self
+                .models(&session)
+                .map(|m| {
+                    let route = serde_json::to_value(m.system2.route)
+                        .ok()
+                        .and_then(|v| v.as_str().map(str::to_string))
+                        .unwrap_or_default();
+                    let model = if m.system2.model.is_empty() {
+                        m.system2.id.clone()
+                    } else {
+                        m.system2.model.clone()
+                    };
+                    (route, model)
+                })
+                .unwrap_or_default();
+            let model = if pathfinder_schema::is_token(&model, 96) {
+                model
+            } else {
+                "other".into()
+            };
+            let step = turn_step(text, &session, had_candidate);
+            crate::telemetry::emit(pathfinder_schema::Event::Turn {
+                route,
+                model,
+                ms: started.elapsed().as_millis() as u64,
+                step,
+                steps: counters
+                    .model_calls
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                tools: tools.lock().unwrap().clone(),
+                retries: counters.retries.load(std::sync::atomic::Ordering::Relaxed),
+                failed: output.is_err(),
+            });
+        }
+        let output = output?;
+
+        self.retire_stale_secrets(&session);
+        self.store.save_session(&session)?;
+        Ok(output)
+    }
+
+    /// One message, by the thread's mode or the command it starts with.
+    async fn dispatch_turn(
+        &self,
+        session: &mut Session,
+        text: &str,
+        files: &[PathBuf],
+        sink: StreamSink,
+    ) -> Result<TurnOutput> {
         let output = if text.starts_with('/') {
-            self.handle_command(&mut session, text, files, sink).await?
+            self.handle_command(session, text, files, sink).await?
         } else {
             match session.mode {
                 SessionMode::Onboarding => {
-                    self.handle_onboarding(&mut session, text, files, sink)
-                        .await?
+                    self.handle_onboarding(session, text, files, sink).await?
                 }
-                SessionMode::Working => self.handle_chat(&mut session, text, files, sink).await?,
+                SessionMode::Working => self.handle_chat(session, text, files, sink).await?,
                 SessionMode::Done => {
-                    self.handle_opening(&mut session, text, files, sink, false)
+                    self.handle_opening(session, text, files, sink, false)
                         .await?
                 }
             }
         };
-
-        self.retire_stale_secrets(&session);
-        self.store.save_session(&session)?;
         Ok(output)
     }
 
@@ -478,6 +550,15 @@ impl Runtime {
             session.goal = Some(goal);
             session.quick_check = decision.check && !decision.exam;
             session.exam = decision.exam;
+            if decision.exam || decision.check {
+                crate::telemetry::emit(pathfinder_schema::Event::Ui {
+                    feature: if decision.exam {
+                        pathfinder_schema::Feature::Exam
+                    } else {
+                        pathfinder_schema::Feature::QuickCheck
+                    },
+                });
+            }
         }
         if !quiet {
             session.push_turn("assistant", &decision.reply);
@@ -1362,6 +1443,11 @@ impl Runtime {
             // A quick check left unanswered: drop it, nothing recorded, and
             // answer the message as chat.
             if session.quick_check || session.exam {
+                crate::telemetry::emit(pathfinder_schema::Event::Check {
+                    outcome: pathfinder_schema::CheckOutcome::Skipped,
+                    concepts: pending.targets.len() as u32,
+                    quick: true,
+                });
                 end_quick_check(session);
                 return self
                     .handle_opening(session, judgment, files, sink, true)
@@ -1372,6 +1458,15 @@ impl Runtime {
             return self.handle_log(session, judgment, files, sink, None).await;
         }
         flush(&sink, &verdict.feedback, &shown);
+        crate::telemetry::emit(pathfinder_schema::Event::Check {
+            outcome: if verdict.pass {
+                pathfinder_schema::CheckOutcome::Right
+            } else {
+                pathfinder_schema::CheckOutcome::Wrong
+            },
+            concepts: pending.targets.len() as u32,
+            quick: session.quick_check || session.exam,
+        });
         self.record_verdict(
             session,
             &pending,
@@ -3562,5 +3657,43 @@ mod tests {
             s.goal.as_deref(),
             Some("Understand convolutional networks for an image classifier")
         );
+    }
+}
+
+/// The usage-event kind of a tool call.
+fn tool_kind(kind: crate::stream::ToolKind) -> pathfinder_schema::Tool {
+    use crate::stream::ToolKind as K;
+    use pathfinder_schema::Tool as T;
+    match kind {
+        K::Read => T::Read,
+        K::Edit => T::Edit,
+        K::Search => T::Search,
+        K::Execute => T::Execute,
+        K::Fetch => T::Fetch,
+        K::Other => T::Other,
+    }
+}
+
+/// What kind of turn this was, for usage events.
+fn turn_step(text: &str, session: &Session, had_candidate: bool) -> pathfinder_schema::Step {
+    use pathfinder_schema::Step;
+    if let Some(cmd) = text.strip_prefix('/') {
+        return match cmd.split_whitespace().next().unwrap_or("") {
+            "plan" | "replan" | "map" => Step::Map,
+            "summary" => Step::Summary,
+            "delegate" => Step::Delegate,
+            "handoff" => Step::Handoff,
+            _ => Step::Other,
+        };
+    }
+    let has_candidate = session.pending_candidate.is_some();
+    match (had_candidate, has_candidate) {
+        (true, false) => Step::Verdict,
+        (false, true) => Step::Candidate,
+        _ => match session.mode {
+            SessionMode::Onboarding => Step::Onboarding,
+            SessionMode::Working => Step::Log,
+            SessionMode::Done => Step::Chat,
+        },
     }
 }

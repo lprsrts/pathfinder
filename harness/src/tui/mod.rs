@@ -51,6 +51,8 @@ pub enum AppEvent {
         always_key: String,
         reply: oneshot::Sender<Permission>,
     },
+    /// The invite code was tried.
+    Enrolled(std::result::Result<(), String>),
 }
 
 /// A dialog over the conversation.
@@ -74,6 +76,15 @@ pub enum Modal {
         reply: Option<oneshot::Sender<Permission>>,
     },
     Help,
+    /// Asks once whether to share usage data. `invite` is None on the
+    /// first screen and the code being typed on the second.
+    Consent {
+        events: bool,
+        threads: bool,
+        invite: Option<String>,
+        error: Option<String>,
+        busy: bool,
+    },
 }
 
 /// The settings the toolbar offers in Zed: (option id, name).
@@ -126,6 +137,9 @@ pub struct App {
     pub side_overlay: bool,
     /// Kinds of command the user allowed for the rest of this thread.
     pub always: std::collections::HashSet<String>,
+    /// When this thread was opened here, and its turns since (usage events).
+    thread_started: std::time::Instant,
+    thread_turns: u32,
     tx: mpsc::UnboundedSender<AppEvent>,
     pub quit: bool,
 }
@@ -161,9 +175,23 @@ pub async fn run(rt: Arc<Runtime>, cwd: PathBuf) -> Result<()> {
         new_below: false,
         side_overlay: false,
         always: Default::default(),
+        thread_started: std::time::Instant::now(),
+        thread_turns: 0,
         tx,
         quit: false,
     };
+    emit(UsageEvent::SessionStart {
+        surface: pathfinder_schema::Surface::Tui,
+    });
+    if crate::telemetry::Consent::load().needs_answer() && !env_says_off() {
+        app.modal = Some(Modal::Consent {
+            events: false,
+            threads: false,
+            invite: None,
+            error: None,
+            busy: false,
+        });
+    }
     if app
         .rt
         .sessions_in(&app.cwd)
@@ -208,7 +236,15 @@ pub async fn run(rt: Arc<Runtime>, cwd: PathBuf) -> Result<()> {
     crossterm::execute!(std::io::stdout(), DisableBracketedPaste).ok();
     ratatui::restore();
     print_transcript(&app);
+    app.end_thread();
     result
+}
+
+use crate::telemetry::emit;
+use pathfinder_schema::{Event as UsageEvent, Feature};
+
+fn used(feature: Feature) {
+    emit(UsageEvent::Ui { feature });
 }
 
 /// After quitting, the conversation goes into the terminal's own
@@ -417,6 +453,7 @@ impl App {
         }
         match key.code {
             KeyCode::Tab if !self.items.is_empty() => {
+                used(Feature::Navigate);
                 self.selected = self.items.last().copied();
                 self.reveal_selected = true;
             }
@@ -426,11 +463,21 @@ impl App {
             },
             KeyCode::Char('d') if ctrl && self.input.is_empty() => self.quit = true,
             KeyCode::Char('n') if ctrl => self.new_thread(),
-            KeyCode::Char('o') if ctrl => self.open_threads(),
-            KeyCode::Char('p') if ctrl => self.modal = Some(Modal::Settings { sel: 0 }),
+            KeyCode::Char('o') if ctrl => {
+                used(Feature::Threads);
+                self.open_threads()
+            }
+            KeyCode::Char('p') if ctrl => {
+                used(Feature::Settings);
+                self.modal = Some(Modal::Settings { sel: 0 })
+            }
             KeyCode::Char('t') if ctrl => self.show_thoughts = !self.show_thoughts,
-            KeyCode::Char('e') if ctrl => self.show_tools = !self.show_tools,
+            KeyCode::Char('e') if ctrl => {
+                used(Feature::ToolGrouping);
+                self.show_tools = !self.show_tools
+            }
             KeyCode::Char('b') if ctrl => {
+                used(Feature::SidePanel);
                 let wide = crossterm::terminal::size().is_ok_and(|(w, _)| w >= view::DOCK_FROM);
                 if wide {
                     self.show_side = !self.show_side;
@@ -439,7 +486,10 @@ impl App {
                 }
             }
             KeyCode::Char('j') if ctrl => self.insert_char('\n'),
-            KeyCode::F(1) => self.modal = Some(Modal::Help),
+            KeyCode::F(1) => {
+                used(Feature::Help);
+                self.modal = Some(Modal::Help)
+            }
             KeyCode::Esc if self.side_overlay => self.side_overlay = false,
             KeyCode::Esc => {
                 if let Some(cancel) = &self.running {
@@ -522,6 +572,7 @@ impl App {
             }
             KeyCode::Char('y') => {
                 let text = self.entry_text(sel);
+                used(Feature::Copy);
                 self.status = match copy_to_clipboard(&text) {
                     Ok(()) => format!("Copied {} characters.", text.chars().count()),
                     Err(e) => format!("Couldn't copy: {e}"),
@@ -583,6 +634,24 @@ impl App {
         self.cursor += c.len_utf8();
     }
 
+    /// Usage events: the thread on screen closes…
+    fn end_thread(&mut self) {
+        emit(UsageEvent::SessionEnd {
+            secs: self.thread_started.elapsed().as_secs(),
+            turns: self.thread_turns,
+        });
+    }
+
+    /// …and another opens.
+    fn begin_thread(&mut self) {
+        crate::telemetry::new_session();
+        self.thread_started = std::time::Instant::now();
+        self.thread_turns = 0;
+        emit(UsageEvent::SessionStart {
+            surface: pathfinder_schema::Surface::Tui,
+        });
+    }
+
     fn new_thread(&mut self) {
         if self.running.is_some() {
             self.status = "A reply is still running; Esc stops it.".into();
@@ -593,6 +662,8 @@ impl App {
             .create_session(uuid::Uuid::new_v4().to_string(), self.cwd.clone())
         {
             Ok(s) => {
+                self.end_thread();
+                self.begin_thread();
                 self.session = s;
                 self.entries.clear();
                 self.always.clear();
@@ -746,6 +817,10 @@ impl App {
             } => {
                 // Allowed "always" earlier in this thread: no question.
                 if self.always.contains(&always_key) {
+                    emit(UsageEvent::Permission {
+                        scope: permission_scope(&always_key),
+                        answer: pathfinder_schema::PermissionAnswer::Remembered,
+                    });
                     let _ = reply.send(Permission::Always);
                     return;
                 }
@@ -759,8 +834,33 @@ impl App {
                     reply: Some(reply),
                 });
             }
+            AppEvent::Enrolled(result) => {
+                if let Some(Modal::Consent {
+                    events,
+                    threads,
+                    invite,
+                    ..
+                }) = self.modal.take()
+                {
+                    match result {
+                        Ok(()) => {
+                            self.status = "Thank you! `harness data` shows what is collected; `harness data off` stops it.".into();
+                        }
+                        Err(e) => {
+                            self.modal = Some(Modal::Consent {
+                                events,
+                                threads,
+                                invite,
+                                error: Some(e),
+                                busy: false,
+                            });
+                        }
+                    }
+                }
+            }
             AppEvent::Done { result, stopped } => {
                 self.running = None;
+                self.thread_turns += 1;
                 match result {
                     Ok(out) if !out.reply.is_empty() => match self.entries.last_mut() {
                         Some(Entry::Text(s)) => s.push_str(&out.reply),
@@ -852,6 +952,13 @@ impl App {
         };
         self.modal = match modal {
             Modal::Help => None,
+            Modal::Consent {
+                events,
+                threads,
+                invite,
+                error,
+                busy,
+            } => self.on_consent_key(key, events, threads, invite, error, busy),
             Modal::Permission {
                 title,
                 always_key,
@@ -878,6 +985,14 @@ impl App {
                             _ => "✓ Allowed once.".to_string(),
                         };
                         self.entries.push(Entry::Note(said));
+                        emit(UsageEvent::Permission {
+                            scope: permission_scope(&always_key),
+                            answer: match a {
+                                Permission::Denied => pathfinder_schema::PermissionAnswer::No,
+                                Permission::Always => pathfinder_schema::PermissionAnswer::Always,
+                                _ => pathfinder_schema::PermissionAnswer::Once,
+                            },
+                        });
                         let _ = tx.send(a);
                         None
                     }
@@ -895,6 +1010,8 @@ impl App {
                     if let Some((id, _)) = items.get(sel)
                         && let Ok(Some(s)) = self.rt.load_session(id)
                     {
+                        self.end_thread();
+                        self.begin_thread();
                         self.entries = entries_of(&s);
                         self.always.clear();
                         self.expanded.clear();
@@ -986,5 +1103,113 @@ mod tests {
         std::fs::write(dir.join("notes.txt"), b"x").unwrap();
         let text = format!("look at {}/my\\ sheet.pdf please notes.txt", dir.display());
         assert_eq!(dropped_files(&text, &dir), vec![dir.join("my sheet.pdf")]);
+    }
+}
+
+/// The kind of permission an always-key stands for.
+fn permission_scope(always_key: &str) -> pathfinder_schema::PermissionScope {
+    use pathfinder_schema::PermissionScope as S;
+    match always_key.split_once(':').map(|(k, _)| k) {
+        Some("unsandboxed") => S::OutsideSandbox,
+        Some("network") => S::Network,
+        Some(_) => S::Other,
+        None => S::Sandboxed,
+    }
+}
+
+fn env_says_off() -> bool {
+    matches!(
+        std::env::var("HARNESS_TELEMETRY").as_deref().map(str::trim),
+        Ok("off" | "0" | "false" | "no")
+    )
+}
+
+impl App {
+    /// Keys on the consent screen. Returns the modal to keep showing.
+    fn on_consent_key(
+        &mut self,
+        key: KeyEvent,
+        mut events: bool,
+        mut threads: bool,
+        invite: Option<String>,
+        error: Option<String>,
+        busy: bool,
+    ) -> Option<Modal> {
+        macro_rules! keep {
+            ($invite:expr, $error:expr, $busy:expr) => {
+                Some(Modal::Consent {
+                    events,
+                    threads,
+                    invite: $invite,
+                    error: $error,
+                    busy: $busy,
+                })
+            };
+        }
+        if busy {
+            return keep!(invite, error, busy);
+        }
+        let save_answer = |events: bool, threads: bool| {
+            let mut c = crate::telemetry::Consent::load();
+            c.events = events;
+            c.threads = threads;
+            c.stamp();
+            if let Err(e) = c.save() {
+                tracing::warn!("saving the data answer: {e:#}");
+            }
+            crate::telemetry::reload();
+        };
+        match invite {
+            // First screen: choose.
+            None => match key.code {
+                KeyCode::Char('e') => {
+                    events = !events;
+                    keep!(None, None, false)
+                }
+                KeyCode::Char('t') => {
+                    threads = !threads;
+                    keep!(None, None, false)
+                }
+                KeyCode::Enter if events || threads => keep!(Some(String::new()), None, false),
+                KeyCode::Enter | KeyCode::Esc | KeyCode::Char('n') => {
+                    save_answer(false, false);
+                    self.status = "Nothing is shared. `harness data` can change that later.".into();
+                    None
+                }
+                _ => keep!(None, error, false),
+            },
+            // Second screen: the invite code.
+            Some(mut code) => match key.code {
+                KeyCode::Esc => {
+                    save_answer(events, threads);
+                    self.status =
+                        "Saved; nothing is sent until you join: harness data join <code> …".into();
+                    None
+                }
+                KeyCode::Enter if !code.trim().is_empty() => {
+                    let mut consent = crate::telemetry::Consent::load();
+                    consent.events = events;
+                    consent.threads = threads;
+                    let tx = self.tx.clone();
+                    let code2 = code.clone();
+                    tokio::spawn(async move {
+                        let r = crate::telemetry::enroll(&code2, &mut consent)
+                            .await
+                            .map_err(|e| format!("{e:#}"));
+                        let _ = tx.send(AppEvent::Enrolled(r));
+                    });
+                    keep!(Some(code), None, true)
+                }
+                KeyCode::Backspace => {
+                    code.pop();
+                    keep!(Some(code), None, false)
+                }
+                KeyCode::Char(c) if !c.is_control() && code.len() < 64 => {
+                    code.push(c);
+                    keep!(Some(code), None, false)
+                }
+                _ => keep!(Some(code), error, false),
+            },
+        }
     }
 }

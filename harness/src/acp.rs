@@ -121,6 +121,10 @@ pub async fn run_stdio(runtime: Arc<Runtime>, creds: Arc<Credentials>) -> Result
                 let id = Uuid::new_v4().to_string();
                 match rt_new.create_session(id.clone(), req.cwd) {
                     Ok(session) => {
+                        crate::telemetry::new_session();
+                        crate::telemetry::emit(pathfinder_schema::Event::SessionStart {
+                            surface: pathfinder_schema::Surface::Zed,
+                        });
                         let sid = SessionId::new(id);
                         let options = model_options(
                             &rt_new.model_choices(&session),

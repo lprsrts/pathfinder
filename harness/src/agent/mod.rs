@@ -796,6 +796,7 @@ async fn complete_with_retry(
             }
             LlmEvent::Text(_) => {}
         };
+        crate::telemetry::count_model_call();
         match llm.complete(request, &on_event, &req.ctx.cancel).await {
             Ok(parts) => return Ok(parts),
             Err(err)
@@ -815,6 +816,7 @@ async fn complete_with_retry(
                     .unwrap_or(base + Duration::from_millis(jitter))
                     .min(Duration::from_secs(60));
                 tracing::warn!("{err}; retrying in {}s", wait.as_secs());
+                crate::telemetry::count_retry();
                 sink(StreamEvent::Thought(format!(
                     "\n\nThe provider didn't answer; retrying in {}s.\n",
                     wait.as_secs()
@@ -822,7 +824,12 @@ async fn complete_with_retry(
                 tokio::time::sleep(wait).await;
             }
             Err(LlmError::Cancelled) => bail!("cancelled"),
-            Err(err) => return Err(anyhow!(err)),
+            Err(err) => {
+                crate::telemetry::emit(pathfinder_schema::Event::Error {
+                    code: crate::telemetry::llm_error_code(&err),
+                });
+                return Err(anyhow!(err));
+            }
         }
     }
 }

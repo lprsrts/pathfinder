@@ -1102,6 +1102,7 @@ dependencies = [
  "globset",
  "ignore",
  "jsonwebtoken",
+ "pathfinder-schema",
  "ratatui",
  "regex",
  "reqwest",
@@ -2093,6 +2094,14 @@ dependencies = [
  "redox_syscall",
  "smallvec",
  "windows-link",
+]
+
+[[package]]
+name = "pathfinder-schema"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

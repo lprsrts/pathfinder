@@ -14,6 +14,7 @@ mod runtime;
 mod secrets;
 mod store;
 mod stream;
+mod telemetry;
 mod tui;
 mod understanding;
 mod validate;
@@ -73,6 +74,7 @@ async fn main() -> Result<()> {
     match args.first().map(String::as_str) {
         Some("acp") => {
             let cfg = Config::load();
+            let cfg_db = cfg.db_path.clone();
             let store = Arc::new(Store::open(&cfg.db_path)?);
             let creds = Arc::new(Credentials::system());
             let engine = Arc::new(RouterEngine::new(
@@ -83,10 +85,14 @@ async fn main() -> Result<()> {
                 Runtime::new(store, engine)
                     .with_decider(Arc::new(decide::SystemDecider::new(creds.clone()))),
             );
-            acp::run_stdio(runtime, creds).await
+            start_telemetry(&cfg_db);
+            let result = acp::run_stdio(runtime, creds).await;
+            stop_telemetry().await;
+            result
         }
         Some("tui") => {
             let cfg = Config::load();
+            let cfg_db = cfg.db_path.clone();
             let store = Arc::new(Store::open(&cfg.db_path)?);
             let creds = Arc::new(Credentials::system());
             let engine = Arc::new(RouterEngine::new(
@@ -101,9 +107,13 @@ async fn main() -> Result<()> {
                 Some(dir) => std::path::PathBuf::from(dir),
                 None => env::current_dir()?,
             };
-            tui::run(runtime, cwd).await
+            start_telemetry(&cfg_db);
+            let result = tui::run(runtime, cwd).await;
+            stop_telemetry().await;
+            result
         }
         Some("auth") => cli::auth(&args[1..]).await,
+        Some("data") => cli::data(&args[1..]).await,
         Some("models") => cli::models(&args[1..]).await,
         Some("coverage") => cli::coverage(&args[1..]),
         Some("eval") => {
@@ -150,10 +160,24 @@ async fn main() -> Result<()> {
         }
         _ => {
             eprintln!(
-                "harness {} — human-in-the-loop pathfinder over ACP\n\nUsage:\n  harness tui [folder]       Pathfinder in the terminal, in a folder (default: here)\n  harness acp                Run the ACP server over stdio (for Zed)\n  harness auth [status|set|remove|import]   Manage API keys\n  harness models [--refresh] List discovered models\n  harness coverage [--export] [path]   Understanding coverage of the agent's changes\n  harness eval [suite ...] [--out FILE]   Run the A10 evals (leak, discrimination, checks, tagging, evidence, coverage)\n  harness --version          Print version",
+                "harness {} — human-in-the-loop pathfinder over ACP\n\nUsage:\n  harness tui [folder]       Pathfinder in the terminal, in a folder (default: here)\n  harness acp                Run the ACP server over stdio (for Zed)\n  harness auth [status|set|remove|import]   Manage API keys\n  harness models [--refresh] List discovered models\n  harness data [status|show|join|on|off|delete]   Usage data you share (off unless you join)\n  harness coverage [--export] [path]   Understanding coverage of the agent's changes\n  harness eval [suite ...] [--out FILE]   Run the A10 evals (leak, discrimination, checks, tagging, evidence, coverage)\n  harness --version          Print version",
                 env!("CARGO_PKG_VERSION")
             );
             Ok(())
         }
     }
+}
+
+/// Opens the usage-event outbox and starts uploading, if you agreed to it.
+fn start_telemetry(db: &std::path::Path) {
+    if let Err(e) = telemetry::init(db) {
+        tracing::warn!("usage events are off: {e:#}");
+        return;
+    }
+    telemetry::spawn_uploader();
+}
+
+/// A last upload on the way out, bounded so quitting stays quick.
+async fn stop_telemetry() {
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(3), telemetry::flush()).await;
 }
