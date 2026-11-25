@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pathfinder</title>
+<style>
+  :root { color-scheme: light dark; --fg: #1d1d1f; --bg: #fff; --muted: #6e6e73; --rule: #e5e5ea; --code: #f5f5f7; --accent: #0a66d8; }
+  @media (prefers-color-scheme: dark) { :root { --fg: #f5f5f7; --bg: #111; --muted: #a1a1a6; --rule: #333; --code: #1c1c1e; --accent: #4c9bff; } }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  main { max-width: 40rem; margin: 0 auto; padding: 3rem 1rem 4rem; }
+  h1 { font-size: 1.8rem; margin: 0 0 .5rem; }
+  h2 { font-size: 1.1rem; margin: 2.25rem 0 .5rem; }
+  p.lead { font-size: 1.1rem; margin: 0 0 1.5rem; }
+  .meta { color: var(--muted); font-size: .95rem; }
+  pre { background: var(--code); border: 1px solid var(--rule); border-radius: 8px; padding: .8rem 1rem; overflow-x: auto; margin: .5rem 0 1rem; }
+  code { font: .9em ui-monospace, SFMono-Regular, Menlo, monospace; }
+  ol { padding-left: 1.3rem; }
+  li { margin: .5rem 0; }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<main>
+<h1>Pathfinder</h1>
+<p class="lead">Pathfinder makes sure you understand the work you do with AI. It answers, checks you, and keeps an honest record of what you understood.</p>
+<p>It runs in your terminal, on your own computer, with your own ChatGPT account. It’s invite-only for now: ask Alper to add your email address.</p>
+
+<h2>Install (Mac)</h2>
+<pre><code>curl -fsSL https://pathfinder.lprsrts.com/install.sh | sh</code></pre>
+<p class="meta">One program, <code>harness</code>, in <code>~/.local/bin</code>, signed and notarised by Apple.</p>
+
+<h2>Start</h2>
+<ol>
+<li>Connect your model account (this opens your browser): <code>harness auth login chatgpt</code></li>
+<li>In the folder you’re working in, start Pathfinder: <code>harness tui</code></li>
+<li>Choose whether to share usage data. It’s optional, and Pathfinder works the same either way.</li>
+<li>Press Enter to sign in with your email. Check that the page shows the same code as your terminal, then press <em>Link this computer</em>.</li>
+</ol>
+
+<h2>Your data</h2>
+<p>Usage events are counts and timings, never your messages. A thread is shared only when you type <code>/share</code> in it and confirm. <code>harness data</code> shows your settings, <code>harness data off</code> stops sending, and <code>harness data delete</code> erases what was sent. <a href="/privacy/">Privacy notice</a></p>
+
+<p class="meta">Built by Alper Sarıtaş · <a href="/releases/latest.json">Latest release</a> · Source in each release, AGPL-3.0</p>
+</main>
+</body>
+</html>

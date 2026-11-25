@@ -113,6 +113,7 @@ PY
 
 # The public folder: installer and notice next to the releases.
 cp "$root/collector/public/install.sh" "$dist/public/"
+cp "$root/collector/public/index.html" "$dist/public/"
 cp -R "$root/collector/public/privacy" "$dist/public/"
 
 echo "release ready in $dist/public"
