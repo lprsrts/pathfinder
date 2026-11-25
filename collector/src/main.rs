@@ -48,6 +48,17 @@ async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("serve") => serve().await,
+        // For the container's healthcheck: the image has no curl.
+        Some("health") => {
+            let addr = env_or("COLLECTOR_ADDR", "0.0.0.0:8080").replace("0.0.0.0", "127.0.0.1");
+            let ok = reqwest::get(format!("http://{addr}/healthz"))
+                .await
+                .is_ok_and(|r| r.status().is_success());
+            if !ok {
+                bail!("not healthy");
+            }
+            Ok(())
+        }
         Some("invite") => {
             let name = args.get(1).context("usage: collector invite <name>")?;
             let code = open_db()?.new_invite(name)?;
