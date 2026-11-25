@@ -862,6 +862,7 @@ mod tests {
                         Answer {
                             choice: choice.into(),
                             probability: 0.9,
+                            ..Default::default()
                         },
                     )
                 })

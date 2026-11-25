@@ -2168,6 +2168,7 @@ mod tests {
                     crate::decide::Answer {
                         choice: "yes".into(),
                         probability: p,
+                        ..Default::default()
                     },
                 );
                 Ok(Some(Decision {
@@ -2447,6 +2448,7 @@ mod tests {
                     crate::decide::Answer {
                         choice: step.into(),
                         probability,
+                        ..Default::default()
                     },
                 );
                 if let Some(part) = part {
@@ -2455,6 +2457,7 @@ mod tests {
                         crate::decide::Answer {
                             choice: part.into(),
                             probability: 0.9,
+                            ..Default::default()
                         },
                     );
                 }

@@ -27,11 +27,27 @@ pub struct Question {
     pub options: Vec<(String, String)>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Answer {
     pub choice: String,
     /// Probability of the chosen option.
     pub probability: f64,
+    /// Every option's probability, where the service reports them.
+    pub all: HashMap<String, f64>,
+}
+
+impl Answer {
+    /// The probability of `option`: reported, or else whatever the chosen
+    /// option leaves, split evenly over the other `n_options - 1`.
+    pub fn p(&self, option: &str, n_options: usize) -> f64 {
+        if let Some(p) = self.all.get(option) {
+            *p
+        } else if self.choice == option {
+            self.probability
+        } else {
+            (1.0 - self.probability) / n_options.saturating_sub(1).max(1) as f64
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -203,9 +219,23 @@ impl Provider {
             }
             .or_else(|| a["confidence"].as_f64())
             .unwrap_or(0.0);
+            let all = match &a["probabilities"] {
+                Value::Array(items) => items
+                    .iter()
+                    .filter_map(|p| {
+                        Some((p["value"].as_str()?.to_string(), p["probability"].as_f64()?))
+                    })
+                    .collect(),
+                Value::Object(map) => map
+                    .iter()
+                    .filter_map(|(k, v)| Some((k.clone(), v.as_f64()?)))
+                    .collect(),
+                _ => HashMap::new(),
+            };
             Ok(Answer {
                 choice,
                 probability,
+                all,
             })
         };
         let mut out = HashMap::new();
@@ -367,12 +397,20 @@ mod tests {
             "confidence": 0.8}]});
         let a = &Provider::Openai.parse(&openai).unwrap()["step"];
         assert_eq!((a.choice.as_str(), a.probability), ("known", 0.9));
+        assert_eq!(a.p("log", 2), 0.1);
 
         let mapped = json!({"answers": {"step": {"type": "choice", "choice": "log",
             "probabilities": {"log": 0.7, "known": 0.3}, "confidence": 0.6}}});
         for p in [Provider::Gemini, Provider::Typesafe] {
             let a = &p.parse(&mapped).unwrap()["step"];
             assert_eq!((a.choice.as_str(), a.probability), ("log", 0.7));
+            assert_eq!(a.p("known", 2), 0.3);
         }
+        let bare = Answer {
+            choice: "a".into(),
+            probability: 0.6,
+            ..Default::default()
+        };
+        assert!((bare.p("b", 3) - 0.2).abs() < 1e-9);
     }
 }

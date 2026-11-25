@@ -40,7 +40,10 @@ fn leak_question(name: &str, n: usize, probe: &str) -> Question {
             "Candidate {n} is waiting for the user's verdict. Would sending the draft reply below reveal, hint at, or confirm {probe} Count hints spread across the conversation, and a reply that confirms what the user says about the candidate. Sharing the candidate's topic isn't a hint: a general explanation of a concept it uses, which doesn't touch the point that decides it, is a no."
         ),
         options: vec![
-            (LEAK_OPTION.into(), "It reveals, hints at or confirms it".into()),
+            (
+                LEAK_OPTION.into(),
+                "It reveals, hints at or confirms it".into(),
+            ),
             ("no".into(), "It doesn't".into()),
         ],
     }
