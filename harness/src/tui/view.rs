@@ -184,16 +184,24 @@ fn group_line(app: &App, members: &[usize], width: u16) -> Vec<Line<'static>> {
     markdown::wrap_hanging(&spans, width, 2)
 }
 
-/// The conversation's lines at `width`, oldest first.
-pub fn transcript(app: &App, width: u16) -> Vec<Line<'static>> {
+/// Lines of one item in the conversation: (entry index, line range).
+pub type ItemSpan = (usize, std::ops::Range<usize>);
+
+/// The conversation's lines at `width`, oldest first, and which lines each
+/// selectable item takes.
+pub fn transcript(app: &App, width: u16) -> (Vec<Line<'static>>, Vec<ItemSpan>) {
     let body = width.saturating_sub(2);
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut prev: Option<&Entry> = None;
+    let mut items: Vec<ItemSpan> = Vec::new();
     // Reads and searches in a row collapse to one line; Ctrl+E shows each.
     let mut group_at = std::collections::HashMap::new();
     let mut folded = std::collections::HashSet::new();
     if !app.show_tools {
         for (first, members) in tool_groups(app) {
+            if app.expanded.contains(&first) {
+                continue;
+            }
             folded.extend(members.iter().skip(1).copied());
             group_at.insert(first, members);
         }
@@ -213,6 +221,7 @@ pub fn transcript(app: &App, width: u16) -> Vec<Line<'static>> {
         if prev.is_some() && !together && !hidden_thought {
             lines.push(Line::default());
         }
+        let item_start = lines.len();
         match entry {
             Entry::User(text) => {
                 let you = Style::default()
@@ -275,7 +284,7 @@ pub fn transcript(app: &App, width: u16) -> Vec<Line<'static>> {
                 ));
                 let out: Vec<&str> = detail.lines().collect();
                 // Never hide a single line behind "+1 line".
-                let shown = if out.len() <= TOOL_LINES + 1 {
+                let shown = if out.len() <= TOOL_LINES + 1 || app.expanded.contains(&index) {
                     out.len()
                 } else {
                     TOOL_LINES
@@ -306,9 +315,10 @@ pub fn transcript(app: &App, width: u16) -> Vec<Line<'static>> {
         }
         if !hidden_thought {
             prev = Some(entry);
+            items.push((index, item_start..lines.len()));
         }
     }
-    lines
+    (lines, items)
 }
 
 fn conversation(f: &mut Frame, app: &mut App, area: Rect) {
@@ -318,7 +328,7 @@ fn conversation(f: &mut Frame, app: &mut App, area: Rect) {
         width: area.width.saturating_sub(2),
         ..area
     };
-    let mut lines = transcript(app, area.width);
+    let (mut lines, items) = transcript(app, area.width);
     if app.entries.is_empty() {
         for hint in [
             format!("Ask anything about what's in {}.", app.cwd.display()),
@@ -340,9 +350,40 @@ fn conversation(f: &mut Frame, app: &mut App, area: Rect) {
     let height = area.height as usize;
     let max_scroll = total.saturating_sub(height);
     app.scroll = app.scroll.min(max_scroll);
-    let start = max_scroll - app.scroll;
+    let mut start = max_scroll - app.scroll;
+    // The selected item, brought into view after a move.
+    let selected = app.selected.and_then(|sel| {
+        items
+            .iter()
+            .find(|(i, _)| *i == sel)
+            .map(|(_, r)| r.clone())
+    });
+    if let Some(r) = &selected
+        && app.reveal_selected
+    {
+        if r.end > start + height {
+            start = r.end.saturating_sub(height);
+        }
+        if r.start < start {
+            start = r.start;
+        }
+        start = start.min(max_scroll);
+        app.scroll = max_scroll - start;
+        app.reveal_selected = false;
+    }
+    app.items = items.iter().map(|(i, _)| *i).collect();
     let visible: Vec<Line> = lines.into_iter().skip(start).take(height).collect();
     f.render_widget(Paragraph::new(visible), area);
+    // A bar in the margin beside the selected item.
+    if let Some(r) = selected {
+        let bar = Style::default().fg(Color::Cyan);
+        for line in r.start.max(start)..r.end.min(start + height) {
+            let y = area.y + (line - start) as u16;
+            f.buffer_mut()[(area.x - 1, y)]
+                .set_symbol("▌")
+                .set_style(bar);
+        }
+    }
 }
 
 /// The latest thinking's headline: its last `**bold**` line, else its last line.
@@ -657,7 +698,7 @@ fn input(f: &mut Frame, app: &App, area: Rect) {
             .scroll((skip, 0)),
         text_area,
     );
-    if app.modal.is_none() {
+    if app.modal.is_none() && app.selected.is_none() {
         f.set_cursor_position((text_area.x + col, text_area.y + row - skip));
     }
 }
@@ -718,7 +759,12 @@ fn footer(f: &mut Frame, app: &App, area: Rect) {
         String::new(),
     ];
     let (left, left_style) = if app.status.is_empty() {
-        let hints: &[&str] = if matches!(app.modal, Some(Modal::Permission { .. })) {
+        let hints: &[&str] = if app.selected.is_some() && app.modal.is_none() {
+            &[
+                "↑↓ move · Enter expand · y copy · g/G first/last · Esc back",
+                "↑↓ · Enter · y copy · Esc",
+            ]
+        } else if matches!(app.modal, Some(Modal::Permission { .. })) {
             &["1/y once · 2/a always · 3/n/Esc no", "y · a · n"]
         } else if app.modal.is_some() {
             &["Enter picks · Esc closes"]
@@ -864,6 +910,7 @@ fn modal(f: &mut Frame, app: &App, area: Rect) {
                 ("Ctrl+P", "models, decisions, checks"),
                 ("Ctrl+T", "show or hide thinking"),
                 ("Ctrl+E", "show each read and search, or group them"),
+                ("Tab", "move between messages: ↑↓, Enter expands, y copies"),
                 ("Ctrl+B", "show or hide the plan panel"),
                 ("/attach <file>", "attach a PDF or image (or drop it in)"),
                 ("/why, /map", "your record, the plan"),

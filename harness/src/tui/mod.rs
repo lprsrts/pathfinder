@@ -102,6 +102,15 @@ pub struct App {
     pub show_thoughts: bool,
     /// Every tool line, instead of runs of reads and searches as one line.
     pub show_tools: bool,
+    /// The message selected with the keyboard (an entry index); None while
+    /// typing.
+    pub selected: Option<usize>,
+    /// Scroll the selection into view at the next draw.
+    pub reveal_selected: bool,
+    /// Selectable entries in order, from the last draw.
+    pub items: Vec<usize>,
+    /// Entries shown in full: a tool's whole output, a group's every step.
+    pub expanded: std::collections::HashSet<usize>,
     pub show_side: bool,
     pub modal: Option<Modal>,
     pub status: String,
@@ -138,6 +147,10 @@ pub async fn run(rt: Arc<Runtime>, cwd: PathBuf) -> Result<()> {
         scroll: 0,
         show_thoughts: false,
         show_tools: false,
+        selected: None,
+        reveal_selected: false,
+        items: Vec::new(),
+        expanded: Default::default(),
         show_side: true,
         modal: None,
         status: String::new(),
@@ -208,7 +221,7 @@ fn print_transcript(app: &App) {
     }
     let width = crossterm::terminal::size().map_or(100, |(w, _)| w).min(120);
     let mut out = std::io::stdout();
-    for line in view::transcript(app, width) {
+    for line in view::transcript(app, width).0 {
         for span in &line.spans {
             let color = match span.style.fg {
                 Some(Color::Green) => Some(C::Green),
@@ -241,6 +254,39 @@ fn print_transcript(app: &App) {
         let _ = crossterm::queue!(out, Print("\r\n"));
     }
     let _ = std::io::Write::flush(&mut out);
+}
+
+/// Puts `text` on the system clipboard: the platform's tool, else OSC 52,
+/// which most terminals pass to the clipboard (over SSH too).
+fn copy_to_clipboard(text: &str) -> std::result::Result<(), String> {
+    use std::io::Write;
+    for (cmd, args) in [
+        ("pbcopy", &[][..]),
+        ("wl-copy", &[][..]),
+        ("xclip", &["-selection", "clipboard"][..]),
+    ] {
+        if let Ok(mut child) = std::process::Command::new(cmd)
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin
+                    .write_all(text.as_bytes())
+                    .map_err(|e| e.to_string())?;
+            }
+            if child.wait().is_ok_and(|s| s.success()) {
+                return Ok(());
+            }
+        }
+    }
+    use base64::Engine as _;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text);
+    let mut out = std::io::stdout();
+    write!(out, "\x1b]52;c;{encoded}\x07").map_err(|e| e.to_string())?;
+    out.flush().map_err(|e| e.to_string())
 }
 
 /// Asks in the terminal before the agent runs a command.
@@ -366,7 +412,14 @@ impl App {
             self.on_modal_key(key);
             return;
         }
+        if self.selected.is_some() && self.on_nav_key(key) {
+            return;
+        }
         match key.code {
+            KeyCode::Tab if !self.items.is_empty() => {
+                self.selected = self.items.last().copied();
+                self.reveal_selected = true;
+            }
             KeyCode::Char('c') if ctrl => match &self.running {
                 Some(cancel) => cancel.cancel(),
                 None => self.quit = true,
@@ -440,6 +493,91 @@ impl App {
         }
     }
 
+    /// Keys while a message is selected. False hands the key on to the
+    /// input, after leaving the selection.
+    fn on_nav_key(&mut self, key: KeyEvent) -> bool {
+        let Some(sel) = self.selected else {
+            return false;
+        };
+        let pos = self.items.iter().position(|i| *i == sel).unwrap_or(0);
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let go = |app: &mut Self, at: usize| {
+            if let Some(i) = app.items.get(at) {
+                app.selected = Some(*i);
+                app.reveal_selected = true;
+            }
+        };
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') if !ctrl => go(self, pos.saturating_sub(1)),
+            KeyCode::Down | KeyCode::Char('j') if !ctrl => go(self, pos + 1),
+            KeyCode::Char('g') => go(self, 0),
+            KeyCode::Char('G') => go(self, self.items.len().saturating_sub(1)),
+            KeyCode::PageUp => go(self, pos.saturating_sub(5)),
+            KeyCode::PageDown => go(self, pos + 5),
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                if !self.expanded.remove(&sel) {
+                    self.expanded.insert(sel);
+                }
+                self.reveal_selected = true;
+            }
+            KeyCode::Char('y') => {
+                let text = self.entry_text(sel);
+                self.status = match copy_to_clipboard(&text) {
+                    Ok(()) => format!("Copied {} characters.", text.chars().count()),
+                    Err(e) => format!("Couldn't copy: {e}"),
+                };
+            }
+            KeyCode::Esc | KeyCode::Tab => {
+                self.selected = None;
+                self.scroll = 0;
+            }
+            // Ctrl keys (stop, settings, quit) work as everywhere.
+            _ if ctrl => {
+                self.selected = None;
+                return false;
+            }
+            // Typing goes back to the input.
+            KeyCode::Char(_) | KeyCode::Backspace => {
+                self.selected = None;
+                return false;
+            }
+            _ => {}
+        }
+        true
+    }
+
+    /// An entry as plain text, for the clipboard: a group copies each step.
+    fn entry_text(&self, index: usize) -> String {
+        let one = |e: &Entry| match e {
+            Entry::User(t) | Entry::Text(t) | Entry::Thought(t) | Entry::Note(t) => t.clone(),
+            Entry::Tool { title, detail, .. } => {
+                if detail.is_empty() {
+                    title.clone()
+                } else {
+                    format!("{title}\n{detail}")
+                }
+            }
+        };
+        let Some(first) = self.entries.get(index) else {
+            return String::new();
+        };
+        // A folded group: this entry and the reads and searches after it.
+        let next_shown = self.items.iter().find(|i| **i > index).copied();
+        if matches!(first, Entry::Tool { .. })
+            && !self.expanded.contains(&index)
+            && !self.show_tools
+        {
+            let end = next_shown.unwrap_or(self.entries.len());
+            return self.entries[index..end]
+                .iter()
+                .filter(|e| matches!(e, Entry::Tool { .. }))
+                .map(one)
+                .collect::<Vec<_>>()
+                .join("\n");
+        }
+        one(first)
+    }
+
     fn insert_char(&mut self, c: char) {
         self.input.insert(self.cursor, c);
         self.cursor += c.len_utf8();
@@ -458,6 +596,8 @@ impl App {
                 self.session = s;
                 self.entries.clear();
                 self.always.clear();
+                self.expanded.clear();
+                self.selected = None;
                 self.scroll = 0;
                 self.status = "New thread.".into();
             }
@@ -757,6 +897,8 @@ impl App {
                     {
                         self.entries = entries_of(&s);
                         self.always.clear();
+                        self.expanded.clear();
+                        self.selected = None;
                         self.session = s;
                         self.scroll = 0;
                         self.status = "Thread opened.".into();
