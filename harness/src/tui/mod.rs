@@ -51,8 +51,10 @@ pub enum AppEvent {
         always_key: String,
         reply: oneshot::Sender<Permission>,
     },
-    /// The invite code was tried.
+    /// Joining finished (an invite code, or signing in with the browser).
     Enrolled(std::result::Result<(), String>),
+    /// The collector gave a sign-in code (or couldn't).
+    SignInStarted(std::result::Result<crate::telemetry::SignIn, String>),
     /// A newer release is out.
     UpdateAvailable(String),
     /// A shared thread was sent (or not).
@@ -80,8 +82,7 @@ pub enum Modal {
         reply: Option<oneshot::Sender<Permission>>,
     },
     Help,
-    /// Asks once whether to share usage data. `invite` is None on the
-    /// first screen and the code being typed on the second.
+    /// Asks once whether to share usage data, then signs in.
     /// Exactly what `/share` would send, before it is sent.
     Share {
         thread: pathfinder_schema::SharedThread,
@@ -92,10 +93,21 @@ pub enum Modal {
     Consent {
         events: bool,
         threads: bool,
-        invite: Option<String>,
+        step: ConsentStep,
         error: Option<String>,
         busy: bool,
     },
+}
+
+/// Where the consent screen is.
+#[derive(Debug, Clone)]
+pub enum ConsentStep {
+    /// Choosing what to share.
+    Choose,
+    /// Signing in with the browser; None until the collector gave a code.
+    Browser(Option<crate::telemetry::SignIn>),
+    /// Typing an invite code instead.
+    Invite(String),
 }
 
 /// The settings the toolbar offers in Zed: (option id, name).
@@ -152,6 +164,8 @@ pub struct App {
     thread_started: std::time::Instant,
     thread_turns: u32,
     tx: mpsc::UnboundedSender<AppEvent>,
+    /// A browser sign-in waiting for its approval.
+    sign_in: Option<tokio::task::AbortHandle>,
     pub quit: bool,
 }
 
@@ -189,6 +203,7 @@ pub async fn run(rt: Arc<Runtime>, cwd: PathBuf) -> Result<()> {
         thread_started: std::time::Instant::now(),
         thread_turns: 0,
         tx,
+        sign_in: None,
         quit: false,
     };
     emit(UsageEvent::SessionStart {
@@ -203,10 +218,12 @@ pub async fn run(rt: Arc<Runtime>, cwd: PathBuf) -> Result<()> {
         });
     }
     if crate::telemetry::Consent::load().needs_answer() && !env_says_off() {
+        let saved = crate::telemetry::Consent::load();
         app.modal = Some(Modal::Consent {
-            events: false,
-            threads: false,
-            invite: None,
+            // Asked again for a new notice: start from the old answers.
+            events: saved.events,
+            threads: saved.threads,
+            step: ConsentStep::Choose,
             error: None,
             busy: false,
         });
@@ -872,11 +889,41 @@ impl App {
                         format!("Pathfinder {version} is out: quit and run `harness update`.");
                 }
             }
-            AppEvent::Enrolled(result) => {
+            AppEvent::SignInStarted(result) => {
                 if let Some(Modal::Consent {
                     events,
                     threads,
-                    invite,
+                    step: ConsentStep::Browser(None),
+                    ..
+                }) = self.modal.take()
+                {
+                    self.modal = Some(match result {
+                        Ok(sign_in) => Modal::Consent {
+                            events,
+                            threads,
+                            step: ConsentStep::Browser(Some(sign_in)),
+                            error: None,
+                            busy: false,
+                        },
+                        Err(e) => {
+                            self.sign_in = None;
+                            Modal::Consent {
+                                events,
+                                threads,
+                                step: ConsentStep::Choose,
+                                error: Some(e),
+                                busy: false,
+                            }
+                        }
+                    });
+                }
+            }
+            AppEvent::Enrolled(result) => {
+                self.sign_in = None;
+                if let Some(Modal::Consent {
+                    events,
+                    threads,
+                    step,
                     ..
                 }) = self.modal.take()
                 {
@@ -895,7 +942,10 @@ impl App {
                             self.modal = Some(Modal::Consent {
                                 events,
                                 threads,
-                                invite,
+                                step: match step {
+                                    ConsentStep::Invite(code) => ConsentStep::Invite(code),
+                                    _ => ConsentStep::Choose,
+                                },
                                 error: Some(e),
                                 busy: false,
                             });
@@ -1054,10 +1104,10 @@ impl App {
             Modal::Consent {
                 events,
                 threads,
-                invite,
+                step,
                 error,
                 busy,
-            } => self.on_consent_key(key, events, threads, invite, error, busy),
+            } => self.on_consent_key(key, events, threads, step, error, busy),
             Modal::Permission {
                 title,
                 always_key,
@@ -1230,23 +1280,23 @@ impl App {
         key: KeyEvent,
         mut events: bool,
         mut threads: bool,
-        invite: Option<String>,
+        step: ConsentStep,
         error: Option<String>,
         busy: bool,
     ) -> Option<Modal> {
         macro_rules! keep {
-            ($invite:expr, $error:expr, $busy:expr) => {
+            ($step:expr, $error:expr, $busy:expr) => {
                 Some(Modal::Consent {
                     events,
                     threads,
-                    invite: $invite,
+                    step: $step,
                     error: $error,
                     busy: $busy,
                 })
             };
         }
         if busy {
-            return keep!(invite, error, busy);
+            return keep!(step, error, busy);
         }
         let save_answer = |events: bool, threads: bool| {
             let mut c = crate::telemetry::Consent::load();
@@ -1258,35 +1308,97 @@ impl App {
             }
             crate::telemetry::reload();
         };
-        match invite {
-            // First screen: choose.
-            None => match key.code {
+        let not_joined = |events: bool, threads: bool| -> String {
+            if events || threads {
+                "Saved; nothing is sent until you join: harness data join".into()
+            } else {
+                "Nothing is shared. `harness data join` adds the shared gate later.".into()
+            }
+        };
+        match step {
+            ConsentStep::Choose => match key.code {
                 KeyCode::Char('e') => {
                     events = !events;
-                    keep!(None, None, false)
+                    keep!(ConsentStep::Choose, None, false)
                 }
                 KeyCode::Char('t') => {
                     threads = !threads;
-                    keep!(None, None, false)
+                    keep!(ConsentStep::Choose, None, false)
                 }
-                KeyCode::Enter => keep!(Some(String::new()), None, false),
+                KeyCode::Char('i') => keep!(ConsentStep::Invite(String::new()), None, false),
+                KeyCode::Enter => {
+                    let mut consent = crate::telemetry::Consent::load();
+                    consent.events = events;
+                    consent.threads = threads;
+                    if consent.enrolled && consent.token().is_some() {
+                        // Already joined, asked again for a new notice:
+                        // just the new answer.
+                        consent.stamp();
+                        if let Err(e) = consent.save() {
+                            return keep!(ConsentStep::Choose, Some(format!("{e:#}")), false);
+                        }
+                        crate::telemetry::reload();
+                        tokio::spawn(async move {
+                            if let Err(e) = crate::telemetry::set_remote_consent(&consent).await {
+                                tracing::warn!("telling the collector the new answer: {e:#}");
+                            }
+                        });
+                        self.status = "Saved. `harness data` changes it later.".into();
+                        return None;
+                    }
+                    let tx = self.tx.clone();
+                    let task = tokio::spawn(async move {
+                        let sign_in = match crate::telemetry::start_sign_in(&consent).await {
+                            Ok(s) => s,
+                            Err(e) => {
+                                let _ = tx.send(AppEvent::SignInStarted(Err(format!("{e:#}"))));
+                                return;
+                            }
+                        };
+                        crate::cli::open_browser(&sign_in.url);
+                        let _ = tx.send(AppEvent::SignInStarted(Ok(sign_in.clone())));
+                        let r = crate::telemetry::finish_sign_in(&sign_in, &mut consent)
+                            .await
+                            .map_err(|e| format!("{e:#}"));
+                        let _ = tx.send(AppEvent::Enrolled(r));
+                    });
+                    self.sign_in = Some(task.abort_handle());
+                    keep!(ConsentStep::Browser(None), None, false)
+                }
                 KeyCode::Esc => {
                     save_answer(false, false);
                     self.status = "Nothing is shared. `harness data` can change that later.".into();
                     None
                 }
-                _ => keep!(None, error, false),
+                _ => keep!(ConsentStep::Choose, error, false),
             },
-            // Second screen: the invite code.
-            Some(mut code) => match key.code {
+            ConsentStep::Browser(sign_in) => match key.code {
+                KeyCode::Esc => {
+                    if let Some(task) = self.sign_in.take() {
+                        task.abort();
+                    }
+                    save_answer(events, threads);
+                    self.status = not_joined(events, threads);
+                    None
+                }
+                KeyCode::Char('i') => {
+                    if let Some(task) = self.sign_in.take() {
+                        task.abort();
+                    }
+                    keep!(ConsentStep::Invite(String::new()), None, false)
+                }
+                KeyCode::Char('o') => {
+                    if let Some(s) = &sign_in {
+                        crate::cli::open_browser(&s.url);
+                    }
+                    keep!(ConsentStep::Browser(sign_in), error, false)
+                }
+                _ => keep!(ConsentStep::Browser(sign_in), error, false),
+            },
+            ConsentStep::Invite(mut code) => match key.code {
                 KeyCode::Esc => {
                     save_answer(events, threads);
-                    self.status = if events || threads {
-                        "Saved; nothing is sent until you join: harness data join <code>".into()
-                    } else {
-                        "Nothing is shared. `harness data join <code>` adds the shared gate later."
-                            .into()
-                    };
+                    self.status = not_joined(events, threads);
                     None
                 }
                 KeyCode::Enter if !code.trim().is_empty() => {
@@ -1301,17 +1413,17 @@ impl App {
                             .map_err(|e| format!("{e:#}"));
                         let _ = tx.send(AppEvent::Enrolled(r));
                     });
-                    keep!(Some(code), None, true)
+                    keep!(ConsentStep::Invite(code), None, true)
                 }
                 KeyCode::Backspace => {
                     code.pop();
-                    keep!(Some(code), None, false)
+                    keep!(ConsentStep::Invite(code), None, false)
                 }
                 KeyCode::Char(c) if !c.is_control() && code.len() < 64 => {
                     code.push(c);
-                    keep!(Some(code), None, false)
+                    keep!(ConsentStep::Invite(code), None, false)
                 }
-                _ => keep!(Some(code), error, false),
+                _ => keep!(ConsentStep::Invite(code), error, false),
             },
         }
     }
@@ -1325,7 +1437,7 @@ impl App {
             self.status = if consent.enrolled {
                 "Sharing threads is off. `harness data on --threads` turns it on.".into()
             } else {
-                "Sharing needs an invite code: harness data join <code> --threads".into()
+                "Sharing needs you to join first: harness data join --threads".into()
             };
             return;
         }

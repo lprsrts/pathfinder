@@ -15,7 +15,7 @@ pub const VERSION: u32 = 1;
 
 /// The privacy notice version the consent was given for. Changing what is
 /// collected means a new notice, and asking again.
-pub const NOTICE_VERSION: u32 = 1;
+pub const NOTICE_VERSION: u32 = 2;
 
 /// One event with what every event carries.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -254,6 +254,33 @@ pub struct Enroll {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Enrolled {
     pub token: String,
+}
+
+/// Signing in with the browser: the app asks for a link code, the person
+/// opens `/join?code=…`, signs in with their email and approves it, and
+/// the app collects its token with the secret.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LinkStart {
+    pub install: String,
+    pub notice: u32,
+    pub events: bool,
+    pub threads: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LinkStarted {
+    /// Shown in the terminal and on the web page, to match them up.
+    pub code: String,
+    /// Only the app knows it; it collects the token with it.
+    pub secret: String,
+    pub expires_in: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LinkPoll {
+    pub secret: String,
 }
 
 /// A consent change after enrolment.

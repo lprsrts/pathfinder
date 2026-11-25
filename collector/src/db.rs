@@ -11,6 +11,52 @@ use sha2::{Digest, Sha256};
 /// Events older than this are deleted.
 pub const RETENTION_DAYS: i64 = 365;
 
+/// How long a browser sign-in may take.
+pub const LINK_SECS: i64 = 15 * 60;
+
+/// Most sign-ins waiting at once (they come from unauthenticated requests).
+const MAX_PENDING_LINKS: i64 = 200;
+
+/// A browser sign-in waiting for its person.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Link {
+    pub code: String,
+    pub events: bool,
+    pub threads: bool,
+    /// Set once someone on the list approved it.
+    pub email: Option<String>,
+}
+
+/// What the app hears when it checks on a sign-in.
+#[derive(Debug, PartialEq)]
+pub enum LinkState {
+    Waiting,
+    /// Unknown secret, or the sign-in took too long.
+    Gone,
+    /// Approved: the install's new token.
+    Done(String),
+}
+
+/// Upper-case letters without vowels or look-alikes: no words, no 0/O.
+const CODE_LETTERS: &[u8] = b"BCDFGHJKLMNPQRSTVWXZ";
+
+fn link_code() -> String {
+    use rand::Rng;
+    let mut rng = rand::rng();
+    let mut code = String::with_capacity(9);
+    for i in 0..8 {
+        if i == 4 {
+            code.push('-');
+        }
+        code.push(CODE_LETTERS[rng.random_range(0..CODE_LETTERS.len())] as char);
+    }
+    code
+}
+
+pub fn normal_email(email: &str) -> String {
+    email.trim().to_lowercase()
+}
+
 pub struct Db(Mutex<Connection>);
 
 #[derive(Debug, Clone, PartialEq)]
@@ -93,6 +139,20 @@ impl Db {
                  received_at INTEGER NOT NULL,
                  PRIMARY KEY (install, id)
              );
+             CREATE TABLE IF NOT EXISTS people (
+                 email TEXT PRIMARY KEY,
+                 added_at INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS links (
+                 code TEXT PRIMARY KEY,
+                 secret_hash TEXT NOT NULL UNIQUE,
+                 install TEXT NOT NULL,
+                 notice INTEGER NOT NULL,
+                 events INTEGER NOT NULL,
+                 threads INTEGER NOT NULL,
+                 created_at INTEGER NOT NULL,
+                 email TEXT
+             );
              CREATE TABLE IF NOT EXISTS gate_use (
                  install TEXT NOT NULL REFERENCES installs(install) ON DELETE CASCADE,
                  day TEXT NOT NULL,
@@ -151,6 +211,157 @@ impl Db {
         )?;
         tx.commit()?;
         Ok(Some(token))
+    }
+
+    /// Lets `email` sign in.
+    pub fn allow(&self, email: &str) -> Result<()> {
+        self.0.lock().unwrap().execute(
+            "INSERT OR IGNORE INTO people (email, added_at) VALUES (?1, ?2)",
+            params![normal_email(email), now()],
+        )?;
+        Ok(())
+    }
+
+    /// Takes `email` off the list and stops its installs. Returns how many
+    /// installs were stopped.
+    pub fn disallow(&self, email: &str) -> Result<usize> {
+        let email = normal_email(email);
+        self.0
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM people WHERE email = ?1", params![email])?;
+        self.stop(&email)
+    }
+
+    pub fn is_allowed(&self, email: &str) -> Result<bool> {
+        Ok(self
+            .0
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT 1 FROM people WHERE email = ?1",
+                params![normal_email(email)],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    pub fn people(&self) -> Result<Vec<String>> {
+        let conn = self.0.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT email FROM people ORDER BY added_at")?;
+        let rows = stmt
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        Ok(rows)
+    }
+
+    /// A new browser sign-in for `install`: (code, secret). None when too
+    /// many are waiting.
+    pub fn start_link(
+        &self,
+        install: &str,
+        notice: u32,
+        events: bool,
+        threads: bool,
+    ) -> Result<Option<(String, String)>> {
+        let conn = self.0.lock().unwrap();
+        conn.execute(
+            "DELETE FROM links WHERE created_at < ?1",
+            params![now() - LINK_SECS],
+        )?;
+        let pending: i64 = conn.query_row("SELECT COUNT(*) FROM links", [], |r| r.get(0))?;
+        if pending >= MAX_PENDING_LINKS {
+            return Ok(None);
+        }
+        let secret = random_hex(32);
+        let code = link_code();
+        conn.execute(
+            "INSERT INTO links (code, secret_hash, install, notice, events, threads, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![code, hash(&secret), install, notice, events, threads, now()],
+        )?;
+        Ok(Some((code, secret)))
+    }
+
+    /// The sign-in behind a code, if it hasn't expired.
+    pub fn link(&self, code: &str) -> Result<Option<Link>> {
+        Ok(self
+            .0
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT code, events, threads, email FROM links WHERE code = ?1 AND created_at >= ?2",
+                params![code.trim().to_uppercase(), now() - LINK_SECS],
+                |r| {
+                    Ok(Link {
+                        code: r.get(0)?,
+                        events: r.get(1)?,
+                        threads: r.get(2)?,
+                        email: r.get(3)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Approves a sign-in for `email` (already checked to be on the list).
+    /// False if the code expired or someone else approved it.
+    pub fn approve_link(&self, code: &str, email: &str) -> Result<bool> {
+        let email = normal_email(email);
+        Ok(self.0.lock().unwrap().execute(
+            "UPDATE links SET email = ?2
+             WHERE code = ?1 AND created_at >= ?3 AND (email IS NULL OR email = ?2)",
+            params![code.trim().to_uppercase(), email, now() - LINK_SECS],
+        )? == 1)
+    }
+
+    /// Checks on a sign-in. Once approved, enrols the install under the
+    /// email that approved it and forgets the sign-in.
+    pub fn poll_link(&self, secret: &str) -> Result<LinkState> {
+        let mut conn = self.0.lock().unwrap();
+        let tx = conn.transaction()?;
+        type Row = (String, String, u32, bool, bool, i64, Option<String>);
+        let row: Option<Row> = tx
+            .query_row(
+                "SELECT code, install, notice, events, threads, created_at, email
+                 FROM links WHERE secret_hash = ?1",
+                params![hash(secret)],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((code, install, notice, events, threads, created_at, email)) = row else {
+            return Ok(LinkState::Gone);
+        };
+        let Some(email) = email else {
+            return Ok(if created_at < now() - LINK_SECS {
+                LinkState::Gone
+            } else {
+                LinkState::Waiting
+            });
+        };
+        let token = random_hex(32);
+        let t = now();
+        tx.execute(
+            "INSERT INTO installs (install, token_hash, label, notice, events, threads, enrolled_at, consent_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
+             ON CONFLICT(install) DO UPDATE SET token_hash = ?2, label = ?3, notice = ?4,
+                 events = ?5, threads = ?6, consent_at = ?7, stopped = 0",
+            params![install, hash(&token), email, notice, events, threads, t],
+        )?;
+        tx.execute("DELETE FROM links WHERE code = ?1", params![code])?;
+        tx.commit()?;
+        Ok(LinkState::Done(token))
     }
 
     /// The install a token belongs to, unless stopped.

@@ -20,7 +20,7 @@
 <body>
 <main>
 <h1>Pathfinder and your data</h1>
-<p class="meta">Version 1 · 25 November 2026 · Alper Sarıtaş, Karlsruhe · <a href="mailto:alper@saritas.io">alper@saritas.io</a></p>
+<p class="meta">Version 2 · 25 November 2026 · Alper Sarıtaş, Karlsruhe · <a href="mailto:alper@saritas.io">alper@saritas.io</a></p>
 
 <p>Pathfinder makes sure you understand the work you do with AI. It runs on your computer, with your own model account. I’m building it, and I’d like to learn how it works for people other than me. If you agree, it sends me usage data. If you don’t, nothing is sent and Pathfinder works the same.</p>
 
@@ -28,12 +28,14 @@
 <p><strong>Usage events</strong> are counts and timings. They cover what kind of step each turn was and how long it took, how many model and tool calls it made, which model was used, whether the gate held a reply back, whether a check was answered right or wrong, permission answers, error codes, and which features you use. Each event also carries the app version, your operating system, the conversation’s language and the time to the minute.</p>
 <p>Usage events never include your messages, the model’s answers, file or folder names, or what you work on. <code>harness data show</code> prints exactly what is waiting to be sent.</p>
 <p><strong>A thread you share</strong> is sent only when you type <code>/share</code> in it, see the whole thread, and press Enter. It’s that thread as you saw it, with paths shortened to <code>./</code> and <code>~</code>, plus your note.</p>
-<p>These are two separate yes/no answers. Your invite code ties what you send to you: I know which code I gave to whom.</p>
+<p>These are two separate yes/no answers.</p>
+<p><strong>Your email address.</strong> You join by signing in with your email, so what you send is stored with that address and I know it’s yours. (If I gave you an invite code instead, I know which code I gave to whom.) Your address is also on the list of people who may sign in. It stays there until you ask me to remove it.</p>
 
 <h2>What goes elsewhere</h2>
 <ul>
 <li><strong>Your work and the model.</strong> Your messages and files go straight from your computer to your model provider (e.g. OpenAI when you sign in with ChatGPT), under your account. They never go through my server.</li>
-<li><strong>The shared gate.</strong> Pathfinder has a check that stops the model from giving away an answer while you’re judging a candidate. With an invite code and no TypeSafe key of your own, that check goes through my server to TypeSafe. It carries the candidate, the conversation since it was shown, and the draft reply. My server passes it on without storing it, and only counts checks per day. To turn this off, set <code>HARNESS_DECISION_PROXY=off</code>.</li>
+<li><strong>Signing in.</strong> Cloudflare Access runs the sign-in page. It emails you a one-time code and tells my server your address. Cloudflare keeps a record of sign-ins (address, IP address and time).</li>
+<li><strong>The shared gate.</strong> Pathfinder has a check that stops the model from giving away an answer while you’re judging a candidate. Once you’ve joined, if you have no TypeSafe key of your own, that check goes through my server to TypeSafe. It carries the candidate, the conversation since it was shown, and the draft reply. My server passes it on without storing it, and only counts checks per day. To turn this off, set <code>HARNESS_DECISION_PROXY=off</code>.</li>
 <li><strong>Update check.</strong> Once a day the app asks my server for the newest version number. To turn this off, set <code>HARNESS_NO_UPDATE_CHECK=1</code>.</li>
 </ul>
 
@@ -44,7 +46,7 @@
 <table>
 <tr><td><code>harness data</code></td><td>see your settings</td></tr>
 <tr><td><code>harness data off</code></td><td>stop sending; the queue is cleared</td></tr>
-<tr><td><code>harness data delete</code></td><td>erase everything I have from you, immediately</td></tr>
+<tr><td><code>harness data delete</code></td><td>erase everything this computer sent, immediately</td></tr>
 <tr><td><code>harness data on --events</code> / <code>--threads</code></td><td>start again</td></tr>
 </table>
 <p>You can also email me for a copy of your data, a correction or erasure. The legal basis is your consent (GDPR Art. 6(1)(a)). You may complain to a data protection authority, such as the LfDI Baden-Württemberg. If what Pathfinder collects changes, it asks you again first.</p>

@@ -20,7 +20,10 @@ use pathfinder_schema::{Arch, Envelope, Event, Os, VERSION};
 use rusqlite::{Connection, params};
 
 pub use consent::Consent;
-pub use upload::{collector_url, delete_remote, enroll, flush, set_remote_consent, share};
+pub use upload::{
+    SignIn, collector_url, delete_remote, enroll, finish_sign_in, flush, set_remote_consent, share,
+    start_sign_in,
+};
 
 /// The outbox keeps at most this many events; the oldest go first.
 const MAX_QUEUED: i64 = 20_000;

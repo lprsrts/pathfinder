@@ -25,9 +25,9 @@ This installs one program, `harness`, into `~/.local/bin`. It is signed and nota
    harness tui
    ```
 
-3. On the first start it asks two things:
-   - **Whether to share usage data with me.** This is optional. Usage events are counts and timings, never your messages. A thread is shared only when you type `/share` and confirm.
-   - **Your invite code**, which I'll send you. The code also turns on the shared gate, which stops the model from giving away an answer while you're judging a candidate. The gate works whether or not you share data.
+3. On the first start it asks **whether to share usage data with me**. This is optional. Usage events are counts and timings, never your messages. A thread is shared only when you type `/share` and confirm.
+
+4. Then press Enter to **sign in with your email**. Your browser opens; enter the email address you gave me, type the code Cloudflare emails you, check the page shows the same code as your terminal, and press *Link this computer*. Signing in also turns on the shared gate, which stops the model from giving away an answer while you're judging a candidate. The gate works whether or not you share data.
 
 Then tell it what you want to do and understand, and work with it. F1 shows the keys.
 

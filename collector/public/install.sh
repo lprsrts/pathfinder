@@ -79,11 +79,11 @@ esac
 cat <<'NEXT'
 
 Next:
-  1. Sign in:            harness auth login chatgpt
+  1. Your model account: harness auth login chatgpt
   2. Start, in the folder you're working in:
                          cd ~/path/to/project && harness tui
-     The first start asks whether to share usage data (it's optional) and
-     for your invite code.
+     The first start asks whether to share usage data (it's optional),
+     then you sign in with your email in the browser.
   3. Later updates:      harness update
 
 Privacy notice: https://pathfinder.lprsrts.com/privacy

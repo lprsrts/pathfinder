@@ -3,7 +3,10 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use pathfinder_schema::{Consent as RemoteConsent, Enroll, Enrolled, NOTICE_VERSION, SharedThread};
+use pathfinder_schema::{
+    Consent as RemoteConsent, Enroll, Enrolled, LinkPoll, LinkStart, LinkStarted, NOTICE_VERSION,
+    SharedThread,
+};
 use reqwest::StatusCode;
 
 use super::{Consent, GLOBAL, clear, queued, sent_up_to};
@@ -52,6 +55,87 @@ pub async fn enroll(invite: &str, consent: &mut Consent) -> Result<()> {
         s => bail!("the collector answered {s}"),
     }
     let Enrolled { token } = res.json().await.context("reading the enrolment")?;
+    consent.set_token(&token)?;
+    consent.save()?;
+    super::reload();
+    Ok(())
+}
+
+/// A browser sign-in in progress: the person opens `url`, signs in with
+/// their email, and checks the page shows `code`.
+#[derive(Debug, Clone)]
+pub struct SignIn {
+    pub code: String,
+    pub url: String,
+    secret: String,
+    expires_in: Duration,
+}
+
+/// Starts signing in with the browser, with the answers in `consent`.
+pub async fn start_sign_in(consent: &Consent) -> Result<SignIn> {
+    let res = client()
+        .post(format!("{}/v1/link", collector_url()))
+        .json(&LinkStart {
+            install: consent.install.clone(),
+            notice: NOTICE_VERSION,
+            events: consent.events,
+            threads: consent.threads,
+        })
+        .send()
+        .await
+        .context("reaching the collector")?;
+    match res.status() {
+        s if s.is_success() => {}
+        StatusCode::SERVICE_UNAVAILABLE => {
+            bail!("signing in with the browser isn't available; use an invite code")
+        }
+        StatusCode::TOO_MANY_REQUESTS => {
+            bail!("too many sign-ins at once; try again in a few minutes")
+        }
+        s => bail!("the collector answered {s}"),
+    }
+    let started: LinkStarted = res.json().await.context("reading the sign-in")?;
+    Ok(SignIn {
+        url: format!("{}/join?code={}", collector_url(), started.code),
+        code: started.code,
+        secret: started.secret,
+        expires_in: Duration::from_secs(started.expires_in),
+    })
+}
+
+/// Waits for the person to approve the sign-in in the browser, then saves
+/// the token and the answers in `consent`.
+pub async fn finish_sign_in(sign_in: &SignIn, consent: &mut Consent) -> Result<()> {
+    let deadline = std::time::Instant::now() + sign_in.expires_in + Duration::from_secs(30);
+    let http = client();
+    let token = loop {
+        if std::time::Instant::now() > deadline {
+            bail!("the sign-in expired (codes last 15 minutes); start again");
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let res = http
+            .post(format!("{}/v1/link/poll", collector_url()))
+            .json(&LinkPoll {
+                secret: sign_in.secret.clone(),
+            })
+            .send()
+            .await;
+        // A dropped connection isn't the end: try again until the deadline.
+        let Ok(res) = res else { continue };
+        match res.status() {
+            StatusCode::OK => {
+                let Enrolled { token } = res.json().await.context("reading the sign-in")?;
+                break token;
+            }
+            StatusCode::ACCEPTED => {}
+            StatusCode::GONE => {
+                bail!("the sign-in expired (codes last 15 minutes); start again")
+            }
+            s if s.is_server_error() => {}
+            s => bail!("the collector answered {s}"),
+        }
+    };
+    consent.stamp();
     consent.set_token(&token)?;
     consent.save()?;
     super::reload();

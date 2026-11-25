@@ -7,14 +7,19 @@ use std::sync::Arc;
 use axum::Json;
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, State};
+use axum::extract::{DefaultBodyLimit, Form, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
-use axum::response::{IntoResponse, Response};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
-use pathfinder_schema::{Batch, Consent, Enroll, Enrolled, NOTICE_VERSION, SharedThread};
+use pathfinder_schema::{
+    Batch, Consent, Enroll, Enrolled, LinkPoll, LinkStart, LinkStarted, NOTICE_VERSION,
+    SharedThread,
+};
+use serde::Deserialize;
 use tower_http::services::ServeDir;
 
-use crate::db::{Db, Install};
+use crate::access::Access;
+use crate::db::{Db, Install, LINK_SECS, LinkState};
 
 /// Most events one upload may carry.
 const MAX_BATCH: usize = 1_000;
@@ -29,6 +34,8 @@ pub struct AppState {
     pub http: reqwest::Client,
     /// `install.sh`, `privacy`, `releases/…`.
     pub public_dir: PathBuf,
+    /// Who is signed in on `/join`; without it, browser sign-in is off.
+    pub access: Option<Access>,
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -40,6 +47,9 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/v1/events",
             post(events).layer(DefaultBodyLimit::max(2 << 20)),
         )
+        .route("/v1/link", post(link_start))
+        .route("/v1/link/poll", post(link_poll))
+        .route("/join", get(join_page).post(join_approve))
         .route("/v1/consent", put(consent))
         .route("/v1/me", delete(erase))
         .route(
@@ -251,4 +261,234 @@ async fn gate_proxy(
             err(StatusCode::BAD_GATEWAY, "the gate service didn't answer")
         }
     }
+}
+
+async fn link_start(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
+    let Ok(req) = serde_json::from_slice::<LinkStart>(&body) else {
+        return err(StatusCode::BAD_REQUEST, "bad sign-in request");
+    };
+    if !is_install_id(&req.install) || req.notice > NOTICE_VERSION {
+        return err(StatusCode::BAD_REQUEST, "bad sign-in request");
+    }
+    if state.access.is_none() {
+        return err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "signing in with the browser isn't set up; use an invite code",
+        );
+    }
+    match state
+        .db
+        .start_link(&req.install, req.notice, req.events, req.threads)
+    {
+        Ok(Some((code, secret))) => Json(LinkStarted {
+            code,
+            secret,
+            expires_in: LINK_SECS as u64,
+        })
+        .into_response(),
+        Ok(None) => err(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many sign-ins at once; try again in a few minutes",
+        ),
+        Err(e) => internal(e),
+    }
+}
+
+async fn link_poll(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
+    let Ok(req) = serde_json::from_slice::<LinkPoll>(&body) else {
+        return err(StatusCode::BAD_REQUEST, "bad poll");
+    };
+    match state.db.poll_link(req.secret.trim()) {
+        Ok(LinkState::Waiting) => (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({ "status": "waiting" })),
+        )
+            .into_response(),
+        Ok(LinkState::Gone) => err(StatusCode::GONE, "this sign-in expired; start again"),
+        Ok(LinkState::Done(token)) => Json(Enrolled { token }).into_response(),
+        Err(e) => internal(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct JoinForm {
+    #[serde(default)]
+    code: String,
+}
+
+/// The page's state for one request: who is signed in, and their sign-in.
+enum Join {
+    Page(StatusCode, &'static str, String),
+    Ready {
+        email: String,
+        link: crate::db::Link,
+    },
+}
+
+async fn join_check(state: &AppState, headers: &HeaderMap, code: &str) -> Join {
+    let Some(access) = &state.access else {
+        return Join::Page(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Not available",
+            "<p>Signing in with the browser isn’t set up yet. Ask Alper for an invite code.</p>"
+                .into(),
+        );
+    };
+    let email = match access.email(headers).await {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!("a /join request without a valid sign-in: {e:#}");
+            return Join::Page(
+                StatusCode::UNAUTHORIZED,
+                "Not signed in",
+                "<p>Your sign-in couldn’t be confirmed. Reload this page to sign in again.</p>"
+                    .into(),
+            );
+        }
+    };
+    let you = format!("<p class=\"meta\">Signed in as {}</p>", esc(&email));
+    match state.db.is_allowed(&email) {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::info!("a sign-in from an address that isn't on the list");
+            return Join::Page(
+                StatusCode::FORBIDDEN,
+                "Not on the list yet",
+                format!(
+                    "{you}<p>Pathfinder is invite-only for now, and this address isn’t on the list. \
+                     Ask Alper to add it, then reload this page.</p>"
+                ),
+            );
+        }
+        Err(e) => {
+            tracing::error!("checking the list: {e:#}");
+            return Join::Page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Something went wrong",
+                format!("{you}<p>Please try again in a minute.</p>"),
+            );
+        }
+    }
+    if code.trim().is_empty() {
+        return Join::Page(
+            StatusCode::OK,
+            "Start from Pathfinder",
+            format!(
+                "{you}<p>You’re on the list. Now run <code>harness tui</code> in a terminal: \
+                 it opens this page again with a code to link your computer.</p>\
+                 <p>Not installed yet? <code>curl -fsSL https://pathfinder.lprsrts.com/install.sh | sh</code></p>"
+            ),
+        );
+    }
+    match state.db.link(code) {
+        Ok(Some(link)) => Join::Ready { email, link },
+        Ok(None) => Join::Page(
+            StatusCode::GONE,
+            "This code has expired",
+            format!(
+                "{you}<p>Codes last 15 minutes. Start again in Pathfinder and it opens a new one.</p>"
+            ),
+        ),
+        Err(e) => {
+            tracing::error!("looking up a sign-in: {e:#}");
+            Join::Page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Something went wrong",
+                format!("{you}<p>Please try again in a minute.</p>"),
+            )
+        }
+    }
+}
+
+async fn join_page(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(q): Query<JoinForm>,
+) -> Response {
+    let (email, link) = match join_check(&state, &headers, &q.code).await {
+        Join::Page(status, title, body) => return page(status, title, &body),
+        Join::Ready { email, link } => (email, link),
+    };
+    let yes = |b: bool| if b { "yes" } else { "no" };
+    let body = format!(
+        "<p class=\"meta\">Signed in as {email}</p>\
+         <p>Your terminal should show this code:</p>\
+         <p class=\"code\">{code}</p>\
+         <p>Only continue if it matches. Then Pathfinder on that computer is linked to {email}.</p>\
+         <table><tr><td>Usage events</td><td>{events}</td></tr>\
+         <tr><td>Sharing threads you choose</td><td>{threads}</td></tr></table>\
+         <p class=\"meta\">You chose these in Pathfinder, and can change them there any time \
+         (<code>harness data</code>). Linking also turns on the shared gate. \
+         <a href=\"/privacy/\">Privacy notice</a></p>\
+         <form method=\"post\" action=\"/join\"><input type=\"hidden\" name=\"code\" value=\"{code}\">\
+         <button type=\"submit\">Link this computer</button></form>",
+        email = esc(&email),
+        code = esc(&link.code),
+        events = yes(link.events),
+        threads = yes(link.threads),
+    );
+    page(StatusCode::OK, "Link Pathfinder", &body)
+}
+
+async fn join_approve(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Form(form): Form<JoinForm>,
+) -> Response {
+    let (email, link) = match join_check(&state, &headers, &form.code).await {
+        Join::Page(status, title, body) => return page(status, title, &body),
+        Join::Ready { email, link } => (email, link),
+    };
+    match state.db.approve_link(&link.code, &email) {
+        Ok(true) => page(
+            StatusCode::OK,
+            "Linked",
+            "<p>Done. Go back to your terminal: Pathfinder carries on there.</p>\
+             <p class=\"meta\">You can close this page.</p>",
+        ),
+        Ok(false) => page(
+            StatusCode::GONE,
+            "This code has expired",
+            "<p>Start again in Pathfinder and it opens a new one.</p>",
+        ),
+        Err(e) => internal(e),
+    }
+}
+
+fn esc(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+fn page(status: StatusCode, title: &str, body: &str) -> Response {
+    let html = format!(
+        r#"<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>{title} · Pathfinder</title>
+<style>
+  :root {{ color-scheme: light dark; --fg: #1d1d1f; --bg: #fff; --muted: #6e6e73; --rule: #e5e5ea; --accent: #0a66d8; }}
+  @media (prefers-color-scheme: dark) {{ :root {{ --fg: #f5f5f7; --bg: #111; --muted: #a1a1a6; --rule: #333; --accent: #4c9bff; }} }}
+  body {{ margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
+  main {{ max-width: 34rem; margin: 0 auto; padding: 3rem 1rem 4rem; }}
+  h1 {{ font-size: 1.5rem; margin: 0 0 1rem; }}
+  .meta {{ color: var(--muted); font-size: .95rem; }}
+  .code {{ font: 600 2rem/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .08em; margin: .5rem 0 1rem; }}
+  table {{ border-collapse: collapse; width: 100%; margin: 1rem 0; }}
+  td {{ padding: .4rem .75rem .4rem 0; border-bottom: 1px solid var(--rule); }}
+  td:last-child {{ text-align: right; }}
+  code {{ font: .9em ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }}
+  button {{ font: inherit; font-weight: 600; color: #fff; background: var(--accent); border: 0; border-radius: 8px; padding: .7rem 1.2rem; margin-top: 1rem; cursor: pointer; width: 100%; }}
+  a {{ color: var(--accent); }}
+</style></head>
+<body><main><h1>{title}</h1>
+{body}
+</main></body></html>"#,
+        title = esc(title),
+    );
+    (status, [(header::CACHE_CONTROL, "no-store")], Html(html)).into_response()
 }

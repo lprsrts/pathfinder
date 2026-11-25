@@ -25,6 +25,7 @@ rand = "0.9"
 reqwest = { version = "0.13", features = ["json"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+jsonwebtoken = { version = "12", default-features = false, features = ["rust_crypto"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

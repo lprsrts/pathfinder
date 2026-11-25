@@ -446,13 +446,22 @@ pub async fn data(args: &[String]) -> Result<()> {
             Ok(())
         }
         Some("join") => {
-            let invite = args
-                .get(1)
-                .filter(|a| !a.starts_with("--"))
-                .context("usage: harness data join <invite code> [--events] [--threads]")?;
             consent.events = has("--events");
             consent.threads = has("--threads");
-            telemetry::enroll(invite, &mut consent).await?;
+            match args.get(1).filter(|a| !a.starts_with("--")) {
+                Some(invite) => telemetry::enroll(invite, &mut consent).await?,
+                None => {
+                    let sign_in = telemetry::start_sign_in(&consent).await?;
+                    println!(
+                        "Sign in with your email in the browser:\n\n  {}\n",
+                        sign_in.url
+                    );
+                    println!("Check that the page shows this code: {}\n", sign_in.code);
+                    open_browser(&sign_in.url);
+                    println!("Waiting for you to link this computer there… (Ctrl+C stops)");
+                    telemetry::finish_sign_in(&sign_in, &mut consent).await?;
+                }
+            }
             if consent.events || consent.threads {
                 println!(
                     "Joined. Thank you! `harness data` shows what is collected; `harness data off` stops it."
@@ -482,9 +491,7 @@ pub async fn data(args: &[String]) -> Result<()> {
             if consent.enrolled {
                 println!("Saved.");
             } else {
-                println!(
-                    "Saved. Nothing is sent until you join with an invite code: harness data join <code>"
-                );
+                println!("Saved. Nothing is sent until you join: harness data join");
             }
             Ok(())
         }

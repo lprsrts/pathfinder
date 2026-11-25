@@ -939,18 +939,10 @@ fn modal(f: &mut Frame, app: &App, area: Rect) {
         Modal::Consent {
             events,
             threads,
-            invite,
+            step,
             error,
             busy,
-        } => consent(
-            f,
-            area,
-            *events,
-            *threads,
-            invite.as_deref(),
-            error.as_deref(),
-            *busy,
-        ),
+        } => consent(f, area, *events, *threads, step, error.as_deref(), *busy),
         Modal::Help => {
             let keys = [
                 ("Enter", "send"),
@@ -1016,16 +1008,17 @@ fn consent(
     area: Rect,
     events: bool,
     threads: bool,
-    invite: Option<&str>,
+    step: &super::ConsentStep,
     error: Option<&str>,
     busy: bool,
 ) {
+    use super::ConsentStep;
     let bold = Style::default().add_modifier(Modifier::BOLD);
     let tick = |on: bool| if on { "[x]" } else { "[ ]" };
     let mut lines: Vec<Line> = vec![
         Line::from("Pathfinder can send usage data to Alper, who builds it, so he can see how it"),
         Line::from("works for people other than him. Nothing is sent unless you say yes here and"),
-        Line::from("join with an invite code. Either way, Pathfinder works the same."),
+        Line::from("sign in. Either way, Pathfinder works the same."),
         Line::default(),
         Line::from(vec![Span::styled(
             format!("{} e  Usage events", tick(events)),
@@ -1041,28 +1034,57 @@ fn consent(
         Line::from("       Only when you type /share in a thread, after seeing exactly what goes."),
         Line::default(),
         Line::from(
-            "Kept on Alper's server in Germany for up to 12 months. Change it any time with",
+            "Kept on Alper's server in Germany for up to 12 months, with the email you sign",
         ),
-        Line::from("`harness data off`; erase everything with `harness data delete`."),
+        Line::from("in with. Change it any time with `harness data off`; erase everything with"),
+        Line::from("`harness data delete`."),
         Line::from(Span::styled(
             format!("Full notice: {}", crate::telemetry::consent::NOTICE_URL),
             dim(),
         )),
         Line::default(),
-        Line::from("Next you can enter an invite code. It also turns on the shared gate service"),
-        Line::from("(the check that keeps a candidate's answer from slipping out), with or"),
-        Line::from("without sharing any data."),
-        Line::default(),
     ];
-    let hint = match invite {
-        None => "e, t toggle · Enter continues · Esc: no, and no invite code",
-        Some(code) => {
+    let hint = match step {
+        ConsentStep::Choose => {
+            lines.push(Line::from(
+                "Next you sign in with your email in the browser. Signing in also turns on the",
+            ));
+            lines.push(Line::from(
+                "shared gate (the check that keeps a candidate's answer from slipping out),",
+            ));
+            lines.push(Line::from("with or without sharing any data."));
+            lines.push(Line::default());
+            "e, t toggle · Enter: sign in with the browser · i: invite code · Esc: not now"
+        }
+        ConsentStep::Browser(None) => {
+            lines.push(Line::from(Span::styled("Starting the sign-in…", dim())));
+            "Esc: not now · i: invite code instead"
+        }
+        ConsentStep::Browser(Some(sign_in)) => {
+            lines.push(Line::from(
+                "Sign in with your email in the browser that just opened:",
+            ));
+            lines.push(Line::from(Span::styled(
+                format!("  {}", sign_in.url),
+                Style::default().fg(ratatui::style::Color::Cyan),
+            )));
+            lines.push(Line::default());
+            lines.push(Line::from(vec![
+                Span::raw("Check that the page shows "),
+                Span::styled(sign_in.code.clone(), bold),
+                Span::raw(", then press Link this computer."),
+            ]));
+            lines.push(Line::from(Span::styled("Waiting for you there…", dim())));
+            lines.push(Line::default());
+            "o: open the page again · i: invite code instead · Esc: not now"
+        }
+        ConsentStep::Invite(code) => {
             lines.push(Line::from(vec![
                 Span::styled("Invite code: ", bold),
                 Span::raw(code.to_string()),
                 Span::styled(if busy { "  checking…" } else { "▏" }, dim()),
             ]));
-            "Enter joins · Esc skips (join later: harness data join <code>)"
+            "Enter joins · Esc skips (join later: harness data join)"
         }
     };
     if let Some(e) = error {

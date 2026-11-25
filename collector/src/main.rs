@@ -4,6 +4,9 @@
 //! ```text
 //! collector serve                 run the service
 //! collector invite <name>         a single-use invite code for <name>
+//! collector allow <email>         let <email> sign in with the browser
+//! collector disallow <email>      take <email> off the list, stop its installs
+//! collector people                who may sign in
 //! collector stats                 one line per install
 //! collector export <dir>          events.jsonl and threads.jsonl
 //! collector stop <name|install>   stop collecting from an install
@@ -14,8 +17,11 @@
 //!
 //! Settings come from the environment: `COLLECTOR_DB`, `COLLECTOR_PUBLIC`,
 //! `COLLECTOR_ADDR`, `TYPESAFE_KEY_FILE`, `TYPESAFE_BASE_URL`,
-//! `GATE_DAILY_CAP`.
+//! `GATE_DAILY_CAP`, and for browser sign-in `ACCESS_TEAM_DOMAIN`
+//! (`<team>.cloudflareaccess.com`) and `ACCESS_AUD` (the Access
+//! application's audience tag).
 
+mod access;
 mod api;
 mod db;
 mod release;
@@ -65,6 +71,30 @@ async fn main() -> Result<()> {
             println!("{code}");
             Ok(())
         }
+        Some("allow") => {
+            let email = args
+                .get(1)
+                .filter(|e| e.contains('@'))
+                .context("usage: collector allow <email>")?;
+            open_db()?.allow(email)?;
+            println!(
+                "{} may sign in now: send them https://pathfinder.lprsrts.com and FRIENDS.md",
+                db::normal_email(email)
+            );
+            Ok(())
+        }
+        Some("disallow") => {
+            let email = args.get(1).context("usage: collector disallow <email>")?;
+            let n = open_db()?.disallow(email)?;
+            println!("removed; stopped {n} install(s)");
+            Ok(())
+        }
+        Some("people") => {
+            for email in open_db()?.people()? {
+                println!("{email}");
+            }
+            Ok(())
+        }
         Some("stats") => {
             for line in open_db()?.stats()? {
                 println!("{line}");
@@ -96,7 +126,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         _ => bail!(
-            "usage: collector serve | invite <name> | stats | export <dir> | stop <name|install> | prune"
+            "usage: collector serve | invite <name> | allow <email> | disallow <email> | people | stats | export <dir> | stop <name|install> | prune"
         ),
     }
 }
@@ -110,6 +140,23 @@ async fn serve() -> Result<()> {
     if typesafe_key.is_none() {
         tracing::warn!("no TypeSafe key: the gate proxy answers 503");
     }
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+    let access = match (
+        std::env::var("ACCESS_TEAM_DOMAIN")
+            .ok()
+            .filter(|v| !v.trim().is_empty()),
+        std::env::var("ACCESS_AUD")
+            .ok()
+            .filter(|v| !v.trim().is_empty()),
+    ) {
+        (Some(team), Some(aud)) => Some(access::Access::cloudflare(&team, &aud, http.clone())),
+        _ => {
+            tracing::warn!("no ACCESS_TEAM_DOMAIN/ACCESS_AUD: browser sign-in is off");
+            None
+        }
+    };
     let state = Arc::new(api::AppState {
         db: open_db()?,
         typesafe_key,
@@ -117,10 +164,9 @@ async fn serve() -> Result<()> {
             .trim_end_matches('/')
             .to_string(),
         gate_cap: env_or("GATE_DAILY_CAP", "400").parse().unwrap_or(400),
-        http: reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()?,
+        http,
         public_dir: PathBuf::from(env_or("COLLECTOR_PUBLIC", "/public")),
+        access,
     });
     // Retention, daily.
     let pruner = state.clone();
@@ -165,6 +211,7 @@ mod tests {
             gate_cap: cap,
             http: reqwest::Client::new(),
             public_dir: std::env::temp_dir(),
+            access: Some(access::Access::Fake),
         })
     }
 
@@ -383,5 +430,102 @@ mod tests {
         )
         .await;
         assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    async fn join(
+        st: &Arc<api::AppState>,
+        method: &str,
+        code: &str,
+        email: Option<&str>,
+    ) -> (StatusCode, String) {
+        let (uri, body) = match method {
+            "GET" => (format!("/join?code={code}"), String::new()),
+            _ => ("/join".to_string(), format!("code={code}")),
+        };
+        let mut req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/x-www-form-urlencoded");
+        if let Some(e) = email {
+            req = req.header("x-test-email", e);
+        }
+        let res = api::router(st.clone())
+            .oneshot(req.body(Body::from(body)).unwrap())
+            .await
+            .unwrap();
+        let status = res.status();
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    #[tokio::test]
+    async fn signing_in_with_the_browser_links_an_install_to_its_email() {
+        let st = state(10);
+        st.db.allow("Friend@Example.com").unwrap();
+        let start = serde_json::json!({"install": INSTALL, "notice": NOTICE_VERSION, "events": true, "threads": false});
+        let (s, started) = call(&st, "POST", "/v1/link", None, start).await;
+        assert_eq!(s, StatusCode::OK);
+        let code = started["code"].as_str().unwrap().to_string();
+        let secret = started["secret"].as_str().unwrap().to_string();
+        assert_eq!(code.len(), 9);
+        let poll = serde_json::json!({ "secret": secret });
+        assert_eq!(
+            call(&st, "POST", "/v1/link/poll", None, poll.clone())
+                .await
+                .0,
+            StatusCode::ACCEPTED
+        );
+
+        // Not signed in, or not on the list: no.
+        assert_eq!(
+            join(&st, "GET", &code, None).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+        let (s, html) = join(&st, "POST", &code, Some("stranger@example.com")).await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+        assert!(html.contains("isn’t on the list"));
+        assert_eq!(
+            call(&st, "POST", "/v1/link/poll", None, poll.clone())
+                .await
+                .0,
+            StatusCode::ACCEPTED
+        );
+
+        // The page shows the code and the choices; approving links it.
+        let (s, html) = join(&st, "GET", &code.to_lowercase(), Some("friend@example.com")).await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(html.contains(&code) && html.contains("Link this computer"));
+        let (s, html) = join(&st, "POST", &code, Some("friend@example.com")).await;
+        assert_eq!(s, StatusCode::OK, "{html}");
+
+        let (s, body) = call(&st, "POST", "/v1/link/poll", None, poll.clone()).await;
+        assert_eq!(s, StatusCode::OK);
+        let token = body["token"].as_str().unwrap();
+        let (install, stopped) = st.db.install_for(token).unwrap().unwrap();
+        assert!(!stopped);
+        assert_eq!(install.label, "friend@example.com");
+        assert!(install.events && !install.threads);
+        // Collected once; the code is gone.
+        assert_eq!(
+            call(&st, "POST", "/v1/link/poll", None, poll).await.0,
+            StatusCode::GONE
+        );
+        assert_eq!(
+            join(&st, "GET", &code, Some("friend@example.com")).await.0,
+            StatusCode::GONE
+        );
+
+        // Taking them off the list stops their installs.
+        assert_eq!(st.db.disallow("friend@example.com").unwrap(), 1);
+        assert!(st.db.install_for(token).unwrap().unwrap().1);
+    }
+
+    #[tokio::test]
+    async fn sign_in_pages_escape_what_they_show() {
+        let st = state(10);
+        st.db.allow("a<b>@example.com").unwrap();
+        let (s, html) = join(&st, "GET", "", Some("a<b>@example.com")).await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(html.contains("a&lt;b&gt;@example.com") && !html.contains("a<b>"));
     }
 }
