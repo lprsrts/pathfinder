@@ -844,7 +844,14 @@ impl App {
                 {
                     match result {
                         Ok(()) => {
-                            self.status = "Thank you! `harness data` shows what is collected; `harness data off` stops it.".into();
+                            emit(UsageEvent::SessionStart {
+                                surface: pathfinder_schema::Surface::Tui,
+                            });
+                            self.status = if events || threads {
+                                "Joined. Thank you! `harness data` shows what is collected; `harness data off` stops it.".into()
+                            } else {
+                                "Joined: the shared gate is on. No usage data is sent.".into()
+                            };
                         }
                         Err(e) => {
                             self.modal = Some(Modal::Consent {
@@ -1170,8 +1177,8 @@ impl App {
                     threads = !threads;
                     keep!(None, None, false)
                 }
-                KeyCode::Enter if events || threads => keep!(Some(String::new()), None, false),
-                KeyCode::Enter | KeyCode::Esc | KeyCode::Char('n') => {
+                KeyCode::Enter => keep!(Some(String::new()), None, false),
+                KeyCode::Esc => {
                     save_answer(false, false);
                     self.status = "Nothing is shared. `harness data` can change that later.".into();
                     None
@@ -1182,8 +1189,12 @@ impl App {
             Some(mut code) => match key.code {
                 KeyCode::Esc => {
                     save_answer(events, threads);
-                    self.status =
-                        "Saved; nothing is sent until you join: harness data join <code> …".into();
+                    self.status = if events || threads {
+                        "Saved; nothing is sent until you join: harness data join <code>".into()
+                    } else {
+                        "Nothing is shared. `harness data join <code>` adds the shared gate later."
+                            .into()
+                    };
                     None
                 }
                 KeyCode::Enter if !code.trim().is_empty() => {

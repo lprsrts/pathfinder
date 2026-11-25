@@ -766,6 +766,8 @@ fn footer(f: &mut Frame, app: &App, area: Rect) {
             ]
         } else if matches!(app.modal, Some(Modal::Permission { .. })) {
             &["1/y once · 2/a always · 3/n/Esc no", "y · a · n"]
+        } else if matches!(app.modal, Some(Modal::Consent { .. })) {
+            &["Your answer is saved; `harness data` changes it later"]
         } else if app.modal.is_some() {
             &["Enter picks · Esc closes"]
         } else {
@@ -1003,22 +1005,20 @@ fn consent(
             dim(),
         )),
         Line::default(),
+        Line::from("Next you can enter an invite code. It also turns on the shared gate service"),
+        Line::from("(the check that keeps a candidate's answer from slipping out), with or"),
+        Line::from("without sharing any data."),
+        Line::default(),
     ];
     let hint = match invite {
-        None => {
-            if events || threads {
-                "e, t toggle · Enter continues · Esc: no, nothing is shared"
-            } else {
-                "e, t toggle · Enter or Esc: no, nothing is shared"
-            }
-        }
+        None => "e, t toggle · Enter continues · Esc: no, and no invite code",
         Some(code) => {
             lines.push(Line::from(vec![
                 Span::styled("Invite code: ", bold),
                 Span::raw(code.to_string()),
                 Span::styled(if busy { "  checking…" } else { "▏" }, dim()),
             ]));
-            "Enter joins · Esc saves your answer and joins later"
+            "Enter joins · Esc skips (join later: harness data join <code>)"
         }
     };
     if let Some(e) = error {

@@ -176,7 +176,10 @@ impl Provider {
     }
 
     fn request(self, input: &str, questions: &[Question]) -> (String, Value) {
-        let base = self.base_url();
+        self.request_at(&self.base_url(), input, questions)
+    }
+
+    fn request_at(self, base: &str, input: &str, questions: &[Question]) -> (String, Value) {
         match self {
             Self::Openai => (
                 format!("{base}/decisions"),
@@ -326,6 +329,12 @@ impl SystemDecider {
             self.creds
                 .named_key(p.key_name(), p.key_env())
                 .map(|(k, _)| (p, k))
+                .or_else(|| {
+                    (p == Provider::Typesafe)
+                        .then(|| proxy_token())
+                        .flatten()
+                        .map(|t| (p, t))
+                })
         }))
     }
 }
@@ -341,8 +350,17 @@ impl Decide for SystemDecider {
             let Some((provider, key)) = self.pick(prefer)? else {
                 return Ok(None);
             };
+            let own_key = self
+                .creds
+                .named_key(provider.key_name(), provider.key_env())
+                .is_some();
             let answers = if provider == Provider::Local {
                 local::decide(&self.http, &self.creds, input, questions).await?
+            } else if provider == Provider::Typesafe && !own_key {
+                // No key of your own: the shared gate service, through
+                // Pathfinder's collector, with your install token.
+                let base = format!("{}/v1/typesafe", crate::telemetry::collector_url());
+                call_at(&self.http, provider, &base, &key, input, questions).await?
             } else {
                 call(&self.http, provider, &key, input, questions).await?
             };
@@ -360,6 +378,10 @@ impl Decide for SystemDecider {
             .filter(|p| match p {
                 Provider::Local => cfg.decisions.is_some(),
                 _ if cfg.local_only => false,
+                Provider::Typesafe => {
+                    self.creds.named_key(p.key_name(), p.key_env()).is_some()
+                        || proxy_token().is_some()
+                }
                 _ => self.creds.named_key(p.key_name(), p.key_env()).is_some(),
             })
             .collect()
@@ -522,6 +544,16 @@ pub mod local {
     }
 }
 
+/// The install token of an enrolled install, which the collector accepts
+/// in place of a TypeSafe key. `HARNESS_DECISION_PROXY=off` ignores it.
+fn proxy_token() -> Option<String> {
+    if env::var("HARNESS_DECISION_PROXY").is_ok_and(|v| v.trim() == "off") {
+        return None;
+    }
+    let consent = crate::telemetry::Consent::load();
+    consent.enrolled.then(|| consent.token()).flatten()
+}
+
 /// One request to `provider`; also used by `harness auth set` to check a key.
 pub async fn call(
     http: &reqwest::Client,
@@ -530,7 +562,19 @@ pub async fn call(
     input: &str,
     questions: &[Question],
 ) -> Result<HashMap<String, Answer>> {
-    let (url, body) = provider.request(input, questions);
+    call_at(http, provider, &provider.base_url(), key, input, questions).await
+}
+
+/// `call`, at another base URL (the collector's gate proxy).
+pub async fn call_at(
+    http: &reqwest::Client,
+    provider: Provider,
+    base: &str,
+    key: &str,
+    input: &str,
+    questions: &[Question],
+) -> Result<HashMap<String, Answer>> {
+    let (url, body) = provider.request_at(base, input, questions);
     let req = http.post(&url).json(&body);
     let req = match provider {
         Provider::Gemini => req.header("x-goog-api-key", key),

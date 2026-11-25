@@ -450,19 +450,20 @@ pub async fn data(args: &[String]) -> Result<()> {
                 .get(1)
                 .filter(|a| !a.starts_with("--"))
                 .context("usage: harness data join <invite code> [--events] [--threads]")?;
-            if !has("--events") && !has("--threads") {
-                bail!(
-                    "say what you agree to: --events (usage events, no message text), \
-                     --threads (sharing threads you choose), or both. Read the notice first: {}",
-                    consent::NOTICE_URL
-                );
-            }
             consent.events = has("--events");
             consent.threads = has("--threads");
             telemetry::enroll(invite, &mut consent).await?;
-            println!(
-                "Enrolled. Thank you! `harness data` shows what is collected; `harness data off` stops it."
-            );
+            if consent.events || consent.threads {
+                println!(
+                    "Joined. Thank you! `harness data` shows what is collected; `harness data off` stops it."
+                );
+            } else {
+                println!(
+                    "Joined: the shared gate is on, and no usage data is sent. To share some: \
+                     harness data on --events and/or --threads (notice: {}).",
+                    consent::NOTICE_URL
+                );
+            }
             Ok(())
         }
         Some("on") => {
@@ -473,15 +474,18 @@ pub async fn data(args: &[String]) -> Result<()> {
             consent.events |= events;
             consent.threads |= threads;
             consent.stamp();
-            consent.save()?;
-            if !consent.enrolled {
-                println!(
-                    "Saved. Nothing is sent until you join with an invite code: harness data join <code> …"
-                );
-                return Ok(());
+            // The collector first: it refuses events it hasn't heard a yes for.
+            if consent.enrolled {
+                telemetry::set_remote_consent(&consent).await?;
             }
-            telemetry::set_remote_consent(&consent).await?;
-            println!("Saved.");
+            consent.save()?;
+            if consent.enrolled {
+                println!("Saved.");
+            } else {
+                println!(
+                    "Saved. Nothing is sent until you join with an invite code: harness data join <code>"
+                );
+            }
             Ok(())
         }
         Some("off") => {
