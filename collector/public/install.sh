@@ -57,7 +57,7 @@ tar -xzf "$tmp/release.tar.gz" -C "$tmp"
 if [ "$target" = universal-apple-darwin ]; then
     if ! codesign --verify --strict "$tmp/harness" 2>/dev/null ||
         ! codesign -dv "$tmp/harness" 2>&1 | grep -q "TeamIdentifier=$TEAM_ID"; then
-        echo "The binary isn't signed by Pathfinder's developer; stopping." >&2
+        echo "The binary isn't signed by Pathfinder's developer (team $TEAM_ID); stopping." >&2
         exit 1
     fi
 fi
@@ -80,8 +80,8 @@ cat <<'NEXT'
 
 Next:
   1. Sign in:            harness auth login chatgpt
-  2. Start, in a folder with your study material:
-                         cd ~/path/to/course && harness tui
+  2. Start, in the folder you're working in:
+                         cd ~/path/to/project && harness tui
      The first start asks whether to share usage data (it's optional) and
      for your invite code.
   3. Later updates:      harness update

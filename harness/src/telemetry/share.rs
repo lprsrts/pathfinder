@@ -6,7 +6,7 @@ use std::path::Path;
 use pathfinder_schema::SharedThread;
 use serde_json::json;
 
-/// Replaces the study folder with `.` and the home folder with `~`.
+/// Replaces the working folder with `.` and the home folder with `~`.
 pub fn scrub_paths(text: &str, cwd: &Path) -> String {
     let mut out = text.to_string();
     let cwd = cwd.display().to_string();

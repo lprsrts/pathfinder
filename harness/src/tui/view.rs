@@ -928,7 +928,7 @@ fn modal(f: &mut Frame, app: &App, area: Rect) {
                         .borders(Borders::ALL)
                         .border_style(dim())
                         .title(Span::styled(
-                            " Share this thread with Pathfinder's developer? ",
+                            " Share this thread with Alper? ",
                             Style::default().add_modifier(Modifier::BOLD),
                         ))
                         .title_bottom(Span::styled(hint, dim())),
@@ -971,7 +971,7 @@ fn modal(f: &mut Frame, app: &App, area: Rect) {
                 ("/why, /map", "your record, the plan"),
                 (
                     "/share [note]",
-                    "send this thread to the developer (shown first)",
+                    "send this thread to Alper (shown in full first)",
                 ),
                 (
                     "Ctrl+C, Ctrl+D (idle)",
@@ -1023,9 +1023,9 @@ fn consent(
     let bold = Style::default().add_modifier(Modifier::BOLD);
     let tick = |on: bool| if on { "[x]" } else { "[ ]" };
     let mut lines: Vec<Line> = vec![
-        Line::from("Pathfinder can send usage data to its developer, to see what works and what"),
-        Line::from("breaks for people other than him. Nothing is sent unless you say yes here"),
-        Line::from("and have an invite code."),
+        Line::from("Pathfinder can send usage data to Alper, who builds it, so he can see how it"),
+        Line::from("works for people other than him. Nothing is sent unless you say yes here and"),
+        Line::from("join with an invite code. Either way, Pathfinder works the same."),
         Line::default(),
         Line::from(vec![Span::styled(
             format!("{} e  Usage events", tick(events)),
@@ -1033,14 +1033,16 @@ fn consent(
         )]),
         Line::from("       Counts and timings: which steps you use, how long replies take,"),
         Line::from("       whether a reply was held back, checks as right or wrong. Never your"),
-        Line::from("       messages, files, folder names or study topics."),
+        Line::from("       messages, the answers, file or folder names, or what you work on."),
         Line::from(vec![Span::styled(
             format!("{} t  Threads you choose to share", tick(threads)),
             bold,
         )]),
         Line::from("       Only when you type /share in a thread, after seeing exactly what goes."),
         Line::default(),
-        Line::from("Kept on his server in Germany for up to 12 months. Change it any time with"),
+        Line::from(
+            "Kept on Alper's server in Germany for up to 12 months. Change it any time with",
+        ),
         Line::from("`harness data off`; erase everything with `harness data delete`."),
         Line::from(Span::styled(
             format!("Full notice: {}", crate::telemetry::consent::NOTICE_URL),
