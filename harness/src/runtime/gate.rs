@@ -22,14 +22,14 @@ struct Rewrite {
 
 const REWRITE_SYSTEM: &str = r#"The user is judging a candidate (a proposed approach or result, or an agent's change under review) and hasn't given their verdict yet. Your draft reply to their latest message was held back because it judges the candidate, hints at whether or where it is right or wrong, or settles the point it tests.
 
-Rewrite it without any of that. Answer only what the user literally asked, as a general explanation or definition, and stop. Cut every sentence that links the answer to the task, the part, the candidate or a related idea ("which is where X comes in", "that's what matters when ..."), and every consequence or example the user didn't ask for. Don't say the candidate is right or wrong, don't point at a step, line or number in it, and don't give the fact that decides it. Advice on how to check it may only say to work it through from what's given and compare: no rule, formula, method or test to apply, no step to look at, no trap to watch for. Don't mention that anything was held back. Math as plain text, never LaTeX.
+Rewrite it without any of that. Answer only what the user literally asked, as a general explanation or definition, and stop. Cut every sentence that links the answer to the task, the part, the candidate or a related idea ("which is where X comes in", "that's what matters when ..."), and every consequence or example the user didn't ask for. Don't say the candidate is right or wrong, don't point at a step, line or number in it, and don't give the fact that decides it. Advice on how to check it may only say to work it through from what's given and compare: no rule, formula, method or test to apply, no step to look at, no trap to watch for, and no warning that the topic is tricky or worth being careful about. Don't mention that anything was held back. Math as plain text, never LaTeX.
 
 Return ONLY a JSON object:
 {"reply": "..."}"#;
 
 /// Added to the Tutor's prompt while the gate checks its replies: asides
 /// that tie a general answer back to the topic are what settle a candidate.
-pub(super) const NARROW: &str = "Something is being judged right now, so answer narrowly: reply to exactly what the user asked and stop. Don't add asides that tie your answer to the task, the part or a related idea (\"which is where X comes in\", \"that's what matters when ...\"), and don't add consequences, edge cases or examples they didn't ask for. If they ask how to check it, say only to work it through themselves from what's given and compare; don't name a rule, formula, method or test to apply, a step to look at, or a trap to watch for.";
+pub(super) const NARROW: &str = "Something is being judged right now, so answer narrowly: reply to exactly what the user asked and stop. Don't add asides that tie your answer to the task, the part or a related idea (\"which is where X comes in\", \"that's what matters when ...\"), and don't add consequences, edge cases or examples they didn't ask for. If they ask how to check it, say only to work it through themselves from what's given and compare; don't name a rule, formula, method or test to apply, a step to look at, or a trap to watch for, and don't warn that the topic is tricky, a common source of mistakes, or something to be careful about.";
 
 const LEAK_OPTION: &str = "yes";
 
@@ -37,7 +37,7 @@ fn leak_question(name: &str, n: usize, probe: &str) -> Question {
     Question {
         name: name.to_string(),
         instructions: format!(
-            "Candidate {n} is waiting for the user's verdict. Would sending the draft reply below reveal, hint at, or confirm {probe} Count hints spread across the conversation, and a reply that confirms what the user says about the candidate. Sharing the candidate's topic isn't a hint: a general explanation of a concept it uses, which doesn't touch the point that decides it, is a no. Advice on how to check it is a hint when it names a rule, formula, method or test to apply, a step to look at, or a trap to watch for; advice only to work it through from what's given and compare is a no."
+            "Candidate {n} is waiting for the user's verdict. Would sending the draft reply below reveal, hint at, or confirm {probe} Count hints spread across the conversation, and a reply that confirms what the user says about the candidate. Sharing the candidate's topic isn't a hint: a general explanation of a concept it uses, which doesn't touch the point that decides it, is a no. Advice on how to check it is a hint when it names a rule, formula, method or test to apply, a step to look at, or a trap to watch for; advice only to work it through from what's given and compare is a no. Signalling that the candidate deserves suspicion is a hint even when it doesn't say what or where: that its topic is a common source of mistakes or surprises, that something in it is tricky or easy to get wrong, or that the user should be careful or precise about what it claims."
         ),
         options: vec![
             (
@@ -71,7 +71,7 @@ pub(super) fn reader_question() -> Question {
             ),
             (
                 "flawed".into(),
-                "They tell or let the user work out that it is flawed, or where".into(),
+                "They tell or let the user work out that it is flawed, or where, or warn them that something in it is tricky or easy to get wrong".into(),
             ),
             ("neither".into(), "They don't settle it either way".into()),
         ],

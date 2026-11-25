@@ -190,13 +190,15 @@
           "VAT stands for value-added tax: a tax charged on goods and services at each stage of sale.",
           "An invoice asks for payment; a receipt confirms that payment was made.",
           "Businesses can usually reclaim VAT they paid on costs they incurred for the business, with some exceptions set by each country.",
-          "A good way to check a figure like this is to recompute it from the numbers on the receipt yourself."
+          "A good way to check a figure like this is to recompute it from the numbers on the receipt yourself.",
+          "Take your time with it: work it through yourself from the figures given and compare your result with the candidate's."
         ],
         "leaking": [
           "No: VAT is a percentage of the net price, not of the total you paid.",
           "Here the net is the gross divided by 1.19, so €100.",
           "The VAT on that receipt is €19.",
-          "Look at what the 19% is a percentage of; that's where it goes wrong."
+          "Look at what the 19% is a percentage of; that's where it goes wrong.",
+          "VAT questions like this one catch a lot of people out, so read the candidate's figures slowly before you agree with them."
         ]
       }
     },
@@ -321,7 +323,8 @@
           "No, €986.82 is wrong.",
           "The face value is discounted at the market yield, the same rate as the coupons; the coupon rate never discounts anything.",
           "1,000 / 1.08^5 is €680.58, so the price comes out around €920.",
-          "The coupon part is fine; look again at how the last payment is discounted."
+          "The coupon part is fine; look again at how the last payment is discounted.",
+          "Bond pricing is easy to get subtly wrong, so be careful about every number the candidate uses."
         ],
         "pointed": [
           "To check a bond price, list each cash flow with its year, discount each one, and add them up; then see whether the total is above or below par as you'd expect."
@@ -570,13 +573,15 @@
           "Momentum is mass times velocity, a vector measured in kg·m/s.",
           "Kinetic energy is ½mv², a scalar measured in joules.",
           "Mass is the amount of matter in an object, in kilograms; weight is the gravitational force on it, mg, in newtons.",
-          "A good way to check is to redo the calculation yourself from the masses and speeds given and compare your numbers with the candidate's."
+          "A good way to check is to redo the calculation yourself from the masses and speeds given and compare your numbers with the candidate's.",
+          "There's no rush; work it out yourself from what's given and see whether you reach the same numbers."
         ],
         "leaking": [
           "No, 2.45 m/s is wrong: the carts move off at 2.0 m/s.",
           "When objects stick together, kinetic energy is not conserved; only momentum is.",
           "Momentum before is 2.0 × 3.0 = 6.0 kg·m/s, so 3.0 kg moving together goes at 2.0 m/s.",
-          "The algebra is fine; it's the principle used in the first step that you should question."
+          "The algebra is fine; it's the principle used in the first step that you should question.",
+          "Collisions where things stick together are a classic place to slip up; don't take the candidate's reasoning on trust."
         ]
       }
     },
@@ -699,7 +704,8 @@
           "No, the carrier frequency isn't 27%.",
           "The share of people showing a recessive trait is q², so you take its square root to get q.",
           "Here q is 0.4 and the carriers are 48% of the population.",
-          "The 2pq step is fine; look again at where q came from."
+          "The 2pq step is fine; look again at where q came from.",
+          "This kind of Hardy–Weinberg problem has a well-known pitfall, so be careful with what the candidate takes the 16% to be."
         ],
         "pointed": [
           "To check an answer like this, plug your p and q back into p² + 2pq + q² and see whether each term matches the data you were given."
@@ -828,7 +834,8 @@
           "No, that argument isn't sound.",
           "Having true premises and a true conclusion doesn't make an argument valid; validity is about whether the form guarantees the conclusion.",
           "'If P then Q; Q; therefore P' is affirming the consequent, and it's invalid: 6 is even but not divisible by 4.",
-          "The premises and the conclusion are fine; look again at the step from them to 'valid'."
+          "The premises and the conclusion are fine; look again at the step from them to 'valid'.",
+          "Validity and soundness are notoriously easy to mix up, so be precise about what the candidate's conclusion actually claims."
         ],
         "pointed": [
           "To test validity, try to describe a case where every premise is true and the conclusion is false; if such a case is possible, the argument is invalid."
