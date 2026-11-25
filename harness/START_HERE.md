@@ -26,9 +26,11 @@ Answers count as *told*, not as understood.
 
 You don't need to ask for a check. It comes at the moments that matter:
 
-- **When you say you've got it** ("ok, macht Sinn", "verstehe", "got it"), Pathfinder shows one short *candidate*: a worked explanation that is either right or has exactly one real mistake. Say whether it's right and why. If you'd rather move on, just ask your next question; nothing is recorded then.
-- **When you want to be tested** ("frag mich ab", "frag mich wie ein Prüfer zum Transformator ab"), it runs an **exam simulation**: open questions one at a time, the way an oral examiner asks them. Answer as you would in the exam. Each answer is graded with feedback on what was missing from your explanation, then the next question follows. Say "genug" to stop.
-- **When you want to solve an exercise yourself** ("Ich will Aufgabe 1 selbst lösen, hilf mir ohne die Lösung"), it splits the exercise into parts and gives hints, never the result. Think out loud as you work; when you can explain a part, say so and get a candidate for it.
+There are no special phrases: Pathfinder reads what you mean.
+
+- **When you tell it something has clicked**, it shows one short *candidate*: a worked explanation that is either right or has exactly one real mistake. Say whether it's right and why. If you'd rather move on, just ask your next question; nothing is recorded then.
+- **When you want to be tested on a topic**, say so however you like, for example that you want to practise for the oral exam. It runs an **exam simulation**: open questions one at a time, the way an oral examiner asks them. Answer as you would in the exam. Each answer is graded with feedback on what was missing from your explanation, then the next question follows. Stop or ask something else whenever you like.
+- **When you want to solve an exercise yourself** and say so, it splits the exercise into parts and gives hints, never the result. Think out loud as you work; when you can explain a part, say so and get a candidate for it.
 
 Passing a candidate or an exam question is what puts an idea on your record as shown. `/why` shows, per idea, what you've shown, claimed or only been told.
 

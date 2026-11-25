@@ -112,7 +112,7 @@ pub fn line(lang: Option<&str>, line: Line) -> &'static str {
             Delegated => "**{title}** ohne Verständnis abgegeben; nicht geprüft.",
             QuickCheckLead => "Dann kurz zum Festigen:",
             ExamLead => {
-                "Prüfungssimulation: eine Frage nach der anderen. Antworte so, wie du es in der Prüfung erklären würdest; mit „genug“ hörst du auf."
+                "Prüfungssimulation: eine Frage nach der anderen. Antworte so, wie du es in der Prüfung erklären würdest. Hör auf oder frag etwas anderes, wann immer du willst."
             }
             ExamQuestionFor => "Prüfungsfrage zu",
             ExamAnswer => "Deine Antwort?",
@@ -158,7 +158,7 @@ pub fn line(lang: Option<&str>, line: Line) -> &'static str {
             Delegated => "**{title}** handed off without understanding; not reviewed.",
             QuickCheckLead => "Then a quick one to make it stick:",
             ExamLead => {
-                "Exam practice, one question at a time. Answer the way you would in the exam; say \"enough\" to stop."
+                "Exam practice, one question at a time. Answer the way you would in the exam. Stop or ask something else whenever you like."
             }
             ExamQuestionFor => "Question on",
             ExamAnswer => "Your answer?",
