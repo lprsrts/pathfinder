@@ -138,12 +138,15 @@ pub fn full_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "bash".into(),
-            description: "Run a shell command in the workspace. The user is asked first and watches it run. Returns its output and exit code. Use it for building, testing, installing and git; use the file tools to read and change files.".into(),
+            description: "Run a shell command in the workspace; the user watches it run. Returns its output and exit code. Use it for building, testing and running code; use the file tools to read and change files. Commands run in a sandbox: they can read files, write only inside the workspace (not .git) and the temp folders, and have no network. When a command truly needs the internet (installing packages, fetching), set `network`; when it must write elsewhere or into .git (e.g. `git commit`), set `outside_sandbox`. Both need a `justification`, and the user is asked first.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "command": {"type": "string"},
-                    "timeout_secs": {"type": "integer", "description": "Default 120, at most 600."}
+                    "timeout_secs": {"type": "integer", "description": "Default 120, at most 600."},
+                    "network": {"type": "boolean", "description": "Allow network access (the user is asked)."},
+                    "outside_sandbox": {"type": "boolean", "description": "Run without the sandbox (the user is asked)."},
+                    "justification": {"type": "string", "description": "Why `network` or `outside_sandbox` is needed, in one sentence for the user."}
                 },
                 "required": ["command"],
                 "additionalProperties": false

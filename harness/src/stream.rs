@@ -58,7 +58,11 @@ pub fn describe_tool(id: String, name: &str, input: &Value, cwd: &Path) -> ToolS
             let file = shown.clone().unwrap_or_default();
             let num = |k: &str| input.get(k).and_then(Value::as_u64);
             match (
-                input.get("pages").and_then(Value::as_str),
+                input
+                    .get("pages")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|p| !p.is_empty()),
                 num("offset"),
                 num("limit"),
             ) {
@@ -102,10 +106,20 @@ pub fn describe_tool(id: String, name: &str, input: &Value, cwd: &Path) -> ToolS
                 None => (ToolKind::Search, label),
             }
         }
-        "bash" => (
-            ToolKind::Execute,
-            format!("Run `{}`", str_field(&["command"]).unwrap_or_default()),
-        ),
+        "bash" => (ToolKind::Execute, {
+            let cmd = str_field(&["command"]).unwrap_or_default();
+            let flag = |k: &str| input.get(k).and_then(Value::as_bool).unwrap_or(false);
+            let why = str_field(&["justification"])
+                .map(|w| format!(": {w}"))
+                .unwrap_or_default();
+            if flag("outside_sandbox") {
+                format!("Run `{cmd}` outside the sandbox{why}")
+            } else if flag("network") {
+                format!("Run `{cmd}` with network access{why}")
+            } else {
+                format!("Run `{cmd}`")
+            }
+        }),
         "webfetch" | "websearch" | "web_search" => (ToolKind::Fetch, capitalize(name)),
         _ => (ToolKind::Other, name.to_string()),
     };

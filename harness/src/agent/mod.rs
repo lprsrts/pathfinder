@@ -3,6 +3,7 @@
 //! runtime.rs doesn't know or care which route ran.
 
 pub mod confine;
+pub mod sandbox;
 pub mod tools;
 
 use std::env;
@@ -617,25 +618,54 @@ async fn run_command(
             .unwrap_or(120)
             .clamp(1, 600),
     );
+    let flag = |k: &str| {
+        args.get(k)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    };
+    let (network, outside) = (flag("network"), flag("outside_sandbox"));
     let cancel = &req.ctx.cancel;
-    let started = std::time::Instant::now();
-    let output = match &req.ctx.host {
-        Some(host) => {
-            // "Always allow" covers later commands with the same program.
-            let program = command.split_whitespace().next().unwrap_or(command);
-            match host.ask(id, program).await {
-                Permission::Denied => {
-                    return Err("The user declined to run this command.".into());
-                }
-                Permission::Once | Permission::Always => {}
-            }
-            match host.run_in_terminal(id, command, &req.cwd, timeout, cancel) {
-                Some(run) => run.await.map_err(|e| e.to_string())?,
-                None => run_local(id, command, &req.cwd, timeout, cancel, sink).await?,
-            }
+    // In the sandbox unless the model asked to leave it; no sandbox on this
+    // machine means every command asks.
+    let jail = if outside { None } else { sandbox::available() };
+    let policy = sandbox::Policy {
+        workspace: req.cwd.clone(),
+        network,
+    };
+    let ask = jail.is_none() || network || crate::config::Config::load().ask_every_command;
+    if let Some(host) = &req.ctx.host
+        && ask
+    {
+        // "Always allow" covers later commands with the same program and
+        // the same kind of access.
+        let program = command.split_whitespace().next().unwrap_or(command);
+        let key = match (jail.is_some(), network) {
+            (false, _) => format!("unsandboxed:{program}"),
+            (true, true) => format!("network:{program}"),
+            (true, false) => program.to_string(),
+        };
+        if host.ask(id, &key).await == Permission::Denied {
+            return Err("The user declined to run this command.".into());
         }
-        // No client (tests): nobody to ask.
-        None => run_local(id, command, &req.cwd, timeout, cancel, sink).await?,
+    }
+    let started = std::time::Instant::now();
+    let merged = format!("{{ {command}\n}} 2>&1");
+    let local_argv = match &jail {
+        Some(kind) => sandbox::wrap(kind, &policy, &merged),
+        None => vec!["/bin/sh".into(), "-c".into(), merged],
+    };
+    let terminal_line = match &jail {
+        Some(kind) => sandbox::shell_join(&sandbox::wrap(kind, &policy, command)),
+        None => command.to_string(),
+    };
+    let terminal = req
+        .ctx
+        .host
+        .as_ref()
+        .and_then(|h| h.run_in_terminal(id, &terminal_line, &req.cwd, timeout, cancel));
+    let output = match terminal {
+        Some(run) => run.await.map_err(|e| e.to_string())?,
+        None => run_local(id, command, local_argv, &req.cwd, timeout, cancel, sink).await?,
     };
     let took = started.elapsed().as_secs_f32();
     let status = match output.exit_code {
@@ -656,6 +686,12 @@ async fn run_command(
     if output.truncated {
         text.push_str("\n(output truncated)");
     }
+    if jail.is_some()
+        && output.exit_code != Some(0)
+        && let Some(hint) = sandbox::denial_hint(&output.output, network)
+    {
+        text.push_str(&hint);
+    }
     match output.exit_code {
         Some(0) => Ok(text),
         _ => Err(text),
@@ -668,15 +704,15 @@ async fn run_command(
 async fn run_local(
     id: &str,
     command: &str,
+    argv: Vec<String>,
     cwd: &std::path::Path,
     timeout: Duration,
     cancel: &tokio_util::sync::CancellationToken,
     sink: &StreamSink,
 ) -> Result<CommandOutput, String> {
     use tokio::io::AsyncReadExt;
-    let mut child = tokio::process::Command::new("sh")
-        .arg("-c")
-        .arg(format!("{{ {command}\n}} 2>&1"))
+    let mut child = tokio::process::Command::new(&argv[0])
+        .args(&argv[1..])
         .current_dir(cwd)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -1022,7 +1058,7 @@ mod tests {
     #[tokio::test]
     async fn agent_work_edits_files_and_runs_allowed_commands() {
         let ws = workspace();
-        let script = || {
+        let script = |network: bool| {
             vec![
                 Ok(vec![
                     Part::Text("Renaming the crate.".into()),
@@ -1035,12 +1071,12 @@ mod tests {
                 Ok(vec![call(
                     "b1",
                     "bash",
-                    json!({"command": "grep -c neuron Cargo.toml"}),
+                    json!({"command": "grep -c neuron Cargo.toml", "network": network, "justification": "test"}),
                 )]),
                 Ok(vec![Part::Text("Renamed it.".into())]),
             ]
         };
-        let (engine, llm) = scripted(script());
+        let (engine, llm) = scripted(script(false));
         let mut req = request(ws.clone(), ToolAccess::Full);
         req.ctx.host = Some(Arc::new(FakeHost(Permission::Once)));
         let (sink, log) = recorder();
@@ -1065,8 +1101,23 @@ mod tests {
         );
         drop(seen);
 
-        // Declined: the command doesn't run and the model is told so.
-        let (engine, llm) = scripted(script());
+        // Sandboxed, it runs without asking: a "no" isn't even consulted.
+        if sandbox::available().is_some() {
+            fs::write(ws.join("Cargo.toml"), "[package]\nname = \"demo\"\n").unwrap();
+            let (engine, llm) = scripted(script(false));
+            req.ctx.host = Some(Arc::new(FakeHost(Permission::Denied)));
+            engine.run_text(&req, recorder().0).await.unwrap();
+            let seen = llm.seen.lock().unwrap();
+            let Message::ToolResults(results) = seen[2].messages.last().unwrap() else {
+                panic!("expected tool results");
+            };
+            assert!(!results[0].is_error, "{}", results[0].content);
+        }
+
+        // Network asks; declined, the command doesn't run and the model is
+        // told so.
+        fs::write(ws.join("Cargo.toml"), "[package]\nname = \"demo\"\n").unwrap();
+        let (engine, llm) = scripted(script(true));
         req.ctx.host = Some(Arc::new(FakeHost(Permission::Denied)));
         engine.run_text(&req, recorder().0).await.unwrap();
         let seen = llm.seen.lock().unwrap();
@@ -1226,9 +1277,11 @@ mod tests {
     #[tokio::test]
     async fn command_output_survives_a_timeout() {
         let ws = workspace();
+        let cmd = "echo before; echo oops >&2; sleep 5";
         let out = run_local(
             "t",
-            "echo before; echo oops >&2; sleep 5",
+            cmd,
+            vec!["/bin/sh".into(), "-c".into(), format!("{{ {cmd}\n}} 2>&1")],
             &ws,
             Duration::from_millis(500),
             &CancellationToken::new(),

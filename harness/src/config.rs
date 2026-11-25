@@ -190,6 +190,11 @@ pub struct Config {
     /// cloud, for on-prem use. Pinned and discovered cloud models are hidden.
     #[serde(default)]
     pub local_only: bool,
+    /// Ask before every agent command, even sandboxed ones. Off: commands
+    /// run in the sandbox without asking, and only those needing the
+    /// network or to leave the sandbox ask.
+    #[serde(default)]
+    pub ask_every_command: bool,
 }
 
 fn lenient_models<'de, D: Deserializer<'de>>(de: D) -> Result<Vec<ModelEntry>, D::Error> {
@@ -258,6 +263,7 @@ impl Default for Config {
             endpoints: Vec::new(),
             decisions: None,
             local_only: false,
+            ask_every_command: false,
         }
     }
 }
