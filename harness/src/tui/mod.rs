@@ -70,6 +70,7 @@ pub enum Modal {
     },
     Permission {
         title: String,
+        always_key: String,
         reply: Option<oneshot::Sender<Permission>>,
     },
     Help,
@@ -112,6 +113,8 @@ pub struct App {
     pub new_below: bool,
     /// The plan panel over the conversation, in a window too narrow to dock it.
     pub side_overlay: bool,
+    /// Kinds of command the user allowed for the rest of this thread.
+    pub always: std::collections::HashSet<String>,
     tx: mpsc::UnboundedSender<AppEvent>,
     pub quit: bool,
 }
@@ -141,6 +144,7 @@ pub async fn run(rt: Arc<Runtime>, cwd: PathBuf) -> Result<()> {
         last_total: 0,
         new_below: false,
         side_overlay: false,
+        always: Default::default(),
         tx,
         quit: false,
     };
@@ -449,6 +453,7 @@ impl App {
             Ok(s) => {
                 self.session = s;
                 self.entries.clear();
+                self.always.clear();
                 self.scroll = 0;
                 self.status = "New thread.".into();
             }
@@ -595,12 +600,18 @@ impl App {
                 always_key,
                 reply,
             } => {
+                // Allowed "always" earlier in this thread: no question.
+                if self.always.contains(&always_key) {
+                    let _ = reply.send(Permission::Always);
+                    return;
+                }
                 let title = match self.tool_mut(&call_id) {
                     Some(Entry::Tool { title, .. }) => title.clone(),
                     _ => format!("Run `{always_key}`"),
                 };
                 self.modal = Some(Modal::Permission {
                     title,
+                    always_key,
                     reply: Some(reply),
                 });
             }
@@ -697,7 +708,11 @@ impl App {
         };
         self.modal = match modal {
             Modal::Help => None,
-            Modal::Permission { title, reply } => {
+            Modal::Permission {
+                title,
+                always_key,
+                reply,
+            } => {
                 let answer = match key.code {
                     KeyCode::Char('y' | '1') | KeyCode::Enter => Some(Permission::Once),
                     KeyCode::Char('a' | '2') => Some(Permission::Always),
@@ -706,16 +721,27 @@ impl App {
                 };
                 match (answer, reply) {
                     (Some(a), Some(tx)) => {
+                        // The tool line above already names the command.
                         let said = match a {
-                            Permission::Denied => "✗ Not allowed",
-                            Permission::Always => "✓ Allowed from now on",
-                            _ => "✓ Allowed once",
+                            Permission::Denied => "✗ You declined this.".to_string(),
+                            Permission::Always => {
+                                self.always.insert(always_key.clone());
+                                format!(
+                                    "✓ Allowed, and from now on in this thread for `{}`.",
+                                    always_key.rsplit(':').next().unwrap_or(&always_key)
+                                )
+                            }
+                            _ => "✓ Allowed once.".to_string(),
                         };
-                        self.entries.push(Entry::Note(format!("{said}: {title}")));
+                        self.entries.push(Entry::Note(said));
                         let _ = tx.send(a);
                         None
                     }
-                    (None, reply) => Some(Modal::Permission { title, reply }),
+                    (None, reply) => Some(Modal::Permission {
+                        title,
+                        always_key,
+                        reply,
+                    }),
                     (Some(_), None) => None,
                 }
             }
@@ -726,6 +752,7 @@ impl App {
                         && let Ok(Some(s)) = self.rt.load_session(id)
                     {
                         self.entries = entries_of(&s);
+                        self.always.clear();
                         self.session = s;
                         self.scroll = 0;
                         self.status = "Thread opened.".into();

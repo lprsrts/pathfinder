@@ -565,13 +565,16 @@ fn permission_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         bold.fg(Color::Yellow),
     ))];
     lines.extend(markdown::wrap_hanging(
-        &[Span::styled(format!("  $ {title}"), bold)],
+        &[Span::styled(format!("  {title}"), bold)],
         width.saturating_sub(1),
         4,
     ));
     for (k, label) in [
         ("1", "Yes, once (y)"),
-        ("2", "Yes, always for this program (a)"),
+        (
+            "2",
+            "Yes, and don't ask again in this thread for this program (a)",
+        ),
         ("3", "No (n, Esc)"),
     ] {
         lines.push(Line::from(vec![
@@ -604,7 +607,9 @@ fn footer(f: &mut Frame, app: &App, area: Rect) {
         String::new(),
     ];
     let (left, left_style) = if app.status.is_empty() {
-        let hints: &[&str] = if app.modal.is_some() {
+        let hints: &[&str] = if matches!(app.modal, Some(Modal::Permission { .. })) {
+            &["1/y once · 2/a always · 3/n/Esc no", "y · a · n"]
+        } else if app.modal.is_some() {
             &["Enter picks · Esc closes"]
         } else {
             &[
