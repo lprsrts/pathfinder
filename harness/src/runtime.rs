@@ -253,6 +253,19 @@ impl Runtime {
         self.store.load_session(id)
     }
 
+    /// The threads opened in `cwd`, most recently active first.
+    pub fn sessions_in(&self, cwd: &std::path::Path) -> Vec<Session> {
+        let mut all: Vec<Session> = self
+            .store
+            .all_sessions()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|s| s.cwd == cwd)
+            .collect();
+        all.reverse();
+        all
+    }
+
     /// Saves what the client was shown this turn (serialized updates).
     pub fn record(&self, id: &str, updates: &[String]) -> Result<()> {
         self.store.append_transcript(id, updates)
@@ -2675,7 +2688,10 @@ mod tests {
         let why = rt.why(&s);
         assert!(!why.contains("Open misconception"), "{why}");
         assert!(why.contains("Command registry<br/><small>shown"), "{why}");
-        assert!(why.contains("n_closures --> n_dispatch"), "prerequisites one level down");
+        assert!(
+            why.contains("n_closures --> n_dispatch"),
+            "prerequisites one level down"
+        );
     }
 
     #[tokio::test]

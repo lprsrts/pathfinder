@@ -8,6 +8,8 @@ Pathfinder is your assistant for study and research, with one difference: it kno
 2. **Open the folder you're working in** as the project: a course (`~/dev/academic/kit/lectures/eet`), your papers (`~/dev/academic/kit/literature`) or your code (`~/dev/academic/kit/fusion-gmbp`). Pathfinder finds and reads the slides, scripts, exercise sheets, PDFs and code there by itself, figures included.
 3. Open the agent panel and start a **new Pathfinder thread**, one per topic or exercise.
 
+Or, without Zed, in any terminal: `harness tui ~/dev/academic/kit/lectures/eet`. Everything below works there too; F1 shows the keys, and you can drop a PDF or a screenshot onto the window to attach it.
+
 ## Use it like any assistant
 
 Just ask, in German or English. It answers from your material:

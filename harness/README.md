@@ -116,6 +116,16 @@ Images reach endpoint models that see them (`view` and attachments). PDFs don't 
 
 How good the loop is depends on the models. With 27B-class open models it works end to end (answers grounded in slides, candidates with one real flaw, the gate holding against a paraphrased question, verdicts judged right), but they make more factual slips than the large hosted models and sometimes write LaTeX, which Zed shows as source. In testing, an 8B decision model read an explanation of the whole part as an ordinary note, while a 27B one got it right, so don't go too small. Run `harness eval` against the models before relying on them.
 
+## In the terminal
+
+```bash
+harness tui ~/dev/academic/kit/lectures/eet   # or: cd there && harness tui
+```
+
+The same Pathfinder as in Zed, in a full-screen terminal UI: the same threads, record, checks, exams and settings, so a thread started in one can't be told from one started in the other. The conversation streams on the left, with thinking folded into one line (Ctrl+T shows it) and each tool call on one line with its result; the side panel shows what the thread is doing (chat, quick check, exam, task), anything waiting for your answer, and the plan. `/why` and `/map` print their diagrams as indented trees.
+
+Enter sends, Alt+Enter (or Ctrl+J) adds a line, Esc stops a reply. Ctrl+N starts a thread, Ctrl+O reopens an earlier one in the same folder, Ctrl+P changes the models, decisions and checks, F1 lists the keys. Attach a PDF or image with `/attach <file>`, or drop the file onto the terminal: a path in your message that names an image or PDF is attached. During agent work the TUI asks before each command (once, always for that program, or no). Logs go to `tui.log` next to the session database.
+
 ## Just asking
 
 Pathfinder is also an everyday assistant. Questions are answered in full by the main model, in your language, from the workspace and any attached files: concepts, derivations, slide summaries, exercise solutions when you ask for them, and reviews of your own work ("I solved it, is this right?"), which go through it step by step. Nothing is mapped and nothing counts as understood: if the question names an idea already on your record, Pathfinder logs that you were told about it (`told`, which never raises its state). Checks come at natural moments, read from what you mean rather than from any phrase: when you say something has clicked, one candidate follows straight away, and asking anything else instead drops it with nothing recorded; when you ask to be tested, an exam simulation asks open questions one at a time, grades each answer like an oral examiner and goes on until you stop or change the subject. Answers and verdicts go on the record per idea. Questions also work in a thread whose task is finished.

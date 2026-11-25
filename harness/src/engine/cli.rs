@@ -83,11 +83,21 @@ async fn run_jsonl(
         buf
     });
 
+    // Stopping the turn (Zed's stop button, Esc in the TUI) kills the CLI.
+    let cancel = super::turn_ctx().cancel;
     let mut reader = BufReader::new(stdout);
     let mut line = String::new();
     loop {
         line.clear();
-        if reader.read_line(&mut line).await? == 0 {
+        let read = tokio::select! {
+            r = reader.read_line(&mut line) => r?,
+            _ = cancel.cancelled() => {
+                child.kill().await.ok();
+                stderr_task.abort();
+                bail!("stopped");
+            }
+        };
+        if read == 0 {
             break;
         }
         if let Ok(val) = serde_json::from_str::<Value>(line.trim()) {
@@ -531,6 +541,29 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
+
+    #[tokio::test]
+    async fn stopping_the_turn_kills_the_cli() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "echo '{}'; sleep 10"]);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let ctx = crate::engine::RunContext {
+            cancel: cancel.clone(),
+            host: None,
+        };
+        let started = std::time::Instant::now();
+        let stopper = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            stopper.cancel();
+        });
+        let result = crate::engine::with_turn(ctx, run_jsonl(cmd, "sh", None, |_| {})).await;
+        assert!(result.is_err(), "a stopped run is an error");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "killed, not waited for"
+        );
+    }
 
     #[test]
     fn attachments_outside_the_workspace_get_their_folder_added() {

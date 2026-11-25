@@ -14,6 +14,7 @@ mod runtime;
 mod secrets;
 mod store;
 mod stream;
+mod tui;
 mod understanding;
 mod validate;
 mod workspace;
@@ -34,15 +35,35 @@ use crate::store::Store;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .with_writer(std::io::stderr)
-        .with_ansi(false)
-        .init();
-
     let args: Vec<String> = env::args().skip(1).collect();
+    let filter = || EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    // The TUI owns the terminal: its logs go to a file.
+    if args.first().map(String::as_str) == Some("tui") {
+        let log = Config::load()
+            .db_path
+            .parent()
+            .map(|d| d.join("tui.log"))
+            .unwrap_or_else(|| env::temp_dir().join("harness-tui.log"));
+        if let Some(dir) = log.parent() {
+            std::fs::create_dir_all(dir).ok();
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log)?;
+        tracing_subscriber::fmt()
+            .with_env_filter(filter())
+            .with_writer(std::sync::Mutex::new(file))
+            .with_ansi(false)
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter())
+            .with_writer(std::io::stderr)
+            .with_ansi(false)
+            .init();
+    }
+
     // Zed's sign-in buttons re-run the agent command with extra arguments,
     // e.g. `harness acp auth set`.
     let args: Vec<String> = match args.split_first() {
@@ -63,6 +84,24 @@ async fn main() -> Result<()> {
                     .with_decider(Arc::new(decide::SystemDecider::new(creds.clone()))),
             );
             acp::run_stdio(runtime, creds).await
+        }
+        Some("tui") => {
+            let cfg = Config::load();
+            let store = Arc::new(Store::open(&cfg.db_path)?);
+            let creds = Arc::new(Credentials::system());
+            let engine = Arc::new(RouterEngine::new(
+                CliEngine::new(cfg),
+                ApiEngine::with_credentials(creds.clone()),
+            ));
+            let runtime = Arc::new(
+                Runtime::new(store, engine)
+                    .with_decider(Arc::new(decide::SystemDecider::new(creds.clone()))),
+            );
+            let cwd = match args.get(1) {
+                Some(dir) => std::path::PathBuf::from(dir),
+                None => env::current_dir()?,
+            };
+            tui::run(runtime, cwd).await
         }
         Some("auth") => cli::auth(&args[1..]).await,
         Some("models") => cli::models(&args[1..]).await,
@@ -111,7 +150,7 @@ async fn main() -> Result<()> {
         }
         _ => {
             eprintln!(
-                "harness {} — human-in-the-loop pathfinder over ACP\n\nUsage:\n  harness acp                Run the ACP server over stdio (for Zed)\n  harness auth [status|set|remove|import]   Manage API keys\n  harness models [--refresh] List discovered models\n  harness coverage [--export] [path]   Understanding coverage of the agent's changes\n  harness eval [suite ...] [--out FILE]   Run the A10 evals (leak, discrimination, checks, tagging, evidence, coverage)\n  harness --version          Print version",
+                "harness {} — human-in-the-loop pathfinder over ACP\n\nUsage:\n  harness tui [folder]       Pathfinder in the terminal, in a folder (default: here)\n  harness acp                Run the ACP server over stdio (for Zed)\n  harness auth [status|set|remove|import]   Manage API keys\n  harness models [--refresh] List discovered models\n  harness coverage [--export] [path]   Understanding coverage of the agent's changes\n  harness eval [suite ...] [--out FILE]   Run the A10 evals (leak, discrimination, checks, tagging, evidence, coverage)\n  harness --version          Print version",
                 env!("CARGO_PKG_VERSION")
             );
             Ok(())

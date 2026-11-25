@@ -25,3 +25,6 @@ jsonwebtoken = { version = "10", default-features = false, features = ["rust_cry
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
+ratatui = "0.30.2"
+crossterm = { version = "0.29.0", features = ["event-stream"] }
+unicode-width = "0.2.3"
