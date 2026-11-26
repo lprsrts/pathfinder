@@ -1,4 +1,8 @@
+<img src="collector/public/favicon.svg" width="56" alt="" align="left">
+
 # Pathfinder
+
+<br clear="left">
 
 Pathfinder makes sure you understand the work you do with AI. It answers your questions, checks you at the moments that matter, and keeps an honest record of what you understood, what you only claimed, and what you handed off.
 
