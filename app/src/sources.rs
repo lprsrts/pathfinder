@@ -151,6 +151,43 @@ pub fn loose(text: &str) -> (String, Vec<(usize, usize)>) {
     (out, from)
 }
 
+/// A search term in the form lines are searched for: its [`loose`] form
+/// with the last word cut to a stem, so "clustering", "clusters" and
+/// "cluster" find each other, as do "Gleichung" and "Gleichungen". Only the
+/// last word is cut, so the words of a phrase still have to stand together.
+pub fn term_form(term: &str) -> String {
+    let full = loose(term).0;
+    let Some(last) = term
+        .split(|c: char| !c.is_alphanumeric())
+        .rfind(|w| !w.is_empty())
+    else {
+        return full;
+    };
+    let last = loose(last).0;
+    match full.strip_suffix(last.as_str()) {
+        Some(head) => format!("{head}{}", stem(stem(&last))),
+        None => full,
+    }
+}
+
+/// `word` without one common English or German ending, if at least four
+/// letters are left. Applied twice, "clustering" and "clusters" both end
+/// at "clust".
+fn stem(word: &str) -> &str {
+    const ENDINGS: &[&str] = &[
+        "ations", "ation", "ungen", "ings", "ing", "ung", "ies", "ers", "es", "ed", "er", "en",
+        "ly", "s", "e",
+    ];
+    for end in ENDINGS {
+        if let Some(head) = word.strip_suffix(end)
+            && head.chars().count() >= 4
+        {
+            return head;
+        }
+    }
+    word
+}
+
 /// Whether `text` contains `term` up to spelling variants (see [`loose`]).
 pub fn mentions(text: &str, term: &str) -> bool {
     let t = loose(term).0;
@@ -435,7 +472,7 @@ pub fn source_files(cwd: &Path) -> Vec<(PathBuf, String)> {
 pub fn find(cwd: &Path, terms: &[String], limit: usize) -> Vec<Hit> {
     let terms: Vec<String> = terms
         .iter()
-        .map(|t| loose(t).0)
+        .map(|t| term_form(t))
         .filter(|t| !t.is_empty())
         .collect();
     if terms.is_empty() {
@@ -590,7 +627,7 @@ pub fn quote_candidates(
 ) -> Vec<(Option<String>, String)> {
     let terms: Vec<String> = terms
         .iter()
-        .map(|t| loose(t).0)
+        .map(|t| term_form(t))
         .filter(|t| t.len() > 1)
         .collect();
     if terms.is_empty() {
@@ -903,6 +940,22 @@ mod tests {
             Some((1, "Schroedinger-Gleichung".to_string()))
         );
         assert!(!mentions("We run k-medoids.", "kmeans"));
+    }
+
+    #[test]
+    fn word_forms_find_each_other() {
+        let f = |t: &str| term_form(t);
+        assert_eq!(f("clustering"), "clust");
+        assert_eq!(f("clusters"), "clust");
+        assert_eq!(f("cluster"), "clust");
+        assert_eq!(f("K-means clustering"), "kmeansclust");
+        assert_eq!(f("Gleichungen"), "gleich");
+        assert_eq!(f("Gleichung"), "gleich");
+        assert_eq!(f("theories"), "theor");
+        assert!(loose("the theory of").0.contains(&f("theories")));
+        // Too short to cut.
+        assert_eq!(f("uses"), "uses");
+        assert_eq!(f("head"), "head");
         let lines = [
             "Then K-means assigns each point",
             "to its nearest centroid.",
