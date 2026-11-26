@@ -8,6 +8,8 @@ Pathfinder makes sure you understand the work you do with AI. It answers your qu
 
 It runs in your terminal (or in Zed), on your own computer, with your own model account.
 
+<img src="collector/public/screenshot.svg" alt="Pathfinder in a terminal, showing a candidate to judge after an explanation of retry jitter">
+
 ## How it works
 
 - **Ask anything.** Pathfinder answers from the folder you're working in: code, papers, slides, PDFs. Answers count as *told*, not as understood.

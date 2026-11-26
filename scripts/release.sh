@@ -139,7 +139,7 @@ PY
 (cd "$root/collector" && CARGO_TARGET_DIR="$root/app/target" cargo run -q --release -- sign "$out/latest.json")
 
 # The public folder: the pages and installer next to the releases.
-for f in index.html install.sh favicon.svg changelog.html; do
+for f in index.html install.sh favicon.svg screenshot.svg; do
     [[ -f "$root/collector/public/$f" ]] && cp "$root/collector/public/$f" "$dist/public/"
 done
 cp -R "$root/collector/public/privacy" "$dist/public/"
