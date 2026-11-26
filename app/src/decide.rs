@@ -701,6 +701,29 @@ mod tests {
     }
 
     #[test]
+    fn jev_requests_have_the_shape_the_shared_gate_accepts() {
+        // The collector forwards exactly {model, state, questions by name}.
+        let q = [Question {
+            name: "s0".into(),
+            instructions: "?".into(),
+            options: vec![("yes".into(), "y".into()), ("no".into(), "n".into())],
+        }];
+        let (url, body) =
+            Provider::Typesafe.request_at("https://collector.test/v1/typesafe", "text", &q);
+        assert_eq!(url, "https://collector.test/v1/typesafe/systemone");
+        let mut keys: Vec<&str> = body
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort();
+        assert_eq!(keys, ["model", "questions", "state"]);
+        assert_eq!(body["model"], Provider::Typesafe.model());
+        assert!(body["questions"]["s0"].is_object());
+    }
+
+    #[test]
     fn only_the_gate_may_use_the_shared_service() {
         let d = decider(false);
         assert!(d.pick(None, false).unwrap().is_none());

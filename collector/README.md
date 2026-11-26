@@ -62,6 +62,7 @@ Email sign-in expects a Cloudflare Access application in front of `/join` only, 
 | `stop <name\|install>` | Stop collecting from someone (their app stops on its next upload) |
 | `prune` | Delete events past retention (also runs daily) |
 | `backup <file>` | A consistent copy of the database, safe while it runs |
+| `alerts` | Problems worth a notification, one per line (the gate paused, 80% of its daily budget used, many TypeSafe errors); nothing when all is well |
 | `keygen`, `sign <file>` | Make the release signing key (macOS keychain) and sign a release manifest |
 
 ## API

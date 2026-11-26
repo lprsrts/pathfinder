@@ -198,8 +198,20 @@ async fn count_fetches(State(state): State<Arc<AppState>>, req: Request, next: N
         p if p.starts_with("/releases/") && p.ends_with(".tar.gz") => Some("release"),
         _ => None,
     };
-    let version = req
-        .headers()
+    let version = app_version(req.headers());
+    let res = next.run(req).await;
+    if let Some(what) = what
+        && res.status().is_success()
+        && let Err(e) = state.db(move |db| db.count_fetch(what, &version)).await
+    {
+        tracing::warn!("counting a download: {e:#}");
+    }
+    res
+}
+
+/// The app version in a `pathfinder/<version>` user agent, else "other".
+fn app_version(headers: &HeaderMap) -> String {
+    headers
         .get(header::USER_AGENT)
         .and_then(|v| v.to_str().ok())
         .and_then(|ua| ua.strip_prefix("pathfinder/"))
@@ -209,15 +221,7 @@ async fn count_fetches(State(state): State<Arc<AppState>>, req: Request, next: N
                     .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
         })
         .unwrap_or("other")
-        .to_string();
-    let res = next.run(req).await;
-    if let Some(what) = what
-        && res.status().is_success()
-        && let Err(e) = state.db(move |db| db.count_fetch(what, &version)).await
-    {
-        tracing::warn!("counting a download: {e:#}");
-    }
-    res
+        .to_string()
 }
 
 async fn healthz(State(state): State<Arc<AppState>>) -> Response {
@@ -613,8 +617,15 @@ async fn link_start(
             "signing in with the browser isn't set up; use an invite code",
         );
     }
+    let version = app_version(&headers);
     match state
-        .db(move |db| db.start_link(&req.install, req.notice, req.events, req.threads))
+        .db(move |db| {
+            let started = db.start_link(&req.install, req.notice, req.events, req.threads)?;
+            if started.is_some() {
+                db.count_fetch("sign-in started", &version)?;
+            }
+            Ok(started)
+        })
         .await
     {
         Ok(Some((code, secret))) => Json(LinkStarted {
@@ -810,7 +821,13 @@ async fn join_approve(
         Join::Ready { email, link } => (email, link),
     };
     match state
-        .db(move |db| db.approve_link(&link.code, &email))
+        .db(move |db| {
+            let approved = db.approve_link(&link.code, &email)?;
+            if approved {
+                db.count_fetch("sign-in approved", "browser")?;
+            }
+            Ok(approved)
+        })
         .await
     {
         Ok(true) => page(
@@ -860,8 +877,10 @@ fn page(status: StatusCode, title: &str, body: &str) -> Response {
 </style></head>
 <body><main><h1>{title}</h1>
 {body}
+<p class="meta"><a href="/">Pathfinder</a> · <a href="/privacy/">Privacy</a> · <a href="{source}">Source</a></p>
 </main></body></html>"#,
         title = esc(title),
+        source = env!("CARGO_PKG_REPOSITORY"),
     );
     (status, [(header::CACHE_CONTROL, "no-store")], Html(html)).into_response()
 }

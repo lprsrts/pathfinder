@@ -681,6 +681,21 @@ impl Db {
             .unwrap_or(0))
     }
 
+    pub fn gate_upstream_errors_today(&self) -> Result<u32> {
+        let day = (now() / 86_400).to_string();
+        Ok(self
+            .0
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT upstream_errors FROM gate_daily WHERE day = ?1",
+                params![day],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(0))
+    }
+
     pub fn gate_upstream_error(&self) -> Result<()> {
         let day = (now() / 86_400).to_string();
         self.0.lock().unwrap().execute(

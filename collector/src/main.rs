@@ -18,6 +18,7 @@
 //! collector stop <name|install>   stop collecting from an install
 //! collector prune                 delete events past retention
 //! collector backup <file>         a consistent copy of the database
+//! collector alerts                problems worth a notification, one per line
 //! collector keygen                make the release signing key (keychain)
 //! collector sign <file>           sign a release manifest
 //! ```
@@ -47,6 +48,12 @@ const DEFAULT_ADDR: &str = "0.0.0.0:8080";
 
 /// How long a request to TypeSafe or Cloudflare may take.
 const HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Gate checks per day for everyone, unless GATE_GLOBAL_DAILY_CAP says otherwise.
+const GATE_GLOBAL_DAILY_CAP: u32 = 5_000;
+
+/// TypeSafe errors in a day that are worth an alert.
+const GATE_ERRORS_ALERT: u32 = 20;
 
 const PRUNE_EVERY: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
 
@@ -156,6 +163,24 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
+        // For the server's health check: one line per problem, nothing when
+        // all is well.
+        Some("alerts") => {
+            let db = open_db()?;
+            let cap: u32 = env_num("GATE_GLOBAL_DAILY_CAP", GATE_GLOBAL_DAILY_CAP);
+            let today = db.gate_today()?;
+            if !db.gate_enabled()? {
+                println!("pathfinder: the shared gate is paused (collector gate on)");
+            }
+            if today >= cap * 8 / 10 {
+                println!("pathfinder: the shared gate used {today} of its {cap} daily checks");
+            }
+            let errors = db.gate_upstream_errors_today()?;
+            if errors >= GATE_ERRORS_ALERT {
+                println!("pathfinder: {errors} TypeSafe errors on the shared gate today");
+            }
+            Ok(())
+        }
         Some("backup") => {
             let to = PathBuf::from(args.get(1).context("usage: collector backup <file>")?);
             open_db()?.backup(&to)?;
@@ -214,7 +239,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         _ => bail!(
-            "usage: collector serve | allow <email> | disallow <email> | people | invite <name> | stats | report | reports [n] | gate-stats | gate on|off | export [dir] | stop <name|install> | prune | backup <file>"
+            "usage: collector serve | allow <email> | disallow <email> | people | invite <name> | stats | report | reports [n] | gate-stats | gate on|off | export [dir] | stop <name|install> | prune | backup <file> | alerts"
         ),
     }
 }
@@ -253,7 +278,7 @@ async fn serve() -> Result<()> {
             .to_string(),
         gate_model: env_or("GATE_MODEL", "jev-1.14.0"),
         gate_cap: env_num("GATE_DAILY_CAP", 400),
-        gate_global_cap: env_num("GATE_GLOBAL_DAILY_CAP", 5_000),
+        gate_global_cap: env_num("GATE_GLOBAL_DAILY_CAP", GATE_GLOBAL_DAILY_CAP),
         gate_timeout: std::time::Duration::from_secs(env_num("GATE_TIMEOUT_SECS", 8)),
         public_url: env_or("COLLECTOR_PUBLIC_URL", "http://127.0.0.1:8080")
             .trim_end_matches('/')

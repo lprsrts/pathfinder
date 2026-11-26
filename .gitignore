@@ -9,6 +9,7 @@
 /scripts/release.env
 .env
 *.env
+*.log
 # Pathfinder's own record in a folder it works in.
 .pathfinder/
 .vscode/
