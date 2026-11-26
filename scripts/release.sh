@@ -10,7 +10,9 @@
 #                              "Developer ID Application" identity in the keychain
 #   PATHFINDER_NOTARY_PROFILE  notarytool keychain profile (required unless
 #                              PATHFINDER_NOTARIZE=0, a dry run)
-#   PATHFINDER_PUBLISH_TO      rsync target for the public folder (unset: build only)
+#   PATHFINDER_PUBLISH_TO      rsync target for the public folder (unset: build only);
+#                              publishing also pushes the tag and makes the GitHub
+#                              release (scripts/github-release.sh)
 #   PATHFINDER_COLLECTOR_URL   the live collector, checked before publishing
 #   PATHFINDER_BUNDLE_ID       code-signing identifier (default com.lprsrts.pathfinder)
 #
@@ -153,11 +155,16 @@ if git -C "$root" rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
         || die "tag v$version already points at another commit"
 else
     git -C "$root" tag -a "v$version" -m "Pathfinder $version" "$commit"
-    echo "tagged v$version (push it with: git push origin v$version)"
+    echo "tagged v$version"
 fi
 
 echo "release ready in $dist/public"
 if [[ -n "$publish_to" ]]; then
     rsync -av "$dist/public/" "$publish_to/"
     echo "published to $publish_to"
+fi
+
+# The same files as a GitHub release, with this version's notes.
+if [[ -n "$publish_to" ]] && command -v gh >/dev/null && git -C "$root" remote get-url origin >/dev/null 2>&1; then
+    "$root/scripts/github-release.sh" "$version" "$out/$version"
 fi
