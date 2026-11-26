@@ -2,6 +2,10 @@
 
 What changed in each release of Pathfinder, newest first. `pathfinder update` shows the newest section.
 
+## 0.3.4
+
+- **Updates work while Pathfinder's server is down.** `pathfinder update` and the installer fall back to the same signed release on GitHub. The installer itself is on every GitHub release too.
+
 ## 0.3.3
 
 - **Updates show up within a minute.** `pathfinder update` and the installer no longer see an old release list that Cloudflare kept too long; while the server is down they still fall back to the cached copy.

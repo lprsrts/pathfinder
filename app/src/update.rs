@@ -73,8 +73,43 @@ fn verify(manifest: &[u8], sig: &str, public: &str) -> Result<()> {
         .map_err(|_| anyhow!("the release manifest's signature doesn't match; not updating"))
 }
 
-/// The newest release, after checking its signature.
+/// The newest release, after checking its signature: from the collector,
+/// or, when it can't be reached, from the same signed files on GitHub.
 pub async fn latest() -> Result<Release> {
+    match from_collector().await {
+        Ok(r) => Ok(r),
+        Err(e) => from_mirror()
+            .await
+            .map_err(|m| anyhow!("{e:#}; the release mirror didn't answer either: {m:#}")),
+    }
+}
+
+async fn fetch(url: &str) -> Result<Vec<u8>> {
+    let res = client()
+        .get(url)
+        .send()
+        .await
+        .context("reaching the update server")?;
+    if !res.status().is_success() {
+        bail!("{url}: {}", res.status());
+    }
+    Ok(res.bytes().await?.to_vec())
+}
+
+/// GitHub's newest release carries the same signed manifest.
+async fn from_mirror() -> Result<Release> {
+    let base = format!("{}/latest/download", crate::operator::RELEASES_MIRROR);
+    let manifest = fetch(&format!("{base}/latest.json")).await?;
+    let sig = fetch(&format!("{base}/latest.json.sig")).await?;
+    verify(
+        &manifest,
+        &String::from_utf8_lossy(&sig),
+        RELEASE_PUBLIC_KEY,
+    )?;
+    Ok(serde_json::from_slice(&manifest)?)
+}
+
+async fn from_collector() -> Result<Release> {
     let http = client();
     let get = |name: &str| {
         let http = http.clone();
@@ -193,11 +228,17 @@ pub async fn run(args: &[String]) -> Result<()> {
 
     print!("Downloading {} MB… ", file.size / 1_000_000 + 1);
     let url = format!("{}/{}", releases_url(), file.path);
-    let res = client().get(&url).send().await?;
-    if !res.status().is_success() {
-        bail!("{url}: {}", res.status());
-    }
-    let bytes = res.bytes().await?;
+    let name = file.path.rsplit('/').next().unwrap_or(&file.path);
+    let mirror = format!(
+        "{}/download/v{}/{name}",
+        crate::operator::RELEASES_MIRROR,
+        release.version
+    );
+    // The checksum below is checked whichever host it came from.
+    let bytes = match fetch(&url).await {
+        Ok(b) => b,
+        Err(_) => fetch(&mirror).await?,
+    };
     let digest: String = Sha256::digest(&bytes)
         .iter()
         .map(|b| format!("{b:02x}"))

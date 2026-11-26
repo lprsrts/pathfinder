@@ -4,6 +4,10 @@
 /// The collector: usage data, sign-in, the shared gate, releases.
 pub const COLLECTOR: &str = "https://pathfinder.lprsrts.com";
 
+/// A second home for the same signed release files, used when the
+/// collector can't be reached.
+pub const RELEASES_MIRROR: &str = "https://github.com/lprsrts/pathfinder/releases";
+
 /// Where bugs are reported in public.
 pub const ISSUES: &str = "https://github.com/lprsrts/pathfinder/issues";
 

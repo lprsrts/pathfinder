@@ -5,7 +5,8 @@
 #   scripts/github-release.sh <version> <folder with that version's files>
 #
 # The notes are the version's section of CHANGELOG.md. Every file in the
-# folder is attached (the archives, and from 0.3.1 the signed manifest). A
+# folder is attached (the archives, and from 0.3.1 the signed manifest), and
+# install.sh. A
 # release that already exists gets any missing files added. Needs `gh`,
 # signed in to an account that can write to the repository.
 set -euo pipefail
@@ -28,7 +29,9 @@ notes="$section
 Install or update on a Mac: \`curl -fsSL https://pathfinder.lprsrts.com/install.sh | sh\`, or \`pathfinder update\`. The archive is signed and notarised by Apple; the installer and \`pathfinder update\` check it against the release manifest, which is signed with Pathfinder's release key."
 
 shopt -s nullglob
-files=("$dir"/*)
+# The installer too, so `releases/latest/download/install.sh` works while
+# Pathfinder's server is down.
+files=("$dir"/* "$root/collector/public/install.sh")
 if gh release view "$tag" >/dev/null 2>&1; then
     gh release upload "$tag" "${files[@]}" --clobber >/dev/null
     echo "updated the GitHub release $tag"

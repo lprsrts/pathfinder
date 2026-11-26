@@ -10,6 +10,8 @@
 set -eu
 
 BASE="${PATHFINDER_URL:-https://pathfinder.lprsrts.com}"
+# The same release files on GitHub, used when the server can't be reached.
+MIRROR="${PATHFINDER_MIRROR:-https://github.com/lprsrts/pathfinder/releases}"
 TEAM_ID="N75CG6NPP4"
 
 case "${XDG_BIN_HOME:-}" in
@@ -40,10 +42,10 @@ esac
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
-# A query that changes every minute gets past a stale edge cache; the plain
-# URL is the fallback while the server is down.
-curl -fsSL "$BASE/releases/latest.json?m=$(( $(date +%s) / 60 ))" -o "$tmp/latest.json" 2>/dev/null ||
-    curl -fsSL "$BASE/releases/latest.json" -o "$tmp/latest.json"
+if ! curl -fsSL "$BASE/releases/latest.json?m=$(( $(date +%s) / 60 ))" -o "$tmp/latest.json" 2>/dev/null; then
+    echo "Pathfinder's server didn't answer; using the release on GitHub."
+    curl -fsSL "$MIRROR/latest/download/latest.json" -o "$tmp/latest.json"
+fi
 # The manifest is indented JSON: the target's block holds path and sha256.
 field() {
     awk -v t="\"$target\"" -v f="\"$1\"" '
@@ -61,7 +63,8 @@ if [ -z "$path" ] || [ -z "$sha" ]; then
 fi
 
 echo "Downloading Pathfinder $version…"
-curl -fsSL "$BASE/releases/$path" -o "$tmp/release.tar.gz"
+curl -fsSL "$BASE/releases/$path" -o "$tmp/release.tar.gz" 2>/dev/null ||
+    curl -fsSL "$MIRROR/download/v$version/$(basename "$path")" -o "$tmp/release.tar.gz"
 if command -v shasum >/dev/null 2>&1; then
     got="$(shasum -a 256 "$tmp/release.tar.gz" | cut -d' ' -f1)"
 else

@@ -28,6 +28,8 @@ On a Mac (Apple silicon or Intel):
 curl -fsSL https://pathfinder.lprsrts.com/install.sh | sh
 ```
 
+If pathfinder.lprsrts.com is down, the same installer and release are on GitHub: `curl -fsSL https://github.com/lprsrts/pathfinder/releases/latest/download/install.sh | sh` (it fetches from GitHub when the server doesn't answer; so does `pathfinder update`).
+
 This installs one program, `pathfinder`, into `~/.local/bin` (or `$XDG_BIN_HOME`, or `$PATHFINDER_BIN_DIR`). It is signed and notarised by Apple, and the installer checks it against a signed release manifest. Linux users can build from source (below).
 
 You need a model account: a paid ChatGPT plan (Plus or Pro), or an Anthropic or OpenAI API key. Usage counts against that plan or key. Optional: `poppler` (`brew install poppler`) lets Pathfinder read PDFs page by page.
