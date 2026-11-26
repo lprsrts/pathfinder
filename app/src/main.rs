@@ -27,6 +27,7 @@ mod tui;
 mod understanding;
 mod update;
 mod validate;
+mod web;
 mod workspace;
 
 use std::env;

@@ -194,6 +194,21 @@ pub struct Config {
     /// network or to leave the sandbox ask.
     #[serde(default)]
     pub ask_every_command: bool,
+    /// Longest verbatim quote shown per hit, in characters.
+    #[serde(default = "default_quote_cap")]
+    pub quote_cap: usize,
+    /// Who searches the sources for a question: `model` (the model proposes
+    /// hits, code verifies them) or `code` (keyword search only, no model).
+    #[serde(default = "default_sources_search")]
+    pub sources_search: String,
+}
+
+fn default_quote_cap() -> usize {
+    crate::sources::QUOTE_CAP
+}
+
+fn default_sources_search() -> String {
+    "model".into()
 }
 
 fn lenient_models<'de, D: Deserializer<'de>>(de: D) -> Result<Vec<ModelEntry>, D::Error> {
@@ -244,6 +259,8 @@ impl Default for Config {
             decisions: None,
             local_only: false,
             ask_every_command: false,
+            quote_cap: default_quote_cap(),
+            sources_search: default_sources_search(),
         }
     }
 }

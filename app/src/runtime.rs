@@ -443,7 +443,7 @@ impl Runtime {
             "/tell" => self.handle_tell(session, arg, files, sink).await,
             "/find" => Ok(self.handle_find(session, arg)),
             "/open" => Ok(self.handle_open(session, arg)),
-            "/web" => Ok(self.handle_web(session, arg)),
+            "/web" => Ok(self.handle_web(session, arg).await),
             _ => Ok(TurnOutput::text(COMMANDS_HELP)),
         }
     }

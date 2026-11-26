@@ -15,6 +15,7 @@ const AUTH_USAGE: &str = "Usage:
   pathfinder auth logout chatgpt [--forget]          Sign out; --forget also drops the registration
   pathfinder auth set [anthropic|openai] [--stdin]   Store an API key in Pathfinder's auth file
   pathfinder auth set [gemini|typesafe] [--stdin]    Store a decision-model key (Gemini Decision 1, TypeSafe Jev)
+  pathfinder auth set brave [--stdin]                Store a Brave Search key for `/web` (or `auth import brave`)
   pathfinder auth remove <provider>                  Remove Pathfinder's stored key
   pathfinder auth import <provider>                  Copy a <provider>-api-key macOS keychain item
   pathfinder auth status                             Show which keys are available";
@@ -148,6 +149,10 @@ pub async fn models(args: &[String]) -> Result<()> {
 /// The key name of a configured endpoint, when `name` is one.
 fn endpoint_key(name: Option<&str>) -> Option<String> {
     let name = name?;
+    // The web search key (`/web`).
+    if matches!(name, "brave" | crate::web::BRAVE_KEY) {
+        return Some(crate::web::BRAVE_KEY.to_string());
+    }
     crate::config::Config::load()
         .endpoints
         .iter()

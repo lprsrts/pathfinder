@@ -54,10 +54,20 @@ impl Runtime {
             .run_text(&req, gate::held(&sink))
             .await
             .unwrap_or_default();
-        let (hits, terms) = cited_hits(&session.cwd, &raw, text);
-        let reply = sources::render(&hits, &terms);
-        // The guard: only what render() makes from verified hits is shown.
-        debug_assert!(sources::is_sourced_only(&reply, &hits, &terms));
+        let (mut hits, terms) = cited_hits(&session.cwd, &raw, text);
+        // Nothing in the workspace: the same search online.
+        let mut skipped = Vec::new();
+        let online = hits.is_empty() && !terms.is_empty();
+        if online {
+            let found = crate::web::search(&terms).await;
+            hits = found.hits;
+            skipped = found.notes;
+            if !hits.is_empty() {
+                self.record_source(session, &terms.join(" "), EventKind::Searched, "web");
+            }
+        }
+        // Only text built from verified hits is shown.
+        let reply = sources::render(&hits, &terms, online, &skipped);
         sink(StreamEvent::TextDelta(reply.clone()));
         session.push_turn("assistant", &reply);
         Ok(TurnOutput::text(String::new()))
@@ -164,17 +174,21 @@ impl Runtime {
     }
 
     /// `/web <terms>`: raw web hits, each checked against the fetched page.
-    pub(super) fn handle_web(&self, session: &mut Session, arg: &str) -> TurnOutput {
+    pub(super) async fn handle_web(&self, session: &mut Session, arg: &str) -> TurnOutput {
         let terms: Vec<String> = arg.split_whitespace().map(str::to_string).collect();
         if terms.is_empty() {
-            return TurnOutput::text("`/web <terms>`: search the web for raw hits.");
+            return TurnOutput::text("`/web <terms>`: search papers and the web for raw hits.");
         }
         self.record_source(session, arg, EventKind::Searched, &format!("web:{arg}"));
-        let reply = match sources::web_hits(&sources::NoWeb, &terms) {
-            Ok(hits) => sources::render(&hits, &[]),
-            Err(e) => format!(
-                "Web search: {e}. Search yourself for `{arg}` and `/attach` or save what you find here."
-            ),
+        let found = crate::web::search(&terms).await;
+        let reply = if found.hits.is_empty() {
+            let mut out = format!("Nothing online matched `{arg}`.");
+            if !found.notes.is_empty() {
+                out.push_str(&format!("\n\nNot searched: {}.", found.notes.join("; ")));
+            }
+            out
+        } else {
+            sources::render(&found.hits, &[], true, &found.notes)
         };
         session.push_turn("user", format!("/web {arg}"));
         session.push_turn("assistant", &reply);

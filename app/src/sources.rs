@@ -9,8 +9,14 @@ use std::path::{Component, Path, PathBuf};
 
 use serde::Deserialize;
 
-/// Longest quote shown, in characters (decision D3 in the design note).
+/// Longest quote shown by default, in characters (`quote_cap` in the config).
 pub const QUOTE_CAP: usize = 220;
+
+/// The configured quote cap, read once.
+pub fn quote_cap() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| crate::config::Config::load().quote_cap.clamp(60, 1000))
+}
 /// Most hits in one reply.
 pub const MAX_HITS: usize = 5;
 /// Most suggested search terms, and their longest length.
@@ -86,10 +92,19 @@ pub fn normalise(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// The 1-based line where `quote` starts in `lines`, if it occurs in them
-/// (exactly, after [`normalise`]), spanning at most [`MAX_SPAN`] lines.
-pub fn locate(lines: &[&str], quote: &str) -> Option<usize> {
-    let want = normalise(quote);
+/// Lowercase, one char per char, so char positions line up with the input.
+fn fold(text: &str) -> String {
+    text.chars()
+        .map(|c| c.to_lowercase().next().unwrap_or(c))
+        .collect()
+}
+
+/// Where `quote` occurs in `lines`, matched after [`normalise`] and ignoring
+/// case ("Kmeans" finds "kmeans"), spanning at most [`MAX_SPAN`] lines: the
+/// 1-based start line and the source's own words for it (its case, not the
+/// quote's).
+pub fn locate(lines: &[&str], quote: &str) -> Option<(usize, String)> {
+    let want = fold(&normalise(quote));
     if want.chars().count() < 8 {
         return None;
     }
@@ -97,8 +112,12 @@ pub fn locate(lines: &[&str], quote: &str) -> Option<usize> {
     // on: that is where it is.
     for end in 0..lines.len() {
         for start in (end.saturating_sub(MAX_SPAN - 1)..=end).rev() {
-            if normalise(&lines[start..=end].join("\n")).contains(&want) {
-                return Some(start + 1);
+            let have = normalise(&lines[start..=end].join("\n"));
+            let folded = fold(&have);
+            if let Some(at) = folded.find(&want) {
+                let from = folded[..at].chars().count();
+                let own: String = have.chars().skip(from).take(want.chars().count()).collect();
+                return Some((start + 1, own));
             }
         }
     }
@@ -108,11 +127,16 @@ pub fn locate(lines: &[&str], quote: &str) -> Option<usize> {
 /// Shortens a verified quote to the cap at a word boundary. A prefix of a
 /// verbatim quote is still verbatim.
 pub fn cap(quote: &str) -> String {
+    cap_to(quote, quote_cap())
+}
+
+/// [`cap`] with an explicit limit.
+pub fn cap_to(quote: &str, limit: usize) -> String {
     let q = normalise(quote);
-    if q.chars().count() <= QUOTE_CAP {
+    if q.chars().count() <= limit {
         return q;
     }
-    let cut: String = q.chars().take(QUOTE_CAP).collect();
+    let cut: String = q.chars().take(limit).collect();
     let cut = cut.rsplit_once(' ').map_or(cut.as_str(), |(a, _)| a);
     format!("{cut} …")
 }
@@ -222,14 +246,14 @@ pub fn verify_local(cwd: &Path, p: &ProposedHit) -> Result<Hit, Rejected> {
         .collect();
     for i in order {
         let lines: Vec<&str> = pages[i].lines().collect();
-        if let Some(line) = locate(&lines, &p.quote) {
+        if let Some((line, own)) = locate(&lines, &p.quote) {
             return Ok(Hit {
                 at: Locator::Local {
                     file,
                     page: pdf.then_some(i + 1),
                     line,
                 },
-                quote: cap(&p.quote),
+                quote: cap(&own),
             });
         }
     }
@@ -239,13 +263,13 @@ pub fn verify_local(cwd: &Path, p: &ProposedHit) -> Result<Hit, Rejected> {
 /// Checks a web hit against the page text that was actually fetched.
 pub fn verify_web(url: &str, section: Option<&str>, page_text: &str, quote: &str) -> Option<Hit> {
     let lines: Vec<&str> = page_text.lines().collect();
-    locate(&lines, quote)?;
+    let (_, own) = locate(&lines, quote)?;
     Some(Hit {
         at: Locator::Web {
             url: url.to_string(),
             section: section.map(str::to_string),
         },
-        quote: cap(quote),
+        quote: cap(&own),
     })
 }
 
@@ -413,38 +437,64 @@ pub struct WebResult {
     pub quote: String,
 }
 
-/// A web search backend (decision D2). It returns raw results; each one is
-/// verified against its fetched text before it is shown.
-pub trait WebSearch: Send + Sync {
-    fn search(&self, terms: &[String]) -> Result<Vec<WebResult>, String>;
-}
-
-/// No backend yet: searches find nothing and say so.
-pub struct NoWeb;
-
-impl WebSearch for NoWeb {
-    fn search(&self, _terms: &[String]) -> Result<Vec<WebResult>, String> {
-        Err("no web search backend is set up yet".into())
-    }
-}
-
-/// Web results that pass verification.
-pub fn web_hits(backend: &dyn WebSearch, terms: &[String]) -> Result<Vec<Hit>, String> {
-    Ok(backend
-        .search(terms)?
+/// Web results that pass verification against their fetched text.
+pub fn web_hits(results: &[WebResult]) -> Vec<Hit> {
+    results
         .iter()
         .filter_map(|r| verify_web(&r.url, r.section.as_deref(), &r.page_text, &r.quote))
         .take(MAX_HITS)
-        .collect())
+        .collect()
+}
+
+/// Marks a heading line in page text, so a hit can name its section.
+pub const HEADING: char = '\u{1}';
+
+/// The page line holding the most search terms (at least half of them, and
+/// at least one), and the heading it sits under: (section, line).
+pub fn pick_quote(page_text: &str, terms: &[String]) -> Option<(Option<String>, String)> {
+    let terms: Vec<String> = terms
+        .iter()
+        .map(|t| fold(t))
+        .filter(|t| t.len() > 1)
+        .collect();
+    if terms.is_empty() {
+        return None;
+    }
+    let need = terms.len().div_ceil(2).max(1);
+    let mut section = None;
+    let mut best: Option<(usize, Option<String>, String)> = None;
+    for line in page_text.lines() {
+        if let Some(h) = line.strip_prefix(HEADING) {
+            section = Some(h.trim().to_string()).filter(|h| !h.is_empty());
+            continue;
+        }
+        let words = line.split_whitespace().count();
+        if words < 5 {
+            continue;
+        }
+        let low = fold(line);
+        let n = terms.iter().filter(|t| low.contains(t.as_str())).count();
+        // A title only wins over body text with more terms.
+        let score = n * 2 + usize::from(section.as_deref() != Some("Title"));
+        if n >= need && best.as_ref().is_none_or(|b| score > b.0) {
+            best = Some((score, section.clone(), line.trim().to_string()));
+        }
+    }
+    best.map(|(_, s, l)| (s, l))
 }
 
 // --------------------------------------------------------------- rendering
 
 /// The only shape a sourced reply takes: pointers and raw hits, or "not
-/// found" with places to look.
-pub fn render(hits: &[Hit], terms: &[String]) -> String {
-    if hits.is_empty() {
-        let mut out = String::from("**Not found** in this workspace's sources.");
+/// found" with places to look. `skipped` lists services that couldn't be
+/// searched.
+pub fn render(hits: &[Hit], terms: &[String], online: bool, skipped: &[String]) -> String {
+    let mut out = if hits.is_empty() {
+        let mut out = String::from(if online {
+            "**Not found** in this workspace's sources or online."
+        } else {
+            "**Not found** in this workspace's sources."
+        });
         if !terms.is_empty() {
             out.push_str(&format!(
                 "\n\nTry: {}",
@@ -456,19 +506,18 @@ pub fn render(hits: &[Hit], terms: &[String]) -> String {
             ));
         }
         out.push_str("\n\nOr `/web <terms>`, a library catalogue, or `/tell` for a told answer.");
-        return out;
-    }
-    let mut out = String::from("**Where to look:**\n");
-    for h in hits {
-        out.push_str(&format!("\n- `{}`\n  > {}", h.at, h.quote));
+        out
+    } else {
+        let mut out = String::from("**Where to look:**\n");
+        for h in hits {
+            out.push_str(&format!("\n- `{}`\n  > {}", h.at, h.quote));
+        }
+        out
+    };
+    if !skipped.is_empty() {
+        out.push_str(&format!("\n\nNot searched: {}.", skipped.join("; ")));
     }
     out
-}
-
-/// Whether `text` is a reply [`render`] could have produced from `hits`:
-/// the last guard before anything is shown.
-pub fn is_sourced_only(text: &str, hits: &[Hit], terms: &[String]) -> bool {
-    text == render(hits, terms)
 }
 
 #[cfg(test)]
@@ -539,7 +588,10 @@ mod tests {
         .unwrap();
         assert!(matches!(h.at, Locator::Local { line: 3, .. }));
         let lines = ["it’s a “phasor” — see", "page 3"];
-        assert_eq!(locate(&lines, "it's a \"phasor\" - see page 3"), Some(1));
+        assert_eq!(
+            locate(&lines, "It's a \"Phasor\" - see page 3"),
+            Some((1, "it's a \"phasor\" - see page 3".to_string()))
+        );
         assert_eq!(normalise("trans-\nform"), "transform");
     }
 
@@ -551,8 +603,9 @@ mod tests {
             verify_local(d.path(), &hit("notes.md", None, "The transform is linear.")),
             Err(Rejected::NotInSource { .. })
         ));
-        // Case matters: it must be the source's own words.
-        assert!(verify_local(d.path(), &hit("notes.md", None, "it is linear.")).is_err());
+        // Case is ignored, but what is shown is the source's own words.
+        let h = verify_local(d.path(), &hit("notes.md", None, "it is LINEAR.")).unwrap();
+        assert_eq!(h.quote, "It is linear.");
         assert!(matches!(
             verify_local(d.path(), &hit("missing.md", None, "It is linear.")),
             Err(Rejected::NoSuchFile(_))
@@ -574,8 +627,9 @@ mod tests {
     #[test]
     fn long_quotes_are_capped_but_stay_a_prefix() {
         let long = "word ".repeat(200);
-        let c = cap(&long);
+        let c = cap_to(&long, QUOTE_CAP);
         assert!(c.chars().count() <= QUOTE_CAP + 2);
+        assert!(cap_to(&long, 120).chars().count() <= 122);
         assert!(normalise(&long).starts_with(c.trim_end_matches(" …")));
     }
 
@@ -608,20 +662,15 @@ mod tests {
     fn rendered_replies_hold_only_pointers_and_quotes() {
         let d = ws(&[("notes.md", NOTES)]);
         let h = verify_local(d.path(), &hit("notes.md", None, "It is linear.")).unwrap();
-        let out = render(std::slice::from_ref(&h), &[]);
+        let out = render(std::slice::from_ref(&h), &[], false, &[]);
         assert_eq!(
             out,
             "**Where to look:**\n\n- `notes.md:5`\n  > It is linear."
         );
-        assert!(is_sourced_only(&out, std::slice::from_ref(&h), &[]));
-        assert!(!is_sourced_only(
-            &format!("{out}\nSo it is linear."),
-            &[h],
-            &[]
-        ));
-        let none = render(&[], &["laplace".into()]);
-        assert!(none.starts_with("**Not found**"));
+        let none = render(&[], &["laplace".into()], true, &["Brave: no key".into()]);
+        assert!(none.starts_with("**Not found** in this workspace's sources or online."));
         assert!(none.contains("`/find laplace`"));
+        assert!(none.ends_with("Not searched: Brave: no key."));
     }
 
     #[test]
@@ -640,28 +689,31 @@ mod tests {
 
     #[test]
     fn web_hits_are_checked_against_the_fetched_page() {
-        struct Fake;
-        impl WebSearch for Fake {
-            fn search(&self, _: &[String]) -> Result<Vec<WebResult>, String> {
-                Ok(vec![
-                    WebResult {
-                        url: "https://example.org/a".into(),
-                        section: Some("Definition".into()),
-                        page_text: "Intro\nA phasor is a complex number.\n".into(),
-                        quote: "A phasor is a complex number.".into(),
-                    },
-                    WebResult {
-                        url: "https://example.org/b".into(),
-                        section: None,
-                        page_text: "Something else entirely.".into(),
-                        quote: "Phasors make AC analysis easy.".into(),
-                    },
-                ])
-            }
-        }
-        let hits = web_hits(&Fake, &["phasor".into()]).unwrap();
+        let results = vec![
+            WebResult {
+                url: "https://example.org/a".into(),
+                section: Some("Definition".into()),
+                page_text: "Intro\nA phasor is a complex number.\n".into(),
+                quote: "A phasor is a complex number.".into(),
+            },
+            WebResult {
+                url: "https://example.org/b".into(),
+                section: None,
+                page_text: "Something else entirely.".into(),
+                quote: "Phasors make AC analysis easy.".into(),
+            },
+        ];
+        let hits = web_hits(&results);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].at.to_string(), "https://example.org/a § Definition");
-        assert!(web_hits(&NoWeb, &[]).is_err());
+    }
+
+    #[test]
+    fn the_quote_is_the_line_with_most_terms_under_its_heading() {
+        let page = "\u{1}Intro\nK-means is old.\n\u{1}Algorithm\nThe kmeans algorithm assigns each point to the nearest centroid.\nCentroids are recomputed as the mean of their assigned points.\n";
+        let (section, line) = pick_quote(page, &["Kmeans".into(), "centroid".into()]).unwrap();
+        assert_eq!(section.as_deref(), Some("Algorithm"));
+        assert!(line.starts_with("The kmeans algorithm"));
+        assert!(pick_quote(page, &["laplace".into()]).is_none());
     }
 }
