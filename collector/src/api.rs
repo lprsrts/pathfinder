@@ -189,9 +189,11 @@ async fn limit_in_flight(State(state): State<Arc<AppState>>, req: Request, next:
     next.run(req).await
 }
 
-/// How long Cloudflare may keep the installer and the release manifest: a
-/// minute fresh, so a new release shows up quickly, and a week from cache
-/// when this service can't be reached, so installs and updates keep working.
+/// How long caches may keep the installer and the top-level release
+/// manifest: a minute fresh, and a week while this service can't be reached,
+/// so installs and updates keep working through an outage. (Cloudflare's
+/// free plan may hold them longer; apps verify each version's own manifest,
+/// so a slow cache delays an update but can't break one.)
 const SHORT_LIVED: &str = "public, max-age=60, stale-if-error=604800";
 const SITE_IMAGE: &str = "public, max-age=300, stale-if-error=604800";
 /// Versioned release files never change.
