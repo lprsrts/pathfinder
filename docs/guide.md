@@ -34,9 +34,11 @@ Read and search yourself:
 - `/open <file> [page or line]` (or `/open notes.md:120`): the page or lines, numbered.
 - `/web <terms>`: papers from OpenAlex and arXiv and pages from Brave Search, each with a line checked against what was fetched. When the folder has nothing for a question, this search runs by itself.
 
+Searches don't mind spelling: "k-means", "K means" and "kmeans" find each other, and so do "Schrödinger" and "Schrodinger".
+
 What you open and search is on your record as *read*; it grows the graph but never counts as understanding.
 
-To check your own work, `/check <your work>` (or `/check derivation.md`) quotes the first step that doesn't hold. It doesn't say why or how to fix it.
+To check your own work, `/check <your work>`, `/check derivation.md` or `/check photo.jpg` quotes the first step that doesn't hold. It doesn't say why or how to fix it. A photo of handwritten work is copied into text first and the copy is shown, so you can see it read your steps right.
 
 When you do want an answer, `/tell <question>` gives one. It's marked **Told** and recorded as told, not as understood.
 

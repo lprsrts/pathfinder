@@ -161,9 +161,9 @@ The task commands (`/why`, `/map`, `/handoff` and the rest) work the same as in 
 
 ## Asking
 
-Pathfinder doesn't answer questions in its own words. It points to where the workspace addresses the question and shows a short line from there, word for word: `file:line`, or `file p.N l.M` for a PDF. Every line is checked against the cited file before it is shown; anything the model writes besides that is dropped. If the workspace has nothing, the same search runs on OpenAlex, arXiv and Brave Search, with each line checked against the fetched page. If that finds nothing too, the reply says **Not found** and suggests terms to search for.
+Pathfinder doesn't answer questions in its own words. It points to where the workspace addresses the question and shows a short line from there, word for word: `file:line`, or `file p.N l.M` for a PDF. Every line is checked against the cited file before it is shown; anything the model writes besides that is dropped. Matching ignores case, spaces, hyphens, punctuation and accents, and shows the source's own text. If the workspace has nothing, the question is searched online: the fast model turns it into a few short queries for OpenAlex, arXiv and Brave Search, code takes the lines of each result that hold the search terms, and the fast model picks the ones that bear on the question. Each picked line is checked against the fetched page before it is shown. If nothing is left, the reply says **Not found** and suggests terms to search for.
 
-Read and search yourself with `/find <terms>` and `/open <file> [page or line]`. `/check <your work>` quotes the first step of your work that doesn't hold, without saying why. `/tell <question>` is the one way to get an answer in full; it is headed **Told**, and the idea is logged as `told`, which never raises its state. Opening and searching are logged as `read` and `searched`, which don't either; a file or search term that names no idea on your record becomes one, shown as *read*.
+Read and search yourself with `/find <terms>` and `/open <file> [page or line]`. `/check <your work, file or photo>` quotes the first step of your work that doesn't hold, without saying why; a photo of handwritten work is copied into text first, and the copy is shown. `/tell <question>` is the one way to get an answer in full; it is headed **Told**, and the idea is logged as `told`, which never raises its state. Opening and searching are logged as `read` and `searched`, which don't either; a file or search term that names no idea on your record becomes one, shown as *read*.
 
 Checks come at natural moments, read from what you mean rather than from any phrase: when you say something has clicked, one candidate follows straight away, and asking anything else instead drops it with nothing recorded; when you ask to be tested, Pathfinder asks open questions one at a time, grades each answer and goes on until you stop or change the subject. Questions also work in a thread whose task is finished.
 
@@ -172,7 +172,7 @@ Two settings shape how questions are answered:
 - `quote_cap` (default 220): the longest verbatim line shown per hit, in characters.
 - `sources_search` (`model` or `code`, default `model`): with `model`, the model reads the workspace and proposes hits, and only those found word for word in the cited file are shown; with `code`, a keyword search runs and no model is asked.
 
-`/web` and questions the workspace can't answer search OpenAlex and arXiv, and Brave Search with a key: `pathfinder auth set brave`, `pathfinder auth import brave` (keychain item `brave-api-key`) or `BRAVE_API_KEY`. `local_only` turns this off.
+`/web` and questions the workspace can't answer search OpenAlex and arXiv, and Brave Search with a key: `pathfinder auth set brave`, `pathfinder auth import brave` (keychain item `brave-api-key`) or `BRAVE_API_KEY`. OpenAlex has a small free daily allowance; past it, add a key with `pathfinder auth set openalex` (or `OPENALEX_API_KEY`). `local_only` turns this off.
 
 
 Attach documents, papers or screenshots: images (PNG, JPEG, GIF, WebP) and PDFs are sent to the model as content it can see, on every route, and a screenshot pasted into the chat is saved and attached the same way. Zed can't render LaTeX in the agent panel, so math is written in plain text and Unicode.
@@ -309,7 +309,7 @@ Shortcuts for the same steps. Agent work runs only through `/handoff` and `/dele
 
 - `/find <terms>`, `/open <file> [page or line]`: search the workspace, read a page or lines
 - `/web <terms>`: search papers and the web
-- `/check <your work or file>`: the first step that doesn't hold
+- `/check <your work, file or photo>`: the first step that doesn't hold
 - `/tell <question>`: an answer in full, logged as told
 - `/plan`: build the map now from onboarding
 - `/summary <text>`: explain the current part; a candidate to judge follows
