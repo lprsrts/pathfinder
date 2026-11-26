@@ -30,6 +30,45 @@ or, if every step holds:
 
 Copy one step or line exactly as they wrote it, at most 200 characters. A step that is not literally in their work is thrown away."#;
 
+const TRANSCRIBE_SYSTEM: &str = r#"You copy handwritten or photographed work into text, exactly as written. You are a scanner: never fix a mistake, never fill in a missing step, never reorder, never comment, never solve anything. A wrong step must stay wrong. Keep the user's own notation, written as plain text or Unicode (x², √, ∫, →), never LaTeX. One step or line of the work per entry, in the order written; crossed-out text is left out. Where something can't be read, write [?] in its place.
+
+Return ONLY this JSON object:
+{"lines": ["first line as written", "second line as written"]}
+If there is no work in the image, return {"lines": []}."#;
+
+/// The lines of a transcription; `None` if the reply is broken or empty.
+fn parse_transcription(raw: &str) -> Option<Vec<String>> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct T {
+        lines: Vec<String>,
+    }
+    let t = raw
+        .trim()
+        .trim_start_matches("```json")
+        .trim_matches('`')
+        .trim();
+    let lines: Vec<String> = serde_json::from_str::<T>(t)
+        .ok()?
+        .lines
+        .into_iter()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .take(200)
+        .collect();
+    (!lines.is_empty()).then_some(lines)
+}
+
+/// Images the model reads (the formats every route accepts).
+fn is_photo(path: &std::path::Path) -> bool {
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+        matches!(
+            e.to_ascii_lowercase().as_str(),
+            "png" | "jpg" | "jpeg" | "gif" | "webp"
+        )
+    })
+}
+
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CheckReply {
@@ -180,33 +219,90 @@ impl Runtime {
         files: &[PathBuf],
         sink: StreamSink,
     ) -> Result<TurnOutput> {
-        // The work: a workspace file named as the argument, else the text.
-        let (work, file) = match sources::confine(&session.cwd, arg) {
-            Some(full) => match sources::pages(&full, arg) {
-                Ok(pages) => (pages.join("\n"), Some(arg.trim().to_string())),
+        // The work: a photo or scan (named or attached), a text file, or the
+        // text itself.
+        let named = sources::confine(&session.cwd, arg);
+        let mut photos: Vec<PathBuf> = files.iter().filter(|f| is_photo(f)).cloned().collect();
+        let mut file = None;
+        let mut work = String::new();
+        match &named {
+            Some(full) if is_photo(full) => photos.push(full.clone()),
+            Some(full) => match sources::pages(full, arg) {
+                // A scanned PDF has no text layer: read it as a photo.
+                Ok(pages) if pages.iter().all(|p| p.trim().is_empty()) => photos.push(full.clone()),
+                Ok(pages) => {
+                    work = pages.join("\n");
+                    file = Some(arg.trim().to_string());
+                }
                 Err(e) => return Ok(TurnOutput::text(e)),
             },
-            None => (arg.to_string(), None),
-        };
-        if work.trim().is_empty() && files.is_empty() {
+            None => work = arg.to_string(),
+        }
+        if work.trim().is_empty() && photos.is_empty() {
             return Ok(TurnOutput::text(
-                "`/check <your work>` or `/check <file>`: the first step that doesn't hold.",
+                "`/check <your work>`, `/check <file>` or `/check <photo>`: the first step that doesn't hold.",
             ));
         }
         session.push_turn("user", format!("/check {arg}"));
+        let mut shown = String::new();
+        if !photos.is_empty() {
+            let raw = self
+                .engine
+                .run_text(
+                    &EngineRequest {
+                        tier: EngineTier::System2,
+                        tools: ToolAccess::None,
+                        cwd: session.cwd.clone(),
+                        system_prompt: TRANSCRIBE_SYSTEM.to_string(),
+                        prompt: "Copy the work in the attached image(s). Return the JSON only."
+                            .into(),
+                        files: photos.clone(),
+                        stream_text: false,
+                        models: self.models(session)?,
+                        ctx: crate::engine::turn_ctx(),
+                    },
+                    gate::held(&sink),
+                )
+                .await?;
+            let Some(lines) = parse_transcription(&raw) else {
+                let reply = "Couldn't read the work in the photo. Try a sharper photo, or type the steps: `/check <your work>`.";
+                session.push_turn("assistant", reply);
+                return Ok(TurnOutput::text(reply));
+            };
+            work = lines.join("\n");
+            let names: Vec<String> = photos
+                .iter()
+                .map(|p| {
+                    p.strip_prefix(&session.cwd)
+                        .unwrap_or(p)
+                        .display()
+                        .to_string()
+                })
+                .collect();
+            shown = format!(
+                "Read from `{}`. Check that this is what you wrote:\n\n```text\n{}```\n\n",
+                names.join("`, `"),
+                lines
+                    .iter()
+                    .enumerate()
+                    .map(|(i, l)| format!("{:>3}  {l}\n", i + 1))
+                    .collect::<String>()
+            );
+        }
         let req = EngineRequest {
             tier: EngineTier::System2,
             tools: ToolAccess::None,
             cwd: session.cwd.clone(),
             system_prompt: CHECK_SYSTEM.to_string(),
             prompt: format!("Their work:\n{work}\n\nReturn the JSON only."),
-            files: files.to_vec(),
+            // The step is checked against text; images were copied above.
+            files: files.iter().filter(|f| !is_photo(f)).cloned().collect(),
             stream_text: false,
             models: self.models(session)?,
             ctx: crate::engine::turn_ctx(),
         };
         let raw = self.engine.run_text(&req, gate::held(&sink)).await?;
-        let reply = render_check(&work, file.as_deref(), &raw);
+        let reply = format!("{shown}{}", render_check(&work, file.as_deref(), &raw));
         session.push_turn("assistant", &reply);
         Ok(TurnOutput::text(reply))
     }
@@ -603,6 +699,21 @@ mod tests {
             )
             .contains("(`w.md:2`)")
         );
+    }
+
+    #[test]
+    fn transcriptions_keep_their_shape() {
+        assert_eq!(
+            parse_transcription(r#"{"lines": ["x² - 4 = 0", " ", "x = 2"]}"#),
+            Some(vec!["x² - 4 = 0".to_string(), "x = 2".to_string()])
+        );
+        assert_eq!(parse_transcription(r#"{"lines": []}"#), None);
+        assert_eq!(
+            parse_transcription(r#"{"lines": ["a"], "note": "fixed it"}"#),
+            None
+        );
+        assert!(is_photo(std::path::Path::new("work.JPG")));
+        assert!(!is_photo(std::path::Path::new("work.md")));
     }
 
     #[test]

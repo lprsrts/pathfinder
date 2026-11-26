@@ -1483,3 +1483,35 @@ async fn accepted_change_can_reset_the_goal() {
         Some("Understand convolutional networks for an image classifier")
     );
 }
+
+#[tokio::test]
+async fn check_reads_a_photo_of_handwritten_work() {
+    let (rt, engine) = runtime(
+        FakeEngine::new(vec![
+            (
+                ToolAccess::None,
+                S2,
+                r#"{"lines": ["x² - 4 = 0", "(x - 2)(x + 2) = 0", "x = 2 or x = 4"]}"#,
+            ),
+            (ToolAccess::None, S2, r#"{"first_wrong": "x = 2 or x = 4"}"#),
+        ]),
+        false,
+    );
+    let cwd = rt.load_session("s").unwrap().unwrap().cwd;
+    std::fs::write(cwd.join("work.jpg"), b"not really a jpeg").unwrap();
+    let out = turn(&rt, "/check work.jpg").await;
+    assert!(
+        out.reply.starts_with("Read from `work.jpg`"),
+        "{}",
+        out.reply
+    );
+    assert!(out.reply.contains("  3  x = 2 or x = 4"));
+    assert!(
+        out.reply
+            .contains("**First step that doesn't hold** (line 3)")
+    );
+    assert!(engine.replies.lock().unwrap().is_empty());
+    // The check saw the copied text, not the image.
+    let prompt = engine.prompts.lock().unwrap().last().cloned().unwrap();
+    assert!(prompt.contains("(x - 2)(x + 2) = 0"));
+}
