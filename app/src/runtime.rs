@@ -124,8 +124,7 @@ pub enum OptionValue {
     Bool(bool),
 }
 
-pub const NO_MODEL: &str = "No model is set up yet. Sign in with your ChatGPT account \
-     (`pathfinder auth login chatgpt` in a terminal), or add an API key (`pathfinder auth set`).";
+pub const NO_MODEL: &str = "No model is set up yet. Run `pathfinder auth login` in a terminal.";
 
 impl Runtime {
     pub fn new(store: Arc<Store>, engine: Arc<dyn Engine>) -> Self {

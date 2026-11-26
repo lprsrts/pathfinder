@@ -56,6 +56,14 @@ How the loop behaves (it borrows what Codex, Claude Code, opencode, Crush and Ge
 - **Commands:** output and errors interleaved; long output keeps its start and end (where errors are); output before a timeout is kept.
 - **Recovery:** tool calls with broken arguments (often cut off by the output limit) go back to the model as an error instead of ending the run; an empty answer gets one nudge; the same call with the same result a third time is flagged, a fifth time ends tool use; three steps before the limit the model is told to converge. A final answer that fails Pathfinder's format check goes back to the model in the same conversation, up to twice, so it fixes the answer without redoing its reads; only then does the check retry from scratch or move to the main model. Stalled streams (no data for 150 s) and overloaded providers are retried up to five times with backoff.
 
+### Connecting models
+
+```bash
+pathfinder auth login
+```
+
+Asks how to connect: sign in with ChatGPT, an Anthropic or OpenAI API key, or another OpenAI-compatible service or your own server (OpenRouter, Ollama, vLLM, ...). Each choice also has a direct form: `pathfinder auth login chatgpt`, `pathfinder auth login anthropic` (or `openai`), `pathfinder auth login server`. A server is checked by listing its models, then added to `config.json` as an endpoint (see [Self-hosted and open models](#self-hosted-and-open-models)); its key, if any, goes to the auth file. The `claude` and `codex` routes use those CLIs' own logins.
+
 ### Sign in with ChatGPT
 
 ```bash

@@ -74,11 +74,11 @@ In the terminal there are also `/help`, `/quit` (or `/exit`), `/new` (or `/clear
 
 ## Models
 
-Ctrl+P (the toolbar in Zed) picks the models for a thread: a fast one for quick replies and a main one for candidates, judging and agent work. With a ChatGPT plan, Pathfinder uses OpenAI's models through your plan. With an API key it can use Anthropic's or OpenAI's models, billed per use, or models on your own server. See the [reference](reference.md#models-and-routes).
+`pathfinder auth login` connects models. Ctrl+P (the toolbar in Zed) picks them for a thread: a fast one for quick replies and a main one for candidates, judging and agent work. See the [reference](reference.md#models-and-routes).
 
 ## If something's off
 
 - **"I can't see the file":** start Pathfinder in the folder that holds it, or attach the file.
-- **No models:** run `pathfinder auth status`.
+- **No models:** run `pathfinder auth login`, or `pathfinder auth status` to see what's connected.
 - **A reply was held back** while you judged a candidate: that's the gate. Give your verdict, and the answer follows.
 - **Anything else:** `/bug what happened`.

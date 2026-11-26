@@ -11,7 +11,10 @@ use crate::config::Route;
 use crate::decide::{self, Provider, Question};
 
 const AUTH_USAGE: &str = "Usage:
+  pathfinder auth login                              Connect models: pick how
   pathfinder auth login chatgpt                      Sign in with ChatGPT (uses your plan)
+  pathfinder auth login [anthropic|openai]           Add an API key
+  pathfinder auth login server                       Add an OpenAI-compatible service or your own server
   pathfinder auth logout chatgpt [--forget]          Sign out; --forget also drops the registration
   pathfinder auth set [anthropic|openai] [--stdin]   Store an API key in Pathfinder's auth file
   pathfinder auth set [gemini|typesafe] [--stdin]    Store a decision-model key (Gemini Decision 1, TypeSafe Jev)
@@ -31,10 +34,17 @@ pub async fn auth(args: &[String]) -> Result<()> {
         .collect();
     match positional.first().copied() {
         Some("login") => match positional.get(1).copied() {
-            Some("chatgpt") | None => login_chatgpt(&creds).await,
-            Some(other) => {
-                bail!("`login` is for ChatGPT; for {other} use `pathfinder auth set {other}`")
+            Some("chatgpt") => login_chatgpt(&creds).await,
+            Some("server") => add_server(&creds).await,
+            Some(p) if Route::from_provider_id(p).is_some() => {
+                set(&creds, Some(p), flag("--stdin")).await
             }
+            Some(other) => bail!("unknown login `{other}`\n\n{AUTH_USAGE}"),
+            None => match choose_login()? {
+                Login::Chatgpt => login_chatgpt(&creds).await,
+                Login::Key(route) => set(&creds, Some(route.provider_id()), false).await,
+                Login::Server => add_server(&creds).await,
+            },
         },
         Some("logout") => match positional.get(1).copied() {
             Some("chatgpt") | None => {
@@ -207,6 +217,131 @@ fn provider(name: Option<&str>) -> Result<Route> {
         .with_context(|| format!("unknown provider `{name}`; use anthropic or openai"))
 }
 
+enum Login {
+    Chatgpt,
+    Key(Route),
+    Server,
+}
+
+fn ask(prompt: &str) -> Result<String> {
+    print!("{prompt}");
+    io::stdout().flush()?;
+    let mut line = String::new();
+    io::stdin().lock().read_line(&mut line)?;
+    Ok(line.trim().to_string())
+}
+
+fn choose_login() -> Result<Login> {
+    if !io::stdin().is_terminal() {
+        bail!("name what to connect\n\n{AUTH_USAGE}");
+    }
+    let mut options = vec![(
+        "Sign in with ChatGPT (uses your plan)".to_string(),
+        Login::Chatgpt,
+    )];
+    for route in Route::API {
+        options.push((
+            format!("{} API key", route.provider_name()),
+            Login::Key(route),
+        ));
+    }
+    options.push((
+        "Another OpenAI-compatible service or your own server (OpenRouter, Ollama, vLLM, ...)"
+            .to_string(),
+        Login::Server,
+    ));
+    println!("Connect models:");
+    for (i, (label, _)) in options.iter().enumerate() {
+        println!("  {}) {label}", i + 1);
+    }
+    let n: usize = ask("Number: ")?.parse().context("enter a number")?;
+    options
+        .into_iter()
+        .nth(n.wrapping_sub(1))
+        .map(|(_, l)| l)
+        .context("no such option")
+}
+
+/// `pathfinder auth login server`: an OpenAI-compatible endpoint, checked
+/// and added to `config.json`.
+async fn add_server(creds: &Credentials) -> Result<()> {
+    let base_url = ask("Base URL, up to and including /v1 (e.g. http://localhost:11434/v1): ")?;
+    if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
+        bail!("the base URL starts with http:// or https://");
+    }
+    let base_url = base_url.trim_end_matches('/').to_string();
+    let suggested = server_name(&base_url);
+    let id = ask(&format!("Short name [{suggested}]: "))?;
+    let id = if id.is_empty() { suggested } else { id };
+    if id.is_empty()
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        bail!("the name is letters, digits, - and _ only");
+    }
+    let key = rpassword::prompt_password("API key (hidden; Enter if it needs none): ")?;
+    let key = key.trim();
+    let key = (!key.is_empty()).then_some(key);
+
+    print!("Checking {base_url}... ");
+    io::stdout().flush()?;
+    let models = crate::llm::chat::list_models(&reqwest::Client::new(), &base_url, key)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e:#}. Nothing was saved."))?;
+    println!("ok, {} models available.", models.len());
+
+    let key_name = key.map(|_| format!("{id}-api-key"));
+    if let (Some(name), Some(key)) = (&key_name, key) {
+        creds.set_named(name, key)?;
+    }
+    crate::config::Config::add_endpoint(&crate::config::Endpoint {
+        id: id.clone(),
+        label: None,
+        base_url,
+        key: key_name,
+        models: Vec::new(),
+        extra: None,
+    })?;
+    catalog::refresh_endpoints(
+        &crate::config::Config::load(),
+        creds,
+        &reqwest::Client::new(),
+    )
+    .await;
+    println!(
+        "Added `{id}` to {}. Start a new Pathfinder thread to use its models.",
+        crate::config::default_config_path().display()
+    );
+    Ok(())
+}
+
+/// A short name for a server from its URL: `openrouter` for
+/// `https://openrouter.ai/api/v1`, `localhost` for a local one.
+fn server_name(base_url: &str) -> String {
+    let host = base_url
+        .split("://")
+        .nth(1)
+        .unwrap_or("")
+        .split(['/', ':'])
+        .next()
+        .unwrap_or("");
+    if host.is_empty() || host.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        return "server".into();
+    }
+    let parts: Vec<&str> = host.split('.').collect();
+    let name = match parts.as_slice() {
+        [one] => one,
+        [.., name, _tld] if name.len() > 2 => name,
+        [.., name, _, _] => name,
+        _ => host,
+    };
+    name.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .collect::<String>()
+        .to_lowercase()
+}
+
 fn choose_provider() -> Result<Route> {
     println!("Which provider's API key do you want to add?");
     for (i, route) in Route::API.iter().enumerate() {
@@ -311,10 +446,7 @@ fn status(creds: &Credentials) -> Result<()> {
             "ChatGPT",
             reg.email.map(|e| format!(" as {e}")).unwrap_or_default()
         ),
-        _ => println!(
-            "{:<10} not signed in (`pathfinder auth login chatgpt`)",
-            "ChatGPT"
-        ),
+        _ => println!("{:<10} not signed in (`pathfinder auth login`)", "ChatGPT"),
     }
     for route in Route::API {
         match creds.lookup(route) {
@@ -572,5 +704,20 @@ pub async fn data(args: &[String]) -> Result<()> {
         Some(other) => {
             bail!("unknown `pathfinder data {other}`: use status, show, join, on, off or delete")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::server_name;
+
+    #[test]
+    fn a_server_is_named_after_its_host() {
+        assert_eq!(server_name("https://openrouter.ai/api/v1"), "openrouter");
+        assert_eq!(server_name("https://api.together.xyz/v1"), "together");
+        assert_eq!(server_name("http://localhost:11434/v1"), "localhost");
+        assert_eq!(server_name("http://gpu-box:8000/v1"), "gpu-box");
+        assert_eq!(server_name("https://llm.lab.example.co.uk/v1"), "example");
+        assert_eq!(server_name("http://192.168.1.5:8000/v1"), "server");
     }
 }

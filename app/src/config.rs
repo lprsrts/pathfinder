@@ -268,6 +268,36 @@ impl Default for Config {
 impl Config {
     /// Reads the config file and env overrides. Called per turn, so edits
     /// apply without restarting the editor.
+    /// Adds `ep` to `config.json` (replacing one with the same id), keeping
+    /// everything else in the file as it is.
+    pub fn add_endpoint(ep: &Endpoint) -> anyhow::Result<()> {
+        let path = default_config_path();
+        let mut root: serde_json::Value = match fs::read_to_string(&path) {
+            Ok(raw) => serde_json::from_str(&raw)
+                .map_err(|e| anyhow::anyhow!("{} isn't valid JSON: {e}", path.display()))?,
+            Err(_) => serde_json::json!({}),
+        };
+        let obj = root
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("{} isn't a JSON object", path.display()))?;
+        let list = obj
+            .entry("endpoints")
+            .or_insert_with(|| serde_json::json!([]))
+            .as_array_mut()
+            .ok_or_else(|| anyhow::anyhow!("`endpoints` in {} isn't a list", path.display()))?;
+        list.retain(|e| e.get("id").and_then(|v| v.as_str()) != Some(ep.id.as_str()));
+        let mut entry = serde_json::to_value(ep)?;
+        if let Some(e) = entry.as_object_mut() {
+            e.retain(|_, v| !v.is_null() && v.as_array().is_none_or(|a| !a.is_empty()));
+        }
+        list.push(entry);
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir)?;
+        }
+        fs::write(&path, serde_json::to_string_pretty(&root)? + "\n")?;
+        Ok(())
+    }
+
     pub fn load() -> Self {
         let path = default_config_path();
         let mut cfg = match fs::read_to_string(&path) {

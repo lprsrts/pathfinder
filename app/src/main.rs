@@ -51,8 +51,7 @@ fn usage() -> String {
 Usage: pathfinder [command]
 
   pathfinder [tui] [folder]   Work in a folder (default: here)
-  pathfinder auth login chatgpt
-                              Sign in with your ChatGPT account (do this first)
+  pathfinder auth login       Connect models (do this first)
   pathfinder auth [status|set|remove]
                               Your model accounts and API keys
   pathfinder data [status|show|join|on|off|delete]

@@ -5,7 +5,7 @@ Thanks for trying Pathfinder. It's in a closed beta: it works, it has rough edge
 ## What you need
 
 - A Mac (Apple silicon or Intel). Linux works if you build it from source.
-- A paid ChatGPT plan (Plus or Pro), or an Anthropic or OpenAI API key. Pathfinder's use counts against that plan or key; on Plus, the five-hour limit is shared with your other ChatGPT apps.
+- Access to models. Pathfinder's use counts against that account.
 - Optional: `brew install poppler`, so Pathfinder can read PDFs page by page.
 
 ## Install
@@ -18,10 +18,10 @@ This installs `pathfinder` into `~/.local/bin` (or `$XDG_BIN_HOME`, or `$PATHFIN
 
 ## Start
 
-1. Connect your model account (this opens your browser):
+1. Connect your models:
 
    ```sh
-   pathfinder auth login chatgpt
+   pathfinder auth login
    ```
 
 2. Go to the folder you're working in and start Pathfinder:

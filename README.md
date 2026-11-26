@@ -32,12 +32,12 @@ If pathfinder.lprsrts.com is down, the same installer and release are on GitHub:
 
 This installs one program, `pathfinder`, into `~/.local/bin` (or `$XDG_BIN_HOME`, or `$PATHFINDER_BIN_DIR`). It is signed and notarised by Apple, and the installer checks it against a signed release manifest. Linux users can build from source (below).
 
-You need a model account: a paid ChatGPT plan (Plus or Pro), or an Anthropic or OpenAI API key. Usage counts against that plan or key. The gate also needs a decision key: TypeSafe (`pathfinder auth set typesafe`), OpenAI or Google (see [decision services](docs/reference.md#while-you-judge)). Optional: `poppler` (`brew install poppler`) lets Pathfinder read PDFs page by page.
+You need access to models; `pathfinder auth login` connects them, and usage counts against that account. The gate also needs a decision key: TypeSafe (`pathfinder auth set typesafe`), OpenAI or Google (see [decision services](docs/reference.md#while-you-judge)). Optional: `poppler` (`brew install poppler`) lets Pathfinder read PDFs page by page.
 
 ## First run
 
 ```sh
-pathfinder auth login chatgpt   # or: pathfinder auth set anthropic
+pathfinder auth login
 cd ~/path/to/your/work
 pathfinder
 ```
