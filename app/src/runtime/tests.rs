@@ -57,6 +57,9 @@ impl Engine for FakeEngine {
 
 use EngineTier::{System1 as S1, System2 as S2};
 
+/// The source search finds nothing.
+const NO_HITS: &str = r#"{"hits":[],"search_terms":[]}"#;
+
 /// Two models; the fake engine ignores their routes.
 fn test_config() -> Config {
     let entry = |id: &str| crate::config::ModelEntry {
@@ -888,109 +891,57 @@ async fn a_review_check_allows_fewer_bits_than_a_candidate() {
 
 #[tokio::test]
 async fn the_gate_holds_replies_while_you_judge() {
-    let leak = log_reply("It is wrong: dispatch never falls back.");
-    let general = log_reply("Dispatch maps a name to a handler.");
+    const NOT_JUDGED: &str = r#"{"is_judgment":false,"pass":false,"feedback":""}"#;
+    let cite = |quote: &str| {
+        format!(r#"{{"hits":[{{"file":"router.md","page":null,"quote":"{quote}"}}]}}"#)
+    };
     let (rt, engine) = runtime(
         FakeEngine::new(vec![
             (ReadOnly, S1, ONBOARD_READY),
             (ReadOnly, S2, MAP),
-            (ReadOnly, S1, &log_reply("Ok.")),
+            (ReadOnly, S1, &log_reply("ok")),
             (
                 ReadOnly,
                 S2,
                 r#"{"candidate":"Unknown commands fall back to help.","key_reason":"The router has no fallback for unknown names, they are rejected"}"#,
             ),
-            // Blocked, rewritten, passes.
+            // A source line that settles the candidate: held by the pre-check.
+            (ReadOnly, S2, NOT_JUDGED),
+            (ReadOnly, S1, &log_reply("ok")),
             (
                 ReadOnly,
                 S2,
-                r#"{"is_judgment":false,"pass":false,"feedback":""}"#,
+                &cite("The router has no fallback for unknown names, they are rejected."),
             ),
-            (ReadOnly, S1, &leak),
-            (
-                ToolAccess::None,
-                S1,
-                r#"{"reply":"Think about what happens to a name with no handler."}"#,
-            ),
-            // Blocked twice: the fixed reply.
-            (
-                ReadOnly,
-                S2,
-                r#"{"is_judgment":false,"pass":false,"feedback":""}"#,
-            ),
-            (ReadOnly, S1, &leak),
-            (ToolAccess::None, S1, r#"{"reply":"Still: it is wrong."}"#),
+            // A general source line passes.
+            (ReadOnly, S2, NOT_JUDGED),
+            (ReadOnly, S1, &log_reply("ok")),
+            (ReadOnly, S2, &cite("Dispatch maps a name to a handler.")),
             // The check errors: withheld.
-            (
-                ReadOnly,
-                S2,
-                r#"{"is_judgment":false,"pass":false,"feedback":""}"#,
-            ),
-            (ReadOnly, S1, &general),
-            // The pre-check catches an echo of the key with no decision.
-            (
-                ReadOnly,
-                S2,
-                r#"{"is_judgment":false,"pass":false,"feedback":""}"#,
-            ),
-            (
-                ReadOnly,
-                S1,
-                &log_reply("Note the router has no fallback for unknown names, so..."),
-            ),
-            (
-                ToolAccess::None,
-                S1,
-                r#"{"reply":"Look at how unknown names are handled."}"#,
-            ),
-            // In the band, the reader learns nothing: shown as drafted.
-            (
-                ReadOnly,
-                S2,
-                r#"{"is_judgment":false,"pass":false,"feedback":""}"#,
-            ),
-            (ReadOnly, S1, &general),
-            // In the band, the reader learns it's right: rewritten.
-            (
-                ReadOnly,
-                S2,
-                r#"{"is_judgment":false,"pass":false,"feedback":""}"#,
-            ),
-            (ReadOnly, S1, &general),
-            (
-                ToolAccess::None,
-                S1,
-                r#"{"reply":"A handler is the function a name maps to."}"#,
-            ),
+            (ReadOnly, S2, NOT_JUDGED),
+            (ReadOnly, S1, &log_reply("ok")),
+            (ReadOnly, S2, &cite("Dispatch maps a name to a handler.")),
             (
                 ReadOnly,
                 S2,
                 r#"{"is_judgment":true,"pass":true,"feedback":"Right: there is no fallback."}"#,
             ),
-            // No secret any more: replies stream unchecked.
-            (ReadOnly, S1, &general),
+            // No secret any more: no check.
+            (ReadOnly, S1, &log_reply("ok")),
+            (ReadOnly, S2, &cite("Dispatch maps a name to a handler.")),
         ]),
         false,
     );
     let rt = rt.with_decider(Arc::new(GateDecider(
-        Mutex::new(
-            vec![
-                Some(0.9),
-                Some(0.1),
-                Some(0.9),
-                Some(0.8),
-                None,
-                Some(0.05),
-                Some(0.25),
-                Some(0.3),
-                Some(0.1),
-            ]
-            .into(),
-        ),
-        // In the band, the reader decides: it sees nothing, then a reply
-        // that tells it the (correct) candidate is right.
-        Mutex::new(vec![[0.0, 0.0, 1.0], [0.9, 0.0, 0.1]].into()),
+        Mutex::new(vec![Some(0.05), None].into()),
+        Mutex::new(VecDeque::new()),
     )));
+    let cwd = rt.load_session("s").unwrap().unwrap().cwd;
+    std::fs::write(
+        cwd.join("router.md"),
+        "Dispatch maps a name to a handler.\nThe router has no fallback for unknown names, they are rejected.\n",
+    )
+    .unwrap();
     turn(&rt, "goal").await;
     turn(&rt, "thinking").await;
     turn(&rt, "/summary names map to handlers").await;
@@ -1009,62 +960,40 @@ async fn the_gate_holds_replies_while_you_judge() {
         .unwrap();
     assert!(rt.store.secret(&id).unwrap().unwrap().active);
 
-    let out = turn(&rt, "does it fall back?").await;
-    let s = rt.load_session("s").unwrap().unwrap();
-    assert_eq!(
-        s.history.last().unwrap().content,
-        "Think about what happens to a name with no handler."
-    );
-    assert!(out.reply.is_empty());
-
-    turn(&rt, "so is it wrong?").await;
+    turn(&rt, "does it fall back?").await;
     let s = rt.load_session("s").unwrap().unwrap();
     assert_eq!(
         s.history.last().unwrap().content,
         crate::secrets::FIXED_REPLY
     );
 
-    // The check fails: the fixed reply, and why it was held back.
     turn(&rt, "what is dispatch?").await;
+    let s = rt.load_session("s").unwrap().unwrap();
+    assert_eq!(
+        s.history.last().unwrap().content,
+        "**Where to look:**\n\n- `router.md:1`\n  > Dispatch maps a name to a handler."
+    );
+
+    // The check fails: the fixed reply, and why it was held back.
+    turn(&rt, "what is a handler?").await;
     let s = rt.load_session("s").unwrap().unwrap();
     let held = &s.history.last().unwrap().content;
     assert!(held.starts_with(crate::secrets::FIXED_REPLY), "{held}");
     assert!(held.contains("couldn't be reached"), "{held}");
-
-    turn(&rt, "hmm").await;
-    let s = rt.load_session("s").unwrap().unwrap();
-    assert_eq!(
-        s.history.last().unwrap().content,
-        "Look at how unknown names are handled."
-    );
-
-    turn(&rt, "what is a handler?").await;
-    let s = rt.load_session("s").unwrap().unwrap();
-    assert_eq!(
-        s.history.last().unwrap().content,
-        "Dispatch maps a name to a handler."
-    );
-    let prompt = engine.prompts.lock().unwrap().last().cloned().unwrap();
-    assert!(prompt.contains(gate::NARROW), "asked to answer narrowly");
-
-    turn(&rt, "and what is a route?").await;
-    let s = rt.load_session("s").unwrap().unwrap();
-    assert_eq!(
-        s.history.last().unwrap().content,
-        "A handler is the function a name maps to."
-    );
 
     turn(&rt, "it's wrong, unknown names are rejected").await;
     assert!(!rt.store.secret(&id).unwrap().unwrap().active);
     turn(&rt, "/next").await;
     turn(&rt, "what is dispatch?").await;
     let s = rt.load_session("s").unwrap().unwrap();
-    assert_eq!(
-        s.history.last().unwrap().content,
-        "Dispatch maps a name to a handler."
+    assert!(
+        s.history
+            .last()
+            .unwrap()
+            .content
+            .ends_with("> Dispatch maps a name to a handler.")
     );
-    let prompt = engine.prompts.lock().unwrap().last().cloned().unwrap();
-    assert!(!prompt.contains(gate::NARROW));
+    assert!(engine.replies.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -1099,6 +1028,7 @@ async fn chat_drives_the_loop() {
                 S1,
                 r#"{"intent":"log","reply":"It means x.","map_change":null}"#,
             ),
+            (ReadOnly, S2, NO_HITS),
             (
                 ReadOnly,
                 S2,
@@ -1337,6 +1267,7 @@ async fn only_a_clear_move_drops_a_waiting_candidate() {
                 S1,
                 r#"{"intent":"log","reply":"That's what you're judging.","map_change":null}"#,
             ),
+            (ReadOnly, S2, NO_HITS),
         ]),
         false,
     );
@@ -1355,9 +1286,13 @@ async fn only_a_clear_move_drops_a_waiting_candidate() {
     let s = rt.load_session("s").unwrap().unwrap();
     assert!(s.pending_candidate.is_some(), "the candidate keeps waiting");
     assert_eq!(s.active.as_deref(), Some("route"));
-    assert_eq!(
-        s.history.last().unwrap().content,
-        "That's what you're judging."
+    assert!(
+        s.history
+            .last()
+            .unwrap()
+            .content
+            .starts_with("**Not found**"),
+        "a question gets sources, never the model's reply"
     );
 
     turn(&rt, "skip it, next part").await;
@@ -1384,6 +1319,7 @@ async fn a_question_about_a_waiting_candidate_skips_the_judge() {
                 S1,
                 r#"{"intent":"summary","reply":"It means x.","map_change":null}"#,
             ),
+            (ReadOnly, S2, NO_HITS),
             (ReadOnly, S2, r#"{"pass":true,"feedback":"Right."}"#),
         ]),
         false,
@@ -1403,9 +1339,14 @@ async fn a_question_about_a_waiting_candidate_skips_the_judge() {
     let out = turn(&rt, "what does dispatch mean?").await;
     // The LLM's own intent is ignored once the decision model has spoken.
     assert!(!out.reply.contains("Candidate"));
-    let prompt = engine.prompts.lock().unwrap().last().cloned().unwrap();
-    assert!(prompt.contains("Fake classified this message as a log entry"));
-    assert!(!prompt.contains("z = 99"));
+    let prompts = engine.prompts.lock().unwrap().clone();
+    let log_prompt = &prompts[prompts.len() - 2];
+    assert!(log_prompt.contains("Fake classified this message as a log entry"));
+    assert!(!log_prompt.contains("z = 99"));
+    assert!(
+        !prompts.last().unwrap().contains("z = 99"),
+        "nor does the source search"
+    );
     assert!(
         rt.load_session("s")
             .unwrap()

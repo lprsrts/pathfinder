@@ -69,6 +69,10 @@ pub enum Line {
     /// A concept you were only told about.
     ToldOnly,
     ReadOnly,
+    /// Before a part's pointer into the workspace.
+    ReadAt,
+    /// A log entry, taken without comment.
+    Logged,
     /// The folder has no record yet.
     NoRecord,
     /// Under the record: "{shown}", "{told}", "{shaky}".
@@ -149,6 +153,8 @@ pub fn line(lang: Option<&str>, line: Line) -> &'static str {
             OpenMisconception => "Offenes Missverständnis bei {concept}: „{statement}“",
             ToldOnly => "nur gesagt",
             ReadOnly => "gelesen",
+            ReadAt => "Lesen:",
+            Logged => "Notiert.",
             NoRecord => {
                 "Für diesen Ordner gibt es noch keinen Verlauf: Frag etwas, oder lass dich prüfen."
             }
@@ -215,6 +221,8 @@ pub fn line(lang: Option<&str>, line: Line) -> &'static str {
             OpenMisconception => "Open misconception on {concept}: \"{statement}\"",
             ToldOnly => "told only",
             ReadOnly => "read",
+            ReadAt => "Read:",
+            Logged => "Logged.",
             NoRecord => "No record for this folder yet: ask something, or get tested.",
             RecordSummary => {
                 "Shown: {shown} · told only: {told} · shaky: {shaky}. Only passed checks count as understanding; a claim never does, and solid understanding cools after 30 days without a fresh check."

@@ -295,6 +295,21 @@ pub fn clean_terms(terms: &[String]) -> Vec<String> {
     out
 }
 
+/// Whether a chat message asks something (and so gets sources), rather
+/// than logging the user's own thinking (which gets none).
+pub fn is_question(text: &str) -> bool {
+    const ASK: &[&str] = &[
+        "what", "why", "how", "where", "when", "which", "who", "is", "are", "does", "do", "can",
+        "could", "should", "was", "wie", "warum", "wieso", "weshalb", "wo", "wann", "welche",
+        "welcher", "welches", "wer", "ist", "sind", "kann", "gibt",
+    ];
+    let t = text.trim();
+    t.contains('?')
+        || t.split_whitespace()
+            .next()
+            .is_some_and(|w| ASK.contains(&w.to_lowercase().as_str()))
+}
+
 /// Keywords from a question, for a search done by code alone.
 pub fn keywords(question: &str) -> Vec<String> {
     const STOP: &[&str] = &[
@@ -423,6 +438,40 @@ pub fn open(cwd: &Path, file: &str, at: Option<usize>) -> Result<String, String>
     }
     out.push_str("```");
     Ok(out)
+}
+
+/// A part's note reduced to a pointer: the first workspace file it names,
+/// with a page (`p. 12`, `page 12`, `S. 12`) or line (`file:40`) if it gives
+/// one that exists. Anything else in the note is dropped.
+pub fn pointer_note(cwd: &Path, note: &str) -> Option<String> {
+    let page_re = regex::Regex::new(r"(?i)\b(?:pp?\.|pages?|seite|s\.)\s*(\d+)").ok()?;
+    for raw in note.split_whitespace() {
+        let token = raw.trim_matches(|c: char| "`'\"()[],;".contains(c));
+        let (file, line) = match token.rsplit_once(':') {
+            Some((f, l)) if l.parse::<usize>().is_ok() => (f, l.parse::<usize>().ok()),
+            _ => (token.trim_end_matches('.'), None),
+        };
+        let Some(full) = confine(cwd, file) else {
+            continue;
+        };
+        let count = pages(&full, file).ok()?;
+        if is_pdf(&full) {
+            let page = page_re
+                .captures(note)
+                .and_then(|c| c[1].parse::<usize>().ok())
+                .filter(|p| *p >= 1 && *p <= count.len());
+            return Some(match page {
+                Some(p) => format!("`{file} p.{p}`"),
+                None => format!("`{file}`"),
+            });
+        }
+        let lines = count[0].lines().count();
+        return Some(match line.filter(|l| *l >= 1 && *l <= lines) {
+            Some(l) => format!("`{file}:{l}`"),
+            None => format!("`{file}`"),
+        });
+    }
+    None
 }
 
 // --------------------------------------------------------------------- web
@@ -685,6 +734,31 @@ mod tests {
         let shown = open(d.path(), "notes.md", Some(5)).unwrap();
         assert!(shown.contains("    5  It is linear."));
         assert!(open(d.path(), "../x", None).is_err());
+    }
+
+    #[test]
+    fn notes_keep_only_a_pointer() {
+        let d = ws(&[("notes.md", NOTES)]);
+        assert_eq!(
+            pointer_note(d.path(), "Read notes.md:5 first.").as_deref(),
+            Some("`notes.md:5`")
+        );
+        assert_eq!(
+            pointer_note(
+                d.path(),
+                "See `notes.md`, the transform is linear because..."
+            )
+            .as_deref(),
+            Some("`notes.md`")
+        );
+        assert_eq!(
+            pointer_note(d.path(), "notes.md:99"),
+            Some("`notes.md`".into())
+        );
+        assert_eq!(
+            pointer_note(d.path(), "The weights scale each input."),
+            None
+        );
     }
 
     #[test]

@@ -519,7 +519,7 @@ impl Runtime {
         };
         let lang = session.language.clone();
         let lang = lang.as_deref();
-        let mut out = render_part(&part, hint, lang);
+        let mut out = render_part(&part, hint, lang, &session.cwd);
         if part.concepts.is_empty() {
             return out;
         }

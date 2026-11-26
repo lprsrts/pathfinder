@@ -71,15 +71,14 @@ impl Runtime {
         };
         let current = session.map.clone();
         let change_waiting = session.pending_change.is_some();
-        let reply_sink = match &gate {
-            gate::GateMode::Checked(_) => {
-                sink(StreamEvent::Thought(
-                    "Checking the reply against what you're judging before showing it.\n".into(),
-                ));
-                gate::held(&sink)
-            }
-            _ => sink.clone(),
-        };
+        // The model's own reply is never shown: a question gets sources, a
+        // log entry gets none.
+        if matches!(gate, gate::GateMode::Checked(_)) {
+            sink(StreamEvent::Thought(
+                "Checking the reply against what you're judging before showing it.\n".into(),
+            ));
+        }
+        let reply_sink = gate::held(&sink);
         let (mut decision, shown): (LogReply, _) = run_gated_streamed(
             self.engine.as_ref(),
             self.store.as_ref(),
@@ -109,15 +108,16 @@ impl Runtime {
                 )
                 .await;
         }
-        match &gate {
-            gate::GateMode::Checked(secrets) => {
-                decision.reply = self
-                    .gate_reply(session, secrets, text, decision.reply, &sink)
-                    .await;
-                sink(StreamEvent::TextDelta(decision.reply.clone()));
-            }
-            _ => flush(&sink, &decision.reply, &shown),
+        let _ = shown;
+        decision.reply = if crate::sources::is_question(text) {
+            self.cite_reply(session, text, files, &sink).await?
+        } else {
+            i18n::line(session.language.as_deref(), i18n::Line::Logged).to_string()
+        };
+        if let gate::GateMode::Checked(secrets) = &gate {
+            decision.reply = self.gate_reply(session, secrets, decision.reply).await;
         }
+        sink(StreamEvent::TextDelta(decision.reply.clone()));
 
         if let Err(e) = self
             .extract_from_log(

@@ -25,8 +25,9 @@ const TELL_SYSTEM: &str = r#"The user typed /tell: they explicitly asked to be t
 const SOURCES: &str = "sources";
 
 impl Runtime {
-    /// A question: pointers and verified verbatim hits from the workspace,
-    /// or an honest "not found". No model text reaches the user.
+    /// A question: pointers and verified verbatim hits from the workspace
+    /// (or online when the workspace has none), or an honest "not found".
+    /// No model text reaches the user.
     pub(super) async fn answer_question(
         &self,
         session: &mut Session,
@@ -35,25 +36,43 @@ impl Runtime {
         sink: StreamSink,
         _offer_check: bool,
     ) -> Result<TurnOutput> {
-        let req = EngineRequest {
-            tier: EngineTier::System2,
-            tools: ToolAccess::ReadOnly,
-            cwd: session.cwd.clone(),
-            system_prompt: CITE_SYSTEM.to_string(),
-            prompt: format!(
-                "Workspace snapshot:\n{}\n\nQuestion: {text}\n\nSearch, then return the JSON only.",
-                WorkspaceSnapshot::scan(&session.cwd).render()
-            ),
-            files: files.to_vec(),
-            stream_text: false,
-            models: self.models(session)?,
-            ctx: crate::engine::turn_ctx(),
+        let reply = self.cite_reply(session, text, files, &sink).await?;
+        sink(StreamEvent::TextDelta(reply.clone()));
+        session.push_turn("assistant", &reply);
+        Ok(TurnOutput::text(String::new()))
+    }
+
+    /// The sourced reply to `text`, not yet shown.
+    pub(super) async fn cite_reply(
+        &self,
+        session: &mut Session,
+        text: &str,
+        files: &[PathBuf],
+        sink: &StreamSink,
+    ) -> Result<String> {
+        // `code`: no model, keyword search only.
+        let raw = if crate::config::Config::load().sources_search == "code" {
+            String::new()
+        } else {
+            let req = EngineRequest {
+                tier: EngineTier::System2,
+                tools: ToolAccess::ReadOnly,
+                cwd: session.cwd.clone(),
+                system_prompt: CITE_SYSTEM.to_string(),
+                prompt: format!(
+                    "Workspace snapshot:\n{}\n\nQuestion: {text}\n\nSearch, then return the JSON only.",
+                    WorkspaceSnapshot::scan(&session.cwd).render()
+                ),
+                files: files.to_vec(),
+                stream_text: false,
+                models: self.models(session)?,
+                ctx: crate::engine::turn_ctx(),
+            };
+            self.engine
+                .run_text(&req, gate::held(sink))
+                .await
+                .unwrap_or_default()
         };
-        let raw = self
-            .engine
-            .run_text(&req, gate::held(&sink))
-            .await
-            .unwrap_or_default();
         let (mut hits, terms) = cited_hits(&session.cwd, &raw, text);
         // Nothing in the workspace: the same search online.
         let mut skipped = Vec::new();
@@ -67,10 +86,7 @@ impl Runtime {
             }
         }
         // Only text built from verified hits is shown.
-        let reply = sources::render(&hits, &terms, online, &skipped);
-        sink(StreamEvent::TextDelta(reply.clone()));
-        session.push_turn("assistant", &reply);
-        Ok(TurnOutput::text(String::new()))
+        Ok(sources::render(&hits, &terms, online, &skipped))
     }
 
     /// `/tell <question>`: the one reasoned answer, recorded as told.

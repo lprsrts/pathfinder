@@ -1,33 +1,17 @@
 //! The gate (theory §11, A6): while a secret is active, every Tutor reply
 //! is held, pre-checked, and checked by a decision model against each
-//! secret's probe before you see it. A blocked draft is rewritten once
-//! without the probe or the secret; a second block, or a check that
+//! secret's probe before you see it. A blocked draft, or a check that
 //! errors, sends a fixed reply instead (fail closed).
 
 use anyhow::{Result, anyhow};
 use pathfinder_schema::ErrorCode;
 use pathfinder_schema::GateOutcome;
-use serde::Deserialize;
 
 use super::{Runtime, format_turns};
 use crate::decide::Question;
 use crate::domain::Session;
-use crate::engine::{EngineRequest, EngineTier, StreamEvent, StreamSink, ToolAccess, run_gated};
+use crate::engine::{StreamEvent, StreamSink};
 use crate::secrets::{BLOCK_FROM, PASS_BELOW, Secret, bits_limit, bits_toward, precheck_hit};
-use crate::validate::Violation;
-
-#[derive(Debug, Deserialize)]
-struct Rewrite {
-    #[serde(default)]
-    reply: String,
-}
-
-const REWRITE_SYSTEM: &str = r#"The user is judging a candidate (a proposed approach or result, or an agent's change under review) and hasn't given their verdict yet. Your draft reply to their latest message was held back because it judges the candidate, hints at whether or where it is right or wrong, or settles the point it tests.
-
-Rewrite it without any of that. Answer only what the user literally asked, as a general explanation or definition, and stop. Cut every sentence that links the answer to the task, the part, the candidate or a related idea ("which is where X comes in", "that's what matters when ..."), and every consequence or example the user didn't ask for. Don't say the candidate is right or wrong, don't point at a step, line or number in it, and don't give the fact that decides it. Advice on how to check it may only say to work it through from what's given and compare: no rule, formula, method or test to apply, no step to look at, no trap to watch for, and no warning that the topic is tricky or worth being careful about. Don't mention that anything was held back. Math as plain text, never LaTeX.
-
-Return ONLY a JSON object:
-{"reply": "..."}"#;
 
 /// Added to the Tutor's prompt while the gate checks its replies: asides
 /// that tie a general answer back to the topic are what settle a candidate.
@@ -110,19 +94,9 @@ impl Runtime {
     }
 
     /// Whether `draft` leaks any secret: the pre-check, then the decision
-    /// check. `Ok(None)`: no decision service answered, so the thread is in
-    /// masked mode.
-    async fn leaks(
-        &self,
-        session: &Session,
-        secrets: &[Secret],
-        draft: &str,
-    ) -> Result<Option<bool>> {
-        Ok(self.leaks_scored(session, secrets, draft).await?.0)
-    }
-
-    /// `leaks`, with the highest decision score (None after a pre-check
-    /// hit or with no decision service).
+    /// check, with the highest decision score (None after a pre-check hit or
+    /// with no decision service). `None` for the verdict: no decision service
+    /// answered, so the thread is in masked mode.
     async fn leaks_scored(
         &self,
         session: &Session,
@@ -256,20 +230,15 @@ impl Runtime {
         Ok(Some(out))
     }
 
-    /// The reply you may see: the draft if it passes, a rewrite if that
-    /// passes, else the fixed reply.
+    /// The reply you may see: the draft if it passes, else the fixed reply.
     pub(super) async fn gate_reply(
         &self,
         session: &Session,
         secrets: &[Secret],
-        message: &str,
         draft: String,
-        sink: &StreamSink,
     ) -> String {
         let started = std::time::Instant::now();
-        let (reply, score, outcome, cause) = self
-            .gate_reply_inner(session, secrets, message, draft, sink)
-            .await;
+        let (reply, score, outcome, cause) = self.gate_reply_inner(session, secrets, draft).await;
         crate::telemetry::emit(pathfinder_schema::Event::Gate {
             score: score.map(|s| s.clamp(0.0, 1.0)),
             outcome,
@@ -284,9 +253,7 @@ impl Runtime {
         &self,
         session: &Session,
         secrets: &[Secret],
-        message: &str,
         draft: String,
-        sink: &StreamSink,
     ) -> (String, Option<f64>, GateOutcome, Option<ErrorCode>) {
         let (blocked, score) = match self.leaks_scored(session, secrets, &draft).await {
             Ok((None | Some(false), score)) => return (draft, score, GateOutcome::Passed, None),
@@ -302,67 +269,8 @@ impl Runtime {
             }
         };
         debug_assert!(blocked);
-        sink(StreamEvent::Thought(
-            "\n\nThat draft touched the candidate you're judging; rewriting it.\n".into(),
-        ));
-        let rewritten = match self.rewrite(session, message, &draft).await {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!("rewriting a held reply: {e:#}");
-                return (
-                    fixed_reply(session),
-                    score,
-                    GateOutcome::Failed,
-                    Some(ErrorCode::Other),
-                );
-            }
-        };
-        match self.leaks(session, secrets, &rewritten).await {
-            Ok(None) | Ok(Some(false)) => (rewritten, score, GateOutcome::Rewritten, None),
-            Ok(Some(true)) => (fixed_reply(session), score, GateOutcome::Fixed, None),
-            Err(e) => {
-                tracing::warn!("the gate's check failed; withholding the reply: {e:#}");
-                (
-                    failed_reply(session, &e),
-                    score,
-                    GateOutcome::Failed,
-                    Some(cause(&e)),
-                )
-            }
-        }
-    }
-
-    async fn rewrite(&self, session: &Session, message: &str, draft: &str) -> Result<String> {
-        let req = EngineRequest {
-            tier: EngineTier::System1,
-            tools: ToolAccess::None,
-            cwd: session.cwd.clone(),
-            system_prompt: REWRITE_SYSTEM.to_string(),
-            prompt: format!(
-                "The user's latest message: {message}\n\nYour held draft:\n{draft}\n\nRespond with JSON only."
-            ),
-            files: vec![],
-            stream_text: false,
-            models: self.models(session)?,
-            ctx: crate::engine::turn_ctx(),
-        };
-        let r: Rewrite = run_gated(
-            self.engine.as_ref(),
-            self.store.as_ref(),
-            &session.id,
-            "rewrite",
-            &req,
-            quiet(),
-            |r: &Rewrite| {
-                if r.reply.trim().is_empty() {
-                    vec![Violation::new("empty_field", "`reply` must not be empty")]
-                } else {
-                    vec![]
-                }
-            },
-        )
-        .await?;
-        Ok(r.reply)
+        // Held, never rewritten: a rewrite would be the model's own words.
+        (fixed_reply(session), score, GateOutcome::Fixed, None)
     }
 
     /// Retires every active secret the thread no longer waits on: after a

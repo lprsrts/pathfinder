@@ -511,10 +511,11 @@ fn flush(sink: &StreamSink, full: &str, shown: &str) {
 }
 
 /// A part as you start on it. The command hint shows only with the first part.
-fn render_part(part: &Part, hint: bool, lang: Option<&str>) -> String {
+/// The note is shown only as a pointer into the workspace ("where to read").
+fn render_part(part: &Part, hint: bool, lang: Option<&str>, cwd: &std::path::Path) -> String {
     let mut out = format!("**{}** (`{}`)", part.title, part.id);
-    if !part.note.trim().is_empty() {
-        out.push_str(&format!("\n{}", part.note.trim()));
+    if let Some(at) = crate::sources::pointer_note(cwd, &part.note) {
+        out.push_str(&format!("\n{} {at}", i18n::line(lang, i18n::Line::ReadAt)));
     }
     if part.status != PartStatus::Open {
         out.push_str(&format!("\nStatus: {}.", part.status.label()));
@@ -635,7 +636,7 @@ const MAP_SYSTEM: &str = r#"You sketch the map for Pathfinder: what the task dep
 - `depends_on` lists parts that must be understood or done before this one makes sense. No cycles.
 - `id`: a short descriptive slug the user types in commands: lowercase words joined by hyphens, at most 12 characters (e.g. `weights`, `fwd-pass`, `loss`). Unique. It names what the part is actually about, not a broad field: `colliders`, not `probability`. Users skip parts by their names.
 - Start where the user is: if the goal or conversation says what they already know or don't, shape the parts for that (e.g. include the basics for a newcomer). Keep parts they say they know on the map; they can mark them known themselves.
-- `note`: one line on what the part covers. `brief`: what the map covers, in one or two sentences.
+- `note`: where to read for this part: a workspace file and page or line (e.g. `slides-4.pdf p. 12`, `notes.md:40`), or "" if the workspace has nothing for it. Never an explanation or a hint about the content. `brief`: what the map covers, in one or two sentences.
 - A goal that is a check of a topic just explained in the conversation ("Check ...", "Prüfen, ...") gets one part for that topic, two at most: the user explains it and judges a candidate.
 - Never give results away: no answers, computed values or intermediate results (a cutoff frequency, a derivative, "≈ 0.157") in the brief, notes or titles. The user works them out; for an exercise, say what each part is about, not what it comes to.
 - `concepts`: the ideas the parts rest on, the record Pathfinder keeps of what the user has shown they understand. Each has an `id` (a lowercase hyphenated slug naming the idea itself, e.g. `d-separation`, `chain-rule`), a short `label`, and `needs`: the concept ids it builds on. Include a concept the task needs even if no part covers it (a prerequisite the user may lack). Reuse ids of concepts already recorded in this workspace when it's the same idea.
@@ -667,13 +668,11 @@ First decide what the latest message is (`intent`):
 - `replan`: they ask to change the plan, or say something that changes the whole task's scope or purpose (a new constraint or aim).
 For anything but `log`, set `reply` to "" and `map_change` to null: Pathfinder takes the step.
 
-For `log`, reply briefly (math as plain text or Unicode, never LaTeX): answer what they ask, or point out what the entry reveals. If they ask whether something is right, say whether it is, even when it belongs to another part. Don't repeat what you already said in the conversation. Do not do the work for them and do not write their explanation of the part for them.
-
-The user decides which parts they do themselves and which go to an agent. Don't suggest it. If they ask you to just do the work, say plainly how: `/handoff` gives an understood part to the agent and they review the result; `/delegate` hands it off without understanding it, recorded as such. Then carry on with the part unless they choose one.
+For `log`, set `reply` to "ok". Pathfinder never answers in its own words: a question gets pointers into the sources, found separately, and a log entry gets no comment.
 
 If a `log` message reveals the map is wrong (a missing dependency, a part that doesn't belong, a wrong edge, or a new constraint that changes the task's scope), propose a change in `map_change`; the user accepts or rejects it. Otherwise set it to null. A change has `brief` (one sentence to the user, saying "you"), `goal` (only when the message changes what the task is, e.g. a new purpose or scope: the new goal as one sentence starting with a verb, not in first person; otherwise null), `parts` (to add, or update by id: id, title, note, depends_on; new ids are short hyphenated slugs of at most 12 characters) and `remove` (ids of parts with no work yet).
 
-If the message shows a gap in something this part depends on, especially a part they delegated or claimed to know (see the map's statuses), explain it in plain words, and propose a small part for it in `map_change` so the gap is on the map.
+If the message shows a gap in something this part depends on, especially a part they delegated or claimed to know (see the map's statuses), propose a small part for it in `map_change` so the gap is on the map. The change's `brief` names the gap; it doesn't explain it.
 
 For `log`, also record what the message is about, without judging it:
 - `concepts`: the concepts it touches, as concept ids from the lists (from any part, not part ids). A short name only for an idea on neither list. Empty if none.
