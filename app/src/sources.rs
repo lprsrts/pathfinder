@@ -723,33 +723,43 @@ fn strip_fence(raw: &str) -> &str {
 /// The only shape a sourced reply takes: pointers and raw hits, or "not
 /// found" with places to look. `skipped` lists services that couldn't be
 /// searched.
-pub fn render(hits: &[Hit], terms: &[String], online: bool, skipped: &[String]) -> String {
+pub fn render(
+    lang: Option<&str>,
+    hits: &[Hit],
+    terms: &[String],
+    online: bool,
+    skipped: &[String],
+) -> String {
+    use crate::i18n::{Line, line};
     let mut out = if hits.is_empty() {
-        let mut out = String::from(if online {
-            "**Not found** here or online."
-        } else {
-            "**Not found** here."
-        });
+        let mut out = String::from(line(
+            lang,
+            if online {
+                Line::NotFoundOnline
+            } else {
+                Line::NotFoundHere
+            },
+        ));
         if !terms.is_empty() {
-            out.push_str(&format!(
-                "\n\nTry: {}",
-                terms
-                    .iter()
-                    .map(|t| format!("`/find {t}`"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
+            let finds = terms
+                .iter()
+                .map(|t| format!("`/find {t}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push_str("\n\n");
+            out.push_str(&line(lang, Line::TryTerms).replace("{terms}", &finds));
         }
         out
     } else {
-        let mut out = String::from("**Where to look:**\n");
+        let mut out = format!("{}\n", line(lang, Line::WhereToLook));
         for h in hits {
             out.push_str(&format!("\n- `{}`\n  > {}", h.at, h.quote));
         }
         out
     };
     if !skipped.is_empty() {
-        out.push_str(&format!("\n\nNot searched: {}.", skipped.join(", ")));
+        out.push_str("\n\n");
+        out.push_str(&line(lang, Line::NotSearched).replace("{services}", &skipped.join(", ")));
     }
     out
 }
@@ -896,14 +906,22 @@ mod tests {
     fn rendered_replies_hold_only_pointers_and_quotes() {
         let d = ws(&[("notes.md", NOTES)]);
         let h = verify_local(d.path(), &hit("notes.md", None, "It is linear.")).unwrap();
-        let out = render(std::slice::from_ref(&h), &[], false, &[]);
+        let out = render(None, std::slice::from_ref(&h), &[], false, &[]);
         assert_eq!(
             out,
             "**Where to look:**\n\n- `notes.md:5`\n  > It is linear."
         );
-        let none = render(&[], &["laplace".into()], true, &["Brave (no key)".into()]);
+        let none = render(
+            None,
+            &[],
+            &["laplace".into()],
+            true,
+            &["Brave (no key)".into()],
+        );
         assert!(none.starts_with("**Not found** here or online."));
         assert!(none.contains("`/find laplace`"));
+        let tr = render(Some("tr"), &[], &["laplace".into()], false, &[]);
+        assert_eq!(tr, "**Bulunamadı**, burada yok.\n\nDene: `/find laplace`");
         assert!(none.ends_with("Not searched: Brave (no key)."));
     }
 

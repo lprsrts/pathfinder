@@ -17,7 +17,7 @@ In Zed, open the folder as the project and start a new Pathfinder thread in the 
 
 ## Ask, and get told where to look
 
-Ask in your own words, in English or German. Pathfinder doesn't answer: like a librarian with a catalogue, it points to where your material addresses the question and shows a short verbatim line from there.
+Ask in your own words, in any language. Pathfinder doesn't answer: like a librarian with a catalogue, it points to where your material addresses the question and shows a short verbatim line from there.
 
 ```
 **Where to look:**

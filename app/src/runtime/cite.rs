@@ -152,7 +152,13 @@ impl Runtime {
             }
         }
         // Only text built from verified hits is shown.
-        Ok(sources::render(&hits, &terms, online, &skipped))
+        Ok(sources::render(
+            session.language.as_deref(),
+            &hits,
+            &terms,
+            online,
+            &skipped,
+        ))
     }
 
     /// `/tell <question>`: the one reasoned answer, recorded as told.
@@ -181,8 +187,11 @@ impl Runtime {
             models: self.models(session)?,
             ctx: crate::engine::turn_ctx(),
         };
-        let header = "**Told**\n\n";
-        sink(StreamEvent::TextDelta(header.into()));
+        let header = format!(
+            "{}\n\n",
+            i18n::line(session.language.as_deref(), i18n::Line::Told)
+        );
+        sink(StreamEvent::TextDelta(header.clone()));
         let answer = self.engine.run_text(&req, sink.clone()).await?;
         let mut told = self.record_told(session, arg);
         if told.is_empty() {
@@ -261,7 +270,7 @@ impl Runtime {
                 )
                 .await?;
             let Some(lines) = parse_transcription(&raw) else {
-                let reply = "Couldn't read the photo.";
+                let reply = i18n::line(session.language.as_deref(), i18n::Line::PhotoUnreadable);
                 session.push_turn("assistant", reply);
                 return Ok(TurnOutput::text(reply));
             };
@@ -275,9 +284,11 @@ impl Runtime {
                         .to_string()
                 })
                 .collect();
+            let files = format!("`{}`", names.join("`, `"));
             shown = format!(
-                "Read from `{}`. Check that this is what you wrote:\n\n```text\n{}```\n\n",
-                names.join("`, `"),
+                "{}\n\n```text\n{}```\n\n",
+                i18n::line(session.language.as_deref(), i18n::Line::PhotoCopy)
+                    .replace("{files}", &files),
                 lines
                     .iter()
                     .enumerate()
@@ -298,7 +309,10 @@ impl Runtime {
             ctx: crate::engine::turn_ctx(),
         };
         let raw = self.engine.run_text(&req, gate::held(&sink)).await?;
-        let reply = format!("{shown}{}", render_check(&work, file.as_deref(), &raw));
+        let reply = format!(
+            "{shown}{}",
+            render_check(session.language.as_deref(), &work, file.as_deref(), &raw)
+        );
         session.push_turn("assistant", &reply);
         Ok(TurnOutput::text(reply))
     }
@@ -312,9 +326,15 @@ impl Runtime {
         let hits = sources::find(&session.cwd, &terms, 12);
         self.record_source(session, arg, EventKind::Searched, &format!("find:{arg}"));
         let reply = if hits.is_empty() {
-            format!("No line in this workspace contains `{arg}`.")
+            i18n::line(session.language.as_deref(), i18n::Line::FindNone)
+                .replace("{terms}", &format!("`{arg}`"))
         } else {
-            let mut out = format!("**{}** for `{arg}`:\n", hits.len());
+            let mut out = format!(
+                "{}\n",
+                i18n::line(session.language.as_deref(), i18n::Line::FindHits)
+                    .replace("{n}", &hits.len().to_string())
+                    .replace("{terms}", &format!("`{arg}`"))
+            );
             for h in &hits {
                 out.push_str(&format!("\n- `{}`  {}", h.at, h.quote));
             }
@@ -361,13 +381,19 @@ impl Runtime {
         self.record_source(session, arg, EventKind::Searched, &format!("web:{arg}"));
         let (hits, notes) = self.online_hits(session, arg, &terms, false, &sink).await;
         let reply = if hits.is_empty() {
-            let mut out = format!("Nothing online matched `{arg}`.");
+            let lang = session.language.as_deref();
+            let mut out =
+                i18n::line(lang, i18n::Line::WebNone).replace("{terms}", &format!("`{arg}`"));
             if !notes.is_empty() {
-                out.push_str(&format!("\n\nNot searched: {}.", notes.join(", ")));
+                out.push_str("\n\n");
+                out.push_str(
+                    &i18n::line(lang, i18n::Line::NotSearched)
+                        .replace("{services}", &notes.join(", ")),
+                );
             }
             out
         } else {
-            sources::render(&hits, &[], true, &notes)
+            sources::render(session.language.as_deref(), &hits, &[], true, &notes)
         };
         session.push_turn("user", format!("/web {arg}"));
         session.push_turn("assistant", &reply);
@@ -574,9 +600,13 @@ pub(crate) fn cited_hits(
 
 /// The `/check` reply: the first wrong step if the model's quote is really
 /// in the work, else nothing it said.
-pub(crate) fn render_check(work: &str, file: Option<&str>, raw: &str) -> String {
-    let unclear =
-        "Couldn't point to a step in your work. Write it out one step per line and `/check` again.";
+pub(crate) fn render_check(
+    lang: Option<&str>,
+    work: &str,
+    file: Option<&str>,
+    raw: &str,
+) -> String {
+    let unclear = i18n::line(lang, i18n::Line::CheckUnclear);
     let t = raw
         .trim()
         .trim_start_matches("```json")
@@ -586,7 +616,7 @@ pub(crate) fn render_check(work: &str, file: Option<&str>, raw: &str) -> String 
         return unclear.into();
     };
     let Some(step) = reply.first_wrong.filter(|s| !s.trim().is_empty()) else {
-        return "**No step found that doesn't hold.**".into();
+        return i18n::line(lang, i18n::Line::NoWrongStep).into();
     };
     let lines: Vec<&str> = work.lines().collect();
     let Some((line, own)) = sources::locate(&lines, &step) else {
@@ -594,10 +624,11 @@ pub(crate) fn render_check(work: &str, file: Option<&str>, raw: &str) -> String 
     };
     let at = match file {
         Some(f) => format!("`{f}:{line}`"),
-        None => format!("line {line}"),
+        None => i18n::line(lang, i18n::Line::StepAt).replace("{n}", &line.to_string()),
     };
     format!(
-        "**First step that doesn't hold** ({at}):\n\n> {}",
+        "{}\n\n> {}",
+        i18n::line(lang, i18n::Line::FirstWrongStep).replace("{at}", &at),
         sources::cap(&own)
     )
 }
@@ -666,7 +697,7 @@ mod tests {
     #[test]
     fn check_names_the_step_and_nothing_else() {
         let work = "x^2 - 4 = 0\n(x - 2)(x + 2) = 0\nx = 2 or x = 4";
-        let out = render_check(work, None, r#"{"first_wrong": "x = 2 or x = 4"}"#);
+        let out = render_check(None, work, None, r#"{"first_wrong": "x = 2 or x = 4"}"#);
         assert!(
             out.starts_with("**First step that doesn't hold** (line 3):"),
             "{out}"
@@ -674,20 +705,22 @@ mod tests {
         assert!(out.contains("> x = 2 or x = 4"));
         // A reason smuggled in is a broken contract.
         let out = render_check(
+            None,
             work,
             None,
             r#"{"first_wrong": "x = 2 or x = 4", "why": "x + 2 = 0 gives -2"}"#,
         );
         assert!(out.starts_with("Couldn't point"));
         // A step that isn't in the work is not shown.
-        let out = render_check(work, None, r#"{"first_wrong": "x = -2"}"#);
+        let out = render_check(None, work, None, r#"{"first_wrong": "x = -2"}"#);
         assert!(out.starts_with("Couldn't point"));
         assert_eq!(
-            render_check(work, Some("w.md"), r#"{"first_wrong": null}"#),
+            render_check(None, work, Some("w.md"), r#"{"first_wrong": null}"#),
             "**No step found that doesn't hold.**"
         );
         assert!(
             render_check(
+                None,
                 work,
                 Some("w.md"),
                 r#"{"first_wrong":"(x - 2)(x + 2) = 0"}"#

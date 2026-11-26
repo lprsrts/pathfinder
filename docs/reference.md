@@ -179,7 +179,7 @@ Attach documents, papers or screenshots: images (PNG, JPEG, GIF, WebP) and PDFs 
 
 Open the folder you're working in as the workspace and the model finds things itself: `read` returns a PDF's text page by page (`pages: "3-7"`), and `view` shows it up to four pages as images, for circuits, diagrams and plots that text can't carry. Both use poppler (`brew install poppler`); without it, attach the file instead.
 
-Pathfinder's own lines (the candidate prompt, the part prompt, map-change proposals, test questions) follow the conversation's language, German or English; models write everything else in your language.
+Pathfinder's own lines (the headers of sourced replies, `/tell`, `/check` and `/find`, the candidate prompt, the part prompt, map-change proposals, test questions) follow the conversation's language: English, Chinese, Hindi, Spanish, Arabic, French, Bengali, Portuguese, Russian, Urdu, Indonesian, German, Japanese, Turkish, Korean, Italian or Vietnamese, and English for any other. Models write everything else in your language. The terminal's own interface (help, hints, status) is in English.
 
 ## How a session goes
 

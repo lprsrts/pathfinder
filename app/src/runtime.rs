@@ -473,14 +473,9 @@ fn exam_questions_asked(session: &Session) -> Vec<String> {
                 .history
                 .iter()
                 .filter(|t| t.role == "assistant")
-                .filter(|t| {
-                    [Some("de"), None].iter().any(|lang| {
-                        t.content
-                            .starts_with(i18n::line(*lang, i18n::Line::ExamQuestionFor))
-                    })
-                })
+                .filter(|t| i18n::opens_with(&t.content, i18n::Line::ExamQuestionFor))
                 .filter_map(|t| {
-                    let (_, q) = t.content.split_once("**:\n\n")?;
+                    let (_, q) = t.content.split_once("\n\n")?;
                     let q = q.rsplit_once("\n\n").map_or(q, |(q, _)| q);
                     Some(q.trim().to_string())
                 }),

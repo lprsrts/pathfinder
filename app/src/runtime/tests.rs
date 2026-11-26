@@ -584,8 +584,8 @@ async fn a_claim_of_understanding_gets_one_candidate_then_chat_goes_on() {
             .last()
             .unwrap()
             .content
-            .starts_with("**Not found**"),
-        "a question gets sources, never the model's answer"
+            .starts_with("**Nicht gefunden**"),
+        "a question gets sources in the conversation's language, never the model's answer"
     );
 }
 
@@ -818,10 +818,7 @@ async fn a_question_is_answered_without_a_task() {
     let last = &s.history.last().unwrap().content;
     assert!(last.starts_with("**Told**"), "{last}");
     assert!(last.contains("A phasor is a complex number"));
-    assert!(
-        last.contains("Recorded as told: Phasors"),
-        "{last}"
-    );
+    assert!(last.contains("Recorded as told: Phasors"), "{last}");
     let events = rt.store.events(&ws, &["phasors".to_string()]).unwrap();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].kind, crate::understanding::EventKind::Told);

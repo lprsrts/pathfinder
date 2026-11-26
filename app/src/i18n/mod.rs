@@ -1,0 +1,314 @@
+//! The fixed lines Pathfinder writes itself, in the conversation's
+//! language. Models write everything else in the user's language already;
+//! these lines are the ones that would otherwise stay English.
+//!
+//! One file per language. A language missing here falls back to English.
+
+use crate::domain::PartStatus;
+use crate::understanding::ConceptState;
+
+mod ar;
+mod bn;
+mod de;
+mod en;
+mod es;
+mod fr;
+mod hi;
+mod id;
+mod it;
+mod ja;
+mod ko;
+mod pt;
+mod ru;
+mod tr;
+mod ur;
+mod vi;
+mod zh;
+
+/// A line Pathfinder writes itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Line {
+    /// Before a candidate: "{title}".
+    CandidateFor,
+    /// After a candidate.
+    IsItRight,
+    /// A pass that doesn't settle the part yet.
+    PassedOneMore,
+    /// Under the first part's card.
+    PartHint,
+    /// Before the concepts a part rests on.
+    RestsOn,
+    /// After an answer that names concepts on the record: "{labels}".
+    ToldNotShown,
+    /// A gap under the part: "{concept}", "{why}".
+    GapNeeds,
+    GapClaimed,
+    GapDelegated,
+    GapShaky,
+    GapUncovered,
+    /// A proposed gap part's note: "{part}".
+    NeededBy,
+    /// A gap proposal's brief: "{names}".
+    AddGapParts,
+    /// Joins names in a list.
+    And,
+    /// Before a proposed map change.
+    ProposedChange,
+    /// After a proposed map change.
+    AcceptReject,
+    /// A proposed part's dependencies: "{deps}".
+    Needs,
+    /// The gate's reply when a draft can't be shown.
+    FixedReply,
+    /// After the fixed reply: the shared gate's daily checks are used up.
+    GateCapped,
+    /// After the fixed reply: the gate's service couldn't be reached.
+    GateUnavailable,
+    /// A part judged understood: "{title}".
+    Understood,
+    /// A failed check.
+    KeepWorking,
+    AllResolved,
+    NoOtherPart,
+    MapUpdated,
+    ChangeRejected,
+    NoChangeWaiting,
+    /// A part skipped as known: "{title}".
+    RecordedKnown,
+    /// A part delegated: "{title}".
+    Delegated,
+    /// Before a quick check's candidate.
+    QuickCheckLead,
+    /// Before an exam's first question.
+    ExamLead,
+    /// Before an exam question: "{title}".
+    ExamQuestionFor,
+    /// After an exam question.
+    ExamAnswer,
+    /// Heading of the folder-wide record.
+    RecordTitle,
+    /// A concept you were only told about.
+    ToldOnly,
+    ReadOnly,
+    /// Before a part's pointer into the workspace.
+    ReadAt,
+    /// A log entry, taken without comment.
+    Logged,
+    /// The folder has no record yet.
+    NoRecord,
+    /// Under the record: "{shown}", "{told}", "{shaky}".
+    RecordSummary,
+    /// Checks on a concept: "{passed}", "{failed}".
+    Checks,
+    /// Under a part's `/why`.
+    EvidenceNote,
+    /// An open misconception: "{concept}", "{statement}".
+    OpenMisconception,
+    /// Before sourced hits.
+    WhereToLook,
+    /// No hit in the workspace or online.
+    NotFoundOnline,
+    /// No hit in the workspace.
+    NotFoundHere,
+    /// Suggested searches: "{terms}".
+    TryTerms,
+    /// Services that couldn't be searched: "{services}".
+    NotSearched,
+    /// Heading of a `/tell` answer.
+    Told,
+    /// `/check` found a wrong step: "{at}".
+    FirstWrongStep,
+    /// `/check` found none.
+    NoWrongStep,
+    /// `/check` couldn't place the step.
+    CheckUnclear,
+    /// A line of typed work: "{n}".
+    StepAt,
+    /// `/check` couldn't copy a photo.
+    PhotoUnreadable,
+    /// Before the copy of a photo: "{files}".
+    PhotoCopy,
+    /// `/find` hits: "{n}", "{terms}".
+    FindHits,
+    /// `/find` found nothing: "{terms}".
+    FindNone,
+    /// `/web` found nothing: "{terms}".
+    WebNone,
+}
+
+/// One language's lines and names.
+pub(crate) struct Table {
+    line: fn(Line) -> &'static str,
+    part: fn(PartStatus) -> &'static str,
+    state: fn(ConceptState) -> &'static str,
+}
+
+/// The languages with their own lines, by two-letter code.
+const LANGS: &[(&str, Table)] = &[
+    ("en", en::TABLE),
+    ("zh", zh::TABLE),
+    ("hi", hi::TABLE),
+    ("es", es::TABLE),
+    ("ar", ar::TABLE),
+    ("fr", fr::TABLE),
+    ("bn", bn::TABLE),
+    ("pt", pt::TABLE),
+    ("ru", ru::TABLE),
+    ("ur", ur::TABLE),
+    ("id", id::TABLE),
+    ("de", de::TABLE),
+    ("ja", ja::TABLE),
+    ("tr", tr::TABLE),
+    ("ko", ko::TABLE),
+    ("it", it::TABLE),
+    ("vi", vi::TABLE),
+];
+
+fn table(lang: Option<&str>) -> &'static Table {
+    let found = lang.and_then(|l| LANGS.iter().find(|(c, _)| c.eq_ignore_ascii_case(l)));
+    &found.unwrap_or(&LANGS[0]).1
+}
+
+/// The line in `lang` (a two-letter code); English when it's unknown.
+pub fn line(lang: Option<&str>, line: Line) -> &'static str {
+    (table(lang).line)(line)
+}
+
+/// A part status's name in `lang`.
+pub fn part_status(lang: Option<&str>, s: PartStatus) -> &'static str {
+    (table(lang).part)(s)
+}
+
+/// A concept state's name in `lang`.
+pub fn state(lang: Option<&str>, s: ConceptState) -> &'static str {
+    (table(lang).state)(s)
+}
+
+/// Whether `text` opens with `line`'s header (one with a "{title}") in any
+/// language.
+pub fn opens_with(text: &str, which: Line) -> bool {
+    let first = text.lines().next().unwrap_or("");
+    LANGS.iter().any(|(_, t)| {
+        let Some((pre, post)) = (t.line)(which).split_once("{title}") else {
+            return false;
+        };
+        first.len() >= pre.len() + post.len() && first.starts_with(pre) && first.ends_with(post)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ALL_LINES: &[Line] = &[
+        Line::CandidateFor,
+        Line::IsItRight,
+        Line::PassedOneMore,
+        Line::PartHint,
+        Line::RestsOn,
+        Line::ToldNotShown,
+        Line::GapNeeds,
+        Line::GapClaimed,
+        Line::GapDelegated,
+        Line::GapShaky,
+        Line::GapUncovered,
+        Line::NeededBy,
+        Line::AddGapParts,
+        Line::And,
+        Line::ProposedChange,
+        Line::AcceptReject,
+        Line::Needs,
+        Line::FixedReply,
+        Line::GateCapped,
+        Line::GateUnavailable,
+        Line::Understood,
+        Line::KeepWorking,
+        Line::AllResolved,
+        Line::NoOtherPart,
+        Line::MapUpdated,
+        Line::ChangeRejected,
+        Line::NoChangeWaiting,
+        Line::RecordedKnown,
+        Line::Delegated,
+        Line::QuickCheckLead,
+        Line::ExamLead,
+        Line::ExamQuestionFor,
+        Line::ExamAnswer,
+        Line::RecordTitle,
+        Line::ToldOnly,
+        Line::ReadOnly,
+        Line::ReadAt,
+        Line::Logged,
+        Line::NoRecord,
+        Line::RecordSummary,
+        Line::Checks,
+        Line::EvidenceNote,
+        Line::OpenMisconception,
+        Line::WhereToLook,
+        Line::NotFoundOnline,
+        Line::NotFoundHere,
+        Line::TryTerms,
+        Line::NotSearched,
+        Line::Told,
+        Line::FirstWrongStep,
+        Line::NoWrongStep,
+        Line::CheckUnclear,
+        Line::StepAt,
+        Line::PhotoUnreadable,
+        Line::PhotoCopy,
+        Line::FindHits,
+        Line::FindNone,
+        Line::WebNone,
+    ];
+
+    fn placeholders(s: &str) -> Vec<&str> {
+        let mut out: Vec<&str> = s
+            .match_indices('{')
+            .filter_map(|(i, _)| s[i..].find('}').map(|j| &s[i..i + j + 1]))
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
+    fn commands(s: &str) -> Vec<&str> {
+        let mut out: Vec<&str> = s.split('`').skip(1).step_by(2).collect();
+        out.sort_unstable();
+        out
+    }
+
+    #[test]
+    fn the_conversation_language_or_english() {
+        assert_eq!(line(Some("de"), Line::IsItRight), "Stimmt das? Sag, warum.");
+        assert_eq!(line(Some("xx"), Line::IsItRight), "Is it right? Say why.");
+        assert_eq!(line(None, Line::RestsOn), "Rests on");
+        assert_eq!(state(Some("DE"), ConceptState::Shaky), "wackelig");
+        assert_eq!(line(Some("tr"), Line::Logged), "Not alındı.");
+    }
+
+    #[test]
+    fn every_language_keeps_placeholders_and_commands() {
+        for (code, t) in LANGS {
+            for &l in ALL_LINES {
+                let (en, own) = (line(None, l), (t.line)(l));
+                assert!(!own.trim().is_empty(), "{code} {l:?} is empty");
+                assert_eq!(placeholders(en), placeholders(own), "{code} {l:?}");
+                assert_eq!(commands(en), commands(own), "{code} {l:?}");
+                if en.starts_with("**") {
+                    assert!(own.starts_with("**"), "{code} {l:?} bold");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn headers_are_recognised_in_every_language() {
+        for (code, _) in LANGS {
+            let h = line(Some(code), Line::ExamQuestionFor).replace("{title}", "Phasors");
+            assert!(
+                opens_with(&format!("{h}\n\nWhy?"), Line::ExamQuestionFor),
+                "{code}"
+            );
+        }
+        assert!(!opens_with("Just a reply.", Line::ExamQuestionFor));
+    }
+}

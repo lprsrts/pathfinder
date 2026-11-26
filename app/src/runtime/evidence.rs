@@ -486,7 +486,7 @@ impl Runtime {
         };
         let lang = session.language.as_deref();
         let header = format!(
-            "{} **{}**:\n\n",
+            "{}\n\n",
             i18n::line(
                 lang,
                 if exam {
@@ -494,8 +494,8 @@ impl Runtime {
                 } else {
                     i18n::Line::CandidateFor
                 }
-            ),
-            part.title
+            )
+            .replace("{title}", &part.title)
         );
         // The candidate's reasoning would give away whether (and where) it's
         // flawed, so it's never shown. The header goes right before the

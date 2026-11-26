@@ -10,6 +10,7 @@ What changed in each release of Pathfinder, newest first. `pathfinder update` sh
 - **`/check`** finds the first step of your work that doesn't hold, from typed steps, a file, or a photo or scan of handwritten work, and quotes it without saying why.
 - **Spelling and word forms don't matter in search:** "K-means" finds "kmeans", "Schroedinger" finds "Schrödinger", "clustering" finds "clusters".
 - In a task, messages that aren't questions get "Logged." and no comment. A reply held back while you judge a candidate is replaced by a fixed one, no longer rewritten.
+- **More languages.** Pathfinder's own lines, including the headers of sourced replies and `/check`, now come in Chinese, Hindi, Spanish, Arabic, French, Bengali, Portuguese, Russian, Urdu, Indonesian, Japanese, Turkish, Korean, Italian and Vietnamese, as well as English and German.
 - New keys: `pathfinder auth set brave` and `pathfinder auth set openalex`. New settings: `quote_cap` and `sources_search`.
 
 ## 0.3.4
