@@ -340,8 +340,11 @@ pub(crate) fn cited_hits(
         hits = sources::find(cwd, &keywords, sources::MAX_HITS * 4)
             .into_iter()
             .filter(|h| {
-                let low = h.quote.to_lowercase();
-                keywords.iter().filter(|k| low.contains(k.as_str())).count() >= 2
+                keywords
+                    .iter()
+                    .filter(|k| sources::mentions(&h.quote, k))
+                    .count()
+                    >= 2
             })
             .take(3)
             .collect();

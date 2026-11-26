@@ -92,20 +92,66 @@ pub fn normalise(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Lowercase, one char per char, so char positions line up with the input.
-fn fold(text: &str) -> String {
-    text.chars()
-        .map(|c| c.to_lowercase().next().unwrap_or(c))
-        .collect()
+/// Latin letters with marks, as the plain letters people type for them.
+fn plain(c: char) -> Option<&'static str> {
+    Some(match c {
+        'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' | 'ā' | 'ă' | 'ą' => "a",
+        'ç' | 'ć' | 'č' => "c",
+        'ď' | 'đ' => "d",
+        'è' | 'é' | 'ê' | 'ë' | 'ē' | 'ė' | 'ę' | 'ě' => "e",
+        'ğ' => "g",
+        'ì' | 'í' | 'î' | 'ï' | 'ī' | 'į' | 'ı' => "i",
+        'ł' | 'ľ' => "l",
+        'ñ' | 'ń' | 'ň' => "n",
+        'ò' | 'ó' | 'ô' | 'õ' | 'ö' | 'ø' | 'ō' | 'ő' => "o",
+        'ř' => "r",
+        'ś' | 'š' | 'ş' => "s",
+        'ß' => "ss",
+        'ť' | 'ţ' => "t",
+        'ù' | 'ú' | 'û' | 'ü' | 'ū' | 'ů' | 'ű' => "u",
+        'ý' | 'ÿ' => "y",
+        'ź' | 'ż' | 'ž' => "z",
+        'æ' => "ae",
+        'œ' => "oe",
+        _ => return None,
+    })
 }
 
-/// Where `quote` occurs in `lines`, matched after [`normalise`] and ignoring
-/// case ("Kmeans" finds "kmeans"), spanning at most [`MAX_SPAN`] lines: the
-/// 1-based start line and the source's own words for it (its case, not the
-/// quote's).
+/// The form spelling variants share: lowercase letters and digits only,
+/// marks dropped. "K-means", "k means" and "kmeans" are all "kmeans";
+/// "Schrödinger" is "schrodinger". With each output char, the index of the
+/// input char it came from.
+pub fn loose(text: &str) -> (String, Vec<usize>) {
+    let mut out = String::new();
+    let mut from = Vec::new();
+    for (i, c) in text.chars().enumerate() {
+        let c = c.to_lowercase().next().unwrap_or(c);
+        if let Some(p) = plain(c) {
+            out.push_str(p);
+            from.extend(std::iter::repeat_n(i, p.len()));
+        } else if c.is_alphanumeric() {
+            out.push(c);
+            from.push(i);
+        }
+    }
+    (out, from)
+}
+
+/// Whether `text` contains `term` up to spelling variants (see [`loose`]).
+pub fn mentions(text: &str, term: &str) -> bool {
+    let t = loose(term).0;
+    !t.is_empty() && loose(text).0.contains(&t)
+}
+
+/// Where `quote` occurs in `lines`, spanning at most [`MAX_SPAN`] lines,
+/// compared in [`loose`] form: case, punctuation, spacing, hyphens and marks
+/// don't matter, the letters and digits and their order do. Returns the
+/// 1-based start line and the source's own text for the match.
 pub fn locate(lines: &[&str], quote: &str) -> Option<(usize, String)> {
-    let want = fold(&normalise(quote));
-    if want.chars().count() < 8 {
+    let want = loose(quote).0;
+    let n = want.chars().count();
+    // Short enough for a step of maths ("(x-2)(x+2)=0" is "x2x20").
+    if n < 4 {
         return None;
     }
     // The first line the quote ends on, then the latest line it can start
@@ -113,10 +159,19 @@ pub fn locate(lines: &[&str], quote: &str) -> Option<(usize, String)> {
     for end in 0..lines.len() {
         for start in (end.saturating_sub(MAX_SPAN - 1)..=end).rev() {
             let have = normalise(&lines[start..=end].join("\n"));
-            let folded = fold(&have);
+            let (folded, from) = loose(&have);
             if let Some(at) = folded.find(&want) {
-                let from = folded[..at].chars().count();
-                let own: String = have.chars().skip(from).take(want.chars().count()).collect();
+                let first = folded[..at].chars().count();
+                let chars: Vec<char> = have.chars().collect();
+                let (mut a, mut b) = (from[first], from[first + n - 1]);
+                // Take the punctuation around the words with them.
+                while a > 0 && "([{\"'“‘«".contains(chars[a - 1]) {
+                    a -= 1;
+                }
+                while b + 1 < chars.len() && ".,;:!?)]}\"'”’»%".contains(chars[b + 1]) {
+                    b += 1;
+                }
+                let own: String = chars[a..=b].iter().collect();
                 return Some((start + 1, own));
             }
         }
@@ -366,7 +421,7 @@ pub fn source_files(cwd: &Path) -> Vec<(PathBuf, String)> {
 pub fn find(cwd: &Path, terms: &[String], limit: usize) -> Vec<Hit> {
     let terms: Vec<String> = terms
         .iter()
-        .map(|t| t.to_lowercase())
+        .map(|t| loose(t).0)
         .filter(|t| !t.is_empty())
         .collect();
     if terms.is_empty() {
@@ -381,7 +436,7 @@ pub fn find(cwd: &Path, terms: &[String], limit: usize) -> Vec<Hit> {
         let pdf = is_pdf(&full);
         for (pi, page) in pages.iter().enumerate() {
             for (li, line) in page.lines().enumerate() {
-                let low = line.to_lowercase();
+                let low = loose(line).0;
                 let n = terms.iter().filter(|t| low.contains(t.as_str())).count();
                 if n == 0 {
                     continue;
@@ -494,7 +549,7 @@ pub fn web_hits(results: &[WebResult]) -> Vec<Hit> {
         .filter_map(|r| verify_web(&r.url, r.section.as_deref(), &r.page_text, &r.quote))
     {
         // The same abstract from two catalogues is one hit.
-        if !hits.iter().any(|o| fold(&o.quote) == fold(&h.quote)) {
+        if !hits.iter().any(|o| loose(&o.quote).0 == loose(&h.quote).0) {
             hits.push(h);
         }
     }
@@ -510,7 +565,7 @@ pub const HEADING: char = '\u{1}';
 pub fn pick_quote(page_text: &str, terms: &[String]) -> Option<(Option<String>, String)> {
     let terms: Vec<String> = terms
         .iter()
-        .map(|t| fold(t))
+        .map(|t| loose(t).0)
         .filter(|t| t.len() > 1)
         .collect();
     if terms.is_empty() {
@@ -528,7 +583,7 @@ pub fn pick_quote(page_text: &str, terms: &[String]) -> Option<(Option<String>, 
         if words < 5 {
             continue;
         }
-        let low = fold(line);
+        let low = loose(line).0;
         let n = terms.iter().filter(|t| low.contains(t.as_str())).count();
         // A title only wins over body text with more terms.
         let score = n * 2 + usize::from(section.as_deref() != Some("Title"));
@@ -741,6 +796,30 @@ mod tests {
         let shown = open(d.path(), "notes.md", Some(5)).unwrap();
         assert!(shown.contains("    5  It is linear."));
         assert!(open(d.path(), "../x", None).is_err());
+    }
+
+    #[test]
+    fn spelling_variants_match_and_show_the_source() {
+        assert!(mentions("We run K-means on the data.", "kmeans"));
+        assert!(mentions("We run k means on the data.", "K-Means"));
+        assert!(mentions("Schrödinger's equation", "schrodinger"));
+        assert!(mentions("Die Straße", "strasse"));
+        assert!(!mentions("We run k-medoids.", "kmeans"));
+        let lines = [
+            "Then K-means assigns each point",
+            "to its nearest centroid.",
+        ];
+        assert_eq!(
+            locate(&lines, "kmeans assigns each point to its nearest centroid"),
+            Some((
+                1,
+                "K-means assigns each point to its nearest centroid.".to_string()
+            ))
+        );
+        let d = ws(&[("c.md", "Intro\nWe use k means clustering here.\n")]);
+        let hits = find(d.path(), &["K-Means".into()], 5);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].quote, "We use k means clustering here.");
     }
 
     #[test]
