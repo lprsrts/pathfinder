@@ -21,6 +21,21 @@ Use your read-only tools (list, grep, read; PDFs are read by page) to search the
 
 const TELL_SYSTEM: &str = r#"The user typed /tell: they explicitly asked to be told the answer, and it is recorded as told (not understood). Answer what they asked, correctly and briefly, like a strong tutor. Where the workspace has a source for it, name the file and page. Write math as plain text or Unicode, never LaTeX. Reply in the user's language."#;
 
+const CHECK_SYSTEM: &str = r#"The user shows their own work (a derivation, calculation, proof or code) and wants to know where it first goes wrong. You never explain why a step is wrong, never give the fix, the right result or a hint.
+
+Find the first step that does not follow from what comes before it (or is wrong on its own). Return ONLY this JSON object:
+{"first_wrong": "the step, copied character for character from their work"}
+or, if every step holds:
+{"first_wrong": null}
+
+Copy one step or line exactly as they wrote it, at most 200 characters. A step that is not literally in their work is thrown away."#;
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckReply {
+    first_wrong: Option<String>,
+}
+
 /// Where a source event is filed when no idea on the record is named.
 const SOURCES: &str = "sources";
 
@@ -142,6 +157,46 @@ impl Runtime {
         sink(StreamEvent::TextDelta(tail.clone()));
         session.push_turn("assistant", format!("{header}{answer}{tail}"));
         Ok(TurnOutput::text(String::new()))
+    }
+
+    /// `/check <your work>` or `/check <file>`: the first step that doesn't
+    /// hold, quoted from the work itself, with no reason and no fix.
+    pub(super) async fn handle_check(
+        &self,
+        session: &mut Session,
+        arg: &str,
+        files: &[PathBuf],
+        sink: StreamSink,
+    ) -> Result<TurnOutput> {
+        // The work: a workspace file named as the argument, else the text.
+        let (work, file) = match sources::confine(&session.cwd, arg) {
+            Some(full) => match sources::pages(&full, arg) {
+                Ok(pages) => (pages.join("\n"), Some(arg.trim().to_string())),
+                Err(e) => return Ok(TurnOutput::text(e)),
+            },
+            None => (arg.to_string(), None),
+        };
+        if work.trim().is_empty() && files.is_empty() {
+            return Ok(TurnOutput::text(
+                "`/check <your work>` or `/check <file>`: the first step that doesn't hold.",
+            ));
+        }
+        session.push_turn("user", format!("/check {arg}"));
+        let req = EngineRequest {
+            tier: EngineTier::System2,
+            tools: ToolAccess::None,
+            cwd: session.cwd.clone(),
+            system_prompt: CHECK_SYSTEM.to_string(),
+            prompt: format!("Their work:\n{work}\n\nReturn the JSON only."),
+            files: files.to_vec(),
+            stream_text: false,
+            models: self.models(session)?,
+            ctx: crate::engine::turn_ctx(),
+        };
+        let raw = self.engine.run_text(&req, gate::held(&sink)).await?;
+        let reply = render_check(&work, file.as_deref(), &raw);
+        session.push_turn("assistant", &reply);
+        Ok(TurnOutput::text(reply))
     }
 
     /// `/find <terms>`: raw matching lines, recorded as searched.
@@ -300,6 +355,36 @@ pub(crate) fn cited_hits(
     (hits, terms)
 }
 
+/// The `/check` reply: the first wrong step if the model's quote is really
+/// in the work, else nothing it said.
+pub(crate) fn render_check(work: &str, file: Option<&str>, raw: &str) -> String {
+    let unclear =
+        "Couldn't point to a step in your work. Write it out one step per line and `/check` again.";
+    let t = raw
+        .trim()
+        .trim_start_matches("```json")
+        .trim_matches('`')
+        .trim();
+    let Ok(reply) = serde_json::from_str::<CheckReply>(t) else {
+        return unclear.into();
+    };
+    let Some(step) = reply.first_wrong.filter(|s| !s.trim().is_empty()) else {
+        return "**No step found that doesn't hold.**".into();
+    };
+    let lines: Vec<&str> = work.lines().collect();
+    let Some((line, own)) = sources::locate(&lines, &step) else {
+        return unclear.into();
+    };
+    let at = match file {
+        Some(f) => format!("`{f}:{line}`"),
+        None => format!("line {line}"),
+    };
+    format!(
+        "**First step that doesn't hold** ({at}):\n\n> {}\n\nWhy is for you to find: `/find`, `/open`, or `/tell` (recorded as told).",
+        sources::cap(&own)
+    )
+}
+
 /// `paper.pdf 3`, `notes.md:120` or `notes.md`.
 fn parse_open(arg: &str) -> (String, Option<usize>) {
     let arg = arg.trim();
@@ -319,6 +404,39 @@ fn parse_open(arg: &str) -> (String, Option<usize>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn check_names_the_step_and_nothing_else() {
+        let work = "x^2 - 4 = 0\n(x - 2)(x + 2) = 0\nx = 2 or x = 4";
+        let out = render_check(work, None, r#"{"first_wrong": "x = 2 or x = 4"}"#);
+        assert!(
+            out.starts_with("**First step that doesn't hold** (line 3):"),
+            "{out}"
+        );
+        assert!(out.contains("> x = 2 or x = 4"));
+        // A reason smuggled in is a broken contract.
+        let out = render_check(
+            work,
+            None,
+            r#"{"first_wrong": "x = 2 or x = 4", "why": "x + 2 = 0 gives -2"}"#,
+        );
+        assert!(out.starts_with("Couldn't point"));
+        // A step that isn't in the work is not shown.
+        let out = render_check(work, None, r#"{"first_wrong": "x = -2"}"#);
+        assert!(out.starts_with("Couldn't point"));
+        assert_eq!(
+            render_check(work, Some("w.md"), r#"{"first_wrong": null}"#),
+            "**No step found that doesn't hold.**"
+        );
+        assert!(
+            render_check(
+                work,
+                Some("w.md"),
+                r#"{"first_wrong":"(x - 2)(x + 2) = 0"}"#
+            )
+            .contains("(`w.md:2`)")
+        );
+    }
 
     #[test]
     fn open_arguments() {

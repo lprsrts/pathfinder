@@ -84,13 +84,17 @@ pub const LOCAL: [(Local, &str, &[&str], &str); 14] = [
 ];
 
 /// The task commands, run by the runtime: (name, what it does).
-pub const TASK: [(&str, &str); 19] = [
+pub const TASK: [(&str, &str); 20] = [
     ("/find", "search the workspace's files: /find <terms>"),
     ("/open", "read a source: /open <file> [page or line]"),
-    ("/web", "search the web for raw hits: /web <terms>"),
+    ("/web", "search papers and the web: /web <terms>"),
     (
         "/tell",
         "be told an answer (recorded as told): /tell <question>",
+    ),
+    (
+        "/check",
+        "the first step of your work that doesn't hold: /check <work or file>",
     ),
     ("/why", "your record, or what the current part rests on"),
     ("/map", "the plan as a diagram"),
