@@ -362,7 +362,7 @@ async fn failed_judgment_keeps_part_open() {
     turn(&rt, "thinking").await;
     turn(&rt, "/summary s").await;
     let out = turn(&rt, "looks wrong").await;
-    assert!(out.reply.contains("explain the part again"));
+    assert!(out.reply.contains("explain it again"));
     let s = rt.load_session("s").unwrap().unwrap();
     assert_eq!(s.map.get("route").unwrap().status, PartStatus::Open);
     assert!(s.pending_candidate.is_none());
@@ -551,7 +551,7 @@ async fn a_claim_of_understanding_gets_one_candidate_then_chat_goes_on() {
     assert!(s.pending_change.is_none(), "no gap parts in a quick check");
     assert!(out.reply.contains("Stimmt das?"), "{}", out.reply);
     let shown: Vec<&str> = s.history.iter().map(|t| t.content.as_str()).collect();
-    assert!(shown.contains(&"Dann kurz zum Festigen:"), "{shown:?}");
+    assert!(shown.contains(&"Kurze Prüfung:"), "{shown:?}");
     assert!(
         !shown.iter().any(|t| t.contains("Denk hier laut")),
         "no part card or hints in a quick check"
@@ -819,7 +819,7 @@ async fn a_question_is_answered_without_a_task() {
     assert!(last.starts_with("**Told**"), "{last}");
     assert!(last.contains("A phasor is a complex number"));
     assert!(
-        last.contains("Told, not shown: Phasors is on your record"),
+        last.contains("Recorded as told: Phasors"),
         "{last}"
     );
     let events = rt.store.events(&ws, &["phasors".to_string()]).unwrap();
@@ -979,7 +979,7 @@ async fn the_gate_holds_replies_while_you_judge() {
     let s = rt.load_session("s").unwrap().unwrap();
     let held = &s.history.last().unwrap().content;
     assert!(held.starts_with(crate::secrets::FIXED_REPLY), "{held}");
-    assert!(held.contains("couldn't be reached"), "{held}");
+    assert!(held.contains("Check unreachable"), "{held}");
 
     turn(&rt, "it's wrong, unknown names are rejected").await;
     assert!(!rt.store.secret(&id).unwrap().unwrap().active);

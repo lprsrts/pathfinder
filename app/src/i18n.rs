@@ -96,42 +96,30 @@ pub fn line(lang: Option<&str>, line: Line) -> &'static str {
         match line {
             CandidateFor => "Kandidat für",
             IsItRight => "Stimmt das? Sag, warum.",
-            PassedOneMore => {
-                "Bestanden. Dieser Teil beruht auf mehr, als diese Prüfung abgedeckt hat, also noch einer:"
-            }
-            PartHint => {
-                "Denk hier laut, während du arbeitest: deine Überlegungen und Gründe sind das Protokoll. Wenn du den ganzen Teil erklären kannst, sag es und erklär ihn (`/summary`); sag, wenn du ihn schon kannst (`/known`); `/delegate` gibt ihn ab, ohne ihn zu verstehen."
-            }
+            PassedOneMore => "Bestanden. Noch einer:",
+            PartHint => "Denk hier laut. `/summary` · `/known` · `/delegate`",
             RestsOn => "Beruht auf",
-            ToldNotShown => "Gesagt, nicht gezeigt: {labels} steht damit in deinem Verlauf.",
+            ToldNotShown => "Als gesagt vermerkt: {labels}.",
             GapNeeds => "Zuerst braucht es **{concept}**: {why}.",
             GapClaimed => "du hast angegeben, es zu können, aber noch nicht gezeigt",
             GapDelegated => "du hast es abgegeben, ohne es zu verstehen",
             GapShaky => "deine letzte Prüfung dazu ist danebengegangen",
             GapUncovered => "nichts auf der Karte deckt es bisher ab",
             NeededBy => "Gebraucht für {part}.",
-            AddGapParts => {
-                "Einen kleinen Teil für {names} hinzufügen, damit dieser Teil nicht ungeprüft darauf beruht."
-            }
+            AddGapParts => "Einen Teil für {names} hinzufügen?",
             And => " und ",
             ProposedChange => "Vorgeschlagene Kartenänderung:",
             AcceptReject => "`/accept` oder `/reject`.",
             Needs => "braucht {deps}",
-            FixedReply => {
-                "Genau das beurteilst du gerade, deshalb kann ich es vor deinem Urteil nicht klären. Gib dein Urteil mit Begründung ab; was richtig oder falsch war, siehst du danach."
-            }
+            FixedReply => "Das beurteilst du gerade. Erst dein Urteil.",
             GateCapped => {
-                "(Die geteilten Prüfungen für heute sind aufgebraucht, deshalb halte ich Antworten zum Kandidaten zurück, bis du geurteilt hast. Mit einem eigenen TypeSafe-Schlüssel geht es sofort weiter: `pathfinder auth set typesafe`.)"
+                "(Geteilte Prüfungen für heute aufgebraucht; Antworten zum Kandidaten erst nach deinem Urteil. Eigener Schlüssel: `pathfinder auth set typesafe`.)"
             }
             GateUnavailable => {
-                "(Die Prüfung, die die Antwort zurückhält, war gerade nicht erreichbar, deshalb halte ich sie lieber zurück. Versuch es gleich noch einmal.)"
+                "(Prüfung nicht erreichbar, Antwort zurückgehalten. Versuch es gleich noch einmal.)"
             }
-            Understood => {
-                "**{title}** verstanden. Sag, wenn es weitergehen soll (`/next`), oder `/handoff`, wenn dieser Teil Arbeit für den Agenten hat."
-            }
-            KeepWorking => {
-                "Arbeite es hier weiter durch und erklär den Teil dann noch einmal für einen neuen Kandidaten."
-            }
+            Understood => "**{title}** verstanden. `/next` · `/handoff`",
+            KeepWorking => "Arbeite weiter und erklär es dann noch einmal.",
             AllResolved => "Alle Teile sind erledigt.",
             NoOtherPart => "Kein weiterer offener Teil.",
             MapUpdated => "Karte aktualisiert.",
@@ -139,67 +127,47 @@ pub fn line(lang: Option<&str>, line: Line) -> &'static str {
             NoChangeWaiting => "Es wartet keine Kartenänderung.",
             RecordedKnown => "**{title}** als schon bekannt vermerkt.",
             Delegated => "**{title}** ohne Verständnis abgegeben; nicht geprüft.",
-            QuickCheckLead => "Dann kurz zum Festigen:",
-            ExamLead => {
-                "Prüfungssimulation: eine Frage nach der anderen. Antworte so, wie du es in der Prüfung erklären würdest. Hör auf oder frag etwas anderes, wann immer du willst."
-            }
+            QuickCheckLead => "Kurze Prüfung:",
+            ExamLead => "Prüfungssimulation, eine Frage nach der anderen.",
             ExamQuestionFor => "Prüfungsfrage zu",
             ExamAnswer => "Deine Antwort?",
             RecordTitle => "**Dein Verlauf in diesem Ordner**",
             Checks => "{passed} bestanden, {failed} nicht",
-            EvidenceNote => {
-                "Als verstanden zählt nur eine bestandene Prüfung; eine Behauptung nie, und sicheres Verständnis kühlt nach 30 Tagen ohne neue Prüfung ab."
-            }
+            EvidenceNote => "Nur bestandene Prüfungen zählen.",
             OpenMisconception => "Offenes Missverständnis bei {concept}: „{statement}“",
             ToldOnly => "nur gesagt",
             ReadOnly => "gelesen",
             ReadAt => "Lesen:",
             Logged => "Notiert.",
-            NoRecord => {
-                "Für diesen Ordner gibt es noch keinen Verlauf: Frag etwas, oder lass dich prüfen."
-            }
-            RecordSummary => {
-                "Gezeigt: {shown} · nur gesagt: {told} · wackelig: {shaky}. Als verstanden zählt nur eine bestandene Prüfung; eine Behauptung nie, und sicheres Verständnis kühlt nach 30 Tagen ohne neue Prüfung ab."
-            }
+            NoRecord => "Noch kein Verlauf.",
+            RecordSummary => "Gezeigt: {shown} · nur gesagt: {told} · wackelig: {shaky}",
         }
     } else {
         match line {
             CandidateFor => "Candidate for",
             IsItRight => "Is it right? Say why.",
-            PassedOneMore => {
-                "Passed. This part rests on more than that check covered, so one more:"
-            }
-            PartHint => {
-                "Talk it through here as you work: your thinking and reasons are the log. When you can explain the whole part, say so and explain it (`/summary`); say if you already know it (`/known`); `/delegate` hands it off without understanding it."
-            }
+            PassedOneMore => "Passed. One more:",
+            PartHint => "Think out loud here. `/summary` · `/known` · `/delegate`",
             RestsOn => "Rests on",
-            ToldNotShown => "Told, not shown: {labels} is on your record as told.",
+            ToldNotShown => "Recorded as told: {labels}.",
             GapNeeds => "It needs **{concept}** first: {why}.",
             GapClaimed => "you claimed to know it, with no evidence yet",
             GapDelegated => "you handed it off without understanding it",
             GapShaky => "your last check on it failed",
             GapUncovered => "nothing on the map covers it yet",
             NeededBy => "Needed by {part}.",
-            AddGapParts => {
-                "Add a small part for {names} so this part doesn't rest on it unchecked."
-            }
+            AddGapParts => "Add a part for {names}?",
             And => " and ",
             ProposedChange => "Proposed map change:",
             AcceptReject => "`/accept` or `/reject`.",
             Needs => "needs {deps}",
             FixedReply => crate::secrets::FIXED_REPLY,
             GateCapped => {
-                "(Today's shared checks are used up, so I'm holding back replies about the candidate until you've judged it. Your own TypeSafe key lifts the limit: `pathfinder auth set typesafe`.)"
+                "(Shared checks used up for today; replies about the candidate wait for your verdict. Own key: `pathfinder auth set typesafe`.)"
             }
-            GateUnavailable => {
-                "(The check that keeps the answer back couldn't be reached just now, so I held the reply back to be safe. Try again in a moment.)"
-            }
-            Understood => {
-                "**{title}** understood. Say when to move on (`/next`), or `/handoff` if this part has work for the agent."
-            }
-            KeepWorking => {
-                "Keep working through it here, then explain the part again for a new candidate."
-            }
+            GateUnavailable => "(Check unreachable, reply held back. Try again in a moment.)",
+            Understood => "**{title}** understood. `/next` · `/handoff`",
+            KeepWorking => "Keep working, then explain it again.",
             AllResolved => "Every part is resolved.",
             NoOtherPart => "No other unresolved part.",
             MapUpdated => "Map updated.",
@@ -207,26 +175,20 @@ pub fn line(lang: Option<&str>, line: Line) -> &'static str {
             NoChangeWaiting => "No map change is waiting.",
             RecordedKnown => "**{title}** recorded as already known.",
             Delegated => "**{title}** handed off without understanding; not reviewed.",
-            QuickCheckLead => "Then a quick one to make it stick:",
-            ExamLead => {
-                "Exam practice, one question at a time. Answer the way you would in the exam. Stop or ask something else whenever you like."
-            }
+            QuickCheckLead => "Quick check:",
+            ExamLead => "Exam practice, one question at a time.",
             ExamQuestionFor => "Question on",
             ExamAnswer => "Your answer?",
             RecordTitle => "**Your record in this folder**",
             Checks => "{passed} passed, {failed} failed",
-            EvidenceNote => {
-                "Only passed checks count as understanding; a claim never does, and solid understanding cools after 30 days without a fresh check."
-            }
+            EvidenceNote => "Only passed checks count.",
             OpenMisconception => "Open misconception on {concept}: \"{statement}\"",
             ToldOnly => "told only",
             ReadOnly => "read",
             ReadAt => "Read:",
             Logged => "Logged.",
-            NoRecord => "No record for this folder yet: ask something, or get tested.",
-            RecordSummary => {
-                "Shown: {shown} · told only: {told} · shaky: {shaky}. Only passed checks count as understanding; a claim never does, and solid understanding cools after 30 days without a fresh check."
-            }
+            NoRecord => "No record yet.",
+            RecordSummary => "Shown: {shown} · told only: {told} · shaky: {shaky}",
         }
     }
 }

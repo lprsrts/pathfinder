@@ -164,9 +164,7 @@ impl Runtime {
         sink: StreamSink,
     ) -> Result<TurnOutput> {
         if arg.is_empty() {
-            return Ok(TurnOutput::text(
-                "`/tell <question>`: told answer, recorded as told.",
-            ));
+            return Ok(TurnOutput::text("`/tell <question>`"));
         }
         session.push_turn("user", format!("/tell {arg}"));
         let req = EngineRequest {
@@ -183,7 +181,7 @@ impl Runtime {
             models: self.models(session)?,
             ctx: crate::engine::turn_ctx(),
         };
-        let header = "**Told** (recorded as told, not as understood)\n\n";
+        let header = "**Told**\n\n";
         sink(StreamEvent::TextDelta(header.into()));
         let answer = self.engine.run_text(&req, sink.clone()).await?;
         let mut told = self.record_told(session, arg);
@@ -239,9 +237,7 @@ impl Runtime {
             None => work = arg.to_string(),
         }
         if work.trim().is_empty() && photos.is_empty() {
-            return Ok(TurnOutput::text(
-                "`/check <your work>`, `/check <file>` or `/check <photo>`: the first step that doesn't hold.",
-            ));
+            return Ok(TurnOutput::text("`/check <work, file or photo>`"));
         }
         session.push_turn("user", format!("/check {arg}"));
         let mut shown = String::new();
@@ -265,7 +261,7 @@ impl Runtime {
                 )
                 .await?;
             let Some(lines) = parse_transcription(&raw) else {
-                let reply = "Couldn't read the work in the photo. Try a sharper photo, or type the steps: `/check <your work>`.";
+                let reply = "Couldn't read the photo.";
                 session.push_turn("assistant", reply);
                 return Ok(TurnOutput::text(reply));
             };
@@ -311,7 +307,7 @@ impl Runtime {
     pub(super) fn handle_find(&self, session: &mut Session, arg: &str) -> TurnOutput {
         let terms: Vec<String> = arg.split_whitespace().map(str::to_string).collect();
         if terms.is_empty() {
-            return TurnOutput::text("`/find <terms>`: search the workspace's files.");
+            return TurnOutput::text("`/find <terms>`");
         }
         let hits = sources::find(&session.cwd, &terms, 12);
         self.record_source(session, arg, EventKind::Searched, &format!("find:{arg}"));
@@ -322,7 +318,6 @@ impl Runtime {
             for h in &hits {
                 out.push_str(&format!("\n- `{}`  {}", h.at, h.quote));
             }
-            out.push_str("\n\n`/open <file> [page or line]` to read.");
             out
         };
         session.push_turn("user", format!("/find {arg}"));
@@ -361,7 +356,7 @@ impl Runtime {
     ) -> TurnOutput {
         let terms: Vec<String> = arg.split_whitespace().map(str::to_string).collect();
         if terms.is_empty() {
-            return TurnOutput::text("`/web <terms>`: search papers and the web for raw hits.");
+            return TurnOutput::text("`/web <terms>`");
         }
         self.record_source(session, arg, EventKind::Searched, &format!("web:{arg}"));
         let (hits, notes) = self.online_hits(session, arg, &terms, false, &sink).await;
@@ -602,7 +597,7 @@ pub(crate) fn render_check(work: &str, file: Option<&str>, raw: &str) -> String 
         None => format!("line {line}"),
     };
     format!(
-        "**First step that doesn't hold** ({at}):\n\n> {}\n\nWhy is for you to find: `/find`, `/open`, or `/tell` (recorded as told).",
+        "**First step that doesn't hold** ({at}):\n\n> {}",
         sources::cap(&own)
     )
 }

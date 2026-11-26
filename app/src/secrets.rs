@@ -49,7 +49,7 @@ pub fn bits_toward(dist: [f64; 3], correct: bool) -> f64 {
 }
 
 /// Shown when a draft fails the gate twice, or the check itself fails.
-pub const FIXED_REPLY: &str = "That's what you're judging right now, so I can't settle it before your verdict. Give your verdict with your reasons; what was right or wrong is shown afterwards.";
+pub const FIXED_REPLY: &str = "That's what you're judging. Verdict first.";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Secret {

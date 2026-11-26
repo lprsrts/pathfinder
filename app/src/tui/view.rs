@@ -330,15 +330,8 @@ fn conversation(f: &mut Frame, app: &mut App, area: Rect) {
     };
     let (mut lines, items) = transcript(app, area.width);
     if app.entries.is_empty() {
-        for hint in [
-            format!(
-                "Ask about what's in {}: you get where to read, quoted from the source.",
-                app.cwd.display()
-            ),
-            "Drop a PDF or a screenshot here to attach it. F1 shows the keys.".to_string(),
-        ] {
-            lines.extend(markdown::wrap(&[Span::styled(hint, dim())], area.width));
-        }
+        let hint = format!("Ask about what's in {}.", app.cwd.display());
+        lines.extend(markdown::wrap(&[Span::styled(hint, dim())], area.width));
     }
     let total = lines.len();
     // Scrolled up: keep the view where it is while new lines arrive.
@@ -565,9 +558,9 @@ fn side_panel(f: &mut Frame, app: &App, area: Rect) {
     if s.pending_candidate.is_some() {
         lines.push(Line::default());
         let what = if s.exam {
-            "An exam question waits for your answer."
+            "Exam question waiting."
         } else {
-            "A candidate waits for your verdict: is it right, and why?"
+            "Candidate waiting for your verdict."
         };
         lines.extend(markdown::wrap(
             &[Span::styled(
@@ -631,9 +624,9 @@ fn placeholder(app: &App) -> String {
     if app.running.is_some() {
         "Esc stops the reply".into()
     } else if app.session.pending_candidate.is_some() && app.session.exam {
-        "Your answer, as you'd give it in the exam".into()
+        "Your answer".into()
     } else if app.session.pending_candidate.is_some() {
-        "Right or wrong, and why? Or just ask your next question".into()
+        "Right or wrong, and why?".into()
     } else {
         "Ask, or show your work".into()
     }

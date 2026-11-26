@@ -85,27 +85,18 @@ pub const LOCAL: [(Local, &str, &[&str], &str); 14] = [
 
 /// The task commands, run by the runtime: (name, what it does).
 pub const TASK: [(&str, &str); 20] = [
-    ("/find", "search the workspace's files: /find <terms>"),
-    ("/open", "read a source: /open <file> [page or line]"),
-    ("/web", "search papers and the web: /web <terms>"),
-    (
-        "/tell",
-        "be told an answer (recorded as told): /tell <question>",
-    ),
-    (
-        "/check",
-        "the first step of your work that doesn't hold: /check <work or file>",
-    ),
+    ("/find", "search files: /find <terms>"),
+    ("/open", "show a file: /open <file> [page or line]"),
+    ("/web", "search online: /web <terms>"),
+    ("/tell", "get an answer, recorded as told: /tell <question>"),
+    ("/check", "first wrong step: /check <work, file or photo>"),
     ("/why", "your record, or what the current part rests on"),
     ("/map", "the plan as a diagram"),
     ("/plan", "build the plan now"),
     ("/summary", "explain the current part; a candidate follows"),
     ("/next", "move to the next open part"),
     ("/focus", "switch to a part: /focus <number or id>"),
-    (
-        "/known",
-        "skip a part you already know (recorded as your claim)",
-    ),
+    ("/known", "skip a part you already know"),
     ("/handoff", "give an understood part to the agent"),
     ("/delegate", "hand a part off without understanding it"),
     ("/approve", "accept the agent's result"),

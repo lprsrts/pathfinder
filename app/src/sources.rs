@@ -726,9 +726,9 @@ fn strip_fence(raw: &str) -> &str {
 pub fn render(hits: &[Hit], terms: &[String], online: bool, skipped: &[String]) -> String {
     let mut out = if hits.is_empty() {
         let mut out = String::from(if online {
-            "**Not found** in this workspace's sources or online."
+            "**Not found** here or online."
         } else {
-            "**Not found** in this workspace's sources."
+            "**Not found** here."
         });
         if !terms.is_empty() {
             out.push_str(&format!(
@@ -740,7 +740,6 @@ pub fn render(hits: &[Hit], terms: &[String], online: bool, skipped: &[String]) 
                     .join(", ")
             ));
         }
-        out.push_str("\n\nOr `/web <terms>`, a library catalogue, or `/tell` for a told answer.");
         out
     } else {
         let mut out = String::from("**Where to look:**\n");
@@ -903,7 +902,7 @@ mod tests {
             "**Where to look:**\n\n- `notes.md:5`\n  > It is linear."
         );
         let none = render(&[], &["laplace".into()], true, &["Brave (no key)".into()]);
-        assert!(none.starts_with("**Not found** in this workspace's sources or online."));
+        assert!(none.starts_with("**Not found** here or online."));
         assert!(none.contains("`/find laplace`"));
         assert!(none.ends_with("Not searched: Brave (no key)."));
     }

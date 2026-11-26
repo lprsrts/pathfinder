@@ -500,9 +500,7 @@ impl Runtime {
         // The candidate's reasoning would give away whether (and where) it's
         // flawed, so it's never shown. The header goes right before the
         // candidate's first words, after any files the model reads.
-        sink(StreamEvent::Thought(
-            "Writing a candidate for you to judge; its reasoning stays hidden.\n".into(),
-        ));
+        sink(StreamEvent::Thought("Writing a candidate…\n".into()));
         let header_sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let candidate_sink: StreamSink = {
             let (inner, header, sent) = (sink.clone(), header.clone(), header_sent.clone());
@@ -636,9 +634,7 @@ impl Runtime {
         };
         // The Judge holds the key: its thinking is never shown, and its
         // feedback only once it confirms the message is a verdict (A2, A6).
-        sink(StreamEvent::Thought(
-            "Judging your verdict against the hidden key; that reasoning stays hidden.\n".into(),
-        ));
+        sink(StreamEvent::Thought("Judging your verdict…\n".into()));
         let verdict: JudgmentVerdict = run_gated(
             self.engine.as_ref(),
             self.store.as_ref(),
