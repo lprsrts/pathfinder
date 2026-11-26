@@ -38,7 +38,7 @@
 <main>
 <header><img src="/icon-180.png" alt="" width="40" height="40"><h1>Pathfinder</h1></header>
 <p class="lead">Pathfinder makes sure you understand the work you do with AI. It answers your questions, checks you at the moments that matter, and keeps an honest record of what you understood, what you only claimed, and what you handed off.</p>
-<p>It runs in your terminal, on your own computer, with your own model account. It’s in a closed beta: ask Alper to add your email address.</p>
+<p>It runs in your terminal, on your own computer, with your own model account. It’s free and open source: anyone can install it and use it with their own keys.</p>
 
 <h2>How it works</h2>
 <ul>
@@ -57,7 +57,9 @@
 <ul>
 <li>A Mac (Apple silicon or Intel). On Linux, build it from <a href="https://github.com/lprsrts/pathfinder">source</a>.</li>
 <li>A paid ChatGPT plan (Plus or Pro), or an Anthropic or OpenAI API key. Pathfinder’s use counts against it.</li>
+<li>For the gate (what keeps an answer from slipping out while you judge it): a decision key from TypeSafe, OpenAI or Google. <code>pathfinder auth set typesafe</code> adds one.</li>
 </ul>
+<p class="meta">There’s also a small invite-only beta, with a shared gate so you don’t need a decision key, for people helping me test it.</p>
 
 <h2>Install</h2>
 <pre><code>curl -fsSL https://pathfinder.lprsrts.com/install.sh | sh</code></pre>

@@ -32,7 +32,7 @@ If pathfinder.lprsrts.com is down, the same installer and release are on GitHub:
 
 This installs one program, `pathfinder`, into `~/.local/bin` (or `$XDG_BIN_HOME`, or `$PATHFINDER_BIN_DIR`). It is signed and notarised by Apple, and the installer checks it against a signed release manifest. Linux users can build from source (below).
 
-You need a model account: a paid ChatGPT plan (Plus or Pro), or an Anthropic or OpenAI API key. Usage counts against that plan or key. Optional: `poppler` (`brew install poppler`) lets Pathfinder read PDFs page by page.
+You need a model account: a paid ChatGPT plan (Plus or Pro), or an Anthropic or OpenAI API key. Usage counts against that plan or key. The gate also needs a decision key: TypeSafe (`pathfinder auth set typesafe`), OpenAI or Google (see [decision services](docs/reference.md#while-you-judge)). Optional: `poppler` (`brew install poppler`) lets Pathfinder read PDFs page by page.
 
 ## First run
 
@@ -48,7 +48,7 @@ F1 shows the keys. [docs/guide.md](docs/guide.md) walks through a session.
 
 - **Your work goes to your model provider**, under your account: your messages, files and the model's replies. Pathfinder itself keeps everything else on your computer (`pathfinder paths` shows where).
 - **Commands run in a sandbox** (Seatbelt on macOS, bubblewrap on Linux) that can't read your credentials or reach the network without asking.
-- **The beta.** You can join with your email. Joining turns on a shared gate service, so the gate works without a decision key of your own. Only the gate's checks go through that service. Sharing usage data (counts and timings, never your messages) and sharing chosen threads are separate, optional choices. `pathfinder data show` prints exactly what is queued, and `pathfinder data delete` erases what was sent. The [privacy notice](https://pathfinder.lprsrts.com/privacy/) has the details, and the full list of usage events is in [schema/src/lib.rs](schema/src/lib.rs).
+- **The beta (invite-only).** People helping me test can join with their email. Joining turns on a shared gate service, so the gate works without a decision key of your own. Only the gate's checks go through that service. Sharing usage data (counts and timings, never your messages) and sharing chosen threads are separate, optional choices. `pathfinder data show` prints exactly what is queued, and `pathfinder data delete` erases what was sent. The [privacy notice](https://pathfinder.lprsrts.com/privacy/) has the details, and the full list of usage events is in [schema/src/lib.rs](schema/src/lib.rs).
 - **Fully on your own servers.** With your own model endpoints and `"local_only": true`, nothing goes to a model company or to the beta service. See [docs/reference.md](docs/reference.md#self-hosted-and-open-models).
 
 ## Bugs and feedback

@@ -1036,7 +1036,7 @@ fn consent(
     let tick = |on: bool| if on { "[x]" } else { "[ ]" };
     let name = crate::operator::NAME;
     let mut lines: Vec<Line> = vec![
-        Line::from(vec![Span::styled("Join the beta", bold)]),
+        Line::from(vec![Span::styled("Join the beta (invite-only for now)", bold)]),
         Line::from(format!(
             "Joining links this computer to {name}'s server with your email. That turns on the"
         )),
