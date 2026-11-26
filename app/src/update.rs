@@ -91,14 +91,36 @@ pub async fn latest() -> Result<Release> {
             Ok(res.bytes().await?.to_vec())
         }
     };
-    let manifest = get("latest.json").await?;
-    let sig = get("latest.json.sig").await?;
+    // The top-level manifest only names the newest version. That version's
+    // own manifest and signature never change, so a cache can serve an older
+    // release but never a manifest with another release's signature.
+    let newest: Release = serde_json::from_slice(&get("latest.json").await?)?;
+    if !is_version(&newest.version) {
+        bail!("the release manifest names an odd version");
+    }
+    let (manifest, sig) = match (
+        get(&format!("{}/latest.json", newest.version)).await,
+        get(&format!("{}/latest.json.sig", newest.version)).await,
+    ) {
+        (Ok(m), Ok(s)) => (m, s),
+        // Releases before 0.3.1 have only the top-level pair.
+        _ => (get("latest.json").await?, get("latest.json.sig").await?),
+    };
     verify(
         &manifest,
         &String::from_utf8_lossy(&sig),
         RELEASE_PUBLIC_KEY,
     )?;
     Ok(serde_json::from_slice(&manifest)?)
+}
+
+/// Dotted numbers with an optional `-suffix`: safe in a URL path.
+fn is_version(v: &str) -> bool {
+    !v.is_empty()
+        && v.len() <= 32
+        && v.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+        && !v.contains("..")
 }
 
 /// The newer release, if there is one (for the TUI's daily check).
@@ -246,6 +268,15 @@ fn install(archive: &[u8], staging: &Path, exe: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
+
+    #[test]
+    fn only_plain_versions_go_into_paths() {
+        assert!(is_version("0.3.1"));
+        assert!(is_version("1.0.0-rc1"));
+        assert!(!is_version("../../x"));
+        assert!(!is_version("0.3/../.."));
+        assert!(!is_version(""));
+    }
 
     #[test]
     fn versions_compare_by_number() {

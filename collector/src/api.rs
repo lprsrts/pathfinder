@@ -193,6 +193,7 @@ async fn limit_in_flight(State(state): State<Arc<AppState>>, req: Request, next:
 /// minute fresh, so a new release shows up quickly, and a week from cache
 /// when this service can't be reached, so installs and updates keep working.
 const SHORT_LIVED: &str = "public, max-age=60, stale-if-error=604800";
+const SITE_IMAGE: &str = "public, max-age=300, stale-if-error=604800";
 /// Versioned release files never change.
 const IMMUTABLE: &str = "public, max-age=31536000, immutable";
 
@@ -204,7 +205,15 @@ async fn cache_headers(req: Request, next: Next) -> Response {
     }
     let policy = match path.as_str() {
         "/install.sh" | "/releases/latest.json" | "/releases/latest.json.sig" => Some(SHORT_LIVED),
-        p if p.starts_with("/releases/") && p.ends_with(".tar.gz") => Some(IMMUTABLE),
+        // Everything under a version's folder: archives, its manifest.
+        p if p
+            .strip_prefix("/releases/")
+            .is_some_and(|rest| rest.contains('/')) =>
+        {
+            Some(IMMUTABLE)
+        }
+        // The site's images: a change shows up within minutes.
+        p if p.ends_with(".svg") => Some(SITE_IMAGE),
         _ => None,
     };
     if let Some(policy) = policy {
@@ -885,6 +894,7 @@ fn page(status: StatusCode, title: &str, body: &str) -> Response {
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="referrer" content="no-referrer">
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
 <title>{title} · Pathfinder</title>
 <style>
   :root {{ color-scheme: light dark; --fg: #1d1d1f; --bg: #fff; --muted: #6e6e73; --rule: #e5e5ea; --accent: #0a66d8; }}

@@ -2,6 +2,12 @@
 
 What changed in each release of Pathfinder, newest first. `pathfinder update` shows the newest section.
 
+## 0.3.1
+
+- **Updates stay consistent while caches catch up.** Each release now has its own signed manifest that never changes, and `pathfinder update` checks that one, so a cache that hasn't caught up can only offer an older release, not a broken one.
+- **Plainer prompts.** The answer and test prompts no longer describe the user as a student; they work the same for any kind of work.
+- A new icon.
+
 ## 0.3.0
 
 The command is now `pathfinder`, and this release gets Pathfinder ready for a wider beta.

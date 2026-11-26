@@ -137,9 +137,12 @@ manifest = {
 json.dump(manifest, open(os.path.join(out, "latest.json"), "w"), indent=2)
 PY
 (cd "$root/collector" && CARGO_TARGET_DIR="$root/app/target" cargo run -q --release -- sign "$out/latest.json")
+# The same signed pair under the version's folder, where it never changes:
+# apps from 0.3.1 verify this one (see app/src/update.rs).
+cp "$out/latest.json" "$out/latest.json.sig" "$out/$version/"
 
 # The public folder: the pages and installer next to the releases.
-for f in index.html install.sh favicon.svg screenshot.svg; do
+for f in index.html install.sh icon.svg screenshot.svg; do
     [[ -f "$root/collector/public/$f" ]] && cp "$root/collector/public/$f" "$dist/public/"
 done
 cp -R "$root/collector/public/privacy" "$dist/public/"
