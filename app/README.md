@@ -10,7 +10,7 @@ cargo test
 See the [repository README](../README.md) for what Pathfinder is, and [docs/reference.md](../docs/reference.md) for how it works.
 
 - `src/main.rs`: the commands
-- `src/runtime.rs` and `src/runtime/`: a turn, from your message to the reply (onboarding, evidence, the gate, checked review, provenance, evals)
+- `src/runtime.rs`: a turn, from your message to the reply; `src/runtime/`: one module per part of the theory (onboarding, evidence, skips, handoff, record, the gate, concepts, checked review, provenance, evals)
 - `src/tui/`: the terminal UI; `src/acp.rs`: the Zed agent server
 - `src/agent/`: Pathfinder's own agent loop, tools and sandbox
 - `src/llm/`: the model providers; `src/auth/`: keys and Sign in with ChatGPT
