@@ -8,7 +8,7 @@ Pathfinder makes sure you understand the work you do with AI. It points you to w
 
 It runs in your terminal (or in Zed), on your own computer, with your own model account.
 
-<img src="collector/public/pathfinder-demo.gif" alt="A Pathfinder session from before questions got sources instead of answers: a question about retry jitter, a reply, 'I think I get it', a candidate to judge, a verdict, and the feedback">
+<img src="collector/public/pathfinder-demo.gif" alt="A real Pathfinder session over lecture notes and an exercise sheet on DC machines: a question answered with quoted lines from the notes, /check finding the wrong step in a worked exercise, /find, a candidate with a planted flaw caught, and /why">
 
 ## How it works
 
