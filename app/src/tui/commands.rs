@@ -84,7 +84,14 @@ pub const LOCAL: [(Local, &str, &[&str], &str); 14] = [
 ];
 
 /// The task commands, run by the runtime: (name, what it does).
-pub const TASK: [(&str, &str); 15] = [
+pub const TASK: [(&str, &str); 19] = [
+    ("/find", "search the workspace's files: /find <terms>"),
+    ("/open", "read a source: /open <file> [page or line]"),
+    ("/web", "search the web for raw hits: /web <terms>"),
+    (
+        "/tell",
+        "be told an answer (recorded as told): /tell <question>",
+    ),
     ("/why", "your record, or what the current part rests on"),
     ("/map", "the plan as a diagram"),
     ("/plan", "build the plan now"),
@@ -211,5 +218,7 @@ mod tests {
         assert_eq!(complete("/zz"), None);
         assert!(matches("/quit now").is_empty());
         assert_eq!(matches("/s"), ["/status", "/share", "/summary"]);
+        assert_eq!(parse("/find laplace"), Parsed::Task);
+        assert_eq!(parse("/tell what is x"), Parsed::Task);
     }
 }

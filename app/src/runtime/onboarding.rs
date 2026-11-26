@@ -3,49 +3,6 @@
 use super::*;
 
 impl Runtime {
-    /// Answers a question directly with the main model, records it as told
-    /// (never as understood) on the concepts it names, and offers a check.
-    pub(super) async fn answer_question(
-        &self,
-        session: &mut Session,
-        text: &str,
-        files: &[PathBuf],
-        sink: StreamSink,
-        offer_check: bool,
-    ) -> Result<TurnOutput> {
-        let req = EngineRequest {
-            tier: EngineTier::System2,
-            tools: ToolAccess::ReadOnly,
-            cwd: session.cwd.clone(),
-            system_prompt: ANSWER_SYSTEM.to_string(),
-            prompt: format!(
-                "Conversation so far:\n{}\n\nAnswer the latest message.",
-                format_history(session)
-            ),
-            files: files.to_vec(),
-            stream_text: true,
-            models: self.models(session)?,
-            ctx: crate::engine::turn_ctx(),
-        };
-        let answer = self.engine.run_text(&req, sink.clone()).await?;
-        let told = self.record_told(session, text);
-        let lang = session.language.as_deref();
-        // Being told is recorded, never counted; a check comes when the user
-        // says they've understood or asks to be tested.
-        let _ = offer_check;
-        let offer = if told.is_empty() {
-            String::new()
-        } else {
-            format!(
-                "\n\n{}",
-                i18n::line(lang, i18n::Line::ToldNotShown).replace("{labels}", &told.join(", "))
-            )
-        };
-        sink(StreamEvent::TextDelta(offer.clone()));
-        session.push_turn("assistant", format!("{answer}{offer}"));
-        Ok(TurnOutput::text(String::new()))
-    }
-
     pub(super) async fn handle_onboarding(
         &self,
         session: &mut Session,

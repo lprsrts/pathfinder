@@ -15,18 +15,28 @@ Pathfinder finds and reads the files there by itself: code, notes, papers, PDFs,
 
 In Zed, open the folder as the project and start a new Pathfinder thread in the agent panel. Everything below works the same there.
 
-## Ask anything
+## Ask, and get told where to look
 
-Ask in your own words, in English or German. Pathfinder answers from your material:
+Ask in your own words, in English or German. Pathfinder doesn't answer: like a librarian with a catalogue, it points to where your material addresses the question and shows a short verbatim line from there.
 
-- "Why does this function hold the lock across the await?"
-- "How does the paper get from equation 3 to equation 4?"
-- "What would break if we switched the queue to at-most-once delivery?"
-- "Here's my derivation, is it right?"
+```
+**Where to look:**
 
-Paste a screenshot or a photo, or attach a PDF (`/attach file.pdf`, or drop it onto the window). Show your own work and ask whether it's right: Pathfinder goes through it step by step and says exactly where it goes wrong.
+- `attention.pdf p.5 l.14`
+  > In this work we employ h = 8 parallel attention layers, or heads. For each of these we use
+```
 
-Answers count as *told*, not as understood.
+Every quote is checked against the file it cites before you see it, and nothing else is shown: no explanation, no summary, no conclusion. You read, calculate and decide. If nothing in the folder addresses the question, it says **Not found** and suggests terms to search for.
+
+Read and search yourself:
+
+- `/find <terms>`: matching lines across the folder's files and PDFs.
+- `/open <file> [page or line]` (or `/open notes.md:120`): the page or lines, numbered.
+- `/web <terms>`: raw web hits under the same rules (not set up yet).
+
+What you open and search is on your record as *read*; it grows the graph but never counts as understanding.
+
+When you do want an answer, `/tell <question>` gives one. It's marked **Told** and recorded as told, not as understood.
 
 ## Where understanding comes from
 
@@ -43,6 +53,8 @@ Passing a candidate or a test question is what puts an idea on your record as sh
 
 | Command | What it does |
 |---|---|
+| `/find <terms>`, `/open <file> [page]` | Search the folder; read a page or lines |
+| `/tell <question>` | A reasoned answer, recorded as told |
 | `/why` | Your record: every idea you've touched here and whether you've shown it, claimed it or were only told |
 | `/map` | In a task: its parts as a diagram |
 | `/summary <your explanation>` | In a task: explain the current part; a candidate follows |

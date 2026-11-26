@@ -24,6 +24,7 @@ use crate::validate::{
 };
 use crate::workspace::WorkspaceSnapshot;
 
+mod cite;
 mod concepts;
 pub mod eval;
 mod evidence;
@@ -61,7 +62,7 @@ impl TurnOutput {
     }
 }
 
-pub const COMMANDS_HELP: &str = "Commands: `/plan`, `/summary <text>`, `/handoff [notes]`, `/approve`, `/object <reason>`, `/known`, `/delegate [notes]`, `/accept`, `/reject`, `/replan [what changed]`, `/next`, `/focus <id|number|prefix>`, `/map`, `/why`, `/coverage`.";
+pub const COMMANDS_HELP: &str = "Commands: `/find <terms>`, `/open <file> [page|line]`, `/web <terms>`, `/tell <question>`, `/plan`, `/summary <text>`, `/handoff [notes]`, `/approve`, `/object <reason>`, `/known`, `/delegate [notes]`, `/accept`, `/reject`, `/replan [what changed]`, `/next`, `/focus <id|number|prefix>`, `/map`, `/why`, `/coverage`.";
 
 /// No decision model: the LLM decides each message's step itself.
 struct NoDecider;
@@ -439,6 +440,10 @@ impl Runtime {
             "/replan" => self.handle_replan(session, arg, files, sink).await,
             "/next" => Ok(self.handle_next(session)),
             "/focus" => Ok(self.handle_focus(session, arg)),
+            "/tell" => self.handle_tell(session, arg, files, sink).await,
+            "/find" => Ok(self.handle_find(session, arg)),
+            "/open" => Ok(self.handle_open(session, arg)),
+            "/web" => Ok(self.handle_web(session, arg)),
             _ => Ok(TurnOutput::text(COMMANDS_HELP)),
         }
     }
@@ -622,15 +627,6 @@ You get a workspace snapshot. If a file could answer something, read it before w
 
 Return ONLY a JSON object:
 {"reply": "...", "ready_to_map": true, "goal": "...", "question": false, "offer_check": false, "check": false, "exam": false, "language": "en"}"#;
-
-const ANSWER_SYSTEM: &str = r#"You are Pathfinder, the user's assistant, answering a question directly. Questions may be about their code, documents, research, their own work, or anything else.
-
-- Answer what they asked, correctly, like a strong tutor or colleague, at the depth they asked for. For a calculation or derivation, go step by step and keep every step. For a concept, give the idea, the precise statement and a short example if it helps. For a broad topic ("how does a transformer work?"), give the core idea and the few relations that matter most, in a screen or two, then name in one line what you could go into next; don't write the whole chapter.
-- When they show their own work (a solution, a derivation, code), review it like a tutor marking it: go through it step by step, say which steps are right, and for each mistake say where it is, what's wrong and which principle fixes it. Give the corrected result only after that, briefly.
-- Read attached files (documents, papers, slides, screenshots) and workspace files when they bear on the question. If the question is about a figure, diagram, slide or page, open it and look at it before answering; never say you can't see a file that is attached or in the workspace.
-- Write math as plain text or Unicode (Z = R + jωL, F(s) = ∫₀^∞ f(t)·e^(−st) dt, ∇·E = ρ/ε₀), never LaTeX: the chat can't render it.
-- Reply in the language the user writes in.
-- Don't offer to check their understanding or ask follow-up questions unless the question is ambiguous; Pathfinder adds that itself."#;
 
 const MAP_SYSTEM: &str = r#"You sketch the map for Pathfinder: what the task depends on.
 

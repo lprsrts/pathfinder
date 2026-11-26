@@ -5,7 +5,7 @@
 use crate::understanding::ConceptState;
 
 /// A line Pathfinder writes itself (English and German).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Line {
     /// Before a candidate: "Candidate for **{title}**:".
     CandidateFor,
@@ -68,6 +68,7 @@ pub enum Line {
     RecordTitle,
     /// A concept you were only told about.
     ToldOnly,
+    ReadOnly,
     /// The folder has no record yet.
     NoRecord,
     /// Under the record: "{shown}", "{told}", "{shaky}".
@@ -147,6 +148,7 @@ pub fn line(lang: Option<&str>, line: Line) -> &'static str {
             }
             OpenMisconception => "Offenes Missverständnis bei {concept}: „{statement}“",
             ToldOnly => "nur gesagt",
+            ReadOnly => "gelesen",
             NoRecord => {
                 "Für diesen Ordner gibt es noch keinen Verlauf: Frag etwas, oder lass dich prüfen."
             }
@@ -212,6 +214,7 @@ pub fn line(lang: Option<&str>, line: Line) -> &'static str {
             }
             OpenMisconception => "Open misconception on {concept}: \"{statement}\"",
             ToldOnly => "told only",
+            ReadOnly => "read",
             NoRecord => "No record for this folder yet: ask something, or get tested.",
             RecordSummary => {
                 "Shown: {shown} · told only: {told} · shaky: {shaky}. Only passed checks count as understanding; a claim never does, and solid understanding cools after 30 days without a fresh check."

@@ -490,7 +490,13 @@ async fn an_ignored_quick_check_is_dropped_without_a_record() {
     let s = rt.load_session("s").unwrap().unwrap();
     assert_eq!(s.mode, SessionMode::Onboarding);
     assert!(s.pending_candidate.is_none() && !s.quick_check);
-    assert_eq!(s.history.last().unwrap().content, "A DAG has no cycles.");
+    assert!(
+        s.history
+            .last()
+            .unwrap()
+            .content
+            .starts_with("**Not found**")
+    );
     let ws = crate::understanding::workspace_key(&s.cwd);
     let ids: Vec<String> = ["dispatch", "handlers", "registry"]
         .map(String::from)
@@ -570,9 +576,13 @@ async fn a_claim_of_understanding_gets_one_candidate_then_chat_goes_on() {
 
     turn(&rt, "Was ist ein Handler?").await;
     let s = rt.load_session("s").unwrap().unwrap();
-    assert_eq!(
-        s.history.last().unwrap().content,
-        "Ein Handler ist eine Funktion."
+    assert!(
+        s.history
+            .last()
+            .unwrap()
+            .content
+            .starts_with("**Not found**"),
+        "a question gets sources, never the model's answer"
     );
 }
 
@@ -764,11 +774,9 @@ fn log_reply(reply: &str) -> String {
 
 #[tokio::test]
 async fn a_question_is_answered_without_a_task() {
-    const QUESTION: &str =
-        r#"{"reply":"","ready_to_map":false,"goal":null,"question":true,"offer_check":true}"#;
     let (rt, engine) = runtime(
         FakeEngine::new(vec![
-            (ReadOnly, S1, QUESTION),
+            // `/tell` skips onboarding: the one reasoned answer.
             (ReadOnly, S2, "A phasor is a complex number for a sinusoid."),
             (
                 ReadOnly,
@@ -800,12 +808,13 @@ async fn a_question_is_answered_without_a_task() {
         )
         .unwrap();
 
-    turn(&rt, "Can you explain phasors?").await;
+    turn(&rt, "/tell Can you explain phasors?").await;
     let s = rt.load_session("s").unwrap().unwrap();
     assert_eq!(s.mode, SessionMode::Onboarding, "no task was started");
     assert!(s.goal.is_none());
     let last = &s.history.last().unwrap().content;
-    assert!(last.starts_with("A phasor is a complex number"));
+    assert!(last.starts_with("**Told**"), "{last}");
+    assert!(last.contains("A phasor is a complex number"));
     assert!(
         last.contains("Told, not shown: Phasors is on your record"),
         "{last}"
@@ -829,15 +838,15 @@ async fn a_question_is_answered_without_a_task() {
 
     turn(&rt, "What's the capital of Peru?").await;
     let s = rt.load_session("s").unwrap().unwrap();
-    assert_eq!(
-        s.history.last().unwrap().content,
-        "Lima.",
-        "no offer on a lookup"
-    );
+    // A plain question gets sources only: the model's prose ("Lima.") is
+    // thrown away and nothing in the workspace says it.
+    let last = &s.history.last().unwrap().content;
+    assert!(last.starts_with("**Not found**"), "{last}");
+    assert!(!last.contains("Lima"));
     let prompt = engine.prompts.lock().unwrap().last().cloned().unwrap();
     assert!(
-        prompt.contains("Can you explain phasors?"),
-        "answers see the conversation"
+        prompt.contains("capital of Peru"),
+        "the question is searched"
     );
 
     turn(&rt, "check me on phasors").await;

@@ -573,7 +573,7 @@ pub fn view(
 /// A PDF's text, one entry per page, through `pdftotext` (poppler); cached
 /// by path and modification time, since grep and read come back to the
 /// same slides often.
-fn pdf_pages(file: &Path, path: &str) -> Result<std::sync::Arc<Vec<String>>, String> {
+pub(crate) fn pdf_pages(file: &Path, path: &str) -> Result<std::sync::Arc<Vec<String>>, String> {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex, OnceLock};
     type Cache = Mutex<HashMap<PathBuf, (std::time::SystemTime, Arc<Vec<String>>)>>;

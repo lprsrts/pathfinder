@@ -19,6 +19,7 @@ mod paths;
 mod providers;
 mod runtime;
 mod secrets;
+mod sources;
 mod store;
 mod stream;
 mod telemetry;

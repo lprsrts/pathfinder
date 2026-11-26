@@ -77,6 +77,10 @@ pub enum EventKind {
     /// You were told about it (a question answered outside a check). It
     /// never counts as understanding.
     Told,
+    /// You opened a source to read it (`/open`). Activity, never evidence.
+    Read,
+    /// You searched the sources (`/find`, `/web`). Activity, never evidence.
+    Searched,
 }
 
 impl EventKind {
@@ -93,6 +97,8 @@ impl EventKind {
             Self::ReviewMissed => "review_missed",
             Self::User => "user",
             Self::Told => "told",
+            Self::Read => "read",
+            Self::Searched => "searched",
         }
     }
 
@@ -109,6 +115,8 @@ impl EventKind {
             "review_missed" => Self::ReviewMissed,
             "user" => Self::User,
             "told" => Self::Told,
+            "read" => Self::Read,
+            "searched" => Self::Searched,
             _ => return None,
         })
     }

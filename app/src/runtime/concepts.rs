@@ -735,13 +735,22 @@ impl Runtime {
         let events = self.store.events(&ws, &ids).unwrap_or_default();
         let views = self.concept_views(session, &ids).unwrap_or_default();
         // Ideas with any event, most recently active first.
-        let mut active: Vec<(&Concept, i64, bool)> = concepts
+        let mut active: Vec<(&Concept, i64, Option<Line>)> = concepts
             .iter()
             .filter_map(|c| {
                 let mine: Vec<&crate::understanding::Event> =
                     events.iter().filter(|e| e.concept == c.id).collect();
                 let last = mine.iter().map(|e| e.id).max()?;
-                let told = mine.iter().any(|e| e.kind == EventKind::Told);
+                let told = if mine.iter().any(|e| e.kind == EventKind::Told) {
+                    Some(Line::ToldOnly)
+                } else if mine
+                    .iter()
+                    .all(|e| matches!(e.kind, EventKind::Read | EventKind::Searched))
+                {
+                    Some(Line::ReadOnly)
+                } else {
+                    None
+                };
                 Some((c, last, told))
             })
             .collect();
@@ -758,9 +767,13 @@ impl Runtime {
         );
         for (c, _, told) in &active {
             let st = understanding::state_of(&views, &c.id);
-            let name = if st == ConceptState::Unknown && *told {
-                told_only += 1;
-                line(lang, Line::ToldOnly).to_string()
+            let name = if st == ConceptState::Unknown
+                && let Some(mark) = told
+            {
+                if *mark == Line::ToldOnly {
+                    told_only += 1;
+                }
+                line(lang, *mark).to_string()
             } else {
                 if st.has_evidence() {
                     shown += 1;
