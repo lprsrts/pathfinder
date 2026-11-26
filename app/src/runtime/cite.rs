@@ -248,7 +248,8 @@ impl Runtime {
     ) -> Result<TurnOutput> {
         // The work: a photo or scan (named or attached), a text file, or the
         // text itself.
-        let named = sources::confine(&session.cwd, arg);
+        let parsed_path = crate::commands::parse_path_arg(arg);
+        let named = sources::confine(&session.cwd, &parsed_path);
         let mut photos: Vec<PathBuf> = files.iter().filter(|f| is_photo(f)).cloned().collect();
         let mut file = None;
         let mut work = String::new();
@@ -256,12 +257,20 @@ impl Runtime {
         let mut pdf_pages: Option<Vec<String>> = None;
         match &named {
             Some(full) if is_photo(full) => photos.push(full.clone()),
-            Some(full) => match sources::pages(full, arg) {
+            Some(full) => match sources::pages(full, &parsed_path) {
                 // A scanned PDF has no text layer: read it as a photo.
                 Ok(pages) if pages.iter().all(|p| p.trim().is_empty()) => photos.push(full.clone()),
                 Ok(pages) => {
                     work = pages.join("\n");
-                    file = Some(arg.trim().to_string());
+                    let root = session
+                        .cwd
+                        .canonicalize()
+                        .unwrap_or_else(|_| session.cwd.clone());
+                    let rel = full
+                        .strip_prefix(&root)
+                        .map(|p| p.to_string_lossy().replace('\\', "/"))
+                        .unwrap_or_else(|_| parsed_path.clone());
+                    file = Some(rel);
                     if sources::is_pdf(full) {
                         pdf_pages = Some(pages);
                     }
@@ -300,10 +309,15 @@ impl Runtime {
                 return Ok(TurnOutput::text(reply));
             };
             work = lines.join("\n");
+            let root = session
+                .cwd
+                .canonicalize()
+                .unwrap_or_else(|_| session.cwd.clone());
             let names: Vec<String> = photos
                 .iter()
                 .map(|p| {
-                    p.strip_prefix(&session.cwd)
+                    p.strip_prefix(&root)
+                        .or_else(|_| p.strip_prefix(&session.cwd))
                         .unwrap_or(p)
                         .display()
                         .to_string()
@@ -350,7 +364,7 @@ impl Runtime {
 
     /// `/find <terms>`: raw matching lines, recorded as searched.
     pub(super) async fn handle_find(&self, session: &mut Session, arg: &str) -> TurnOutput {
-        let terms: Vec<String> = arg.split_whitespace().map(str::to_string).collect();
+        let terms = split_search_terms(arg);
         if terms.is_empty() {
             return TurnOutput::text("`/find <terms>`");
         }
@@ -379,30 +393,35 @@ impl Runtime {
         TurnOutput::text(reply)
     }
 
-    /// `/open <file> [page|line]`, also `file:line`: the source, numbered,
-    /// recorded as read.
+    /// `/open <file> [page|line]`, also `file:line`, `file p.N`, `file:start-end`:
+    /// the source, numbered, recorded as read.
     pub(super) async fn handle_open(&self, session: &mut Session, arg: &str) -> TurnOutput {
-        let (file, at) = parse_open(arg);
-        if file.is_empty() {
+        let spec = sources::parse_open_spec(arg);
+        if spec.file.is_empty() {
             return TurnOutput::text("`/open <file> [page or line]`");
         }
-        let (cwd, wanted) = (session.cwd.clone(), file.clone());
-        let opened = tokio::task::spawn_blocking(move || sources::open(&cwd, &wanted, at))
+        let cwd = session.cwd.clone();
+        let opened = tokio::task::spawn_blocking(move || sources::open_spec(&cwd, &spec))
             .await
             .unwrap_or_else(|e| Err(e.to_string()));
-        let reply = match opened {
-            Ok(view) => {
-                let r = match at {
-                    Some(n) => format!("{file}#{n}"),
-                    None => file.clone(),
-                };
-                self.record_source(session, &file, EventKind::Read, &r);
-                view
-            }
-            Err(e) => e,
-        };
         session.push_turn("user", format!("/open {arg}"));
-        TurnOutput::text(reply)
+        match opened {
+            Ok(opened) => {
+                let reference = match (opened.target.page, opened.target.lines) {
+                    (Some(p), Some((l, _))) => format!("{}#p{p}l{l}", opened.target.rel),
+                    (Some(p), None) => format!("{}#p{p}", opened.target.rel),
+                    (None, Some((l, _))) => format!("{}#{l}", opened.target.rel),
+                    (None, None) => opened.target.rel.clone(),
+                };
+                self.record_source(session, &opened.target.rel, EventKind::Read, &reference);
+                session.push_turn("assistant", &opened.markdown);
+                TurnOutput::text(opened.markdown)
+            }
+            Err(e) => {
+                session.push_turn("assistant", &e);
+                TurnOutput::text(e)
+            }
+        }
     }
 
     /// `/web <terms>`: raw web hits, each checked against the fetched page.
@@ -544,7 +563,8 @@ impl Runtime {
             .unwrap_or_default()
     }
 
-    /// Files reading/searching on the ideas `text` names, else on `sources`.
+    /// Files reading/searching on the ideas `text` names, else under `sources`
+    /// so raw filenames/queries don't pollute the workspace's concept list.
     fn record_source(&self, session: &Session, text: &str, kind: EventKind, reference: &str) {
         let concepts = self
             .store
@@ -552,9 +572,7 @@ impl Runtime {
             .unwrap_or_default();
         let named = crate::understanding::named_in(text, &concepts);
         let ids: Vec<String> = if named.is_empty() {
-            // The reading itself becomes a node: the file, or the terms.
-            self.own_concept(session, text)
-                .map_or_else(|| vec![SOURCES.to_string()], |id| vec![id])
+            vec![SOURCES.to_string()]
         } else {
             named.iter().map(|c| c.id.clone()).collect()
         };
@@ -739,20 +757,35 @@ fn best_per_page(cands: Vec<sources::WebResult>) -> Vec<sources::WebResult> {
         .collect()
 }
 
+/// Splits `/find` input into terms, keeping `"quoted phrases"` together.
+fn split_search_terms(arg: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    for ch in arg.chars() {
+        match (quote, ch) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), c) => cur.push(c),
+            (None, '"' | '\'') if cur.is_empty() => quote = Some(ch),
+            (None, c) if c.is_whitespace() => {
+                if !cur.is_empty() {
+                    terms.push(std::mem::take(&mut cur));
+                }
+            }
+            (None, c) => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        terms.push(cur);
+    }
+    terms
+}
+
 /// `paper.pdf 3`, `notes.md:120` or `notes.md`.
+#[cfg(test)]
 fn parse_open(arg: &str) -> (String, Option<usize>) {
-    let arg = arg.trim();
-    if let Some((f, n)) = arg.rsplit_once(char::is_whitespace)
-        && let Ok(n) = n.trim().parse()
-    {
-        return (f.trim().to_string(), Some(n));
-    }
-    if let Some((f, n)) = arg.rsplit_once(':')
-        && let Ok(n) = n.parse()
-    {
-        return (f.to_string(), Some(n));
-    }
-    (arg.to_string(), None)
+    let spec = sources::parse_open_spec(arg);
+    (spec.file, spec.at)
 }
 
 #[cfg(test)]

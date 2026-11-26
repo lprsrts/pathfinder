@@ -701,10 +701,7 @@ impl Runtime {
             session.active = Some(next_id.clone());
             sink(StreamEvent::TextDelta("\n\n".into()));
             let ask = self.write_candidate(session, &next_id, files, sink).await?;
-            return Ok(TurnOutput {
-                reply: ask,
-                plan_changed: true,
-            });
+            return Ok(TurnOutput::changed(ask));
         }
         // A quick check is one candidate: record it and go back to chat.
         if session.quick_check {

@@ -176,10 +176,7 @@ impl Runtime {
             sink(StreamEvent::TextDelta(lead.clone()));
             session.push_turn("assistant", lead.trim());
             let ask = self.write_candidate(session, &part_id, files, sink).await?;
-            return Ok(TurnOutput {
-                reply: ask,
-                plan_changed: true,
-            });
+            return Ok(TurnOutput::changed(ask));
         }
 
         // The map itself shows in Zed's plan panel (and on `/map`).

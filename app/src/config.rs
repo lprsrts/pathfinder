@@ -174,6 +174,21 @@ pub struct Config {
     pub system1: Option<String>,
     #[serde(default)]
     pub system2: Option<String>,
+    /// Default effort for the main model (`low`, `medium`, `high`).
+    #[serde(default)]
+    pub effort: Option<String>,
+    /// Default effort for the fast model (`low`, `medium`, `high`).
+    #[serde(default)]
+    pub fast_effort: Option<String>,
+    /// Default Decisions switch (`true` on, `false` off; `None` = on).
+    #[serde(default)]
+    pub decisions_on: Option<bool>,
+    /// Default decision service id (`typesafe`, `openai`, `gemini`).
+    #[serde(default)]
+    pub decision_model: Option<String>,
+    /// Default review checks (`off`, `light`, `normal`).
+    #[serde(default)]
+    pub checks: Option<String>,
     /// Add the models your API keys give access to (cached, refreshed daily).
     #[serde(default = "default_true")]
     pub discover: bool,
@@ -237,10 +252,25 @@ fn default_codex_bin() -> String {
     "codex".to_string()
 }
 
-/// [`Config::add_endpoint`] for the file at `path`. Only a missing file starts
-/// empty: one that can't be read is an error, never overwritten, and the new
-/// file replaces the old one in a single rename.
-fn add_endpoint_at(path: &Path, ep: &Endpoint) -> anyhow::Result<()> {
+/// Fields to update in `config.json` defaults: `Some(Some(v))` sets, `Some(None)`
+/// clears, and `None` leaves the existing setting untouched.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DefaultSettings {
+    pub system1: Option<Option<String>>,
+    pub system2: Option<Option<String>>,
+    pub effort: Option<Option<String>>,
+    pub fast_effort: Option<Option<String>>,
+    pub decisions_on: Option<Option<bool>>,
+    pub decision_model: Option<Option<String>>,
+    pub checks: Option<Option<String>>,
+}
+
+/// Reads `path` as a JSON object (starting empty only when missing), applies
+/// `edit`, and replaces the file atomically.
+fn update_config_json(
+    path: &Path,
+    edit: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
     let mut root: serde_json::Value = match fs::read_to_string(path) {
         Ok(raw) => serde_json::from_str(&raw)
             .map_err(|e| anyhow::anyhow!("{} isn't valid JSON: {e}", path.display()))?,
@@ -250,17 +280,7 @@ fn add_endpoint_at(path: &Path, ep: &Endpoint) -> anyhow::Result<()> {
     let obj = root
         .as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("{} isn't a JSON object", path.display()))?;
-    let list = obj
-        .entry("endpoints")
-        .or_insert_with(|| serde_json::json!([]))
-        .as_array_mut()
-        .ok_or_else(|| anyhow::anyhow!("`endpoints` in {} isn't a list", path.display()))?;
-    list.retain(|e| e.get("id").and_then(|v| v.as_str()) != Some(ep.id.as_str()));
-    let mut entry = serde_json::to_value(ep)?;
-    if let Some(e) = entry.as_object_mut() {
-        e.retain(|_, v| !v.is_null() && v.as_array().is_none_or(|a| !a.is_empty()));
-    }
-    list.push(entry);
+    edit(obj)?;
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
@@ -268,6 +288,57 @@ fn add_endpoint_at(path: &Path, ep: &Endpoint) -> anyhow::Result<()> {
     fs::write(&tmp, serde_json::to_string_pretty(&root)? + "\n")?;
     fs::rename(&tmp, path)?;
     Ok(())
+}
+
+/// [`Config::add_endpoint`] for the file at `path`. Only a missing file starts
+/// empty: one that can't be read is an error, never overwritten, and the new
+/// file replaces the old one in a single rename.
+fn add_endpoint_at(path: &Path, ep: &Endpoint) -> anyhow::Result<()> {
+    update_config_json(path, |obj| {
+        let list = obj
+            .entry("endpoints")
+            .or_insert_with(|| serde_json::json!([]))
+            .as_array_mut()
+            .ok_or_else(|| anyhow::anyhow!("`endpoints` in {} isn't a list", path.display()))?;
+        list.retain(|e| e.get("id").and_then(|v| v.as_str()) != Some(ep.id.as_str()));
+        let mut entry = serde_json::to_value(ep)?;
+        if let Some(e) = entry.as_object_mut() {
+            e.retain(|_, v| !v.is_null() && v.as_array().is_none_or(|a| !a.is_empty()));
+        }
+        list.push(entry);
+        Ok(())
+    })
+}
+
+fn set_optional_json<T: Serialize>(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    patch: &Option<Option<T>>,
+) -> anyhow::Result<()> {
+    if let Some(val) = patch {
+        match val {
+            Some(v) => {
+                obj.insert(key.to_string(), serde_json::to_value(v)?);
+            }
+            None => {
+                obj.remove(key);
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn save_defaults_at(path: &Path, defaults: &DefaultSettings) -> anyhow::Result<()> {
+    update_config_json(path, |obj| {
+        set_optional_json(obj, "system1", &defaults.system1)?;
+        set_optional_json(obj, "system2", &defaults.system2)?;
+        set_optional_json(obj, "effort", &defaults.effort)?;
+        set_optional_json(obj, "fast_effort", &defaults.fast_effort)?;
+        set_optional_json(obj, "decisions_on", &defaults.decisions_on)?;
+        set_optional_json(obj, "decision_model", &defaults.decision_model)?;
+        set_optional_json(obj, "checks", &defaults.checks)?;
+        Ok(())
+    })
 }
 
 pub fn default_config_path() -> PathBuf {
@@ -286,6 +357,11 @@ impl Default for Config {
             models: Vec::new(),
             system1: None,
             system2: None,
+            effort: None,
+            fast_effort: None,
+            decisions_on: None,
+            decision_model: None,
+            checks: None,
             discover: true,
             db_path: default_db_path(),
             endpoints: Vec::new(),
@@ -305,6 +381,12 @@ impl Config {
     /// everything else in the file as it is.
     pub fn add_endpoint(ep: &Endpoint) -> anyhow::Result<()> {
         add_endpoint_at(&default_config_path(), ep)
+    }
+
+    /// Updates default model/effort/decision/check fields in `config.json`,
+    /// preserving all other settings.
+    pub fn save_defaults(defaults: &DefaultSettings) -> anyhow::Result<()> {
+        save_defaults_at(&default_config_path(), defaults)
     }
 
     pub fn load() -> Self {
@@ -636,5 +718,46 @@ mod tests {
             ..Config::default()
         };
         assert!(empty.pick(None, true).is_none());
+    }
+
+    #[test]
+    fn save_defaults_preserves_other_fields_and_clears_reset_values() {
+        let dir = std::env::temp_dir().join(format!("pf-def-{}", uuid::Uuid::new_v4().simple()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        fs::write(
+            &path,
+            r#"{"quote_cap": 42, "effort": "low", "checks": "normal"}"#,
+        )
+        .unwrap();
+
+        save_defaults_at(
+            &path,
+            &DefaultSettings {
+                system1: Some(Some("fast".into())),
+                system2: Some(Some("main".into())),
+                effort: Some(Some("high".into())),
+                fast_effort: Some(Some("medium".into())),
+                decisions_on: Some(Some(false)),
+                decision_model: Some(Some("openai".into())),
+                checks: Some(None),
+            },
+        )
+        .unwrap();
+
+        let raw = fs::read_to_string(&path).unwrap();
+        let cfg: Config = serde_json::from_str(&raw).unwrap();
+        assert_eq!(cfg.quote_cap, 42);
+        assert_eq!(cfg.system1.as_deref(), Some("fast"));
+        assert_eq!(cfg.system2.as_deref(), Some("main"));
+        assert_eq!(cfg.effort.as_deref(), Some("high"));
+        assert_eq!(cfg.fast_effort.as_deref(), Some("medium"));
+        assert_eq!(cfg.decisions_on, Some(false));
+        assert_eq!(cfg.decision_model.as_deref(), Some("openai"));
+        assert_eq!(cfg.checks, None);
+
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(v.get("checks").is_none());
+        let _ = fs::remove_dir_all(&dir);
     }
 }
