@@ -613,7 +613,7 @@ mod tests {
             out,
             "**Where to look:**\n\n- `notes.md:5`\n  > It is linear."
         );
-        assert!(is_sourced_only(&out, &[h.clone()], &[]));
+        assert!(is_sourced_only(&out, std::slice::from_ref(&h), &[]));
         assert!(!is_sourced_only(
             &format!("{out}\nSo it is linear."),
             &[h],
