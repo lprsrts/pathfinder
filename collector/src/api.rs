@@ -248,6 +248,19 @@ async fn count_fetches(State(state): State<Arc<AppState>>, req: Request, next: N
     res
 }
 
+/// Whether a form post came from this service's own page: its Origin is
+/// this service, or (when a referrer policy makes the browser send
+/// `Origin: null`) the browser itself says the request is same-origin. Pages
+/// can't set `Sec-Fetch-Site`, and posts from other sites carry `cross-site`.
+fn same_origin(headers: &HeaderMap, public_url: &str) -> bool {
+    let get = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    match get("origin") {
+        Some(origin) if origin == public_url => true,
+        None | Some("null") => get("sec-fetch-site") == Some("same-origin"),
+        Some(_) => false,
+    }
+}
+
 /// The app version in a `pathfinder/<version>` user agent, else "other".
 fn app_version(headers: &HeaderMap) -> String {
     headers
@@ -846,8 +859,7 @@ async fn join_approve(
     Form(form): Form<JoinForm>,
 ) -> Response {
     // The form only counts when posted from this service's own page.
-    let origin = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok());
-    if origin != Some(state.settings.public_url.as_str()) {
+    if !same_origin(&headers, &state.settings.public_url) {
         tracing::warn!("a sign-in form posted from another origin");
         return page(
             StatusCode::FORBIDDEN,
@@ -897,7 +909,7 @@ fn page(status: StatusCode, title: &str, body: &str) -> Response {
         r#"<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="referrer" content="no-referrer">
+<meta name="referrer" content="same-origin">
 <link rel="icon" type="image/png" sizes="32x32" href="/icon-32.png">
 <link rel="apple-touch-icon" href="/icon-180.png">
 <title>{title} · Pathfinder</title>

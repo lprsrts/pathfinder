@@ -832,4 +832,55 @@ mod tests {
         assert_eq!(cache("/healthz").await, None);
         std::fs::remove_dir_all(dir).ok();
     }
+
+    #[tokio::test]
+    async fn sign_in_forms_post_the_way_browsers_post_them() {
+        let st = state(10);
+        st.db.allow("friend@example.com").unwrap();
+        let post = |origin: Option<&'static str>, site: &'static str, code: String| {
+            let st = st.clone();
+            async move {
+                let mut req = Request::builder()
+                    .method("POST")
+                    .uri("/join")
+                    .header("sec-fetch-site", site)
+                    .header("x-test-email", "friend@example.com")
+                    .header("content-type", "application/x-www-form-urlencoded");
+                if let Some(o) = origin {
+                    req = req.header("origin", o);
+                }
+                api::router(st)
+                    .oneshot(req.body(Body::from(format!("code={code}"))).unwrap())
+                    .await
+                    .unwrap()
+                    .status()
+            }
+        };
+        let fresh = || {
+            st.db
+                .start_link(INSTALL, NOTICE_VERSION, false, false)
+                .unwrap()
+                .unwrap()
+                .0
+        };
+        // A referrer policy can make the browser send `Origin: null`.
+        assert_eq!(
+            post(Some("null"), "same-origin", fresh()).await,
+            StatusCode::OK
+        );
+        assert_eq!(post(None, "same-origin", fresh()).await, StatusCode::OK);
+        assert_eq!(
+            post(Some(PUBLIC), "same-origin", fresh()).await,
+            StatusCode::OK
+        );
+        // Another site's form never counts.
+        assert_eq!(
+            post(Some("null"), "cross-site", fresh()).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            post(Some("https://evil.test"), "cross-site", fresh()).await,
+            StatusCode::FORBIDDEN
+        );
+    }
 }
