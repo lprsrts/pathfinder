@@ -218,8 +218,7 @@ flowchart TD
     AS -->|no: stream| OUT
     AS -->|yes: buffer| GT{Gate · A6}
     GT -->|pass| OUT
-    GT -->|block| RW[rewrite once without it] --> GT2{Gate} -->|pass| OUT
-    GT2 -->|block| FX[fixed reply] --> OUT
+    GT -->|block| FX[fixed reply] --> OUT
     X --> TX
     K --> OUT
     RT --> OUT
@@ -407,15 +406,7 @@ sequenceDiagram
     alt pre-check clear, all p < 0.5, and every p ≥ 0.15 moves the reader less than its stakes allow
         O->>U: reply
     else pre-check hit, any p ≥ 0.5, or over the stakes' bits (candidate 0.2 = 57.5% guessing odds, review check 0.14 = 55%)
-        O->>T: rewrite without judging, hinting at, or resolving the pending check (never the probe or secret)
-        T->>O: second draft
-        O->>O: deterministic pre-check
-        O->>D: check again
-        alt passes
-            O->>U: reply
-        else blocked
-            O->>U: fixed reply: "that's what the candidate is testing"
-        end
+        O->>U: fixed reply: "that's what the candidate is testing"
     end
     Note over O,D: a check or reader that errors withholds the reply (fail closed).<br/>The reader judges mostly the last reply, so bits don't add up across a conversation reliably; the predicate still counts hints spread across turns.<br/>Judge buffers feedback until verdict is confirmed.<br/>No decision service: masked-history mode, shown in the toolbar (cannot stop paraphrase re-derivation).
 ```

@@ -32,9 +32,11 @@ Read and search yourself:
 
 - `/find <terms>`: matching lines across the folder's files and PDFs.
 - `/open <file> [page or line]` (or `/open notes.md:120`): the page or lines, numbered.
-- `/web <terms>`: raw web hits under the same rules (not set up yet).
+- `/web <terms>`: papers from OpenAlex and arXiv and pages from Brave Search, each with a line checked against what was fetched. When the folder has nothing for a question, this search runs by itself.
 
 What you open and search is on your record as *read*; it grows the graph but never counts as understanding.
+
+To check your own work, `/check <your work>` (or `/check derivation.md`) quotes the first step that doesn't hold. It doesn't say why or how to fix it.
 
 When you do want an answer, `/tell <question>` gives one. It's marked **Told** and recorded as told, not as understood.
 
@@ -44,7 +46,7 @@ You don't need to ask for a check. It comes at the moments that matter, and ther
 
 - **When you say something has clicked**, it shows one short *candidate*: an explanation that is either right or has exactly one real mistake. Say whether it's right and why. If you'd rather move on, just ask your next question; nothing is recorded then.
 - **When you want to be tested on a topic**, say so. Pathfinder asks open questions one at a time, grades each answer with what was missing, and goes on until you stop.
-- **When you want to do a task yourself** and say so, it splits the task into parts and gives hints, never the result. Think out loud as you work. When you can explain a part, say so and get a candidate for it.
+- **When you want to do a task yourself** and say so, it splits the task into parts, each with where to read for it, never the result. Think out loud as you work; questions get sources, the rest is logged. When you can explain a part, say so and get a candidate for it.
 - **When you want the agent to do the work**, `/handoff` gives it a part you understand and shows you the result to approve or object to. `/delegate` hands off a part without understanding it, and the record says so.
 
 Passing a candidate or a test question is what puts an idea on your record as shown. `/why` shows, per idea, what you've shown, claimed or only been told.
@@ -54,6 +56,8 @@ Passing a candidate or a test question is what puts an idea on your record as sh
 | Command | What it does |
 |---|---|
 | `/find <terms>`, `/open <file> [page]` | Search the folder; read a page or lines |
+| `/web <terms>` | Search papers and the web |
+| `/check <your work>` | The first step that doesn't hold, without the why |
 | `/tell <question>` | A reasoned answer, recorded as told |
 | `/why` | Your record: every idea you've touched here and whether you've shown it, claimed it or were only told |
 | `/map` | In a task: its parts as a diagram |

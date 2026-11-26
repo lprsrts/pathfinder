@@ -159,20 +159,32 @@ Typing `/` shows the commands that match, and Tab completes one. `/help` lists t
 
 The task commands (`/why`, `/map`, `/handoff` and the rest) work the same as in Zed; see [Slash commands in Zed](#slash-commands-in-zed). An unknown command says so instead of being sent to the model.
 
-## Just asking
+## Asking
 
-Pathfinder is also an everyday assistant. Questions are answered in full by the main model, in your language, from the workspace and any attached files: concepts, derivations, summaries of documents, solutions when you ask for them, and reviews of your own work ("I did it this way, is it right?"), which go through it step by step. Nothing is mapped and nothing counts as understood: if the question names an idea already on your record, Pathfinder logs that you were told about it (`told`, which never raises its state). Checks come at natural moments, read from what you mean rather than from any phrase: when you say something has clicked, one candidate follows straight away, and asking anything else instead drops it with nothing recorded; when you ask to be tested, Pathfinder asks open questions one at a time, grades each answer and goes on until you stop or change the subject. Answers and verdicts go on the record per idea. Questions also work in a thread whose task is finished.
+Pathfinder doesn't answer questions in its own words. It points to where the workspace addresses the question and shows a short line from there, word for word: `file:line`, or `file p.N l.M` for a PDF. Every line is checked against the cited file before it is shown; anything the model writes besides that is dropped. If the workspace has nothing, the same search runs on OpenAlex, arXiv and Brave Search, with each line checked against the fetched page. If that finds nothing too, the reply says **Not found** and suggests terms to search for.
+
+Read and search yourself with `/find <terms>` and `/open <file> [page or line]`. `/check <your work>` quotes the first step of your work that doesn't hold, without saying why. `/tell <question>` is the one way to get an answer in full; it is headed **Told**, and the idea is logged as `told`, which never raises its state. Opening and searching are logged as `read` and `searched`, which don't either; a file or search term that names no idea on your record becomes one, shown as *read*.
+
+Checks come at natural moments, read from what you mean rather than from any phrase: when you say something has clicked, one candidate follows straight away, and asking anything else instead drops it with nothing recorded; when you ask to be tested, Pathfinder asks open questions one at a time, grades each answer and goes on until you stop or change the subject. Questions also work in a thread whose task is finished.
+
+Two settings shape how questions are answered:
+
+- `quote_cap` (default 220): the longest verbatim line shown per hit, in characters.
+- `sources_search` (`model` or `code`, default `model`): with `model`, the model reads the workspace and proposes hits, and only those found word for word in the cited file are shown; with `code`, a keyword search runs and no model is asked.
+
+`/web` and questions the workspace can't answer search OpenAlex and arXiv, and Brave Search with a key: `pathfinder auth set brave`, `pathfinder auth import brave` (keychain item `brave-api-key`) or `BRAVE_API_KEY`. `local_only` turns this off.
+
 
 Attach documents, papers or screenshots: images (PNG, JPEG, GIF, WebP) and PDFs are sent to the model as content it can see, on every route, and a screenshot pasted into the chat is saved and attached the same way. Zed can't render LaTeX in the agent panel, so math is written in plain text and Unicode.
 
 Open the folder you're working in as the workspace and the model finds things itself: `read` returns a PDF's text page by page (`pages: "3-7"`), and `view` shows it up to four pages as images, for circuits, diagrams and plots that text can't carry. Both use poppler (`brew install poppler`); without it, attach the file instead.
 
-Pathfinder's own lines (the candidate prompt, part hints, map-change proposals, test questions) follow the conversation's language, German or English; models write everything else in your language.
+Pathfinder's own lines (the candidate prompt, the part prompt, map-change proposals, test questions) follow the conversation's language, German or English; models write everything else in your language.
 
 ## How a session goes
 
 1. Say what you want done. Onboarding settles the goal, then sketches a map of what the task depends on (no size limit).
-2. Work on a part by chatting. Your thinking and the reasons behind your steps are the log; the model replies briefly and may propose map changes. Pathfinder reads what each message means, so plain words drive the loop: "I think I get it: …" explains the part, "I already know this" skips it, "let's move on" goes to the next part, "yes, add it" accepts a map change.
+2. Work on a part by chatting. Your thinking and the reasons behind your steps are the log, taken without comment; questions get sources, as above, and the model may propose map changes. A part shows where to read for it, as a file and page. Pathfinder reads what each message means, so plain words drive the loop: "I think I get it: …" explains the part, "I already know this" skips it, "let's move on" goes to the next part, "yes, add it" accepts a map change.
 3. When you explain the part, you're shown a candidate (an approach or result, right or with one real flaw) and say whether it's right and why. That decides whether the part is understood. While it waits you can still ask questions; see [While you judge](#while-you-judge).
 4. You decide what to give the agent: `/handoff` an understood part and review the result, skip a part you already know, or `/delegate` to hand it off without understanding it.
 
@@ -198,7 +210,7 @@ Until you give your verdict, every reply goes through a gate:
 1. The reply and its reasoning are held. The reply model is asked to answer narrowly: exactly what you asked, with no asides tying the answer back to the topic, since those asides are what tend to give a candidate away. If you ask how to check the candidate, it only says to work it through from what's given and compare; naming the rule, method, step or trap to use counts as a hint.
 2. A pre-check looks for text copied from the key.
 3. A decision model asks whether the reply, read with the conversation since the candidate appeared, reveals, hints at or confirms the key. Sharing the candidate's topic doesn't count: a general explanation that doesn't touch the deciding point passes. Under 0.15 the reply passes and from 0.5 it's blocked. In between, a second reader that never sees the key reads the conversation with the reply and says whether it now tells you the candidate is right, flawed, or neither. The key is one bit (right or flawed); the reply is blocked if it moves that reader toward the true answer by more than the stakes allow (bits = log₂ of the reader's probability for the truth over the even prior of ½). b bits let someone guessing from the hint be right with probability ½ · 2^b, so the limits are set as guessing odds: 0.2 bits (57.5%) for a learning candidate, and 0.14 bits (55%) for a review check, whose verdict vouches for the agent's work or marks it shaky. This replaced a single 0.3 cut-off, which blocked some harmless definitions and missed some hints.
-4. A blocked reply is rewritten once without the candidate, keeping only the direct answer to what you asked. If that is blocked too, or the check fails, you get a fixed reply.
+4. A blocked reply, or one whose check fails, is replaced by a fixed reply.
 
 When you give your verdict the key is retired and replies stream again.
 
@@ -295,6 +307,10 @@ Main model, Effort (main model reasoning: default, low, medium, high), Fast mode
 
 Shortcuts for the same steps. Agent work runs only through `/handoff` and `/delegate`.
 
+- `/find <terms>`, `/open <file> [page or line]`: search the workspace, read a page or lines
+- `/web <terms>`: search papers and the web
+- `/check <your work or file>`: the first step that doesn't hold
+- `/tell <question>`: an answer in full, logged as told
 - `/plan`: build the map now from onboarding
 - `/summary <text>`: explain the current part; a candidate to judge follows
 - `/handoff [notes]`: give an understood part to the agent; you review the result

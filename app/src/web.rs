@@ -259,7 +259,7 @@ async fn fetch_text(c: &reqwest::Client, url: &str) -> Result<String, String> {
 pub fn html_text(html: &str) -> String {
     let mut html = html.to_string();
     for t in [
-        "script", "style", "noscript", "svg", "nav", "footer", "header",
+        "script", "style", "noscript", "svg", "nav", "footer", "header", "math",
     ] {
         let re = regex::Regex::new(&format!(r"(?is)<{t}\b.*?</{t}\s*>")).unwrap();
         html = re.replace_all(&html, " ").into_owned();
@@ -337,7 +337,7 @@ mod tests {
     #[test]
     fn html_becomes_text_with_headings() {
         let t = html_text(
-            "<html><script>x()</script><h2>K-means <b>clustering</b></h2><p>The algorithm assigns points &amp; moves centroids.</p></html>",
+            "<html><script>x()</script><h2>K-means <b>clustering</b><math><mi>k</mi></math></h2><p>The algorithm assigns points &amp; moves centroids.</p></html>",
         );
         assert_eq!(
             t,

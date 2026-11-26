@@ -488,11 +488,18 @@ pub struct WebResult {
 
 /// Web results that pass verification against their fetched text.
 pub fn web_hits(results: &[WebResult]) -> Vec<Hit> {
-    results
+    let mut hits: Vec<Hit> = Vec::new();
+    for h in results
         .iter()
         .filter_map(|r| verify_web(&r.url, r.section.as_deref(), &r.page_text, &r.quote))
-        .take(MAX_HITS)
-        .collect()
+    {
+        // The same abstract from two catalogues is one hit.
+        if !hits.iter().any(|o| fold(&o.quote) == fold(&h.quote)) {
+            hits.push(h);
+        }
+    }
+    hits.truncate(MAX_HITS);
+    hits
 }
 
 /// Marks a heading line in page text, so a hit can name its section.
@@ -777,7 +784,9 @@ mod tests {
                 quote: "Phasors make AC analysis easy.".into(),
             },
         ];
-        let hits = web_hits(&results);
+        let mut twice = results.clone();
+        twice.push(results[0].clone());
+        let hits = web_hits(&twice);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].at.to_string(), "https://example.org/a § Definition");
     }
