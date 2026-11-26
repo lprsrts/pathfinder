@@ -562,36 +562,109 @@ pub const HEADING: char = '\u{1}';
 
 /// The page line holding the most search terms (at least half of them, and
 /// at least one), and the heading it sits under: (section, line).
+#[cfg(test)]
 pub fn pick_quote(page_text: &str, terms: &[String]) -> Option<(Option<String>, String)> {
+    quote_candidates(page_text, terms, 1).into_iter().next()
+}
+
+/// Up to `k` page lines holding at least half of the search terms, best
+/// first, each with the heading it sits under.
+pub fn quote_candidates(
+    page_text: &str,
+    terms: &[String],
+    k: usize,
+) -> Vec<(Option<String>, String)> {
     let terms: Vec<String> = terms
         .iter()
         .map(|t| loose(t).0)
         .filter(|t| t.len() > 1)
         .collect();
     if terms.is_empty() {
-        return None;
+        return Vec::new();
     }
     let need = terms.len().div_ceil(2).max(1);
     let mut section = None;
-    let mut best: Option<(usize, Option<String>, String)> = None;
-    for line in page_text.lines() {
+    let mut found: Vec<(usize, usize, Option<String>, String)> = Vec::new();
+    for (i, line) in page_text.lines().enumerate() {
         if let Some(h) = line.strip_prefix(HEADING) {
             section = Some(h.trim().to_string()).filter(|h| !h.is_empty());
             continue;
         }
-        let words = line.split_whitespace().count();
-        if words < 5 {
+        if line.split_whitespace().count() < 5 {
             continue;
         }
         let low = loose(line).0;
         let n = terms.iter().filter(|t| low.contains(t.as_str())).count();
         // A title only wins over body text with more terms.
         let score = n * 2 + usize::from(section.as_deref() != Some("Title"));
-        if n >= need && best.as_ref().is_none_or(|b| score > b.0) {
-            best = Some((score, section.clone(), line.trim().to_string()));
+        if n >= need {
+            found.push((score, i, section.clone(), line.trim().to_string()));
         }
     }
-    best.map(|(_, s, l)| (s, l))
+    found.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    found
+        .into_iter()
+        .take(k)
+        .map(|(_, _, s, l)| (s, l))
+        .collect()
+}
+
+/// Search queries the model proposes for the web: `{"queries": [...]}`,
+/// at most 3, each a short query (no sentences of reasoning, no question
+/// marks). Anything else is dropped.
+pub fn parse_queries(raw: &str) -> Vec<String> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Q {
+        queries: Vec<String>,
+    }
+    let Ok(q) = serde_json::from_str::<Q>(strip_fence(raw)) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for q in q.queries {
+        let q = q.trim();
+        if q.is_empty()
+            || q.chars().count() > 100
+            || q.split_whitespace().count() > 10
+            || q.contains(['?', '!', ';'])
+            || out.iter().any(|o| o.eq_ignore_ascii_case(q))
+        {
+            continue;
+        }
+        out.push(q.to_string());
+        if out.len() == 3 {
+            break;
+        }
+    }
+    out
+}
+
+/// The candidate numbers the model picks as relevant: `{"pick": [..]}`, in
+/// range, no repeats, at most [`MAX_HITS`]. `None` if the reply is broken.
+pub fn parse_pick(raw: &str, count: usize) -> Option<Vec<usize>> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct P {
+        pick: Vec<usize>,
+    }
+    let p: P = serde_json::from_str(strip_fence(raw)).ok()?;
+    let mut out: Vec<usize> = Vec::new();
+    for i in p.pick {
+        if i < count && !out.contains(&i) {
+            out.push(i);
+        }
+    }
+    out.truncate(MAX_HITS);
+    Some(out)
+}
+
+fn strip_fence(raw: &str) -> &str {
+    let t = raw.trim();
+    t.strip_prefix("```json")
+        .or_else(|| t.strip_prefix("```"))
+        .map(|s| s.trim().trim_end_matches("```").trim())
+        .unwrap_or(t)
 }
 
 // --------------------------------------------------------------- rendering
@@ -626,7 +699,7 @@ pub fn render(hits: &[Hit], terms: &[String], online: bool, skipped: &[String]) 
         out
     };
     if !skipped.is_empty() {
-        out.push_str(&format!("\n\nNot searched: {}.", skipped.join("; ")));
+        out.push_str(&format!("\n\nNot searched: {}.", skipped.join(", ")));
     }
     out
 }
@@ -778,10 +851,10 @@ mod tests {
             out,
             "**Where to look:**\n\n- `notes.md:5`\n  > It is linear."
         );
-        let none = render(&[], &["laplace".into()], true, &["Brave: no key".into()]);
+        let none = render(&[], &["laplace".into()], true, &["Brave (no key)".into()]);
         assert!(none.starts_with("**Not found** in this workspace's sources or online."));
         assert!(none.contains("`/find laplace`"));
-        assert!(none.ends_with("Not searched: Brave: no key."));
+        assert!(none.ends_with("Not searched: Brave (no key)."));
     }
 
     #[test]
@@ -820,6 +893,24 @@ mod tests {
         let hits = find(d.path(), &["K-Means".into()], 5);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].quote, "We use k means clustering here.");
+    }
+
+    #[test]
+    fn model_queries_and_picks_are_kept_to_their_shape() {
+        assert_eq!(
+            parse_queries(
+                r#"{"queries": ["k-means initialization", "K-Means Initialization", "Why is it slow? Because..."]}"#
+            ),
+            ["k-means initialization"]
+        );
+        assert!(parse_queries(r#"{"queries": ["a"], "answer": "x"}"#).is_empty());
+        assert!(parse_queries("Search for k-means.").is_empty());
+        assert_eq!(parse_pick(r#"{"pick": [2, 0, 2, 9]}"#, 3), Some(vec![2, 0]));
+        assert_eq!(parse_pick(r#"{"pick": []}"#, 3), Some(vec![]));
+        assert_eq!(parse_pick("none of them", 3), None);
+        let page = "\u{1}A\nkmeans picks centroids at random first.\nThen kmeans moves each centroid to the mean.\n";
+        let c = quote_candidates(page, &["kmeans".into(), "centroid".into()], 5);
+        assert_eq!(c.len(), 2);
     }
 
     #[test]

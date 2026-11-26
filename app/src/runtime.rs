@@ -444,7 +444,7 @@ impl Runtime {
             "/check" => self.handle_check(session, arg, files, sink).await,
             "/find" => Ok(self.handle_find(session, arg)),
             "/open" => Ok(self.handle_open(session, arg)),
-            "/web" => Ok(self.handle_web(session, arg).await),
+            "/web" => Ok(self.handle_web(session, arg, sink).await),
             _ => Ok(TurnOutput::text(COMMANDS_HELP)),
         }
     }

@@ -36,6 +36,20 @@ struct CheckReply {
     first_wrong: Option<String>,
 }
 
+const FOCUS_SYSTEM: &str = r#"You turn a question into web search queries for papers and pages that address it. You never answer the question.
+
+Return ONLY this JSON object:
+{"queries": ["query one", "query two"]}
+
+At most 3 queries, each a few precise keywords (names, technical terms, the paper or field it is about), at most 10 words, no question marks. The first one goes to the general web, all of them to paper catalogues."#;
+
+const PICK_SYSTEM: &str = r#"You pick which numbered lines from search results bear directly on the user's question: lines a reader would want to open to answer it themselves. You never answer the question.
+
+Return ONLY this JSON object:
+{"pick": [3, 0]}
+
+The most relevant first, at most 5. A line must be about the same people, work and thing the question means; the files the user is working with tell you what "the paper" or "the authors" refers to. Leave out lines that only share words with the question but are about someone or something else. If none bear on it, return {"pick": []}."#;
+
 /// Where a source event is filed when no idea on the record is named.
 const SOURCES: &str = "sources";
 
@@ -93,9 +107,7 @@ impl Runtime {
         let mut skipped = Vec::new();
         let online = hits.is_empty() && !terms.is_empty();
         if online {
-            let found = crate::web::search(&terms).await;
-            hits = found.hits;
-            skipped = found.notes;
+            (hits, skipped) = self.online_hits(session, text, &terms, true, sink).await;
             if !hits.is_empty() {
                 self.record_source(session, &terms.join(" "), EventKind::Searched, "web");
             }
@@ -245,25 +257,136 @@ impl Runtime {
     }
 
     /// `/web <terms>`: raw web hits, each checked against the fetched page.
-    pub(super) async fn handle_web(&self, session: &mut Session, arg: &str) -> TurnOutput {
+    pub(super) async fn handle_web(
+        &self,
+        session: &mut Session,
+        arg: &str,
+        sink: StreamSink,
+    ) -> TurnOutput {
         let terms: Vec<String> = arg.split_whitespace().map(str::to_string).collect();
         if terms.is_empty() {
             return TurnOutput::text("`/web <terms>`: search papers and the web for raw hits.");
         }
         self.record_source(session, arg, EventKind::Searched, &format!("web:{arg}"));
-        let found = crate::web::search(&terms).await;
-        let reply = if found.hits.is_empty() {
+        let (hits, notes) = self.online_hits(session, arg, &terms, false, &sink).await;
+        let reply = if hits.is_empty() {
             let mut out = format!("Nothing online matched `{arg}`.");
-            if !found.notes.is_empty() {
-                out.push_str(&format!("\n\nNot searched: {}.", found.notes.join("; ")));
+            if !notes.is_empty() {
+                out.push_str(&format!("\n\nNot searched: {}.", notes.join(", ")));
             }
             out
         } else {
-            sources::render(&found.hits, &[], true, &found.notes)
+            sources::render(&hits, &[], true, &notes)
         };
         session.push_turn("user", format!("/web {arg}"));
         session.push_turn("assistant", &reply);
         TurnOutput::text(reply)
+    }
+
+    /// Online hits for `question`: the model turns it into focused queries,
+    /// code searches and extracts candidate lines, the model picks the ones
+    /// that bear on the question, and code verifies each against its page.
+    /// With `sources_search: "code"`, no model: the terms as the query and
+    /// the best line per page. Also returns what couldn't be searched.
+    /// `from_workspace`: the question came up while reading the workspace,
+    /// so its files tell what "the paper" means; for `/web` the terms alone
+    /// are the topic.
+    async fn online_hits(
+        &self,
+        session: &Session,
+        question: &str,
+        terms: &[String],
+        from_workspace: bool,
+        sink: &StreamSink,
+    ) -> (Vec<Hit>, Vec<String>) {
+        let context = if from_workspace {
+            format!(
+                "Files the user is working with:\n{}\n",
+                workspace_files(&session.cwd)
+            )
+        } else {
+            String::new()
+        };
+        if cfg!(test) {
+            return (Vec::new(), vec!["web search is off in tests".into()]);
+        }
+        let use_model = crate::config::Config::load().sources_search != "code";
+        let mut queries = Vec::new();
+        if use_model {
+            let raw = self
+                .small_call(
+                    session,
+                    FOCUS_SYSTEM,
+                    format!(
+                        "{context}Question: {question}\nSearch terms so far: {}",
+                        terms.join(", ")
+                    ),
+                    sink,
+                )
+                .await;
+            queries = sources::parse_queries(&raw);
+        }
+        if queries.is_empty() {
+            queries.push(terms.join(" "));
+        }
+        // Lines are kept by the user's own terms, not the model's queries.
+        let words = sources::keywords(&terms.join(" "));
+        let found = crate::web::search(&queries, &words).await;
+        let cands = found.candidates;
+        let picked: Vec<sources::WebResult> = match use_model && !cands.is_empty() {
+            true => {
+                let list: String = cands
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| {
+                        let line: String = c.quote.chars().take(300).collect();
+                        format!("[{i}] {}: {line}\n", c.url)
+                    })
+                    .collect();
+                let raw = self
+                    .small_call(
+                        session,
+                        PICK_SYSTEM,
+                        format!("{context}Question: {question}\n\nLines:\n{list}"),
+                        sink,
+                    )
+                    .await;
+                match sources::parse_pick(&raw, cands.len()) {
+                    Some(ids) => ids.into_iter().map(|i| cands[i].clone()).collect(),
+                    None => best_per_page(cands),
+                }
+            }
+            false => best_per_page(cands),
+        };
+        (sources::web_hits(&picked), found.notes)
+    }
+
+    /// A short JSON-only call to the fast model, with no tools; "" on error.
+    async fn small_call(
+        &self,
+        session: &Session,
+        system: &str,
+        prompt: String,
+        sink: &StreamSink,
+    ) -> String {
+        let Ok(models) = self.models(session) else {
+            return String::new();
+        };
+        let req = EngineRequest {
+            tier: EngineTier::System1,
+            tools: ToolAccess::None,
+            cwd: session.cwd.clone(),
+            system_prompt: system.to_string(),
+            prompt: format!("{prompt}\n\nReturn the JSON only."),
+            files: vec![],
+            stream_text: false,
+            models,
+            ctx: crate::engine::turn_ctx(),
+        };
+        self.engine
+            .run_text(&req, gate::held(sink))
+            .await
+            .unwrap_or_default()
     }
 
     /// Files reading/searching on the ideas `text` names, else on `sources`.
@@ -386,6 +509,47 @@ pub(crate) fn render_check(work: &str, file: Option<&str>, raw: &str) -> String 
         "**First step that doesn't hold** ({at}):\n\n> {}\n\nWhy is for you to find: `/find`, `/open`, or `/tell` (recorded as told).",
         sources::cap(&own)
     )
+}
+
+/// The workspace's source files with their first lines (often the title),
+/// so "the paper" in a question can be resolved.
+fn workspace_files(cwd: &std::path::Path) -> String {
+    sources::source_files(cwd)
+        .into_iter()
+        .take(30)
+        .map(|(full, rel)| {
+            let first = sources::pages(&full, &rel)
+                .ok()
+                .and_then(|p| {
+                    p.iter()
+                        .flat_map(|pg| pg.lines())
+                        .map(str::trim)
+                        .filter(|l| l.split_whitespace().count() >= 3)
+                        .take(4)
+                        .collect::<Vec<_>>()
+                        .join(" / ")
+                        .chars()
+                        .take(240)
+                        .collect::<String>()
+                        .into()
+                })
+                .unwrap_or_default();
+            format!("- {rel}: {first}\n")
+        })
+        .collect()
+}
+
+/// Without the model: the first (best) candidate line of each page.
+fn best_per_page(cands: Vec<sources::WebResult>) -> Vec<sources::WebResult> {
+    let mut seen: Vec<String> = Vec::new();
+    cands
+        .into_iter()
+        .filter(|c| {
+            let new = !seen.contains(&c.url);
+            seen.push(c.url.clone());
+            new
+        })
+        .collect()
 }
 
 /// `paper.pdf 3`, `notes.md:120` or `notes.md`.

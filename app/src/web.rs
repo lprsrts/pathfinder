@@ -7,23 +7,30 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::sources::{self, HEADING, Hit, WebResult};
+use crate::sources::{self, HEADING, WebResult};
 
 /// The auth file / keychain entry for Brave Search.
 pub const BRAVE_KEY: &str = "brave-api-key";
 const BRAVE_ENV: &str = "BRAVE_API_KEY";
+/// OpenAlex works without a key, within a small daily allowance.
+pub const OPENALEX_KEY: &str = "openalex-api-key";
+const OPENALEX_ENV: &str = "OPENALEX_API_KEY";
 
 /// Results asked of each service.
 const PER_SERVICE: usize = 4;
 /// Largest page body read.
 const MAX_PAGE: usize = 2 * 1024 * 1024;
 
-/// What a search found, and what couldn't be searched (one line each).
+/// What a search found: candidate lines (each a result with its quote set,
+/// not yet verified), and what couldn't be searched (one line each).
 #[derive(Debug, Default)]
 pub struct WebFound {
-    pub hits: Vec<Hit>,
+    pub candidates: Vec<WebResult>,
     pub notes: Vec<String>,
 }
+
+/// Candidate lines kept per page.
+const PER_PAGE: usize = 2;
 
 fn client() -> reqwest::Client {
     reqwest::Client::builder()
@@ -33,25 +40,24 @@ fn client() -> reqwest::Client {
         .unwrap_or_default()
 }
 
-fn brave_key() -> Option<String> {
+/// A search key: the environment, the auth file, or the keychain item of
+/// the same name (copied into the auth file on first use).
+fn search_key(name: &str, env: &'static str) -> Option<String> {
     let creds = crate::auth::Credentials::system();
-    creds
-        .named_key(BRAVE_KEY, BRAVE_ENV)
-        .map(|(k, _)| k)
-        .or_else(|| {
-            // The keychain item, copied in on first use.
-            creds.import_named(BRAVE_KEY).ok().filter(|ok| *ok)?;
-            creds.stored(BRAVE_KEY)
-        })
+    creds.named_key(name, env).map(|(k, _)| k).or_else(|| {
+        creds.import_named(name).ok().filter(|ok| *ok)?;
+        creds.stored(name)
+    })
 }
 
-/// Searches all services. Offline in `local_only` mode.
-pub async fn search(terms: &[String]) -> WebFound {
+/// Searches papers for every query and the web for the first, and returns
+/// the lines of each result that hold at least half of `words`. Offline in
+/// `local_only` mode and in tests.
+pub async fn search(queries: &[String], words: &[String]) -> WebFound {
     let mut found = WebFound::default();
-    if terms.is_empty() {
+    if queries.is_empty() {
         return found;
     }
-    // Tests never reach the network.
     if cfg!(test) {
         found.notes.push("web search is off in tests".into());
         return found;
@@ -60,51 +66,95 @@ pub async fn search(terms: &[String]) -> WebFound {
         found.notes.push("web search is off (`local_only`)".into());
         return found;
     }
-    let q = terms.join(" ");
     let c = client();
-    let key = brave_key();
-    let (oa, ax, br) = tokio::join!(openalex(&c, &q), arxiv(&c, &q), async {
-        match &key {
-            Some(k) => brave(&c, &q, k).await,
-            None => Err("Brave: no key (`pathfinder auth set brave`)".to_string()),
+    let key = search_key(BRAVE_KEY, BRAVE_ENV);
+    let openalex_key = search_key(OPENALEX_KEY, OPENALEX_ENV);
+    // One query at a time: the catalogues rate-limit bursts.
+    let papers = async {
+        let mut out = Vec::new();
+        for q in queries {
+            out.push(tokio::join!(
+                openalex(&c, q, openalex_key.as_deref()),
+                arxiv(&c, q)
+            ));
         }
-    });
+        out
+    };
+    let web = async {
+        match &key {
+            Some(k) => brave(&c, &queries[0], k).await,
+            None => Err("Brave (no key: `pathfinder auth set brave`)".to_string()),
+        }
+    };
+    let (papers, web) = tokio::join!(papers, web);
     let mut results: Vec<WebResult> = Vec::new();
-    for r in [oa, ax, br] {
-        match r {
-            Ok(rs) => results.extend(rs),
-            Err(e) => found.notes.push(e),
+    let mut add = |r: Result<Vec<WebResult>, String>, notes: &mut Vec<String>| match r {
+        Ok(rs) => {
+            for r in rs {
+                if !results.iter().any(|o| o.url == r.url) {
+                    results.push(r);
+                }
+            }
+        }
+        Err(e) => {
+            if !notes.contains(&e) {
+                notes.push(e)
+            }
+        }
+    };
+    for (oa, ax) in papers {
+        add(oa, &mut found.notes);
+        add(ax, &mut found.notes);
+    }
+    add(web, &mut found.notes);
+    for r in results {
+        for (section, line) in sources::quote_candidates(&r.page_text, words, PER_PAGE) {
+            found.candidates.push(WebResult {
+                url: r.url.clone(),
+                section: section.or(r.section.clone()),
+                page_text: r.page_text.clone(),
+                quote: line,
+            });
         }
     }
-    let results: Vec<WebResult> = results
-        .into_iter()
-        .filter_map(|mut r| {
-            let (section, line) = sources::pick_quote(&r.page_text, terms)?;
-            r.section = section.or(r.section);
-            r.quote = line;
-            Some(r)
-        })
-        .collect();
-    found.hits = sources::web_hits(&results);
     found
 }
 
+/// A short note for a service that couldn't be searched.
+fn failed(service: &str, e: &reqwest::Error) -> String {
+    match e.status() {
+        Some(s) if s.as_u16() == 429 && service == "OpenAlex" => {
+            "OpenAlex (free daily allowance used up; a key: `pathfinder auth set openalex`)".into()
+        }
+        Some(s) if s.as_u16() == 429 => format!("{service} (rate limited, try again shortly)"),
+        Some(s) => format!("{service} (HTTP {})", s.as_u16()),
+        None if e.is_timeout() => format!("{service} (timed out)"),
+        None => format!("{service} (unreachable)"),
+    }
+}
+
 /// OpenAlex works: title and abstract (rebuilt from its inverted index).
-async fn openalex(c: &reqwest::Client, q: &str) -> Result<Vec<WebResult>, String> {
-    let v: Value = c
-        .get("https://api.openalex.org/works")
-        .query(&[
-            ("search", q),
-            ("per-page", &PER_SERVICE.to_string()),
-            ("select", "id,doi,title,abstract_inverted_index"),
-        ])
+async fn openalex(
+    c: &reqwest::Client,
+    q: &str,
+    key: Option<&str>,
+) -> Result<Vec<WebResult>, String> {
+    let mut req = c.get("https://api.openalex.org/works").query(&[
+        ("search", q),
+        ("per-page", &PER_SERVICE.to_string()),
+        ("select", "id,doi,title,abstract_inverted_index"),
+    ]);
+    if let Some(k) = key {
+        req = req.query(&[("api_key", k)]);
+    }
+    let v: Value = req
         .send()
         .await
         .and_then(|r| r.error_for_status())
-        .map_err(|e| format!("OpenAlex: {e}"))?
+        .map_err(|e| failed("OpenAlex", &e))?
         .json()
         .await
-        .map_err(|e| format!("OpenAlex: {e}"))?;
+        .map_err(|e| failed("OpenAlex", &e))?;
     Ok(v["results"]
         .as_array()
         .into_iter()
@@ -168,10 +218,10 @@ async fn arxiv(c: &reqwest::Client, q: &str) -> Result<Vec<WebResult>, String> {
         .send()
         .await
         .and_then(|r| r.error_for_status())
-        .map_err(|e| format!("arXiv: {e}"))?
+        .map_err(|e| failed("arXiv", &e))?
         .text()
         .await
-        .map_err(|e| format!("arXiv: {e}"))?;
+        .map_err(|e| failed("arXiv", &e))?;
     Ok(parse_arxiv(&body))
 }
 
@@ -210,10 +260,10 @@ async fn brave(c: &reqwest::Client, q: &str, key: &str) -> Result<Vec<WebResult>
         .send()
         .await
         .and_then(|r| r.error_for_status())
-        .map_err(|e| format!("Brave: {e}"))?
+        .map_err(|e| failed("Brave", &e))?
         .json()
         .await
-        .map_err(|e| format!("Brave: {e}"))?;
+        .map_err(|e| failed("Brave", &e))?;
     let urls: Vec<String> = v["web"]["results"]
         .as_array()
         .into_iter()
