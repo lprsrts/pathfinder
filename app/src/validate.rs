@@ -45,7 +45,8 @@ pub fn check_onboarding(d: &OnboardingDecision) -> Vec<Violation> {
     let mut out = Vec::new();
     // A question's answer comes from its own call; a quick check shows no
     // goal sentence.
-    if !(d.question && !d.ready_to_map) && !d.check && !d.exam {
+    let answers_a_question = d.question && !d.ready_to_map;
+    if !answers_a_question && !d.check && !d.exam {
         require_text(&mut out, &d.reply, "reply");
     }
     if d.ready_to_map && d.goal.as_deref().is_none_or(|g| g.trim().is_empty()) {

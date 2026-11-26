@@ -991,11 +991,10 @@ fn extract_turn_input(blocks: &[ContentBlock]) -> TurnInput {
 
     for block in blocks {
         match block {
-            ContentBlock::Text(t) => {
-                if !t.text.trim().is_empty() {
-                    text_parts.push(t.text.clone());
-                }
+            ContentBlock::Text(t) if !t.text.trim().is_empty() => {
+                text_parts.push(t.text.clone());
             }
+            ContentBlock::Text(_) => {}
             ContentBlock::ResourceLink(link) => {
                 if let Some(path) = file_uri_to_path(&link.uri) {
                     files.push(path);

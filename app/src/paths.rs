@@ -121,7 +121,7 @@ fn xdg_base(kind: Kind, home: &Path) -> PathBuf {
         .fold(home.to_path_buf(), |p, part| p.join(part))
 }
 
-#[cfg(test)]
+#[cfg(any(test, not(any(target_os = "macos", windows))))]
 fn xdg_default(kind: Kind, home: &Path) -> PathBuf {
     xdg_base(kind, home).join(NAME)
 }
