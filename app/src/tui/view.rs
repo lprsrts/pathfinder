@@ -331,7 +331,10 @@ fn conversation(f: &mut Frame, app: &mut App, area: Rect) {
     let (mut lines, items) = transcript(app, area.width);
     if app.entries.is_empty() {
         for hint in [
-            format!("Ask anything about what's in {}.", app.cwd.display()),
+            format!(
+                "Ask about what's in {}: you get where to read, quoted from the source.",
+                app.cwd.display()
+            ),
             "Drop a PDF or a screenshot here to attach it. F1 shows the keys.".to_string(),
         ] {
             lines.extend(markdown::wrap(&[Span::styled(hint, dim())], area.width));

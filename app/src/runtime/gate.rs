@@ -13,10 +13,6 @@ use crate::domain::Session;
 use crate::engine::{StreamEvent, StreamSink};
 use crate::secrets::{BLOCK_FROM, PASS_BELOW, Secret, bits_limit, bits_toward, precheck_hit};
 
-/// Added to the Tutor's prompt while the gate checks its replies: asides
-/// that tie a general answer back to the topic are what settle a candidate.
-pub(super) const NARROW: &str = "Something is being judged right now, so answer narrowly: reply to exactly what the user asked and stop. Don't add asides that tie your answer to the task, the part or a related idea (\"which is where X comes in\", \"that's what matters when ...\"), and don't add consequences, edge cases or examples they didn't ask for. If they ask how to check it, say only to work it through themselves from what's given and compare; don't name a rule, formula, method or test to apply, a step to look at, or a trap to watch for, and don't warn that the topic is tricky, a common source of mistakes, or something to be careful about.";
-
 const LEAK_OPTION: &str = "yes";
 
 fn leak_question(name: &str, n: usize, probe: &str) -> Question {

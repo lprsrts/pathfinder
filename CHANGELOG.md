@@ -2,6 +2,16 @@
 
 What changed in each release of Pathfinder, newest first. `pathfinder update` shows the newest section.
 
+## Unreleased
+
+- **Sources, not answers.** A question gets the places in your folder that address it, each with a short line quoted from there and checked against the file by code; the model's own words are never shown. If the folder has nothing, OpenAlex, arXiv and (with a key) Brave Search are searched the same way. Otherwise the reply says **Not found** and suggests terms.
+- **`/tell <question>`** gives a model's answer, recorded as *told*.
+- **`/find`, `/open` and `/web`** search the folder, show a file or PDF page, and search online. What you read and search is on the record, never as understanding.
+- **`/check`** finds the first step of your work that doesn't hold, from typed steps, a file, or a photo or scan of handwritten work, and quotes it without saying why.
+- **Spelling and word forms don't matter in search:** "K-means" finds "kmeans", "Schroedinger" finds "Schrödinger", "clustering" finds "clusters".
+- In a task, messages that aren't questions get "Logged." and no comment. A reply held back while you judge a candidate is replaced by a fixed one, no longer rewritten.
+- New keys: `pathfinder auth set brave` and `pathfinder auth set openalex`. New settings: `quote_cap` and `sources_search`.
+
 ## 0.3.4
 
 - **Updates work while Pathfinder's server is down.** `pathfinder update` and the installer fall back to the same signed release on GitHub. The installer itself is on every GitHub release too.

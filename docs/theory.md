@@ -89,10 +89,12 @@ It is used, not just kept:
 
 ## 11. What each model sees, and what reaches you
 
+No model answers your questions in its own words. A question gets the places in your sources (or online) that address it, each with a short line quoted from there and checked by code against the source; you read and conclude. `/tell` is the one way to get a model's answer, and it is recorded as told, never as understood (section 10).
+
 Some things must not reach you yet: whether a candidate is right and why, and an answer you are meant to produce yourself. These are kept from you in two ways:
 
-- **Separation.** Each model is given only what its job needs. The model that answers your questions never sees a candidate's key. Models that hold a secret get no unnecessary tools, their reasoning is never shown to you, and a judge holds its reply until it confirms you gave a verdict.
-- **A check on every reply.** Separation stops a model from leaking a stored secret, not from re-deriving an answer when you quote or paraphrase a candidate back to it. While a secret is active, a separate check inspects each draft before it reaches you, together with the turns since the secret opened, to catch multi-turn narrowing. If it reveals, hints at, or confirms the secret, the reply is written again without it.
+- **Separation.** Each model is given only what its job needs. The model that looks for sources for your questions never sees a candidate's key. Models that hold a secret get no unnecessary tools, their reasoning is never shown to you, and a judge holds its reply until it confirms you gave a verdict.
+- **A check on every reply.** Separation stops a model from leaking a stored secret, not from re-deriving an answer when you quote or paraphrase a candidate back to it. While a secret is active, a separate check inspects each draft before it reaches you, together with the turns since the secret opened, to catch multi-turn narrowing. A quoted line can settle a candidate as well as a model's own words can. If the reply reveals, hints at, or confirms the secret, a fixed reply is sent instead.
 
 Separation stops what a model never saw from leaking. The check catches what slips through or gets re-derived anyway.
 
@@ -118,7 +120,7 @@ Handoff runs in an isolated staging copy, and live diffs and prose summaries of 
 - **Understanding is not verification.** Vouching for a change means you understood the concepts behind it and reviewed it, not that it is free of runtime, integration or concurrency bugs. Automated tests and formal checks stay separate, and should be shown beside understanding coverage rather than conflated with it.
 - **Tying work to concepts can be wrong.** You can see and correct it, and when it is unsure, or when later formatting breaks a hash, coverage is counted as lower, never higher.
 - **Local integrity is not cryptographic proof.** The hash chain and tool boundaries keep the agent from altering the record (as far as command permissions and routes enforce them). Proving the record to an untrusting third party requires external signing.
-- **Separation has a boundary.** Without the reply check (or on external CLI routes that keep their own transcripts), Pathfinder can mask history, but cannot stop a model from re-deriving an answer you paraphrase back to it.
+- **Separation has a boundary.** Without the reply check (or on external CLI routes that keep their own transcripts), Pathfinder can mask history, but cannot stop a quoted line or a told answer from settling a candidate you paraphrase back to it.
 - **Checks have a cost.** How often reviews are checked (section 13) is a visible setting of the session. A check you can't see is not allowed.
 
 ---
@@ -187,7 +189,7 @@ flowchart TB
 | Role | Kind | Tools | Map, log | Concept states | Candidate text | Key ● | Planted hunk ● | Returns |
 |---|---|---|:-:|:-:|:-:|:-:|:-:|---|
 | Router | decision | none | ✓ | | ✓ | | | step, part |
-| Tutor | language | read-only | ✓ | ✓ | masked | | | reply, map change |
+| Tutor | language | read-only | ✓ | ✓ | masked | | | cited lines (JSON), map change |
 | Extractor | decision+language | none | ✓ | ✓ | | | | concepts, misconceptions |
 | Mapper | language | read-only | ✓ | ✓ | | | | parts, concepts, prerequisites |
 | Examiner | language | read-only | part only | targets | writes it | writes it | | candidate, key |
@@ -214,8 +216,8 @@ flowchart TD
     R -->|move · replan · accept · reject| MV[map and focus]
     R -->|handoff| AH[Agent in staging] --> TH[Tagger] --> LH[ledger] --> RV[review · A8]
     R -->|delegate| AD[Agent] --> TD[Tagger] --> LD[ledger: all delegated]
-    T --> AS{active secret?}
-    AS -->|no: stream| OUT
+    T --> V[code checks each quote against its source · renders the reply] --> AS{active secret?}
+    AS -->|no| OUT
     AS -->|yes: buffer| GT{Gate · A6}
     GT -->|pass| OUT
     GT -->|block| FX[fixed reply] --> OUT
@@ -384,7 +386,7 @@ stateDiagram-v2
     active --> active: every reply buffered and checked against its probe
     active --> retired: your verdict is recorded
     retired --> [*]
-    note right of active: Tutor streams when no secret is active, and buffers while one is
+    note right of active: Tutor never streams; code renders checked quotes, and the gate checks them while a secret is active
     note right of retired: Judge feedback may reveal it now
 ```
 

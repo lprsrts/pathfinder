@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Pathfinder</title>
-<meta name="description" content="Pathfinder makes sure you understand the work you do with AI. It answers, checks you at the moments that matter, and keeps an honest record of what you understood.">
+<meta name="description" content="Pathfinder makes sure you understand the work you do with AI. It points you to where your sources answer a question, checks you at the moments that matter, and keeps an honest record of what you understood.">
 <link rel="icon" type="image/png" sizes="32x32" href="/icon-32.png">
 <link rel="icon" type="image/png" sizes="16x16" href="/icon-16.png">
 <link rel="apple-touch-icon" href="/icon-180.png">
@@ -37,12 +37,12 @@
 <body>
 <main>
 <header><img src="/icon-180.png" alt="" width="40" height="40"><h1>Pathfinder</h1></header>
-<p class="lead">Pathfinder makes sure you understand the work you do with AI. It answers your questions, checks you at the moments that matter, and keeps an honest record of what you understood, what you only claimed, and what you handed off.</p>
+<p class="lead">Pathfinder makes sure you understand the work you do with AI. It points you to where your sources answer a question, checks you at the moments that matter, and keeps an honest record of what you understood, what you only claimed, and what you handed off.</p>
 <p>It runs in your terminal, on your own computer, with your own model account. It’s free and open source: anyone can install it and use it with their own keys.</p>
 
 <h2>How it works</h2>
 <ul>
-<li><strong>Ask anything</strong> about the folder you’re working in: code, papers, notes, PDFs. Answers count as <em>told</em>, not as understood.</li>
+<li><strong>Sources, not answers.</strong> Ask about the folder you’re working in (code, papers, notes, PDFs) and Pathfinder shows where it addresses your question, with a short line quoted from there and checked against the file. Nothing in the folder? It searches OpenAlex, arXiv and the web the same way. You do the reading. <code>/tell</code> gives a real answer when you want one, recorded as <em>told</em>.</li>
 <li><strong>Say when something has clicked.</strong> You get a short candidate that is either right or has exactly one real mistake, and you say which and why. Passing is the only thing that counts as understanding.</li>
 <li><strong>While you judge, nothing gives it away.</strong> A gate checks every reply against the answer before you see it.</li>
 <li><strong>Hand work to the agent</strong> when you understand it, and review the result. <code>/why</code> shows your record.</li>
@@ -50,7 +50,7 @@
 
 <figure>
 <video src="/pathfinder-demo.mp4" poster="/screenshot.svg" controls muted playsinline preload="metadata" style="width:100%;height:auto;border-radius:10px;background:#16181d"></video>
-<figcaption class="meta">A real session: a question, an answer, a candidate to judge, and the verdict.</figcaption>
+<figcaption class="meta">A session from an earlier version, before questions got sources instead of answers: a question, a reply, a candidate to judge, and the verdict.</figcaption>
 </figure>
 
 <h2>What you need</h2>

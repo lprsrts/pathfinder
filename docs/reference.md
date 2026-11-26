@@ -207,14 +207,14 @@ A candidate's key (right or flawed, and why) is kept in the session database's s
 
 Until you give your verdict, every reply goes through a gate:
 
-1. The reply and its reasoning are held. The reply model is asked to answer narrowly: exactly what you asked, with no asides tying the answer back to the topic, since those asides are what tend to give a candidate away. If you ask how to check the candidate, it only says to work it through from what's given and compare; naming the rule, method, step or trap to use counts as a hint.
+1. The reply is held. A question's reply is built by code from checked quotes, as always; a line quoted from your sources can still settle a candidate, so it goes through the same check as any other reply.
 2. A pre-check looks for text copied from the key.
 3. A decision model asks whether the reply, read with the conversation since the candidate appeared, reveals, hints at or confirms the key. Sharing the candidate's topic doesn't count: a general explanation that doesn't touch the deciding point passes. Under 0.15 the reply passes and from 0.5 it's blocked. In between, a second reader that never sees the key reads the conversation with the reply and says whether it now tells you the candidate is right, flawed, or neither. The key is one bit (right or flawed); the reply is blocked if it moves that reader toward the true answer by more than the stakes allow (bits = log₂ of the reader's probability for the truth over the even prior of ½). b bits let someone guessing from the hint be right with probability ½ · 2^b, so the limits are set as guessing odds: 0.2 bits (57.5%) for a learning candidate, and 0.14 bits (55%) for a review check, whose verdict vouches for the agent's work or marks it shaky. This replaced a single 0.3 cut-off, which blocked some harmless definitions and missed some hints.
 4. A blocked reply, or one whose check fails, is replaced by a fixed reply.
 
-When you give your verdict the key is retired and replies stream again.
+When you give your verdict the key is retired and replies are shown without the check.
 
-With Decisions off, the gate can't run. The reply model then only has the candidate hidden from its history, so it can still work the answer out if you paraphrase the candidate to it.
+With Decisions off, the gate can't run. The candidate is still hidden from the model that looks for sources, but nothing stops a quoted line from settling the candidate.
 
 
 Before an LLM sees a chat message, a decision model can say which step it is (a log entry, an explanation of the part, a skip, a move, a map-change answer, or a verdict on a waiting candidate). Skips and moves then happen without an LLM call, a question about a waiting candidate skips the judge, and log replies get the decision in their prompt. If the decision model is unsure, unset or unreachable, the LLM decides as part of its reply.

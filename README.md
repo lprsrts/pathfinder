@@ -8,7 +8,7 @@ Pathfinder makes sure you understand the work you do with AI. It points you to w
 
 It runs in your terminal (or in Zed), on your own computer, with your own model account.
 
-<img src="collector/public/pathfinder-demo.gif" alt="A real Pathfinder session: a question about retry jitter, an answer, 'I think I get it', a candidate to judge, a verdict, and the feedback">
+<img src="collector/public/pathfinder-demo.gif" alt="A Pathfinder session from before questions got sources instead of answers: a question about retry jitter, a reply, 'I think I get it', a candidate to judge, a verdict, and the feedback">
 
 ## How it works
 
@@ -47,6 +47,7 @@ F1 shows the keys. [docs/guide.md](docs/guide.md) walks through a session.
 ## Data and network
 
 - **Your work goes to your model provider**, under your account: your messages, files and the model's replies. Pathfinder itself keeps everything else on your computer (`pathfinder paths` shows where).
+- **Online search.** When a question isn't covered by your folder, or you use `/web`, short search queries made from it go to OpenAlex, arXiv and, with your key, Brave Search, and the result pages are fetched from your computer. `local_only` turns this off.
 - **Commands run in a sandbox** (Seatbelt on macOS, bubblewrap on Linux) that can't read your credentials or reach the network without asking.
 - **The beta (invite-only).** People helping me test can join with their email. Joining turns on a shared gate service, so the gate works without a decision key of your own. Only the gate's checks go through that service. Sharing usage data (counts and timings, never your messages) and sharing chosen threads are separate, optional choices. `pathfinder data show` prints exactly what is queued, and `pathfinder data delete` erases what was sent. The [privacy notice](https://pathfinder.lprsrts.com/privacy/) has the details, and the full list of usage events is in [schema/src/lib.rs](schema/src/lib.rs).
 - **Fully on your own servers.** With your own model endpoints and `"local_only": true`, nothing goes to a model company or to the beta service. See [docs/reference.md](docs/reference.md#self-hosted-and-open-models).

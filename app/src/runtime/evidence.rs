@@ -41,16 +41,11 @@ impl Runtime {
         if let Some(pending) = &session.pending_candidate {
             history = history.replace(&pending.candidate, CANDIDATE_HIDDEN);
             waiting.push_str(
-                "\n\nA candidate for this part is waiting for the user's verdict; it's hidden from you, so you don't know whether it's right. Never say it is right or wrong, or that any detail of it is. Answer questions about the general concepts only. If they ask about the candidate itself (a claim, step or number in it, or whether it's right), say that's what they're judging. Don't mention that it's hidden from you. A message that asks about the candidate is `log`, even if they add that they want to move on; `move` or `known` only when they ask to leave it unjudged and ask nothing about it.",
+                "\n\nA candidate for this part is waiting for the user's verdict; it's hidden from you, so you don't know whether it's right. A message that asks about the candidate is `log`, even if they add that they want to move on; `move` or `known` only when they ask to leave it unjudged and ask nothing about it.",
             );
         }
 
-        // While a secret is active the reply is held for the gate (A6),
-        // thinking included: it may re-derive what the candidate tests.
         let gate = self.gate_mode(session);
-        if matches!(gate, gate::GateMode::Checked(_)) {
-            waiting.push_str(&format!("\n\n{}", gate::NARROW));
-        }
         let req = EngineRequest {
             tier: EngineTier::System1,
             tools: ToolAccess::ReadOnly,

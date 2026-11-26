@@ -39,10 +39,11 @@ F1 shows the keys. The [guide](guide.md) walks through a session.
 
 ## Things to try
 
-1. Ask about something in your folder you only half understand, then say when it clicks. Judge the candidate you get.
-2. Ask Pathfinder to test you on a topic, and answer a few questions.
-3. Give it a small task, work through it yourself, then `/handoff` a part you understand and review what the agent did.
-4. Run `/why` and see whether the record matches what you think you know.
+1. Ask about something in your folder you only half understand. You get where to read, with a line quoted from there, not an answer. Read it, say when it clicks, and judge the candidate you get.
+2. Ask something your folder doesn't cover, or use `/web <terms>`, to search OpenAlex, arXiv and (with a key) Brave. `/find <terms>` searches the folder yourself; `/tell <question>` gets a model's answer, recorded as told.
+3. Ask Pathfinder to test you on a topic, and answer a few questions.
+4. Give it a small task, work through it yourself, then `/handoff` a part you understand and review what the agent did.
+5. Run `/why` and see whether the record matches what you think you know.
 
 ## Known issues
 
@@ -50,6 +51,8 @@ F1 shows the keys. The [guide](guide.md) walks through a session.
 - In Zed, math shows as LaTeX source; ask for plain text, or use the terminal app.
 - Without poppler, PDFs are read only when you attach them.
 - The gate needs you to have joined, or a decision key of your own (`pathfinder auth set typesafe`). The shared gate allows a daily number of checks per person; when they're used up, Pathfinder holds back replies about the candidate until you've judged it.
+- OpenAlex allows a small number of searches a day without a key; past it, online search notes that OpenAlex wasn't searched. `pathfinder auth set openalex` adds a free key.
+- Without poppler, PDFs can't be quoted page by page, so questions about them get fewer sources.
 - Open models of 8B parameters or less make the gate and the judging unreliable.
 
 ## Your data
