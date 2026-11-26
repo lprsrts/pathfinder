@@ -8,7 +8,7 @@ Thanks for wanting to help. Bug reports, ideas and small fixes are all welcome.
 
 ## Building and testing
 
-You need a recent stable Rust toolchain. There are three crates, each built on its own:
+You need a recent stable Rust toolchain and `git` (some tests make repositories). There are three crates, each built on its own:
 
 ```sh
 (cd app && cargo test)
