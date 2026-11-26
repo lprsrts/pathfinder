@@ -793,4 +793,43 @@ mod tests {
         );
         std::fs::remove_dir_all(dir).ok();
     }
+
+    #[tokio::test]
+    async fn releases_tell_the_edge_how_long_to_keep_them() {
+        let dir = std::env::temp_dir().join(format!("collector-public-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("releases/1.0.0")).unwrap();
+        std::fs::write(dir.join("install.sh"), "#!/bin/sh\n").unwrap();
+        std::fs::write(dir.join("releases/latest.json"), "{}").unwrap();
+        std::fs::write(dir.join("releases/1.0.0/p.tar.gz"), "x").unwrap();
+        let mut st = Arc::try_unwrap(state(10)).ok().unwrap();
+        st.settings.public_dir = dir.clone();
+        let st = Arc::new(st);
+        let cache = |uri: &'static str| {
+            let st = st.clone();
+            async move {
+                let res = api::router(st)
+                    .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                res.headers()
+                    .get("cache-control")
+                    .map(|v| v.to_str().unwrap().to_string())
+            }
+        };
+        assert!(
+            cache("/releases/latest.json")
+                .await
+                .unwrap()
+                .contains("stale-if-error")
+        );
+        assert!(cache("/install.sh").await.unwrap().contains("max-age=60"));
+        assert!(
+            cache("/releases/1.0.0/p.tar.gz")
+                .await
+                .unwrap()
+                .contains("immutable")
+        );
+        assert_eq!(cache("/healthz").await, None);
+        std::fs::remove_dir_all(dir).ok();
+    }
 }

@@ -146,6 +146,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(authed)
         .merge(erasure)
         .fallback_service(public)
+        .layer(middleware::from_fn(cache_headers))
         .layer(middleware::from_fn_with_state(state.clone(), count_fetches))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -186,6 +187,31 @@ async fn limit_in_flight(State(state): State<Arc<AppState>>, req: Request, next:
         return busy(2);
     };
     next.run(req).await
+}
+
+/// How long Cloudflare may keep the installer and the release manifest: a
+/// minute fresh, so a new release shows up quickly, and a week from cache
+/// when this service can't be reached, so installs and updates keep working.
+const SHORT_LIVED: &str = "public, max-age=60, stale-if-error=604800";
+/// Versioned release files never change.
+const IMMUTABLE: &str = "public, max-age=31536000, immutable";
+
+async fn cache_headers(req: Request, next: Next) -> Response {
+    let path = req.uri().path().to_string();
+    let mut res = next.run(req).await;
+    if !res.status().is_success() {
+        return res;
+    }
+    let policy = match path.as_str() {
+        "/install.sh" | "/releases/latest.json" | "/releases/latest.json.sig" => Some(SHORT_LIVED),
+        p if p.starts_with("/releases/") && p.ends_with(".tar.gz") => Some(IMMUTABLE),
+        _ => None,
+    };
+    if let Some(policy) = policy {
+        res.headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static(policy));
+    }
+    res
 }
 
 /// Counts downloads of the installer and releases by app version (from the
