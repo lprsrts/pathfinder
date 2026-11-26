@@ -141,7 +141,11 @@ impl Runtime {
                 .await
                 .unwrap_or_default()
         };
-        let (mut hits, terms) = cited_hits(&session.cwd, &raw, text);
+        let (cwd, question) = (session.cwd.clone(), text.to_string());
+        let (mut hits, terms) =
+            tokio::task::spawn_blocking(move || cited_hits(&cwd, &raw, &question))
+                .await
+                .unwrap_or_default();
         // Nothing in the workspace: the same search online.
         let mut skipped = Vec::new();
         let online = hits.is_empty() && !terms.is_empty();
@@ -173,17 +177,21 @@ impl Runtime {
             return Ok(TurnOutput::text("`/tell <question>`"));
         }
         session.push_turn("user", format!("/tell {arg}"));
+        // As for any reply: a waiting candidate is hidden from the model, and
+        // the answer is held for the gate before you see it.
+        let mut history = format_history(session);
+        let waiting = session.pending_candidate.is_some();
+        if let Some(pending) = &session.pending_candidate {
+            history = history.replace(&pending.candidate, CANDIDATE_HIDDEN);
+        }
         let req = EngineRequest {
             tier: EngineTier::System2,
             tools: ToolAccess::ReadOnly,
             cwd: session.cwd.clone(),
             system_prompt: TELL_SYSTEM.to_string(),
-            prompt: format!(
-                "Conversation so far:\n{}\n\nAnswer: {arg}",
-                format_history(session)
-            ),
+            prompt: format!("Conversation so far:\n{history}\n\nAnswer: {arg}"),
             files: files.to_vec(),
-            stream_text: true,
+            stream_text: !waiting,
             models: self.models(session)?,
             ctx: crate::engine::turn_ctx(),
         };
@@ -191,8 +199,20 @@ impl Runtime {
             "{}\n\n",
             i18n::line(session.language.as_deref(), i18n::Line::Told)
         );
-        sink(StreamEvent::TextDelta(header.clone()));
-        let answer = self.engine.run_text(&req, sink.clone()).await?;
+        let answer = if waiting {
+            let draft = self.engine.run_text(&req, gate::held(&sink)).await?;
+            let shown = self.gate_strict(session, draft.clone()).await;
+            if shown != draft {
+                sink(StreamEvent::TextDelta(shown.clone()));
+                session.push_turn("assistant", &shown);
+                return Ok(TurnOutput::text(String::new()));
+            }
+            sink(StreamEvent::TextDelta(format!("{header}{draft}")));
+            draft
+        } else {
+            sink(StreamEvent::TextDelta(header.clone()));
+            self.engine.run_text(&req, sink.clone()).await?
+        };
         let mut told = self.record_told(session, arg);
         if told.is_empty() {
             // Nothing on the record is named: file it under the question, so
@@ -232,6 +252,8 @@ impl Runtime {
         let mut photos: Vec<PathBuf> = files.iter().filter(|f| is_photo(f)).cloned().collect();
         let mut file = None;
         let mut work = String::new();
+        // A PDF's pages, so the step is pointed to by page and line.
+        let mut pdf_pages: Option<Vec<String>> = None;
         match &named {
             Some(full) if is_photo(full) => photos.push(full.clone()),
             Some(full) => match sources::pages(full, arg) {
@@ -240,6 +262,9 @@ impl Runtime {
                 Ok(pages) => {
                     work = pages.join("\n");
                     file = Some(arg.trim().to_string());
+                    if sources::is_pdf(full) {
+                        pdf_pages = Some(pages);
+                    }
                 }
                 Err(e) => return Ok(TurnOutput::text(e)),
             },
@@ -309,21 +334,30 @@ impl Runtime {
             ctx: crate::engine::turn_ctx(),
         };
         let raw = self.engine.run_text(&req, gate::held(&sink)).await?;
-        let reply = format!(
-            "{shown}{}",
-            render_check(session.language.as_deref(), &work, file.as_deref(), &raw)
+        let verdict = render_check(
+            session.language.as_deref(),
+            &work,
+            file.as_deref(),
+            pdf_pages.as_deref(),
+            &raw,
         );
+        // Which step fails (or that none does) can settle a waiting candidate.
+        let verdict = self.gate_strict(session, verdict).await;
+        let reply = format!("{shown}{verdict}");
         session.push_turn("assistant", &reply);
         Ok(TurnOutput::text(reply))
     }
 
     /// `/find <terms>`: raw matching lines, recorded as searched.
-    pub(super) fn handle_find(&self, session: &mut Session, arg: &str) -> TurnOutput {
+    pub(super) async fn handle_find(&self, session: &mut Session, arg: &str) -> TurnOutput {
         let terms: Vec<String> = arg.split_whitespace().map(str::to_string).collect();
         if terms.is_empty() {
             return TurnOutput::text("`/find <terms>`");
         }
-        let hits = sources::find(&session.cwd, &terms, 12);
+        let cwd = session.cwd.clone();
+        let hits = tokio::task::spawn_blocking(move || sources::find(&cwd, &terms, 12))
+            .await
+            .unwrap_or_default();
         self.record_source(session, arg, EventKind::Searched, &format!("find:{arg}"));
         let reply = if hits.is_empty() {
             i18n::line(session.language.as_deref(), i18n::Line::FindNone)
@@ -347,12 +381,16 @@ impl Runtime {
 
     /// `/open <file> [page|line]`, also `file:line`: the source, numbered,
     /// recorded as read.
-    pub(super) fn handle_open(&self, session: &mut Session, arg: &str) -> TurnOutput {
+    pub(super) async fn handle_open(&self, session: &mut Session, arg: &str) -> TurnOutput {
         let (file, at) = parse_open(arg);
         if file.is_empty() {
             return TurnOutput::text("`/open <file> [page or line]`");
         }
-        let reply = match sources::open(&session.cwd, &file, at) {
+        let (cwd, wanted) = (session.cwd.clone(), file.clone());
+        let opened = tokio::task::spawn_blocking(move || sources::open(&cwd, &wanted, at))
+            .await
+            .unwrap_or_else(|e| Err(e.to_string()));
+        let reply = match opened {
             Ok(view) => {
                 let r = match at {
                     Some(n) => format!("{file}#{n}"),
@@ -568,7 +606,15 @@ pub(crate) fn cited_hits(
                     Err(why) => tracing::info!("dropped a cited hit: {why:?}"),
                 }
             }
-            (hits, sources::clean_terms(&reply.search_terms))
+            // A suggested term is shown and searched only if your folder has
+            // it or your question used its words: never the model's own.
+            let mut terms = sources::clean_terms(&reply.search_terms);
+            terms.retain(|t| {
+                let words = sources::keywords(t);
+                (!words.is_empty() && words.iter().all(|w| sources::mentions(question, w)))
+                    || !sources::find(cwd, std::slice::from_ref(t), 1).is_empty()
+            });
+            (hits, terms)
         }
         Err(why) => {
             tracing::info!("cite reply rejected: {why}");
@@ -600,10 +646,13 @@ pub(crate) fn cited_hits(
 
 /// The `/check` reply: the first wrong step if the model's quote is really
 /// in the work, else nothing it said.
+/// `pages`: a PDF's pages, when the work is one; the step is then pointed
+/// to by page and line on that page, as `/open` reads it.
 pub(crate) fn render_check(
     lang: Option<&str>,
     work: &str,
     file: Option<&str>,
+    pages: Option<&[String]>,
     raw: &str,
 ) -> String {
     let unclear = i18n::line(lang, i18n::Line::CheckUnclear);
@@ -618,12 +667,28 @@ pub(crate) fn render_check(
     let Some(step) = reply.first_wrong.filter(|s| !s.trim().is_empty()) else {
         return i18n::line(lang, i18n::Line::NoWrongStep).into();
     };
-    let lines: Vec<&str> = work.lines().collect();
-    let Some((line, own)) = sources::locate(&lines, &step) else {
+    let found = match pages {
+        Some(pages) => pages.iter().enumerate().find_map(|(pi, page)| {
+            let lines: Vec<&str> = page.lines().collect();
+            sources::locate(&lines, &step).map(|(line, own)| (Some(pi + 1), line, own))
+        }),
+        None => {
+            let lines: Vec<&str> = work.lines().collect();
+            sources::locate(&lines, &step).map(|(line, own)| (None, line, own))
+        }
+    };
+    let Some((page, line, own)) = found else {
         return unclear.into();
     };
     let at = match file {
-        Some(f) => format!("`{f}:{line}`"),
+        Some(f) => format!(
+            "`{}`",
+            sources::Locator::Local {
+                file: f.to_string(),
+                page,
+                line,
+            }
+        ),
         None => i18n::line(lang, i18n::Line::StepAt).replace("{n}", &line.to_string()),
     };
     format!(
@@ -697,7 +762,13 @@ mod tests {
     #[test]
     fn check_names_the_step_and_nothing_else() {
         let work = "x^2 - 4 = 0\n(x - 2)(x + 2) = 0\nx = 2 or x = 4";
-        let out = render_check(None, work, None, r#"{"first_wrong": "x = 2 or x = 4"}"#);
+        let out = render_check(
+            None,
+            work,
+            None,
+            None,
+            r#"{"first_wrong": "x = 2 or x = 4"}"#,
+        );
         assert!(
             out.starts_with("**First step that doesn't hold** (line 3):"),
             "{out}"
@@ -708,14 +779,15 @@ mod tests {
             None,
             work,
             None,
+            None,
             r#"{"first_wrong": "x = 2 or x = 4", "why": "x + 2 = 0 gives -2"}"#,
         );
         assert!(out.starts_with("Couldn't point"));
         // A step that isn't in the work is not shown.
-        let out = render_check(None, work, None, r#"{"first_wrong": "x = -2"}"#);
+        let out = render_check(None, work, None, None, r#"{"first_wrong": "x = -2"}"#);
         assert!(out.starts_with("Couldn't point"));
         assert_eq!(
-            render_check(None, work, Some("w.md"), r#"{"first_wrong": null}"#),
+            render_check(None, work, Some("w.md"), None, r#"{"first_wrong": null}"#),
             "**No step found that doesn't hold.**"
         );
         assert!(
@@ -723,10 +795,24 @@ mod tests {
                 None,
                 work,
                 Some("w.md"),
+                None,
                 r#"{"first_wrong":"(x - 2)(x + 2) = 0"}"#
             )
             .contains("(`w.md:2`)")
         );
+        // In a PDF: the page, and the line on that page.
+        let pages = [
+            "Intro\nx^2 - 4 = 0".to_string(),
+            "(x - 2)(x + 2) = 0\nx = 2 or x = 4".to_string(),
+        ];
+        let out = render_check(
+            None,
+            &pages.join("\n"),
+            Some("w.pdf"),
+            Some(&pages),
+            r#"{"first_wrong": "x = 2 or x = 4"}"#,
+        );
+        assert!(out.contains("(`w.pdf p.2 l.2`)"), "{out}");
     }
 
     #[test]
@@ -772,6 +858,13 @@ mod tests {
         );
         assert!(hits.is_empty());
         assert_eq!(terms, ["phasor"]);
+        // A "term" that is really an answer, found nowhere, is dropped.
+        let (_, terms) = cited_hits(
+            &d,
+            r#"{"hits":[],"search_terms":["answer is minus two","use Fourier not Laplace","phasor","impedance"]}"#,
+            "what is impedance",
+        );
+        assert_eq!(terms, ["phasor", "impedance"]);
         let _ = std::fs::remove_dir_all(&d);
     }
 }

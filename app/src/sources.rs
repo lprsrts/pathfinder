@@ -76,11 +76,14 @@ pub struct Hit {
 // ---------------------------------------------------------------- matching
 
 /// The form quotes are compared in: typographic quotes, dashes and
-/// ligatures unified, hyphenation at line ends joined, whitespace collapsed.
+/// ligatures unified, a word broken at a line end joined (its hyphen kept:
+/// it is in the source, and [`loose`] ignores it), whitespace collapsed.
 /// Case is kept: a quote must be the source's own words.
 pub fn normalise(text: &str) -> String {
+    static BROKEN: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"(\p{L})-\n[ \t]*(\p{L})").unwrap());
+    let text = BROKEN.replace_all(text, "$1-$2");
     let text = text
-        .replace("-\n", "")
         .replace('\u{ad}', "")
         .replace(['‘', '’', '‚', '′'], "'")
         .replace(['“', '”', '„', '″'], "\"")
@@ -137,8 +140,13 @@ pub fn loose(text: &str) -> (String, Vec<(usize, usize)>) {
     let mut k = 0;
     while k < chars.len() {
         let (c, i) = chars[k];
-        // The German way of writing ä, ö, ü without the marks.
-        if matches!(c, 'a' | 'o' | 'u') && chars.get(k + 1).is_some_and(|n| n.0 == 'e') {
+        // The German way of writing ä, ö, ü without the marks, inside a
+        // word only: "data entry" keeps its "a e".
+        if matches!(c, 'a' | 'o' | 'u')
+            && chars
+                .get(k + 1)
+                .is_some_and(|n| n.0 == 'e' && (n.1 == i || n.1 == i + 1))
+        {
             out.push(c);
             from.push((i, chars[k + 1].1));
             k += 2;
@@ -205,16 +213,38 @@ pub fn locate(lines: &[&str], quote: &str) -> Option<(usize, String)> {
     if n < 4 {
         return None;
     }
+    // Each line folded once: a window that can't hold the quote is skipped
+    // without building it, and a quote that isn't anywhere costs one pass.
+    let folded_lines: Vec<String> = lines.iter().map(|l| loose(&normalise(l)).0).collect();
+    if !folded_lines.concat().contains(&want) {
+        return None;
+    }
     // The first line the quote ends on, then the latest line it can start
     // on: that is where it is.
     for end in 0..lines.len() {
         for start in (end.saturating_sub(MAX_SPAN - 1)..=end).rev() {
+            if !folded_lines[start..=end].concat().contains(&want) {
+                continue;
+            }
             let have = normalise(&lines[start..=end].join("\n"));
             let (folded, from) = loose(&have);
-            if let Some(at) = folded.find(&want) {
+            let chars: Vec<char> = have.chars().collect();
+            let mut next = 0;
+            while let Some(found) = folded[next..].find(&want) {
+                let at = next + found;
+                // Matches may overlap: look again one char further on.
+                next = at + folded[at..].chars().next().map_or(1, char::len_utf8);
                 let first = folded[..at].chars().count();
-                let chars: Vec<char> = have.chars().collect();
                 let (mut a, mut b) = (from[first].0, from[first + n - 1].1);
+                // Whole words and numbers only: "stable" isn't quoted out of
+                // "unstable", nor "5 ms" out of "15 ms" or "1.5 ms".
+                if !starts_clean(&chars, a) || !ends_clean(&chars, b) {
+                    continue;
+                }
+                // A sign belongs to its number: "-5", not "5".
+                if a > 0 && "-+".contains(chars[a - 1]) && chars[a].is_ascii_digit() {
+                    a -= 1;
+                }
                 // Take the punctuation around the words with them.
                 while a > 0 && "([{\"'“‘«".contains(chars[a - 1]) {
                     a -= 1;
@@ -228,6 +258,36 @@ pub fn locate(lines: &[&str], quote: &str) -> Option<(usize, String)> {
         }
     }
     None
+}
+
+/// Whether a match starting at char `a` starts a word or number.
+fn starts_clean(chars: &[char], a: usize) -> bool {
+    let Some(&before) = a.checked_sub(1).and_then(|i| chars.get(i)) else {
+        return true;
+    };
+    if before.is_alphanumeric() {
+        return false;
+    }
+    // A decimal point or separator inside a number: "1.5", "1,000".
+    let in_number = ".,'".contains(before)
+        && chars[a].is_ascii_digit()
+        && a >= 2
+        && chars[a - 2].is_ascii_digit();
+    !in_number
+}
+
+/// Whether a match ending at char `b` ends a word or number.
+fn ends_clean(chars: &[char], b: usize) -> bool {
+    let Some(&after) = chars.get(b + 1) else {
+        return true;
+    };
+    if after.is_alphanumeric() {
+        return false;
+    }
+    let in_number = ".,'".contains(after)
+        && chars[b].is_ascii_digit()
+        && chars.get(b + 2).is_some_and(|c| c.is_ascii_digit());
+    !in_number
 }
 
 /// Shortens a verified quote to the cap at a word boundary. A prefix of a
@@ -259,11 +319,14 @@ pub fn confine(cwd: &Path, file: &str) -> Option<PathBuf> {
     {
         return None;
     }
+    // Symlinks are resolved: a link inside the folder to a file outside it
+    // is outside.
+    crate::agent::confine::confine(cwd, &rel.to_string_lossy(), false, &[]).ok()?;
     let full = cwd.join(rel);
     full.is_file().then_some(full)
 }
 
-fn is_pdf(p: &Path) -> bool {
+pub fn is_pdf(p: &Path) -> bool {
     p.extension().is_some_and(|e| e.eq_ignore_ascii_case("pdf"))
 }
 
@@ -446,9 +509,16 @@ pub fn source_files(cwd: &Path) -> Vec<(PathBuf, String)> {
         "ipynb", "pdf",
     ];
     let mut out = Vec::new();
+    let Ok(root) = cwd.canonicalize() else {
+        return out;
+    };
     for entry in ignore::WalkBuilder::new(cwd).build().flatten() {
         let p = entry.path();
         if !p.is_file() {
+            continue;
+        }
+        // A linked file counts only if it really is inside the folder.
+        if entry.path_is_symlink() && !p.canonicalize().is_ok_and(|r| r.starts_with(&root)) {
             continue;
         }
         let ok = p
@@ -467,6 +537,9 @@ pub fn source_files(cwd: &Path) -> Vec<(PathBuf, String)> {
     out
 }
 
+/// Most files one search reads.
+const MAX_FIND_FILES: usize = 5000;
+
 /// `/find`: lines in the workspace's sources that contain the terms, most
 /// terms first. Raw lines, nothing else.
 pub fn find(cwd: &Path, terms: &[String], limit: usize) -> Vec<Hit> {
@@ -480,7 +553,12 @@ pub fn find(cwd: &Path, terms: &[String], limit: usize) -> Vec<Hit> {
     }
     let mut scored: Vec<(usize, usize, Hit)> = Vec::new();
     let mut seq = 0;
-    for (full, rel) in source_files(cwd) {
+    // Most terms first, then the earliest; only the best `limit` are kept.
+    let best = |scored: &mut Vec<(usize, usize, Hit)>| {
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        scored.truncate(limit);
+    };
+    for (full, rel) in source_files(cwd).into_iter().take(MAX_FIND_FILES) {
         let Ok(pages) = pages(&full, &rel) else {
             continue;
         };
@@ -493,6 +571,9 @@ pub fn find(cwd: &Path, terms: &[String], limit: usize) -> Vec<Hit> {
                     continue;
                 }
                 seq += 1;
+                if scored.len() >= limit.max(64) * 4 {
+                    best(&mut scored);
+                }
                 scored.push((
                     n,
                     seq,
@@ -509,8 +590,8 @@ pub fn find(cwd: &Path, terms: &[String], limit: usize) -> Vec<Hit> {
         }
     }
     // Need every term when there are enough such lines; else the best.
-    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-    scored.into_iter().take(limit).map(|(_, _, h)| h).collect()
+    best(&mut scored);
+    scored.into_iter().map(|(_, _, h)| h).collect()
 }
 
 /// `/open`: a numbered view of a file, a PDF page, or lines around a line.
@@ -532,8 +613,16 @@ pub fn open(cwd: &Path, file: &str, at: Option<usize>) -> Result<String, String>
         return Ok(out);
     }
     let lines: Vec<&str> = pages[0].lines().collect();
+    if lines.is_empty() {
+        return Err(format!("`{rel}` is empty."));
+    }
+    if let Some(l) = at
+        && (l == 0 || l > lines.len())
+    {
+        return Err(format!("`{rel}` has {} lines.", lines.len()));
+    }
     let start = at.map_or(0, |l| l.saturating_sub(WINDOW / 4).saturating_sub(1));
-    let end = (start + WINDOW).min(lines.len());
+    let end = start.saturating_add(WINDOW).min(lines.len());
     let mut out = format!(
         "`{rel}` lines {}–{end} of {}\n\n```text\n",
         start + 1,
@@ -836,7 +925,9 @@ mod tests {
             locate(&lines, "It's a \"Phasor\" - see page 3"),
             Some((1, "it's a \"phasor\" - see page 3".to_string()))
         );
-        assert_eq!(normalise("trans-\nform"), "transform");
+        // A word broken at a line end is joined; its hyphen is the source's.
+        assert_eq!(normalise("trans-\nform"), "trans-form");
+        assert_eq!(normalise("b -\nc"), "b - c");
     }
 
     #[test]
@@ -861,11 +952,118 @@ mod tests {
     }
 
     #[test]
+    fn open_stays_inside_the_file() {
+        let body: String = (1..=100).map(|i| format!("line {i}\n")).collect();
+        let d = ws(&[("notes.md", body.as_str()), ("empty.md", "")]);
+        assert!(
+            open(d.path(), "notes.md", Some(90))
+                .unwrap()
+                .contains("lines 75–100 of 100")
+        );
+        assert_eq!(
+            open(d.path(), "notes.md", Some(500)).unwrap_err(),
+            "`notes.md` has 100 lines."
+        );
+        assert!(open(d.path(), "notes.md", Some(usize::MAX)).is_err());
+        assert!(open(d.path(), "notes.md", Some(0)).is_err());
+        assert_eq!(
+            open(d.path(), "empty.md", None).unwrap_err(),
+            "`empty.md` is empty."
+        );
+    }
+
+    #[test]
+    fn a_quote_is_whole_words_from_the_source() {
+        let unstable = ["The closed loop is unstable for all k > 1."];
+        assert_eq!(locate(&unstable, "stable for all k > 1"), None);
+        assert_eq!(
+            locate(&unstable, "unstable for all k > 1").unwrap().1,
+            "unstable for all k > 1."
+        );
+        let ms = ["Each request takes 15 ms on average here, 1.5 ms at best."];
+        assert_eq!(locate(&ms, "5 ms on average here"), None);
+        assert_eq!(locate(&ms, "5 ms at best"), None);
+        assert_eq!(
+            locate(&["The offset is -5 mm here."], "5 mm here")
+                .unwrap()
+                .1,
+            "-5 mm here."
+        );
+        // The same words later in the line, standing on their own, are found.
+        let twice = ["unstable at first, then stable for all k > 1."];
+        assert_eq!(
+            locate(&twice, "stable for all k > 1").unwrap().1,
+            "stable for all k > 1."
+        );
+    }
+
+    #[test]
+    fn nothing_is_shown_that_isnt_in_the_source() {
+        // A minus at a line end stays in what is shown.
+        let minus = ["The result is a = b -", "c, as shown."];
+        assert_eq!(
+            locate(&minus, "result is a = b c").unwrap().1,
+            "result is a = b - c,"
+        );
+        // A word broken over two lines is joined, with its hyphen.
+        let broken = ["a well-", "known result"];
+        assert_eq!(
+            locate(&broken, "well-known result").unwrap().1,
+            "well-known result"
+        );
+        assert_eq!(
+            locate(&["the tech-", "nology works"], "the technology works")
+                .unwrap()
+                .1,
+            "the tech-nology works"
+        );
+    }
+
+    #[test]
+    fn umlaut_spellings_fold_only_inside_a_word() {
+        assert!(mentions("convert it into equations", "equations"));
+        assert_eq!(
+            locate(
+                &["We feed the data entry form to the model."],
+                "entry form to the model"
+            )
+            .unwrap()
+            .1,
+            "entry form to the model."
+        );
+        assert!(
+            loose("zu entscheiden")
+                .0
+                .contains(&term_form("entscheiden"))
+        );
+        assert!(mentions("Die Schrödinger-Gleichung", "Schroedinger"));
+        assert!(mentions("Die Schroedinger-Gleichung", "Schrödinger"));
+    }
+
+    #[test]
     fn paths_outside_the_workspace_are_refused() {
         let d = ws(&[("notes.md", NOTES)]);
         assert!(confine(d.path(), "../notes.md").is_none());
         assert!(confine(d.path(), "/etc/hosts").is_none());
         assert!(confine(d.path(), "./notes.md").is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn links_out_of_the_folder_are_outside_it() {
+        let outside = ws(&[("id_rsa", "secret key\n")]);
+        let d = tempdir::Dir::new();
+        std::os::unix::fs::symlink(outside.path(), d.path().join("home")).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("id_rsa"), d.path().join("key.txt"))
+            .unwrap();
+        std::fs::write(d.path().join("notes.md"), "secret notes\n").unwrap();
+        assert!(confine(d.path(), "home/id_rsa").is_none());
+        assert!(confine(d.path(), "key.txt").is_none());
+        let files: Vec<String> = source_files(d.path()).into_iter().map(|f| f.1).collect();
+        assert_eq!(files, ["notes.md"]);
+        let hits = find(d.path(), &["secret".to_string()], 10);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].quote, "secret notes");
     }
 
     #[test]

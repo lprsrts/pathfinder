@@ -53,8 +53,8 @@ impl Runtime {
             Some("reply"),
         )
         .await?;
-        if let Some(lang) = decision.language.as_deref().filter(|l| l.len() == 2) {
-            session.language = Some(lang.to_lowercase());
+        if let Some(lang) = decision.language.as_deref().and_then(crate::i18n::code) {
+            session.language = Some(lang);
         }
         if decision.question && !decision.ready_to_map {
             return self

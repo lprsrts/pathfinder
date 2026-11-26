@@ -1512,3 +1512,108 @@ async fn check_reads_a_photo_of_handwritten_work() {
     let prompt = engine.prompts.lock().unwrap().last().cloned().unwrap();
     assert!(prompt.contains("(x - 2)(x + 2) = 0"));
 }
+
+#[tokio::test]
+async fn tell_and_check_go_through_the_gate_while_you_judge() {
+    const CANDIDATE: &str = "Unknown commands fall back to help.";
+    let (rt, engine) = runtime(
+        FakeEngine::new(vec![
+            (ReadOnly, S1, ONBOARD_READY),
+            (ReadOnly, S2, MAP),
+            (ReadOnly, S1, &log_reply("ok")),
+            (
+                ReadOnly,
+                S2,
+                r#"{"candidate":"Unknown commands fall back to help.","key_reason":"The router has no fallback for unknown names, they are rejected"}"#,
+            ),
+            // /tell settles it: held.
+            (
+                ReadOnly,
+                S2,
+                "It's wrong: names it doesn't know get an error.",
+            ),
+            // /check on the candidate's text: which step fails is the key.
+            (
+                ToolAccess::None,
+                S2,
+                r#"{"first_wrong": "Unknown commands fall back to help."}"#,
+            ),
+            // A /tell about something else passes.
+            (ReadOnly, S2, "A handler is the function a name maps to."),
+        ]),
+        false,
+    );
+    let rt = rt.with_decider(Arc::new(GateDecider(
+        Mutex::new(vec![Some(0.9), Some(0.9), Some(0.05)].into()),
+        Mutex::new(VecDeque::new()),
+    )));
+    turn(&rt, "goal").await;
+    turn(&rt, "thinking").await;
+    turn(&rt, "/summary names map to handlers").await;
+    assert!(
+        rt.load_session("s")
+            .unwrap()
+            .unwrap()
+            .pending_candidate
+            .is_some()
+    );
+
+    turn(&rt, "/tell is the candidate right?").await;
+    let s = rt.load_session("s").unwrap().unwrap();
+    assert_eq!(
+        s.history.last().unwrap().content,
+        crate::secrets::FIXED_REPLY
+    );
+    let prompt = engine.prompts.lock().unwrap().last().cloned().unwrap();
+    assert!(
+        !prompt.contains(CANDIDATE),
+        "the candidate is hidden: {prompt}"
+    );
+
+    let out = turn(&rt, &format!("/check {CANDIDATE}")).await;
+    assert_eq!(out.reply, crate::secrets::FIXED_REPLY);
+
+    turn(&rt, "/tell what is a handler?").await;
+    let s = rt.load_session("s").unwrap().unwrap();
+    let last = &s.history.last().unwrap().content;
+    assert!(
+        last.contains("A handler is the function a name maps to."),
+        "{last}"
+    );
+    assert!(engine.replies.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn tell_is_held_while_you_judge_without_a_decision_service() {
+    let (rt, _engine) = runtime(
+        FakeEngine::new(vec![
+            (ReadOnly, S1, ONBOARD_READY),
+            (ReadOnly, S2, MAP),
+            (ReadOnly, S1, &log_reply("ok")),
+            (
+                ReadOnly,
+                S2,
+                r#"{"candidate":"Unknown commands fall back to help.","key_reason":"The router has no fallback for unknown names, they are rejected"}"#,
+            ),
+            (
+                ReadOnly,
+                S2,
+                "It's wrong: names it doesn't know get an error.",
+            ),
+        ]),
+        false,
+    );
+    turn(&rt, "goal").await;
+    turn(&rt, "thinking").await;
+    turn(&rt, "/summary names map to handlers").await;
+    let mut s = rt.load_session("s").unwrap().unwrap();
+    assert!(s.pending_candidate.is_some());
+    s.decisions_off = true;
+    rt.store.save_session(&s).unwrap();
+    turn(&rt, "/tell is the candidate right?").await;
+    let s = rt.load_session("s").unwrap().unwrap();
+    assert_eq!(
+        s.history.last().unwrap().content,
+        crate::secrets::FIXED_REPLY
+    );
+}

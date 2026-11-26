@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -237,6 +237,39 @@ fn default_codex_bin() -> String {
     "codex".to_string()
 }
 
+/// [`Config::add_endpoint`] for the file at `path`. Only a missing file starts
+/// empty: one that can't be read is an error, never overwritten, and the new
+/// file replaces the old one in a single rename.
+fn add_endpoint_at(path: &Path, ep: &Endpoint) -> anyhow::Result<()> {
+    let mut root: serde_json::Value = match fs::read_to_string(path) {
+        Ok(raw) => serde_json::from_str(&raw)
+            .map_err(|e| anyhow::anyhow!("{} isn't valid JSON: {e}", path.display()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(e) => anyhow::bail!("can't read {}: {e}. Nothing was changed.", path.display()),
+    };
+    let obj = root
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("{} isn't a JSON object", path.display()))?;
+    let list = obj
+        .entry("endpoints")
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut()
+        .ok_or_else(|| anyhow::anyhow!("`endpoints` in {} isn't a list", path.display()))?;
+    list.retain(|e| e.get("id").and_then(|v| v.as_str()) != Some(ep.id.as_str()));
+    let mut entry = serde_json::to_value(ep)?;
+    if let Some(e) = entry.as_object_mut() {
+        e.retain(|_, v| !v.is_null() && v.as_array().is_none_or(|a| !a.is_empty()));
+    }
+    list.push(entry);
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, serde_json::to_string_pretty(&root)? + "\n")?;
+    fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 pub fn default_config_path() -> PathBuf {
     crate::paths::config_dir().join("config.json")
 }
@@ -271,31 +304,7 @@ impl Config {
     /// Adds `ep` to `config.json` (replacing one with the same id), keeping
     /// everything else in the file as it is.
     pub fn add_endpoint(ep: &Endpoint) -> anyhow::Result<()> {
-        let path = default_config_path();
-        let mut root: serde_json::Value = match fs::read_to_string(&path) {
-            Ok(raw) => serde_json::from_str(&raw)
-                .map_err(|e| anyhow::anyhow!("{} isn't valid JSON: {e}", path.display()))?,
-            Err(_) => serde_json::json!({}),
-        };
-        let obj = root
-            .as_object_mut()
-            .ok_or_else(|| anyhow::anyhow!("{} isn't a JSON object", path.display()))?;
-        let list = obj
-            .entry("endpoints")
-            .or_insert_with(|| serde_json::json!([]))
-            .as_array_mut()
-            .ok_or_else(|| anyhow::anyhow!("`endpoints` in {} isn't a list", path.display()))?;
-        list.retain(|e| e.get("id").and_then(|v| v.as_str()) != Some(ep.id.as_str()));
-        let mut entry = serde_json::to_value(ep)?;
-        if let Some(e) = entry.as_object_mut() {
-            e.retain(|_, v| !v.is_null() && v.as_array().is_none_or(|a| !a.is_empty()));
-        }
-        list.push(entry);
-        if let Some(dir) = path.parent() {
-            fs::create_dir_all(dir)?;
-        }
-        fs::write(&path, serde_json::to_string_pretty(&root)? + "\n")?;
-        Ok(())
+        add_endpoint_at(&default_config_path(), ep)
     }
 
     pub fn load() -> Self {
@@ -450,6 +459,42 @@ fn pick_from(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adding_a_server_keeps_the_rest_of_config_json() {
+        let dir = std::env::temp_dir().join(format!("pf-cfg-{}", uuid::Uuid::new_v4().simple()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        let ep = |id: &str| Endpoint {
+            id: id.into(),
+            label: None,
+            base_url: "http://localhost:11434/v1".into(),
+            key: None,
+            models: Vec::new(),
+            extra: None,
+        };
+        fs::write(
+            &path,
+            r#"{"quote_cap": 30, "endpoints": [{"id": "old", "base_url": "http://x/v1"}]}"#,
+        )
+        .unwrap();
+        add_endpoint_at(&path, &ep("lab")).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v["quote_cap"], 30);
+        assert_eq!(v["endpoints"].as_array().unwrap().len(), 2);
+        // A file that can't be read as text is left alone, not replaced.
+        let mut bytes = br#"{"label": "Gr"#.to_vec();
+        bytes.extend([0xfc, b'n', b'"', b'}']);
+        fs::write(&path, &bytes).unwrap();
+        assert!(add_endpoint_at(&path, &ep("lab")).is_err());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        // A missing file starts empty.
+        fs::remove_file(&path).unwrap();
+        add_endpoint_at(&path, &ep("lab")).unwrap();
+        assert!(fs::read_to_string(&path).unwrap().contains("\"lab\""));
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn endpoints_list_their_models_and_local_only_hides_the_cloud() {

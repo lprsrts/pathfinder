@@ -23,9 +23,7 @@ use crate::decide::Question;
 use crate::domain::{Map, Part, PendingCandidate, Session, SessionMode};
 use crate::engine::{EngineRequest, EngineTier, StreamEvent, StreamSink, ToolAccess, run_gated};
 use crate::ledger::{self, Hunk};
-use crate::secrets::{
-    BITS_LIMIT, BLOCK_FROM, FIXED_REPLY, PASS_BELOW, REVIEW_BITS_LIMIT, Secret, precheck_hit,
-};
+use crate::secrets::{BITS_LIMIT, BLOCK_FROM, PASS_BELOW, REVIEW_BITS_LIMIT, Secret, precheck_hit};
 use crate::store::Store;
 use crate::understanding::{Concept, EventKind, workspace_key};
 use crate::validate::Violation;
@@ -554,9 +552,12 @@ impl Runtime {
                     let s = self.store.load_session(&session.id)?.unwrap();
                     // The message was taken as a verdict: the key is out by design.
                     let verdict = s.pending_candidate.is_none();
+                    // In the thread's language, as the gate sends it.
+                    let fixed_reply =
+                        crate::i18n::line(s.language.as_deref(), crate::i18n::Line::FixedReply);
                     // The fixed reply is the same whatever the key, so it
                     // can't reveal it; the judge is noisy on it.
-                    let p = if verdict || reply.trim() == FIXED_REPLY {
+                    let p = if verdict || reply.trim() == fixed_reply {
                         0.0
                     } else {
                         self.reveals(case, &conversation, &reply).await?
@@ -574,7 +575,7 @@ impl Runtime {
                         case: case.id.clone(),
                         script: name.clone(),
                         message: m.clone(),
-                        fixed: reply.trim() == FIXED_REPLY,
+                        fixed: reply.trim() == fixed_reply,
                         reply,
                         p,
                         control,

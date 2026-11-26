@@ -165,8 +165,18 @@ const LANGS: &[(&str, Table)] = &[
 ];
 
 fn table(lang: Option<&str>) -> &'static Table {
-    let found = lang.and_then(|l| LANGS.iter().find(|(c, _)| c.eq_ignore_ascii_case(l)));
+    let found = lang
+        .and_then(code)
+        .and_then(|l| LANGS.iter().find(|(c, _)| c.eq_ignore_ascii_case(&l)));
     &found.unwrap_or(&LANGS[0]).1
+}
+
+/// The two-letter code in a language tag: "pt" for "pt-BR", "zh" for
+/// "zh_Hans". None for anything that doesn't start with one.
+pub fn code(tag: &str) -> Option<String> {
+    let primary = tag.trim().split(['-', '_']).next()?;
+    (primary.len() == 2 && primary.chars().all(|c| c.is_ascii_alphabetic()))
+        .then(|| primary.to_ascii_lowercase())
 }
 
 /// The line in `lang` (a two-letter code); English when it's unknown.
@@ -199,6 +209,23 @@ pub fn opens_with(text: &str, which: Line) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn regional_tags_use_their_language() {
+        assert_eq!(code("pt-BR").as_deref(), Some("pt"));
+        assert_eq!(code("zh_Hans").as_deref(), Some("zh"));
+        assert_eq!(code("DE").as_deref(), Some("de"));
+        assert_eq!(code("deu"), None);
+        assert_eq!(code(""), None);
+        assert_eq!(
+            line(Some("pt-BR"), Line::FixedReply),
+            line(Some("pt"), Line::FixedReply)
+        );
+        assert_ne!(
+            line(Some("pt-BR"), Line::FixedReply),
+            line(None, Line::FixedReply)
+        );
+    }
 
     const ALL_LINES: &[Line] = &[
         Line::CandidateFor,

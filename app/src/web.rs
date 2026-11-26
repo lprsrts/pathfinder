@@ -40,14 +40,129 @@ fn client() -> reqwest::Client {
         .unwrap_or_default()
 }
 
-/// A search key: the environment, the auth file, or the keychain item of
-/// the same name (copied into the auth file on first use).
+/// A search key: the environment or the auth file. The keychain is read
+/// only by `pathfinder auth import`, never during a search.
 fn search_key(name: &str, env: &'static str) -> Option<String> {
-    let creds = crate::auth::Credentials::system();
-    creds.named_key(name, env).map(|(k, _)| k).or_else(|| {
-        creds.import_named(name).ok().filter(|ok| *ok)?;
-        creds.stored(name)
-    })
+    crate::auth::Credentials::system()
+        .named_key(name, env)
+        .map(|(k, _)| k)
+}
+
+/// Largest API response read (search results, abstracts).
+const MAX_API: usize = 4 * 1024 * 1024;
+
+/// A response body, read until `cap` bytes and no further: a page can't fill
+/// memory however much it sends.
+async fn read_capped(mut r: reqwest::Response, cap: usize) -> Result<Vec<u8>, reqwest::Error> {
+    let mut out = Vec::new();
+    while let Some(chunk) = r.chunk().await? {
+        let room = cap - out.len();
+        out.extend_from_slice(&chunk[..chunk.len().min(room)]);
+        if out.len() >= cap {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+/// A service's JSON reply, capped.
+async fn json_capped(service: &str, r: reqwest::Response) -> Result<Value, String> {
+    let body = read_capped(r, MAX_API)
+        .await
+        .map_err(|e| failed(service, &e))?;
+    serde_json::from_slice(&body).map_err(|_| format!("{service} (unreadable reply)"))
+}
+
+/// Whether `ip` is on the public internet: not this computer, your network,
+/// link-local (cloud metadata), shared or reserved space.
+fn public_ip(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(a) => {
+            let [o1, o2, ..] = a.octets();
+            !(a.is_private()
+                || a.is_loopback()
+                || a.is_link_local()
+                || a.is_unspecified()
+                || a.is_broadcast()
+                || a.is_documentation()
+                || o1 == 0
+                || (o1 == 100 && (o2 & 0xc0) == 64)
+                || o1 >= 240)
+        }
+        IpAddr::V6(a) => {
+            if let Some(v4) = a.to_ipv4_mapped() {
+                return public_ip(IpAddr::V4(v4));
+            }
+            let first = a.segments()[0];
+            !(a.is_loopback()
+                || a.is_unspecified()
+                || (first & 0xfe00) == 0xfc00
+                || (first & 0xffc0) == 0xfe80)
+        }
+    }
+}
+
+/// Whether a page URL may be fetched: http(s), and a public host.
+fn public_url(url: &reqwest::Url) -> bool {
+    if !matches!(url.scheme(), "http" | "https") {
+        return false;
+    }
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return public_ip(ip);
+    }
+    !(host == "localhost"
+        || host.ends_with(".localhost")
+        || host.ends_with(".local")
+        || host.ends_with(".internal")
+        || !host.contains('.'))
+}
+
+/// Resolves names to public addresses only, so a page (or a redirect) whose
+/// name points into your network isn't fetched.
+struct PublicOnly;
+
+impl reqwest::dns::Resolve for PublicOnly {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host.as_str(), 0))
+                .await?
+                .filter(|a| public_ip(a.ip()))
+                .collect();
+            if addrs.is_empty() {
+                return Err(format!("{host} has no public address").into());
+            }
+            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+/// The client for fetching result pages: public addresses only, including
+/// every redirect.
+fn page_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .user_agent(concat!("pathfinder/", env!("CARGO_PKG_VERSION")))
+        .timeout(Duration::from_secs(10))
+        .dns_resolver(std::sync::Arc::new(PublicOnly))
+        .redirect(reqwest::redirect::Policy::custom(|a| {
+            if a.previous().len() >= 5 {
+                a.error("too many redirects")
+            } else if public_url(a.url()) {
+                a.follow()
+            } else {
+                a.error("redirect to a non-public address")
+            }
+        }))
+        .build()
+        .unwrap_or_default()
 }
 
 /// Searches papers for every query and the web for the first, and returns
@@ -147,14 +262,12 @@ async fn openalex(
     if let Some(k) = key {
         req = req.query(&[("api_key", k)]);
     }
-    let v: Value = req
+    let r = req
         .send()
         .await
         .and_then(|r| r.error_for_status())
-        .map_err(|e| failed("OpenAlex", &e))?
-        .json()
-        .await
         .map_err(|e| failed("OpenAlex", &e))?;
+    let v = json_capped("OpenAlex", r).await?;
     Ok(v["results"]
         .as_array()
         .into_iter()
@@ -218,11 +331,11 @@ async fn arxiv(c: &reqwest::Client, q: &str) -> Result<Vec<WebResult>, String> {
         .send()
         .await
         .and_then(|r| r.error_for_status())
-        .map_err(|e| failed("arXiv", &e))?
-        .text()
+        .map_err(|e| failed("arXiv", &e))?;
+    let body = read_capped(body, MAX_API)
         .await
         .map_err(|e| failed("arXiv", &e))?;
-    Ok(parse_arxiv(&body))
+    Ok(parse_arxiv(&String::from_utf8_lossy(&body)))
 }
 
 fn parse_arxiv(atom: &str) -> Vec<WebResult> {
@@ -252,7 +365,7 @@ fn parse_arxiv(atom: &str) -> Vec<WebResult> {
 
 /// Brave web results; each page is then fetched and read as text.
 async fn brave(c: &reqwest::Client, q: &str, key: &str) -> Result<Vec<WebResult>, String> {
-    let v: Value = c
+    let r = c
         .get("https://api.search.brave.com/res/v1/web/search")
         .header("X-Subscription-Token", key)
         .header("Accept", "application/json")
@@ -260,10 +373,8 @@ async fn brave(c: &reqwest::Client, q: &str, key: &str) -> Result<Vec<WebResult>
         .send()
         .await
         .and_then(|r| r.error_for_status())
-        .map_err(|e| failed("Brave", &e))?
-        .json()
-        .await
         .map_err(|e| failed("Brave", &e))?;
+    let v = json_capped("Brave", r).await?;
     let urls: Vec<String> = v["web"]["results"]
         .as_array()
         .into_iter()
@@ -271,7 +382,8 @@ async fn brave(c: &reqwest::Client, q: &str, key: &str) -> Result<Vec<WebResult>
         .filter_map(|r| r["url"].as_str().map(str::to_string))
         .take(PER_SERVICE)
         .collect();
-    let pages = futures_util::future::join_all(urls.iter().map(|u| fetch_text(c, u))).await;
+    let pc = page_client();
+    let pages = futures_util::future::join_all(urls.iter().map(|u| fetch_text(&pc, u))).await;
     Ok(urls
         .into_iter()
         .zip(pages)
@@ -288,6 +400,10 @@ async fn brave(c: &reqwest::Client, q: &str, key: &str) -> Result<Vec<WebResult>
 
 /// A page's readable text, headings marked with [`HEADING`].
 async fn fetch_text(c: &reqwest::Client, url: &str) -> Result<String, String> {
+    let parsed = reqwest::Url::parse(url).map_err(|e| e.to_string())?;
+    if !public_url(&parsed) {
+        return Err(format!("{url} isn't a public address"));
+    }
     let r = c
         .get(url)
         .send()
@@ -299,8 +415,8 @@ async fn fetch_text(c: &reqwest::Client, url: &str) -> Result<String, String> {
         .get("content-type")
         .and_then(|v| v.to_str().ok())
         .is_none_or(|t| t.contains("html"));
-    let bytes = r.bytes().await.map_err(|e| e.to_string())?;
-    let body = String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_PAGE)]).into_owned();
+    let bytes = read_capped(r, MAX_PAGE).await.map_err(|e| e.to_string())?;
+    let body = String::from_utf8_lossy(&bytes).into_owned();
     Ok(if html_page { html_text(&body) } else { body })
 }
 
@@ -363,6 +479,49 @@ fn decode_entities(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pages_on_your_own_network_are_never_fetched() {
+        let ok = |u: &str| public_url(&reqwest::Url::parse(u).unwrap());
+        assert!(ok("https://example.org/paper"));
+        assert!(ok("http://93.184.215.14/"));
+        for bad in [
+            "http://127.0.0.1:11434/api",
+            "http://localhost/",
+            "http://192.168.1.10/",
+            "http://10.0.0.2/",
+            "http://169.254.169.254/latest/meta-data",
+            "http://[::1]/",
+            "http://[fd00::1]/",
+            "http://[::ffff:127.0.0.1]/",
+            "http://printer.local/",
+            "http://intranet/",
+            "file:///etc/passwd",
+        ] {
+            assert!(!ok(bad), "{bad}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_body_is_read_only_up_to_its_cap() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = tokio::io::AsyncReadExt::read(&mut sock, &mut buf).await;
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n")
+                .await;
+            let chunk = vec![b'x'; 64 * 1024];
+            // An endless body: only the cap stops the read.
+            while sock.write_all(&chunk).await.is_ok() {}
+        });
+        let r = reqwest::get(format!("http://{addr}/")).await.unwrap();
+        let body = read_capped(r, 100_000).await.unwrap();
+        assert_eq!(body.len(), 100_000);
+    }
 
     #[test]
     fn openalex_abstracts_are_rebuilt_in_order() {

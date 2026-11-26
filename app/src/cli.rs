@@ -141,7 +141,7 @@ pub async fn auth(args: &[String]) -> Result<()> {
 pub async fn models(args: &[String]) -> Result<()> {
     if args.iter().any(|a| a == "--refresh") {
         let creds = Credentials::system();
-        let http = reqwest::Client::new();
+        let http = checking_client()?;
         catalog::refresh(&creds, &http, &Route::DISCOVERED).await;
         catalog::refresh_endpoints(&crate::config::Config::load(), &creds, &http).await;
     }
@@ -197,7 +197,7 @@ async fn set_decision(creds: &Credentials, p: Provider, from_stdin: bool) -> Res
         instructions: "Is this a greeting?".into(),
         options: vec![("yes".into(), String::new()), ("no".into(), String::new())],
     }];
-    match decide::call(&reqwest::Client::new(), p, key, "hello", &probe).await {
+    match decide::call(&checking_client()?, p, key, "hello", &probe).await {
         Ok(_) => println!("ok."),
         Err(e) => bail!("{e:#}. The key was not saved."),
     }
@@ -273,25 +273,20 @@ async fn add_server(creds: &Credentials) -> Result<()> {
     let suggested = server_name(&base_url);
     let id = ask(&format!("Short name [{suggested}]: "))?;
     let id = if id.is_empty() { suggested } else { id };
-    if id.is_empty()
-        || !id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
-        bail!("the name is letters, digits, - and _ only");
-    }
+    let key_name = server_key_name(&id)?;
     let key = rpassword::prompt_password("API key (hidden; Enter if it needs none): ")?;
     let key = key.trim();
     let key = (!key.is_empty()).then_some(key);
 
     print!("Checking {base_url}... ");
     io::stdout().flush()?;
-    let models = crate::llm::chat::list_models(&reqwest::Client::new(), &base_url, key)
+    let http = checking_client()?;
+    let models = crate::llm::chat::list_models(&http, &base_url, key)
         .await
         .map_err(|e| anyhow::anyhow!("{e:#}. Nothing was saved."))?;
     println!("ok, {} models available.", models.len());
 
-    let key_name = key.map(|_| format!("{id}-api-key"));
+    let key_name = key.map(|_| key_name);
     if let (Some(name), Some(key)) = (&key_name, key) {
         creds.set_named(name, key)?;
     }
@@ -303,17 +298,54 @@ async fn add_server(creds: &Credentials) -> Result<()> {
         models: Vec::new(),
         extra: None,
     })?;
-    catalog::refresh_endpoints(
-        &crate::config::Config::load(),
-        creds,
-        &reqwest::Client::new(),
-    )
-    .await;
+    catalog::refresh_endpoints(&crate::config::Config::load(), creds, &http).await;
     println!(
         "Added `{id}` to {}. Start a new Pathfinder thread to use its models.",
         crate::config::default_config_path().display()
     );
     Ok(())
+}
+
+/// Names a server can't take: they belong to Pathfinder's own routes and
+/// keys.
+const RESERVED_SERVERS: &[&str] = &[
+    "anthropic",
+    "openai",
+    "chatgpt",
+    "claude",
+    "codex",
+    "endpoint",
+    "gemini",
+    "google",
+    "typesafe",
+    "brave",
+    "openalex",
+];
+
+/// The auth file entry for a server's key. It has its own prefix, so a
+/// server's key can never replace a provider's (`openai-api-key`) or a search
+/// key.
+fn server_key_name(id: &str) -> Result<String> {
+    if id.is_empty()
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        bail!("the name is letters, digits, - and _ only");
+    }
+    if RESERVED_SERVERS.contains(&id.to_ascii_lowercase().as_str()) {
+        bail!("`{id}` is one of Pathfinder's own names; pick another for this server");
+    }
+    Ok(format!("endpoint-{id}-api-key"))
+}
+
+/// For checking a server: one that accepts the connection but never answers
+/// fails instead of hanging.
+fn checking_client() -> Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?)
 }
 
 /// A short name for a server from its URL: `openrouter` for
@@ -378,7 +410,7 @@ async fn set(creds: &Credentials, name: Option<&str>, from_stdin: bool) -> Resul
 
     print!("Checking the key with {}... ", route.provider_name());
     io::stdout().flush()?;
-    match catalog::list_models(&reqwest::Client::new(), route, key).await {
+    match catalog::list_models(&checking_client()?, route, key).await {
         Ok(models) => println!("ok, {} models available.", models.len()),
         Err(e) => bail!("{e:#}. The key was not saved."),
     }
@@ -435,7 +467,7 @@ pub fn open_browser(url: &str) {
 
 /// Refreshes the model list of the one provider a command changed.
 async fn refresh(creds: &Credentials, route: Route) {
-    catalog::refresh(creds, &reqwest::Client::new(), &[route]).await;
+    catalog::refresh(creds, &checking_client().unwrap_or_default(), &[route]).await;
 }
 
 fn status(creds: &Credentials) -> Result<()> {
@@ -709,7 +741,24 @@ pub async fn data(args: &[String]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::server_name;
+    use super::{server_key_name, server_name};
+
+    #[test]
+    fn a_server_key_never_takes_a_providers_name() {
+        assert_eq!(server_key_name("lab").unwrap(), "endpoint-lab-api-key");
+        for taken in [
+            "openai",
+            "Anthropic",
+            "brave",
+            "openalex",
+            "typesafe",
+            "gemini",
+        ] {
+            assert!(server_key_name(taken).is_err(), "{taken}");
+        }
+        assert!(server_key_name("my lab").is_err());
+        assert!(server_key_name("").is_err());
+    }
 
     #[test]
     fn a_server_is_named_after_its_host() {

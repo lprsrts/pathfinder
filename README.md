@@ -4,7 +4,7 @@
 
 <br clear="left">
 
-Pathfinder makes sure you understand the work you do with AI. It points you to where your sources answer a question, checks you at the moments that matter, and keeps an honest record of what you understood, what you only claimed, and what you handed off.
+Pathfinder makes sure you understand the work you do with AI. It points you to where your sources answer a question, checks you at the moments that matter, and keeps an honest record of what you understood, what you only claimed, and what you handed off to the agent.
 
 It runs in your terminal (or in Zed), on your own computer, with your own model account.
 
@@ -12,7 +12,7 @@ It runs in your terminal (or in Zed), on your own computer, with your own model 
 
 ## How it works
 
-- **Sources, not answers.** Ask, and Pathfinder points to where the folder you're working in (code, papers, slides, PDFs) addresses it, with a short verbatim line checked against the file. You do the reading. `/tell` gives a real answer when you want one, recorded as *told*.
+- **Sources and pointers.** Ask, and Pathfinder points to where the folder you're working in addresses it, with a short verbatim line checked against the file. You do the reading. `/tell` gives a real answer when you want one, recorded as *told*.
 - **Say when something has clicked.** You get one short *candidate*: an explanation that is either right or has exactly one real mistake. You say which and why. Passing is the only thing that counts as understanding.
 - **While you judge, nothing gives the answer away.** A gate checks every reply against the candidate's key before you see it, and holds back anything that would settle it for you.
 - **Hand work to the agent when you're ready.** `/handoff` gives a part you understand to the agent and shows you the result to review. `/delegate` hands off what you don't need to understand, and the record says so.

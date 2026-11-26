@@ -587,33 +587,86 @@ pub(crate) fn pdf_pages(file: &Path, path: &str) -> Result<std::sync::Arc<Vec<St
     {
         return Ok(pages.clone());
     }
-    let out = std::process::Command::new("pdftotext")
-        .args(["-layout", "-enc", "UTF-8"])
-        .arg(file)
-        .arg("-")
-        .output()
-        .map_err(|_| {
-            format!(
-                "can't read the PDF `{path}`: `pdftotext` isn't installed (`brew install poppler`). Ask the user to attach it instead."
-            )
-        })?;
-    if !out.status.success() {
-        return Err(format!(
-            "can't read the PDF `{path}`: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
+    // A size limit and a time limit: one odd PDF can't stall a turn.
+    if fs::metadata(file).map(|m| m.len()).unwrap_or(0) > PDF_MAX_BYTES {
+        return Err(format!("the PDF `{path}` is too large to read here"));
     }
+    let out = run_pdftotext(file, path)?;
     let text = String::from_utf8_lossy(&out.stdout);
     let mut pages: Vec<String> = text.split('\u{c}').map(str::to_string).collect();
     if pages.last().is_some_and(|p| p.trim().is_empty()) {
         pages.pop();
     }
     let pages = Arc::new(pages);
-    cache
-        .lock()
-        .unwrap()
-        .insert(file.to_path_buf(), (mtime, pages.clone()));
+    let mut cache = cache.lock().unwrap();
+    // Bounded: past the limit, start over rather than grow.
+    let held: usize = cache
+        .values()
+        .map(|(_, p)| p.iter().map(String::len).sum::<usize>())
+        .sum();
+    if cache.len() >= PDF_CACHE_FILES || held > PDF_CACHE_BYTES {
+        cache.clear();
+    }
+    cache.insert(file.to_path_buf(), (mtime, pages.clone()));
     Ok(pages)
+}
+
+/// Largest PDF read, how long `pdftotext` may take, and how much text the
+/// PDF cache keeps.
+const PDF_MAX_BYTES: u64 = 100 * 1024 * 1024;
+const PDF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const PDF_CACHE_FILES: usize = 64;
+const PDF_CACHE_BYTES: usize = 128 * 1024 * 1024;
+
+/// `pdftotext -layout` on `file`, stopped after [`PDF_TIMEOUT`].
+fn run_pdftotext(file: &Path, path: &str) -> Result<std::process::Output, String> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new("pdftotext")
+        .args(["-layout", "-enc", "UTF-8"])
+        .arg(file)
+        .arg("-")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|_| {
+            format!(
+                "can't read the PDF `{path}`: `pdftotext` isn't installed (`brew install poppler`). Ask the user to attach it instead."
+            )
+        })?;
+    let mut stdout = child.stdout.take().expect("piped");
+    let mut stderr = child.stderr.take().expect("piped");
+    let out = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = stdout.read_to_end(&mut b);
+        b
+    });
+    let err = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = stderr.read_to_end(&mut b);
+        b
+    });
+    let deadline = std::time::Instant::now() + PDF_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break s,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("reading the PDF `{path}` took too long"));
+            }
+            Err(e) => return Err(format!("can't read the PDF `{path}`: {e}")),
+        }
+    };
+    Ok(std::process::Output {
+        status,
+        stdout: out.join().unwrap_or_default(),
+        stderr: err.join().unwrap_or_default(),
+    })
 }
 
 /// Pages a PDF read returns when none are asked for.

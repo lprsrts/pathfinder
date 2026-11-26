@@ -245,6 +245,26 @@ impl Runtime {
         reply
     }
 
+    /// A reply that can settle a candidate by itself (`/tell`, `/check`):
+    /// while one waits, it's shown only if a decision service clears it.
+    /// With no service to ask (masked mode, or none answered) it's held.
+    pub(super) async fn gate_strict(&self, session: &Session, draft: String) -> String {
+        match self.gate_mode(session) {
+            GateMode::Open => draft,
+            GateMode::Masked => fixed_reply(session),
+            GateMode::Checked(secrets) => {
+                match self.leaks_scored(session, &secrets, &draft).await {
+                    Ok((Some(false), _)) => draft,
+                    Ok(_) => fixed_reply(session),
+                    Err(e) => {
+                        tracing::warn!("the gate's check failed; withholding the reply: {e:#}");
+                        failed_reply(session, &e)
+                    }
+                }
+            }
+        }
+    }
+
     async fn gate_reply_inner(
         &self,
         session: &Session,
