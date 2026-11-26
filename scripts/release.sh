@@ -114,8 +114,8 @@ fi
 # link, stored once) for apps before 0.3, which update by that name.
 mac_tar="$version/pathfinder-$version-universal-apple-darwin.tar.gz"
 ln "$bin" "$dist/pkg/harness"
-cp "$root/LICENSE" "$root/NOTICE" "$dist/pkg/"
-tar -czf "$out/$mac_tar" -C "$dist/pkg" pathfinder harness LICENSE NOTICE
+cp "$root/LICENSE" "$root/NOTICE" "$dist/pkg/" && cp -R "$root/LICENSES" "$dist/pkg/"
+tar -czf "$out/$mac_tar" -C "$dist/pkg" pathfinder harness LICENSE NOTICE LICENSES
 
 # The source of exactly this build (AGPL).
 src_tar="$version/pathfinder-$version-source.tar.gz"

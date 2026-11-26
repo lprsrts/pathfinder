@@ -1,0 +1,8 @@
+Pathfinder
+Copyright 2026 Alper Sarıtaş
+Licensed under the GNU Affero General Public License v3.0 or later (LICENSE).
+
+The macOS sandbox policies in app/src/agent/sandbox/*.sbpl are adapted from
+OpenAI Codex (https://github.com/openai/codex), Copyright 2025 OpenAI,
+licensed under the Apache License, Version 2.0 (LICENSES/Apache-2.0.txt).
+Codex's policies are in turn inspired by Chromium's sandbox policies.

@@ -567,6 +567,20 @@ impl Db {
             .collect()
     }
 
+    /// A consistent copy of the database at `to`, safe while the service
+    /// runs (unlike copying the file, which can miss what's still in the
+    /// write-ahead log). Refuses to overwrite.
+    pub fn backup(&self, to: &Path) -> Result<()> {
+        if to.exists() {
+            anyhow::bail!("{} already exists", to.display());
+        }
+        self.0
+            .lock()
+            .unwrap()
+            .execute("VACUUM INTO ?1", params![to.to_string_lossy()])?;
+        Ok(())
+    }
+
     /// Whether the shared gate is on (`collector gate on|off`).
     pub fn gate_enabled(&self) -> Result<bool> {
         Ok(self.setting("gate")?.as_deref() != Some("off"))

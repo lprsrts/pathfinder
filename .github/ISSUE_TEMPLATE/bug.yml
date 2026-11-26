@@ -1,0 +1,45 @@
+name: Bug report
+description: Something in Pathfinder didn't work as it should.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        `/bug` in Pathfinder (or `pathfinder bug "what happened"`) collects your settings, the last log lines and any crash, and shows it all before it's sent. You can paste its saved file here instead of filling this in.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The output of `pathfinder --version`.
+      placeholder: pathfinder 0.3.0
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: System
+      description: macOS or Linux, and the version.
+    validations:
+      required: true
+  - type: input
+    id: models
+    attributes:
+      label: Models
+      description: The route and models in use (`pathfinder auth status`), e.g. ChatGPT with GPT-6.2 Sol.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what you saw instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+  - type: textarea
+    id: log
+    attributes:
+      label: Log or crash
+      description: The end of the log or crash log (`pathfinder paths` shows where). Check it for anything private first.
+      render: text

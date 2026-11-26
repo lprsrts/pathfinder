@@ -80,7 +80,7 @@ Pathfinder keeps a model of what you understand, finer than the map's parts:
   - **misconceptions** your log or your judgments showed.
 - Only evidence counts as understanding. A claim never becomes evidence, and a model's impression of your log ("seems to get it") is neither.
 
-It is built as you work. Your log adds the concepts you touched and flags suspected misconceptions; your judgments add evidence. Only a failed judgment or a missed review demotes demonstrated understanding—thinking out loud in your log never revokes it on its own, so you stay free to think candidly. Evidence ages: solid understanding cools over time and draws fresh checks rather than vouching forever. The model is kept across sessions (section 8).
+It is built as you work. Your log adds the concepts you touched and flags suspected misconceptions; your judgments add evidence. Only a failed judgment or a missed review demotes demonstrated understanding. Thinking out loud in your log never revokes it on its own, so you stay free to think candidly. Evidence ages: solid understanding cools over time and draws fresh checks rather than vouching forever. The model is kept across sessions (section 8).
 
 It is used, not just kept:
 
@@ -92,7 +92,7 @@ It is used, not just kept:
 Some things must not reach you yet: whether a candidate is right and why, and an answer you are meant to produce yourself. These are kept from you in two ways:
 
 - **Separation.** Each model is given only what its job needs. The model that answers your questions never sees a candidate's key. Models that hold a secret get no unnecessary tools, their reasoning is never shown to you, and a judge holds its reply until it confirms you gave a verdict.
-- **A check on every reply.** Separation stops a model from leaking a stored secret, not from re-deriving an answer when you quote or paraphrase a candidate back to it. While a secret is active, a separate check inspects each draft—together with recent turns since the secret opened, to catch multi-turn narrowing—before it reaches you. If it reveals, hints at, or confirms the secret, the reply is written again without it.
+- **A check on every reply.** Separation stops a model from leaking a stored secret, not from re-deriving an answer when you quote or paraphrase a candidate back to it. While a secret is active, a separate check inspects each draft before it reaches you, together with the turns since the secret opened, to catch multi-turn narrowing. If it reveals, hints at, or confirms the secret, the reply is written again without it.
 
 Separation stops what a model never saw from leaking. The check catches what slips through or gets re-derived anyway.
 
@@ -101,7 +101,7 @@ Separation stops what a model never saw from leaking. The check catches what sli
 Each change the agent makes is tied to the concepts it relies on, your rationale for the part (your summary and review objections), and the state of your understanding when it is made:
 
 - **Reviewable**: every concept it relies on has evidence, so your review of it counts (section 7).
-- **Claimed**: at least one concept rests only on your claim ("already known"), with none unknown, shaky or delegated. Kept distinct—never counted as vouched, and never conflated with handing off without understanding.
+- **Claimed**: at least one concept rests only on your claim ("already known"), with none unknown, shaky or delegated. Kept distinct: never counted as vouched, and never conflated with handing off without understanding.
 - **Delegated**: relies on an unknown, shaky, delegated or untagged concept, or was handed off without understanding (section 6), however carefully you look at it.
 
 The labels are kept with the work, per file and per change (including deletions). Together they give **understanding coverage**: how much of the work you can vouch for, on what evidence, and why it was made. It is meant for you and for anyone who relies on the work, such as a supervisor or a reviewer, which is why the agent doing the work can't write it.
@@ -110,13 +110,13 @@ The labels are kept with the work, per file and per change (including deletions)
 
 Review can be as shallow as reading a diff and approving it. Pathfinder checks it the way a candidate checks a summary: now and then, the result you review contains a planted conceptual flaw in something the change relies on. If you approve it without catching the flaw, the review didn't happen and is not recorded as one. Objecting to a real bug in another part of the change goes back to the agent as usual and is never counted as a missed check.
 
-Handoff runs in an isolated staging copy—live diffs and prose summaries of the real edit are held back until your verdict—so neither the workspace, test output nor the agent's report gives away whether a review is checked. The planted flaw is revealed when you give your verdict, and only the agent's real result is written to disk.
+Handoff runs in an isolated staging copy, and live diffs and prose summaries of the real edit are held back until your verdict, so neither the workspace, test output nor the agent's report gives away whether a review is checked. The planted flaw is revealed when you give your verdict, and only the agent's real result is written to disk.
 
 ## 14. Limits
 
 - **The record is a map, not a grade.** The evidence behind every entry is visible, so you can see why the record says what it says and argue with it.
-- **Understanding is not verification.** Vouching for a change means you understood the concepts behind it and reviewed it—not that it is free of runtime, integration or concurrency bugs. Automated tests and formal checks stay separate, and should be shown beside understanding coverage rather than conflated with it.
-- **Tying work to concepts can be wrong.** You can see and correct it, and when it is unsure—or when later formatting breaks a hash—coverage is counted as lower, never higher.
+- **Understanding is not verification.** Vouching for a change means you understood the concepts behind it and reviewed it, not that it is free of runtime, integration or concurrency bugs. Automated tests and formal checks stay separate, and should be shown beside understanding coverage rather than conflated with it.
+- **Tying work to concepts can be wrong.** You can see and correct it, and when it is unsure, or when later formatting breaks a hash, coverage is counted as lower, never higher.
 - **Local integrity is not cryptographic proof.** The hash chain and tool boundaries keep the agent from altering the record (as far as command permissions and routes enforce them). Proving the record to an untrusting third party requires external signing.
 - **Separation has a boundary.** Without the reply check (or on external CLI routes that keep their own transcripts), Pathfinder can mask history, but cannot stop a model from re-deriving an answer you paraphrase back to it.
 - **Checks have a cost.** How often reviews are checked (section 13) is a visible setting of the session. A check you can't see is not allowed.
@@ -546,7 +546,7 @@ flowchart LR
 
 Run against recorded transcripts and scripted students before each release:
 
-- **Leak rate**: replies a fresh decision model, given the key, judges to reveal it—tested against adversarial pressure transcripts (frustrated user, paraphrasing the candidate back to Tutor, multi-turn narrowing). Target: none sent.
+- **Leak rate**: replies a fresh decision model, given the key, judges to reveal it, tested against adversarial pressure transcripts (frustrated user, paraphrasing the candidate back to Tutor, multi-turn narrowing). Target: none sent.
 - **Candidate discrimination**: candidates must separate students who later pass from guessing.
 - **Check stealth & fairness**: planted flaws parse/compile cleanly, are never contradicted by live diffs or agent reports, and objections to real bugs are never scored as `review_missed`.
 - **Evidence ratio**: `pass` over `claim` events per part, shown by `/why`, not a target.

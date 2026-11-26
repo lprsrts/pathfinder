@@ -4,44 +4,80 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Pathfinder</title>
+<meta name="description" content="Pathfinder makes sure you understand the work you do with AI. It answers, checks you at the moments that matter, and keeps an honest record of what you understood.">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<meta property="og:title" content="Pathfinder">
+<meta property="og:description" content="Make sure you understand the work you do with AI.">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://pathfinder.lprsrts.com/">
+<meta property="og:image" content="https://pathfinder.lprsrts.com/favicon.svg">
+<meta name="twitter:card" content="summary">
 <style>
-  :root { color-scheme: light dark; --fg: #1d1d1f; --bg: #fff; --muted: #6e6e73; --rule: #e5e5ea; --code: #f5f5f7; --accent: #0a66d8; }
-  @media (prefers-color-scheme: dark) { :root { --fg: #f5f5f7; --bg: #111; --muted: #a1a1a6; --rule: #333; --code: #1c1c1e; --accent: #4c9bff; } }
+  :root { color-scheme: light dark; --fg: #1d1d1f; --bg: #fff; --muted: #6e6e73; --rule: #e5e5ea; --code: #f5f5f7; --accent: #0a66d8; --you: #eef4fd; }
+  @media (prefers-color-scheme: dark) { :root { --fg: #f5f5f7; --bg: #111; --muted: #a1a1a6; --rule: #333; --code: #1c1c1e; --accent: #4c9bff; --you: #16233a; } }
   body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-  main { max-width: 40rem; margin: 0 auto; padding: 3rem 1rem 4rem; }
-  h1 { font-size: 1.8rem; margin: 0 0 .5rem; }
+  main { max-width: 42rem; margin: 0 auto; padding: 3rem 1rem 4rem; }
+  header { display: flex; align-items: center; gap: .75rem; margin-bottom: .75rem; }
+  header img { width: 2.5rem; height: 2.5rem; }
+  h1 { font-size: 1.8rem; margin: 0; }
   h2 { font-size: 1.1rem; margin: 2.25rem 0 .5rem; }
-  p.lead { font-size: 1.1rem; margin: 0 0 1.5rem; }
+  p.lead { font-size: 1.15rem; margin: 0 0 1rem; }
   .meta { color: var(--muted); font-size: .95rem; }
   pre { background: var(--code); border: 1px solid var(--rule); border-radius: 8px; padding: .8rem 1rem; overflow-x: auto; margin: .5rem 0 1rem; }
   code { font: .9em ui-monospace, SFMono-Regular, Menlo, monospace; }
-  ol { padding-left: 1.3rem; }
-  li { margin: .5rem 0; }
+  ul, ol { padding-left: 1.3rem; }
+  li { margin: .45rem 0; }
   a { color: var(--accent); }
+  .example { border: 1px solid var(--rule); border-radius: 10px; padding: .25rem 1rem; margin: 1rem 0; font-size: .95rem; }
+  .example p { margin: .75rem 0; }
+  .you { background: var(--you); border-radius: 8px; padding: .5rem .75rem; }
+  .who { font-weight: 600; display: block; font-size: .85rem; color: var(--muted); }
 </style>
 </head>
 <body>
 <main>
-<h1>Pathfinder</h1>
-<p class="lead">Pathfinder makes sure you understand the work you do with AI. It answers, checks you, and keeps an honest record of what you understood.</p>
-<p>It runs in your terminal, on your own computer, with your own ChatGPT account. It’s invite-only for now: ask Alper to add your email address.</p>
+<header><img src="/favicon.svg" alt=""><h1>Pathfinder</h1></header>
+<p class="lead">Pathfinder makes sure you understand the work you do with AI. It answers your questions, checks you at the moments that matter, and keeps an honest record of what you understood, what you only claimed, and what you handed off.</p>
+<p>It runs in your terminal, on your own computer, with your own model account. It’s in a closed beta: ask Alper to add your email address.</p>
 
-<h2>Install (Mac)</h2>
+<h2>How it works</h2>
+<ul>
+<li><strong>Ask anything</strong> about the folder you’re working in: code, papers, notes, PDFs. Answers count as <em>told</em>, not as understood.</li>
+<li><strong>Say when something has clicked.</strong> You get a short candidate that is either right or has exactly one real mistake, and you say which and why. Passing is the only thing that counts as understanding.</li>
+<li><strong>While you judge, nothing gives it away.</strong> A gate checks every reply against the answer before you see it.</li>
+<li><strong>Hand work to the agent</strong> when you understand it, and review the result. <code>/why</code> shows your record.</li>
+</ul>
+
+<div class="example" aria-label="An example exchange">
+<p class="you"><span class="who">You</span>I think I get why the retry needs jitter now.</p>
+<p><span class="who">Pathfinder</span>Candidate: without jitter, clients that failed together retry together, so the retries arrive as one burst and the service fails again. Adding a random delay spreads them out; doubling the delay each time also lowers the total load. <strong>Is it right? Say why.</strong></p>
+<p class="you"><span class="who">You</span>Right, but doubling alone doesn’t spread them: they still double in lockstep. The jitter does that.</p>
+<p><span class="who">Pathfinder</span>Correct: the candidate was right, and you named what each part does. <em>Retry jitter</em> is now on your record as shown.</p>
+</div>
+<p class="meta">An illustration of a check, not a recording.</p>
+
+<h2>What you need</h2>
+<ul>
+<li>A Mac (Apple silicon or Intel). On Linux, build it from <a href="https://github.com/lprsrts/pathfinder">source</a>.</li>
+<li>A paid ChatGPT plan (Plus or Pro), or an Anthropic or OpenAI API key. Pathfinder’s use counts against it.</li>
+</ul>
+
+<h2>Install</h2>
 <pre><code>curl -fsSL https://pathfinder.lprsrts.com/install.sh | sh</code></pre>
-<p class="meta">One program, <code>harness</code>, in <code>~/.local/bin</code> by default (<code>PATHFINDER_BIN_DIR</code> or <code>XDG_BIN_HOME</code> choose another folder), signed and notarised by Apple.</p>
+<p class="meta">One program, <code>pathfinder</code>, in <code>~/.local/bin</code> by default (<code>PATHFINDER_BIN_DIR</code> or <code>XDG_BIN_HOME</code> choose another folder), signed and notarised by Apple.</p>
 
 <h2>Start</h2>
 <ol>
-<li>Connect your model account (this opens your browser): <code>harness auth login chatgpt</code></li>
-<li>In the folder you’re working in, start Pathfinder: <code>harness tui</code></li>
-<li>Choose whether to share usage data. It’s optional, and Pathfinder works the same either way.</li>
-<li>Press Enter to sign in with your email. Check that the page shows the same code as your terminal, then press <em>Link this computer</em>.</li>
+<li>Connect your model account (this opens your browser): <code>pathfinder auth login chatgpt</code></li>
+<li>In the folder you’re working in, start Pathfinder: <code>pathfinder</code></li>
+<li>Join the beta with your email. Sharing usage data is a separate, optional choice.</li>
 </ol>
+<p>The <a href="https://github.com/lprsrts/pathfinder/blob/main/docs/beta.md">beta guide</a> has what to try and the known issues. <code>/bug what happened</code> reports a problem, after showing you everything it would send.</p>
 
 <h2>Your data</h2>
-<p>Usage events are counts and timings, never your messages. A thread is shared only when you type <code>/share</code> in it and confirm. <code>harness data</code> shows your settings, <code>harness data off</code> stops sending, and <code>harness data delete</code> erases what was sent. <a href="/privacy/">Privacy notice</a></p>
+<p>Your messages and files go to your model provider, under your account. Usage events, if you share them, are counts and timings, never your messages. A thread is shared only when you type <code>/share</code> in it and confirm. <code>pathfinder data</code> shows your settings, <code>pathfinder data off</code> stops sending, and <code>pathfinder data delete</code> erases what was sent. <a href="/privacy/">Privacy notice</a></p>
 
-<p class="meta">Built by Alper Sarıtaş · <a href="/releases/latest.json">Latest release</a> · Source in each release, AGPL-3.0</p>
+<p class="meta">Built by Alper Sarıtaş · <a href="https://github.com/lprsrts/pathfinder">Source</a> (AGPL-3.0) · <a href="https://github.com/lprsrts/pathfinder/blob/main/CHANGELOG.md">Changelog</a> · <a href="https://github.com/lprsrts/pathfinder/blob/main/SECURITY.md">Security</a></p>
 </main>
 </body>
 </html>

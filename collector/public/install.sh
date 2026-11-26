@@ -4,7 +4,7 @@
 #
 # It downloads the newest release for this computer, checks it against the
 # release manifest (and, on a Mac, that Apple's notarised signature is
-# Pathfinder's), and puts `harness` in a folder for your own programs:
+# Pathfinder's), and puts `pathfinder` in a folder for your own programs:
 # PATHFINDER_BIN_DIR if set, else XDG_BIN_HOME, else ~/.local/bin.
 # Nothing else changes.
 set -eu
@@ -69,27 +69,35 @@ if [ "$got" != "$sha" ]; then
     exit 1
 fi
 tar -xzf "$tmp/release.tar.gz" -C "$tmp"
+# Releases before 0.3 name the program `harness`.
+prog="$tmp/pathfinder"
+[ -f "$prog" ] || prog="$tmp/harness"
+[ -f "$prog" ] || { echo "The release has no pathfinder program; stopping." >&2; exit 1; }
 
 if [ "$target" = universal-apple-darwin ]; then
-    if ! codesign --verify --strict "$tmp/harness" 2>/dev/null ||
-        ! codesign -dv "$tmp/harness" 2>&1 | grep -q "TeamIdentifier=$TEAM_ID"; then
+    if ! codesign --verify --strict "$prog" 2>/dev/null ||
+        ! codesign -dv "$prog" 2>&1 | grep -q "TeamIdentifier=$TEAM_ID"; then
         echo "The binary isn't signed by Pathfinder's developer (team $TEAM_ID); stopping." >&2
         exit 1
     fi
 fi
 
 mkdir -p "$DEST"
-chmod 755 "$tmp/harness"
-mv "$tmp/harness" "$DEST/harness"
-echo "Installed: $DEST/harness ($version)"
+chmod 755 "$prog"
+mv "$prog" "$DEST/pathfinder"
+# An install from before 0.3 runs as `harness`: keep that name working.
+if [ -e "$DEST/harness" ] || [ -L "$DEST/harness" ]; then
+    ln -sf pathfinder "$DEST/harness"
+fi
+echo "Installed: $DEST/pathfinder ($version)"
 
 case ":$PATH:" in
     *":$DEST:"*)
-        found="$(command -v harness 2>/dev/null || true)"
-        if [ -n "$found" ] && [ "$found" != "$DEST/harness" ]; then
+        found="$(command -v pathfinder 2>/dev/null || true)"
+        if [ -n "$found" ] && [ "$found" != "$DEST/pathfinder" ]; then
             echo
-            echo "Note: another harness comes first on your PATH ($found)."
-            echo "Remove it, or run Pathfinder as $DEST/harness."
+            echo "Note: another pathfinder comes first on your PATH ($found)."
+            echo "Remove it, or run Pathfinder as $DEST/pathfinder."
         fi
         ;;
     *)
@@ -110,12 +118,14 @@ esac
 cat <<'NEXT'
 
 Next:
-  1. Your model account: harness auth login chatgpt
-  2. Start, in the folder you're working in:
-                         cd ~/path/to/project && harness tui
-     The first start asks whether to share usage data (it's optional),
-     then you sign in with your email in the browser.
-  3. Later updates:      harness update
+  1. Connect your model account (opens your browser):
+                         pathfinder auth login chatgpt
+  2. Start it in the folder you're working in:
+                         cd ~/path/to/your/work && pathfinder
+     The first start asks whether to join the beta (with your email) and,
+     separately, whether to share usage data. Both are optional.
+  3. Later updates:      pathfinder update
+  Problems:              /bug in Pathfinder, or pathfinder bug "what happened"
 
-Privacy notice: https://pathfinder.lprsrts.com/privacy
+Privacy notice: https://pathfinder.lprsrts.com/privacy/
 NEXT

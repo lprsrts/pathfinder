@@ -17,6 +17,7 @@
 //!                                 (pseudonymous unless --with-emails)
 //! collector stop <name|install>   stop collecting from an install
 //! collector prune                 delete events past retention
+//! collector backup <file>         a consistent copy of the database
 //! collector keygen                make the release signing key (keychain)
 //! collector sign <file>           sign a release manifest
 //! ```
@@ -155,6 +156,12 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
+        Some("backup") => {
+            let to = PathBuf::from(args.get(1).context("usage: collector backup <file>")?);
+            open_db()?.backup(&to)?;
+            println!("backed up to {}", to.display());
+            Ok(())
+        }
         Some("report") => {
             print!("{}", open_db()?.report()?);
             Ok(())
@@ -207,7 +214,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         _ => bail!(
-            "usage: collector serve | invite <name> | allow <email> | disallow <email> | people | stats | export <dir> | stop <name|install> | prune"
+            "usage: collector serve | allow <email> | disallow <email> | people | invite <name> | stats | report | reports [n] | gate-stats | gate on|off | export [dir] | stop <name|install> | prune | backup <file>"
         ),
     }
 }
@@ -744,5 +751,21 @@ mod tests {
             .unwrap();
         assert!(st.db.link(&first).unwrap().is_none());
         assert!(st.db.link(&second).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_backup_is_a_working_copy() {
+        let dir = std::env::temp_dir().join(format!("collector-backup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = db::Db::open(&dir.join("live.sqlite")).unwrap();
+        db.allow("a@example.com").unwrap();
+        let copy = dir.join("copy.sqlite");
+        db.backup(&copy).unwrap();
+        assert!(db.backup(&copy).is_err(), "must not overwrite");
+        assert_eq!(
+            db::Db::open(&copy).unwrap().people().unwrap(),
+            ["a@example.com"]
+        );
+        std::fs::remove_dir_all(dir).ok();
     }
 }
