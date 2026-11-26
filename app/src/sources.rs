@@ -118,21 +118,35 @@ fn plain(c: char) -> Option<&'static str> {
 }
 
 /// The form spelling variants share: lowercase letters and digits only,
-/// marks dropped. "K-means", "k means" and "kmeans" are all "kmeans";
-/// "Schrödinger" is "schrodinger". With each output char, the index of the
-/// input char it came from.
-pub fn loose(text: &str) -> (String, Vec<usize>) {
-    let mut out = String::new();
-    let mut from = Vec::new();
+/// marks dropped, and "ae", "oe", "ue" read as "a", "o", "u". "K-means",
+/// "k means" and "kmeans" are all "kmeans"; "Schrödinger" and
+/// "Schroedinger" are both "schrodinger". With each output char, the first
+/// and last index of the input chars it came from.
+pub fn loose(text: &str) -> (String, Vec<(usize, usize)>) {
+    let mut chars: Vec<(char, usize)> = Vec::new();
     for (i, c) in text.chars().enumerate() {
         let c = c.to_lowercase().next().unwrap_or(c);
         if let Some(p) = plain(c) {
-            out.push_str(p);
-            from.extend(std::iter::repeat_n(i, p.len()));
+            chars.extend(p.chars().map(|p| (p, i)));
         } else if c.is_alphanumeric() {
-            out.push(c);
-            from.push(i);
+            chars.push((c, i));
         }
+    }
+    let mut out = String::new();
+    let mut from: Vec<(usize, usize)> = Vec::new();
+    let mut k = 0;
+    while k < chars.len() {
+        let (c, i) = chars[k];
+        // The German way of writing ä, ö, ü without the marks.
+        if matches!(c, 'a' | 'o' | 'u') && chars.get(k + 1).is_some_and(|n| n.0 == 'e') {
+            out.push(c);
+            from.push((i, chars[k + 1].1));
+            k += 2;
+            continue;
+        }
+        out.push(c);
+        from.push((i, i));
+        k += 1;
     }
     (out, from)
 }
@@ -163,7 +177,7 @@ pub fn locate(lines: &[&str], quote: &str) -> Option<(usize, String)> {
             if let Some(at) = folded.find(&want) {
                 let first = folded[..at].chars().count();
                 let chars: Vec<char> = have.chars().collect();
-                let (mut a, mut b) = (from[first], from[first + n - 1]);
+                let (mut a, mut b) = (from[first].0, from[first + n - 1].1);
                 // Take the punctuation around the words with them.
                 while a > 0 && "([{\"'“‘«".contains(chars[a - 1]) {
                     a -= 1;
@@ -877,6 +891,17 @@ mod tests {
         assert!(mentions("We run k means on the data.", "K-Means"));
         assert!(mentions("Schrödinger's equation", "schrodinger"));
         assert!(mentions("Die Straße", "strasse"));
+        assert!(mentions("Schrödinger's equation", "Schroedinger"));
+        assert!(mentions("Schroedinger's equation", "schrödinger"));
+        assert!(mentions("Übung 3: Lösung", "uebung"));
+        assert!(mentions("die Lösung", "loesung"));
+        assert_eq!(
+            locate(
+                &["Die Schroedinger-Gleichung gilt."],
+                "Schrödinger-Gleichung"
+            ),
+            Some((1, "Schroedinger-Gleichung".to_string()))
+        );
         assert!(!mentions("We run k-medoids.", "kmeans"));
         let lines = [
             "Then K-means assigns each point",

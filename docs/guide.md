@@ -34,7 +34,7 @@ Read and search yourself:
 - `/open <file> [page or line]` (or `/open notes.md:120`): the page or lines, numbered.
 - `/web <terms>`: papers from OpenAlex and arXiv and pages from Brave Search, each with a line checked against what was fetched. When the folder has nothing for a question, this search runs by itself.
 
-Searches don't mind spelling: "k-means", "K means" and "kmeans" find each other, and so do "Schrödinger" and "Schrodinger".
+Searches don't mind spelling: "k-means", "K means" and "kmeans" find each other, and so do "Schrödinger", "Schroedinger" and "Schrodinger".
 
 What you open and search is on your record as *read*; it grows the graph but never counts as understanding.
 
