@@ -146,7 +146,7 @@ PY
 cp "$out/latest.json" "$out/latest.json.sig" "$out/$version/"
 
 # The public folder: the pages and installer next to the releases.
-for f in index.html install.sh screenshot.svg icon-1024.png icon-512.png icon-180.png icon-32.png icon-16.png; do
+for f in index.html install.sh screenshot.svg pathfinder-demo.mp4 pathfinder-demo.gif icon-1024.png icon-512.png icon-180.png icon-32.png icon-16.png; do
     [[ -f "$root/collector/public/$f" ]] && cp "$root/collector/public/$f" "$dist/public/"
 done
 cp -R "$root/collector/public/privacy" "$dist/public/"
