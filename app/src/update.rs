@@ -94,7 +94,18 @@ pub async fn latest() -> Result<Release> {
     // The top-level manifest only names the newest version. That version's
     // own manifest and signature never change, so a cache can serve an older
     // release but never a manifest with another release's signature.
-    let newest: Release = serde_json::from_slice(&get("latest.json").await?)?;
+    // A query that changes every minute is a cache key of its own, so the
+    // edge can't keep this older than a minute; if that fails (the server is
+    // down), the plain URL is served from the edge's cache.
+    let minute = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() / 60)
+        .unwrap_or(0);
+    let top = match get(&format!("latest.json?m={minute}")).await {
+        Ok(bytes) => bytes,
+        Err(_) => get("latest.json").await?,
+    };
+    let newest: Release = serde_json::from_slice(&top)?;
     if !is_version(&newest.version) {
         bail!("the release manifest names an odd version");
     }

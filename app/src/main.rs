@@ -275,16 +275,24 @@ async fn run(args: Vec<String>) -> Result<()> {
     }
 }
 
-/// Installs from before 0.3 put the program at `harness`. Gives it its
-/// new name beside it, once, so `pathfinder` works too.
+/// Installs from before 0.3 put the program at `harness`, and updated it in
+/// place under that name. Moves it to `pathfinder`, once, and leaves
+/// `harness` as a link to it, so settings that still run `harness` (Zed's)
+/// keep working.
 fn link_new_name() {
     #[cfg(unix)]
     if let Ok(exe) = env::current_exe()
         && exe.file_name().is_some_and(|n| n == "harness")
+        && std::fs::symlink_metadata(&exe).is_ok_and(|m| m.file_type().is_file())
     {
         let new = exe.with_file_name("pathfinder");
-        if !new.exists() {
-            std::os::unix::fs::symlink(&exe, &new).ok();
+        // 0.3.0 left `pathfinder` as a link to `harness`: replace it.
+        let new_is_link = std::fs::symlink_metadata(&new).is_ok_and(|m| m.file_type().is_symlink());
+        if (new_is_link || !new.exists())
+            && (!new_is_link || std::fs::remove_file(&new).is_ok())
+            && std::fs::rename(&exe, &new).is_ok()
+        {
+            std::os::unix::fs::symlink("pathfinder", &exe).ok();
         }
     }
 }

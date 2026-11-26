@@ -40,7 +40,10 @@ esac
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
-curl -fsSL "$BASE/releases/latest.json" -o "$tmp/latest.json"
+# A query that changes every minute gets past a stale edge cache; the plain
+# URL is the fallback while the server is down.
+curl -fsSL "$BASE/releases/latest.json?m=$(( $(date +%s) / 60 ))" -o "$tmp/latest.json" 2>/dev/null ||
+    curl -fsSL "$BASE/releases/latest.json" -o "$tmp/latest.json"
 # The manifest is indented JSON: the target's block holds path and sha256.
 field() {
     awk -v t="\"$target\"" -v f="\"$1\"" '

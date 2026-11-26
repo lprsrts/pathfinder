@@ -2,6 +2,11 @@
 
 What changed in each release of Pathfinder, newest first. `pathfinder update` shows the newest section.
 
+## 0.3.3
+
+- **Updates show up within a minute.** `pathfinder update` and the installer no longer see an old release list that Cloudflare kept too long; while the server is down they still fall back to the cached copy.
+- **The program is now `pathfinder`, not `harness`.** Installs that were updated in place under the old name move to `pathfinder` the first time they run, and `harness` stays as a link to it, so a Zed setting that runs `harness` keeps working. Change it to `pathfinder` when you like.
+
 ## 0.3.2
 
 - **The commands you'd expect.** `/quit` (or `/exit`, `/q`), `/help`, `/new` (or `/clear`), `/resume`, `/model`, `/status`, `/copy`, `/thinking`, `/join`, `/data` and `/update`. Typing `/` shows the commands that match; Tab completes. An unknown command says so instead of going to the model.
