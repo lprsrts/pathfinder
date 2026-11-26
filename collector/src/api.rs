@@ -215,7 +215,9 @@ async fn cache_headers(req: Request, next: Next) -> Response {
             Some(IMMUTABLE)
         }
         // The site's images: a change shows up within minutes.
-        p if p.ends_with(".svg") => Some(SITE_IMAGE),
+        p if !p.starts_with("/releases/") && (p.ends_with(".svg") || p.ends_with(".png")) => {
+            Some(SITE_IMAGE)
+        }
         _ => None,
     };
     if let Some(policy) = policy {
@@ -896,7 +898,8 @@ fn page(status: StatusCode, title: &str, body: &str) -> Response {
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="referrer" content="no-referrer">
-<link rel="icon" href="/icon.svg" type="image/svg+xml">
+<link rel="icon" type="image/png" sizes="32x32" href="/icon-32.png">
+<link rel="apple-touch-icon" href="/icon-180.png">
 <title>{title} · Pathfinder</title>
 <style>
   :root {{ color-scheme: light dark; --fg: #1d1d1f; --bg: #fff; --muted: #6e6e73; --rule: #e5e5ea; --accent: #0a66d8; }}

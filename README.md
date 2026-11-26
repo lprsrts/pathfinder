@@ -1,4 +1,4 @@
-<img src="collector/public/icon.svg" width="56" alt="" align="left">
+<img src="collector/public/icon-512.png" width="64" alt="" align="left">
 
 # Pathfinder
 
