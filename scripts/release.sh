@@ -15,6 +15,8 @@
 #                              release (scripts/github-release.sh)
 #   PATHFINDER_COLLECTOR_URL   the live collector, checked before publishing
 #   PATHFINDER_BUNDLE_ID       code-signing identifier (default com.lprsrts.pathfinder)
+#   PATHFINDER_CF_ZONE, PATHFINDER_CF_TOKEN_SERVICE
+#                              purge the edge cache after publishing (scripts/purge-cache.sh)
 #
 # The manifest is signed with the release key in the login keychain
 # (`collector keygen` made it; `collector sign` uses it).
@@ -162,6 +164,9 @@ echo "release ready in $dist/public"
 if [[ -n "$publish_to" ]]; then
     rsync -av "$dist/public/" "$publish_to/"
     echo "published to $publish_to"
+    # The edge keeps the installer and manifest for a day: drop its copies so
+    # the new release is what everyone gets now.
+    "$root/scripts/purge-cache.sh"
 fi
 
 # The same files as a GitHub release, with this version's notes.
