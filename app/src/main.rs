@@ -1,34 +1,9 @@
+pub use pathfinder::*;
+
 mod acp;
-mod agent;
-mod auth;
-mod bugreport;
-mod catalog;
 mod cli;
-mod config;
-mod crash;
-mod decide;
-mod domain;
-mod engine;
-mod envvar;
-mod i18n;
-mod ledger;
-mod llm;
-mod operator;
-mod options;
-mod paths;
-mod providers;
-mod runtime;
-mod secrets;
-mod sources;
-mod store;
-mod stream;
-mod telemetry;
 mod tui;
-mod understanding;
 mod update;
-mod validate;
-mod web;
-mod workspace;
 
 use std::env;
 use std::sync::Arc;

@@ -6,17 +6,24 @@ mod commands;
 mod markdown;
 mod view;
 
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
 use crossterm::event::{
-    DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyCode, KeyEvent,
-    KeyEventKind, KeyModifiers,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
+    EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+    MouseButton, MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use futures_util::StreamExt;
+use ratatui::layout::Rect;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
+
+static KEYBOARD_ENHANCED: AtomicBool = AtomicBool::new(false);
 
 use crate::domain::Session;
 use crate::engine::{
@@ -68,6 +75,7 @@ pub enum AppEvent {
 pub enum Modal {
     Threads {
         items: Vec<(String, String)>,
+        query: String,
         sel: usize,
     },
     Settings {
@@ -77,11 +85,13 @@ pub enum Modal {
         option: &'static str,
         title: String,
         items: Vec<(String, String)>,
+        query: String,
         sel: usize,
     },
     Permission {
         title: String,
         always_key: String,
+        sel: Option<usize>,
         reply: Option<oneshot::Sender<Permission>>,
     },
     /// Keys and commands; `scroll` lines down.
@@ -102,7 +112,24 @@ pub enum Modal {
         step: ConsentStep,
         error: Option<String>,
         busy: bool,
+        scroll: usize,
     },
+}
+
+/// Indices into `items` matching `query` (case-insensitive substring on id or label).
+pub fn filter_matches(items: &[(String, String)], query: &str) -> Vec<usize> {
+    let q = query.trim().to_ascii_lowercase();
+    if q.is_empty() {
+        return (0..items.len()).collect();
+    }
+    items
+        .iter()
+        .enumerate()
+        .filter(|(_, (id, label))| {
+            label.to_ascii_lowercase().contains(&q) || id.to_ascii_lowercase().contains(&q)
+        })
+        .map(|(i, _)| i)
+        .collect()
 }
 
 /// Something you may send, shown in full first.
@@ -171,6 +198,18 @@ pub struct App {
     pub modal: Option<Modal>,
     pub status: String,
     pub last_sent: String,
+    pub cmd_sel: usize,
+    pub input_history: Vec<String>,
+    pub history_idx: Option<usize>,
+    pub history_draft: String,
+    pub side_scroll: usize,
+    pub side_max_scroll: usize,
+    pub mouse_capture: bool,
+    pub input_width: u16,
+    pub conv_area: Rect,
+    pub side_area: Rect,
+    pub help_max_scroll: usize,
+    pub consent_max_scroll: usize,
     pub tick: usize,
     /// When the running reply started.
     pub started: Option<std::time::Instant>,
@@ -195,46 +234,95 @@ pub struct App {
 /// Puts the terminal back as it was: on quit, and from the panic hook.
 pub fn restore_terminal() {
     print!("\x1b[?1007l");
-    crossterm::execute!(std::io::stdout(), DisableBracketedPaste).ok();
+    if KEYBOARD_ENHANCED.swap(false, Ordering::SeqCst) {
+        crossterm::execute!(std::io::stdout(), PopKeyboardEnhancementFlags).ok();
+    }
+    crossterm::execute!(
+        std::io::stdout(),
+        DisableMouseCapture,
+        DisableBracketedPaste
+    )
+    .ok();
     ratatui::restore();
+}
+
+impl App {
+    pub fn new(
+        rt: Arc<Runtime>,
+        cwd: PathBuf,
+        session: Session,
+        tx: mpsc::UnboundedSender<AppEvent>,
+    ) -> Self {
+        Self {
+            rt,
+            cwd,
+            session,
+            entries: Vec::new(),
+            input: String::new(),
+            cursor: 0,
+            attachments: Vec::new(),
+            running: None,
+            scroll: 0,
+            show_thoughts: false,
+            show_tools: false,
+            selected: None,
+            reveal_selected: false,
+            items: Vec::new(),
+            expanded: Default::default(),
+            show_side: true,
+            modal: None,
+            status: String::new(),
+            last_sent: String::new(),
+            cmd_sel: 0,
+            input_history: Vec::new(),
+            history_idx: None,
+            history_draft: String::new(),
+            side_scroll: 0,
+            side_max_scroll: 0,
+            mouse_capture: true,
+            input_width: 76,
+            conv_area: Rect::default(),
+            side_area: Rect::default(),
+            help_max_scroll: 0,
+            consent_max_scroll: 0,
+            tick: 0,
+            started: None,
+            last_total: 0,
+            new_below: false,
+            side_overlay: false,
+            always: Default::default(),
+            thread_started: std::time::Instant::now(),
+            thread_turns: 0,
+            tx,
+            sign_in: None,
+            quit: false,
+        }
+    }
+
+    fn check_models_on_startup(&mut self) {
+        let empty = self.rt.model_choices(&self.session).catalog.is_empty();
+        self.apply_startup_model_note(empty);
+    }
+
+    fn apply_startup_model_note(&mut self, catalog_empty: bool) {
+        if catalog_empty {
+            self.entries.push(Entry::Note(
+                "No models are configured yet. Run `pathfinder auth login` (or `pathfinder auth set <provider>`) in a terminal to connect an account or API key, then open /model (Ctrl+P)."
+                    .into(),
+            ));
+            if self.status.is_empty() {
+                self.status =
+                    "No models configured — run `pathfinder auth login` first.".into();
+            }
+        }
+    }
 }
 
 pub async fn run(rt: Arc<Runtime>, cwd: PathBuf) -> Result<()> {
     let cwd = cwd.canonicalize().unwrap_or(cwd);
     let (tx, mut rx) = mpsc::unbounded_channel();
     let session = rt.create_session(uuid::Uuid::new_v4().to_string(), cwd.clone())?;
-    let mut app = App {
-        rt,
-        cwd,
-        session,
-        entries: Vec::new(),
-        input: String::new(),
-        cursor: 0,
-        attachments: Vec::new(),
-        running: None,
-        scroll: 0,
-        show_thoughts: false,
-        show_tools: false,
-        selected: None,
-        reveal_selected: false,
-        items: Vec::new(),
-        expanded: Default::default(),
-        show_side: true,
-        modal: None,
-        status: String::new(),
-        last_sent: String::new(),
-        tick: 0,
-        started: None,
-        last_total: 0,
-        new_below: false,
-        side_overlay: false,
-        always: Default::default(),
-        thread_started: std::time::Instant::now(),
-        thread_turns: 0,
-        tx,
-        sign_in: None,
-        quit: false,
-    };
+    let mut app = App::new(rt, cwd, session, tx);
     emit(UsageEvent::SessionStart {
         surface: pathfinder_schema::Surface::Tui,
     });
@@ -255,6 +343,7 @@ pub async fn run(rt: Arc<Runtime>, cwd: PathBuf) -> Result<()> {
             step: ConsentStep::Choose,
             error: None,
             busy: false,
+            scroll: 0,
         });
     }
     if app
@@ -265,12 +354,23 @@ pub async fn run(rt: Arc<Runtime>, cwd: PathBuf) -> Result<()> {
     {
         app.status = "Ctrl+O opens an earlier thread in this folder.".into();
     }
+    app.check_models_on_startup();
 
     let mut terminal = ratatui::init();
-    crossterm::execute!(std::io::stdout(), EnableBracketedPaste)?;
-    // Alternate scroll: the mouse wheel arrives as ↑/↓, and text selection
-    // stays the terminal's own because the mouse isn't captured.
-    print!("\x1b[?1007h");
+    crossterm::execute!(
+        std::io::stdout(),
+        EnableBracketedPaste,
+        EnableMouseCapture
+    )?;
+    if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false)
+        && crossterm::execute!(
+            std::io::stdout(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )
+        .is_ok()
+    {
+        KEYBOARD_ENHANCED.store(true, Ordering::SeqCst);
+    }
     let mut events = EventStream::new();
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(120));
     let result: Result<()> = async {
@@ -280,6 +380,7 @@ pub async fn run(rt: Arc<Runtime>, cwd: PathBuf) -> Result<()> {
                 ev = events.next() => match ev {
                     Some(Ok(Event::Key(key))) if key.kind != KeyEventKind::Release => app.on_key(key),
                     Some(Ok(Event::Paste(text))) => app.on_paste(&text),
+                    Some(Ok(Event::Mouse(mouse))) => app.on_mouse(mouse),
                     Some(Ok(_)) => {}
                     Some(Err(e)) => return Err(e.into()),
                     None => break,
@@ -496,17 +597,198 @@ impl App {
         }
     }
 
+    fn is_attach_arg(&self) -> bool {
+        commands::path_arg_slice(&self.input).is_some_and(|(cmd, _)| cmd == "/attach")
+    }
+
+    fn is_path_arg(&self) -> bool {
+        commands::path_arg_slice(&self.input).is_some()
+    }
+
+    fn palette_open(&self) -> bool {
+        self.input.starts_with('/')
+            && !self.input.contains(char::is_whitespace)
+            && !commands::search_for(&self.input, Some(&self.session)).is_empty()
+    }
+
+    fn has_part_in_review(&self) -> bool {
+        self.session
+            .active_part()
+            .is_some_and(|p| p.status == crate::domain::PartStatus::InReview)
+            || self
+                .session
+                .map
+                .parts
+                .iter()
+                .any(|p| p.status == crate::domain::PartStatus::InReview)
+    }
+
+    fn toggle_mouse_capture(&mut self) {
+        self.mouse_capture = !self.mouse_capture;
+        if std::io::stdout().is_terminal() {
+            if self.mouse_capture {
+                let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
+            } else {
+                let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+            }
+        }
+        self.status = if self.mouse_capture {
+            "Mouse scroll/click on (F2 for terminal text selection).".into()
+        } else {
+            "Terminal text selection on (F2 restores mouse scroll).".into()
+        };
+    }
+
     fn on_paste(&mut self, text: &str) {
-        if self.modal.is_some() {
+        let clean = text.replace("\r\n", "\n").replace('\r', "\n");
+        self.selected = None;
+        self.status.clear();
+        if let Some(modal) = self.modal.as_mut() {
+            match modal {
+                Modal::Consent {
+                    step: ConsentStep::Invite(code),
+                    error,
+                    busy: false,
+                    scroll,
+                    ..
+                } => {
+                    for c in clean.chars() {
+                        if !c.is_control() && code.len() + c.len_utf8() <= 64 {
+                            code.push(c);
+                        }
+                    }
+                    *error = None;
+                    *scroll = self.consent_max_scroll;
+                }
+                Modal::Threads { query, sel, .. } | Modal::Choose { query, sel, .. } => {
+                    for c in clean.chars() {
+                        if !c.is_control() {
+                            query.push(c);
+                        }
+                    }
+                    *sel = 0;
+                }
+                _ => {}
+            }
             return;
         }
-        self.input.insert_str(self.cursor, text);
-        self.cursor += text.len();
+        self.history_idx = None;
+        self.history_draft.clear();
+        self.cmd_sel = 0;
+        self.input.insert_str(self.cursor, &clean);
+        self.cursor += clean.len();
+    }
+
+    fn on_mouse(&mut self, mouse: MouseEvent) {
+        let rect_contains = |r: Rect, col: u16, row: u16| {
+            r.width > 0
+                && r.height > 0
+                && col >= r.x
+                && col < r.x + r.width
+                && row >= r.y
+                && row < r.y + r.height
+        };
+        match mouse.kind {
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
+                if let Some(modal) = self.modal.as_mut() {
+                    match modal {
+                        Modal::Permission { .. } => {
+                            if up {
+                                self.scroll = self.scroll.saturating_add(3);
+                            } else {
+                                self.scroll = self.scroll.saturating_sub(3);
+                                if self.scroll == 0 {
+                                    self.new_below = false;
+                                }
+                            }
+                        }
+                        Modal::Help { scroll } => {
+                            *scroll = if up {
+                                scroll.saturating_sub(3)
+                            } else {
+                                (*scroll + 3).min(self.help_max_scroll)
+                            };
+                        }
+                        Modal::Share { scroll, lines, .. } => {
+                            let max = lines.len().saturating_sub(1);
+                            *scroll = if up {
+                                scroll.saturating_sub(3)
+                            } else {
+                                (*scroll + 3).min(max)
+                            };
+                        }
+                        Modal::Consent { scroll, .. } => {
+                            *scroll = if up {
+                                scroll.saturating_sub(3)
+                            } else {
+                                (*scroll + 3).min(self.consent_max_scroll)
+                            };
+                        }
+                        Modal::Threads { items, query, sel } => {
+                            let len = filter_matches(items, query).len();
+                            *sel = if up {
+                                sel.saturating_sub(1)
+                            } else {
+                                (*sel + 1).min(len.saturating_sub(1))
+                            };
+                        }
+                        Modal::Choose {
+                            items, query, sel, ..
+                        } => {
+                            let len = filter_matches(items, query).len();
+                            *sel = if up {
+                                sel.saturating_sub(1)
+                            } else {
+                                (*sel + 1).min(len.saturating_sub(1))
+                            };
+                        }
+                        Modal::Settings { sel } => {
+                            *sel = if up {
+                                sel.saturating_sub(1)
+                            } else {
+                                (*sel + 1).min(SETTINGS.len().saturating_sub(1))
+                            };
+                        }
+                    }
+                    return;
+                }
+                if (self.show_side || self.side_overlay)
+                    && rect_contains(self.side_area, mouse.column, mouse.row)
+                {
+                    self.side_scroll = if up {
+                        self.side_scroll.saturating_sub(3)
+                    } else {
+                        (self.side_scroll + 3).min(self.side_max_scroll)
+                    };
+                } else if up {
+                    self.scroll = self.scroll.saturating_add(3);
+                } else {
+                    self.scroll = self.scroll.saturating_sub(3);
+                    if self.scroll == 0 {
+                        self.new_below = false;
+                    }
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left)
+                if self.modal.is_none()
+                    && self.selected.is_some()
+                    && !rect_contains(self.conv_area, mouse.column, mouse.row) =>
+            {
+                self.selected = None;
+            }
+            _ => {}
+        }
     }
 
     fn on_key(&mut self, key: KeyEvent) {
+        if matches!(key.code, KeyCode::Modifier(_)) {
+            return;
+        }
+        self.status.clear();
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         if self.modal.is_some() {
             self.on_modal_key(key);
             return;
@@ -515,35 +797,73 @@ impl App {
             return;
         }
         match key.code {
-            KeyCode::Tab if self.input.starts_with('/') => {
-                if let Some(done) = commands::complete(&self.input) {
-                    self.input = done;
-                    self.cursor = self.input.len();
-                }
-            }
-            KeyCode::Tab if !self.items.is_empty() => {
+            KeyCode::F(2) => self.toggle_mouse_capture(),
+            KeyCode::Up if ctrl && !self.items.is_empty() => {
                 used(Feature::Navigate);
                 self.selected = self.items.last().copied();
                 self.reveal_selected = true;
             }
+            KeyCode::Tab if self.is_path_arg() => {
+                let matches = commands::path_matches(&self.input, &self.cwd);
+                if !matches.is_empty() {
+                    let completed = if self.cmd_sel == 0 && matches.len() > 1 {
+                        commands::complete_path(&self.input, &self.cwd)
+                            .or_else(|| commands::complete_path_at(&self.input, 0, &self.cwd))
+                    } else {
+                        commands::complete_path_at(&self.input, self.cmd_sel, &self.cwd)
+                    };
+                    if let Some(done) = completed {
+                        self.input = done;
+                        self.cursor = self.input.len();
+                        self.cmd_sel = 0;
+                        self.history_idx = None;
+                        self.history_draft.clear();
+                    }
+                }
+            }
+            KeyCode::Tab if self.input.starts_with('/') && !self.input.contains(char::is_whitespace) => {
+                let matches = commands::search_for(&self.input, Some(&self.session));
+                if !matches.is_empty()
+                    && let Some(done) =
+                        commands::complete_at(&self.input, self.cmd_sel, Some(&self.session))
+                {
+                    self.input = done;
+                    self.cursor = self.input.len();
+                    self.cmd_sel = 0;
+                    self.history_idx = None;
+                    self.history_draft.clear();
+                }
+            }
+            KeyCode::Tab if self.input.is_empty() && !self.items.is_empty() => {
+                used(Feature::Navigate);
+                self.selected = self.items.last().copied();
+                self.reveal_selected = true;
+            }
+            KeyCode::Tab => {}
             KeyCode::Char('c') if ctrl => match &self.running {
                 Some(cancel) => cancel.cancel(),
                 None => self.quit = true,
             },
-            KeyCode::Char('d') if ctrl && self.input.is_empty() => self.quit = true,
+            KeyCode::Char('d') if ctrl => {
+                if self.input.is_empty() {
+                    self.quit = true;
+                } else {
+                    self.delete_char_forward();
+                }
+            }
             KeyCode::Char('n') if ctrl => self.new_thread(),
             KeyCode::Char('o') if ctrl => {
                 used(Feature::Threads);
-                self.open_threads()
+                self.open_threads();
             }
             KeyCode::Char('p') if ctrl => {
                 used(Feature::Settings);
-                self.modal = Some(Modal::Settings { sel: 0 })
+                self.modal = Some(Modal::Settings { sel: 0 });
             }
             KeyCode::Char('t') if ctrl => self.show_thoughts = !self.show_thoughts,
-            KeyCode::Char('e') if ctrl => {
+            KeyCode::Char('g') if ctrl => {
                 used(Feature::ToolGrouping);
-                self.show_tools = !self.show_tools
+                self.show_tools = !self.show_tools;
             }
             KeyCode::Char('b') if ctrl => {
                 used(Feature::SidePanel);
@@ -553,11 +873,12 @@ impl App {
                 } else {
                     self.side_overlay = !self.side_overlay;
                 }
+                self.side_scroll = 0;
             }
             KeyCode::Char('j') if ctrl => self.insert_char('\n'),
             KeyCode::F(1) => {
                 used(Feature::Help);
-                self.modal = Some(Modal::Help { scroll: 0 })
+                self.modal = Some(Modal::Help { scroll: 0 });
             }
             KeyCode::Esc if self.side_overlay => self.side_overlay = false,
             KeyCode::Esc => {
@@ -565,54 +886,241 @@ impl App {
                     cancel.cancel();
                 }
             }
-            KeyCode::Enter if alt || key.modifiers.contains(KeyModifiers::SHIFT) => {
-                self.insert_char('\n')
+            KeyCode::Enter if alt || shift => self.insert_char('\n'),
+            KeyCode::Enter => {
+                if self.is_attach_arg() {
+                    let arg = self
+                        .input
+                        .split_once(char::is_whitespace)
+                        .map(|(_, a)| a.trim())
+                        .unwrap_or("");
+                    let ready = arg.eq_ignore_ascii_case("clear")
+                        || commands::resolve_attach_path(arg, &self.cwd)
+                            .is_some_and(|p| p.is_file());
+                    if ready {
+                        self.submit();
+                    } else if let Some(cand) = commands::attach_matches(&self.input, &self.cwd)
+                        .get(self.cmd_sel)
+                        .cloned()
+                    {
+                        self.input = format!("/attach {}", cand.arg);
+                        self.cursor = self.input.len();
+                        self.cmd_sel = 0;
+                        if !cand.is_dir {
+                            self.submit();
+                        }
+                    } else {
+                        self.submit();
+                    }
+                } else if self.palette_open() {
+                    let matches = commands::search_for(&self.input, Some(&self.session));
+                    let typed = self.input.trim().to_ascii_lowercase();
+                    if let Some(cmd) = matches.get(self.cmd_sel).copied() {
+                        if cmd.name == typed || cmd.aliases.contains(&typed.as_str()) {
+                            self.cmd_sel = 0;
+                            self.submit();
+                        } else if cmd.args.contains('<') {
+                            self.input = format!("{} ", cmd.name);
+                            self.cursor = self.input.len();
+                            self.cmd_sel = 0;
+                            self.history_idx = None;
+                            self.history_draft.clear();
+                        } else {
+                            self.input = cmd.name.to_string();
+                            self.cursor = self.input.len();
+                            self.cmd_sel = 0;
+                            self.submit();
+                        }
+                    } else {
+                        self.submit();
+                    }
+                } else {
+                    self.submit();
+                }
             }
-            KeyCode::Enter => self.submit(),
-            KeyCode::PageUp => self.scroll += 10,
-            KeyCode::PageDown => self.scroll = self.scroll.saturating_sub(10),
-            KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => self.scroll += 1,
-            KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                self.scroll = self.scroll.saturating_sub(1)
+            KeyCode::PageUp => self.scroll = self.scroll.saturating_add(10),
+            KeyCode::PageDown => {
+                self.scroll = self.scroll.saturating_sub(10);
+                if self.scroll == 0 {
+                    self.new_below = false;
+                }
+            }
+            KeyCode::Up if shift => self.scroll = self.scroll.saturating_add(1),
+            KeyCode::Down if shift => {
+                self.scroll = self.scroll.saturating_sub(1);
+                if self.scroll == 0 {
+                    self.new_below = false;
+                }
             }
             KeyCode::Up if alt => {
-                self.input = self.last_sent.clone();
-                self.cursor = self.input.len();
+                if !self.last_sent.is_empty() {
+                    self.input = self.last_sent.clone();
+                    self.cursor = self.input.len();
+                    self.cmd_sel = 0;
+                }
             }
-            // The wheel arrives as ↑/↓; with nothing typed they scroll.
-            KeyCode::Up if self.input.is_empty() => self.scroll += 1,
-            KeyCode::Down if self.input.is_empty() => self.scroll = self.scroll.saturating_sub(1),
-            KeyCode::End if self.input.is_empty() || ctrl => self.scroll = 0,
-            // Line editing, the way shells do it.
+            KeyCode::Up if !ctrl && !alt => {
+                if self.is_attach_arg() {
+                    let len = commands::attach_matches(&self.input, &self.cwd).len();
+                    if len > 0 {
+                        self.cmd_sel = commands::step_selection(self.cmd_sel, len, -1);
+                        return;
+                    }
+                } else if self.palette_open() {
+                    let len = commands::search_for(&self.input, Some(&self.session)).len();
+                    if len > 0 {
+                        self.cmd_sel = commands::step_selection(self.cmd_sel, len, -1);
+                        return;
+                    }
+                }
+                let (_, cur_row, cur_col) =
+                    markdown::wrap_input(&self.input, self.cursor, self.input_width.max(10));
+                if cur_row > 0 {
+                    self.move_cursor_visual_row(cur_row - 1, cur_col);
+                } else {
+                    self.history_prev();
+                }
+            }
+            KeyCode::Down if !ctrl && !alt => {
+                if self.is_attach_arg() {
+                    let len = commands::attach_matches(&self.input, &self.cwd).len();
+                    if len > 0 {
+                        self.cmd_sel = commands::step_selection(self.cmd_sel, len, 1);
+                        return;
+                    }
+                } else if self.palette_open() {
+                    let len = commands::search_for(&self.input, Some(&self.session)).len();
+                    if len > 0 {
+                        self.cmd_sel = commands::step_selection(self.cmd_sel, len, 1);
+                        return;
+                    }
+                }
+                let (lines, cur_row, cur_col) =
+                    markdown::wrap_input(&self.input, self.cursor, self.input_width.max(10));
+                if (cur_row as usize) + 1 < lines.len() {
+                    self.move_cursor_visual_row(cur_row + 1, cur_col);
+                } else {
+                    self.history_next();
+                }
+            }
+            KeyCode::Home if ctrl => {
+                if self.input.is_empty() {
+                    self.scroll = self.last_total;
+                } else {
+                    self.cursor = 0;
+                }
+            }
+            KeyCode::End if ctrl => {
+                self.scroll = 0;
+                self.new_below = false;
+                if !self.input.is_empty() {
+                    self.cursor = self.input.len();
+                }
+            }
+            KeyCode::End if self.input.is_empty() => {
+                self.scroll = 0;
+                self.new_below = false;
+            }
+            // Line editing, the way shells / readline do it.
             KeyCode::Char('a') if ctrl => self.cursor = self.line_start(),
+            KeyCode::Char('e') if ctrl => self.cursor = self.line_end(),
+            KeyCode::Home => self.cursor = self.line_start(),
+            KeyCode::End => self.cursor = self.line_end(),
             KeyCode::Char('u') if ctrl => {
                 let start = self.line_start();
                 self.input.replace_range(start..self.cursor, "");
                 self.cursor = start;
+                self.history_idx = None;
+                self.history_draft.clear();
+                self.cmd_sel = 0;
             }
             KeyCode::Char('k') if ctrl => {
                 let end = self.line_end();
                 self.input.replace_range(self.cursor..end, "");
+                self.history_idx = None;
+                self.history_draft.clear();
+                self.cmd_sel = 0;
             }
             KeyCode::Char('w') if ctrl => self.delete_word_back(),
             KeyCode::Backspace if alt || ctrl => self.delete_word_back(),
+            KeyCode::Delete if alt || ctrl => self.delete_word_forward(),
             KeyCode::Left if alt || ctrl => self.cursor = self.word_left(),
             KeyCode::Right if alt || ctrl => self.cursor = self.word_right(),
-            // Any other Ctrl+letter isn't typed as the letter.
-            KeyCode::Char(_) if ctrl => {}
+            KeyCode::Char('b') if alt && !ctrl => self.cursor = self.word_left(),
+            KeyCode::Char('f') if alt && !ctrl => self.cursor = self.word_right(),
+            KeyCode::Char('d') if alt && !ctrl => self.delete_word_forward(),
+            // Contextual quick actions while waiting on a change, review, or candidate.
+            KeyCode::Char('a')
+                if alt && !ctrl && self.running.is_none() && self.session.pending_change.is_some() =>
+            {
+                self.run_task_shortcut("/accept");
+            }
+            KeyCode::Char('r')
+                if alt && !ctrl && self.running.is_none() && self.session.pending_change.is_some() =>
+            {
+                self.run_task_shortcut("/reject");
+            }
+            KeyCode::Char('a')
+                if alt && !ctrl && self.running.is_none() && self.has_part_in_review() =>
+            {
+                self.run_task_shortcut("/approve");
+            }
+            KeyCode::Char('o')
+                if alt && !ctrl && self.running.is_none() && self.has_part_in_review() =>
+            {
+                self.input = "/object ".into();
+                self.cursor = self.input.len();
+                self.cmd_sel = 0;
+                self.history_idx = None;
+                self.history_draft.clear();
+            }
+            KeyCode::Char('y')
+                if alt
+                    && !ctrl
+                    && self.running.is_none()
+                    && self.session.pending_candidate.is_some()
+                    && !self.session.exam =>
+            {
+                self.input = "Right, because ".into();
+                self.cursor = self.input.len();
+                self.cmd_sel = 0;
+                self.history_idx = None;
+                self.history_draft.clear();
+            }
+            KeyCode::Char('n')
+                if alt
+                    && !ctrl
+                    && self.running.is_none()
+                    && self.session.pending_candidate.is_some()
+                    && !self.session.exam =>
+            {
+                self.input = "Flawed, because ".into();
+                self.cursor = self.input.len();
+                self.cmd_sel = 0;
+                self.history_idx = None;
+                self.history_draft.clear();
+            }
+            // Guard against stray characters from unhandled Ctrl or Alt combos.
+            KeyCode::Char(_) if ctrl || alt => {}
             KeyCode::Char(c) => self.insert_char(c),
             KeyCode::Backspace => {
-                if let Some((i, _)) = self.input[..self.cursor].char_indices().next_back() {
+                if self.input.is_empty() && !self.attachments.is_empty() {
+                    if let Some(removed) = self.attachments.pop() {
+                        let name = removed
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| removed.display().to_string());
+                        self.status = format!("Removed attachment {name}.");
+                    }
+                } else if let Some((i, _)) = self.input[..self.cursor].char_indices().next_back() {
                     self.input.replace_range(i..self.cursor, "");
                     self.cursor = i;
+                    self.history_idx = None;
+                    self.history_draft.clear();
+                    self.cmd_sel = 0;
                 }
             }
-            KeyCode::Delete => {
-                if let Some(ch) = self.input[self.cursor..].chars().next() {
-                    self.input
-                        .replace_range(self.cursor..self.cursor + ch.len_utf8(), "");
-                }
-            }
+            KeyCode::Delete => self.delete_char_forward(),
             KeyCode::Left => {
                 if let Some((i, _)) = self.input[..self.cursor].char_indices().next_back() {
                     self.cursor = i;
@@ -623,8 +1131,6 @@ impl App {
                     self.cursor += ch.len_utf8();
                 }
             }
-            KeyCode::Home => self.cursor = 0,
-            KeyCode::End => self.cursor = self.input.len(),
             _ => {}
         }
     }
@@ -656,7 +1162,15 @@ impl App {
                 }
                 self.reveal_selected = true;
             }
-            KeyCode::Char('y') => {
+            KeyCode::Char('y') if !ctrl => {
+                let text = self.entry_text(sel);
+                used(Feature::Copy);
+                self.status = match copy_to_clipboard(&text) {
+                    Ok(()) => format!("Copied {} characters.", text.chars().count()),
+                    Err(e) => format!("Couldn't copy: {e}"),
+                };
+            }
+            KeyCode::Char('c') if ctrl => {
                 let text = self.entry_text(sel);
                 used(Feature::Copy);
                 self.status = match copy_to_clipboard(&text) {
@@ -666,7 +1180,6 @@ impl App {
             }
             KeyCode::Esc | KeyCode::Tab => {
                 self.selected = None;
-                self.scroll = 0;
             }
             // Ctrl keys (stop, settings, quit) work as everywhere.
             _ if ctrl => {
@@ -745,15 +1258,102 @@ impl App {
         self.cursor + skip + word
     }
 
+    fn delete_char_forward(&mut self) {
+        if let Some(ch) = self.input[self.cursor..].chars().next() {
+            self.input
+                .replace_range(self.cursor..self.cursor + ch.len_utf8(), "");
+            self.history_idx = None;
+            self.history_draft.clear();
+            self.cmd_sel = 0;
+        }
+    }
+
     fn delete_word_back(&mut self) {
         let start = self.word_left();
         self.input.replace_range(start..self.cursor, "");
         self.cursor = start;
+        self.history_idx = None;
+        self.history_draft.clear();
+        self.cmd_sel = 0;
+    }
+
+    fn delete_word_forward(&mut self) {
+        let end = self.word_right();
+        self.input.replace_range(self.cursor..end, "");
+        self.history_idx = None;
+        self.history_draft.clear();
+        self.cmd_sel = 0;
     }
 
     fn insert_char(&mut self, c: char) {
         self.input.insert(self.cursor, c);
         self.cursor += c.len_utf8();
+        self.history_idx = None;
+        self.history_draft.clear();
+        self.cmd_sel = 0;
+    }
+
+    fn move_cursor_visual_row(&mut self, target_row: u16, target_col: u16) {
+        let w = self.input_width.max(1);
+        let bounds: Vec<usize> = self
+            .input
+            .char_indices()
+            .map(|(i, _)| i)
+            .chain(std::iter::once(self.input.len()))
+            .collect();
+        let row_col = |pos: usize| {
+            let (_, r, c) = markdown::wrap_input(&self.input, pos, w);
+            (r, c)
+        };
+        let lo = bounds.partition_point(|&p| row_col(p).0 < target_row);
+        let hi = bounds.partition_point(|&p| row_col(p).0 <= target_row);
+        if lo >= hi {
+            return;
+        }
+        let slice = &bounds[lo..hi];
+        let idx = slice.partition_point(|&p| row_col(p).1 <= target_col);
+        self.cursor = if idx > 0 { slice[idx - 1] } else { slice[0] };
+    }
+
+    fn history_prev(&mut self) {
+        if self.input_history.is_empty() {
+            return;
+        }
+        let next_idx = match self.history_idx {
+            None => {
+                self.history_draft = std::mem::take(&mut self.input);
+                self.input_history.len() - 1
+            }
+            Some(0) => return,
+            Some(i) => i - 1,
+        };
+        self.history_idx = Some(next_idx);
+        self.input = self.input_history[next_idx].clone();
+        self.cursor = self.input.len();
+        self.cmd_sel = 0;
+    }
+
+    fn history_next(&mut self) {
+        let Some(idx) = self.history_idx else {
+            return;
+        };
+        if idx + 1 < self.input_history.len() {
+            let next_idx = idx + 1;
+            self.history_idx = Some(next_idx);
+            self.input = self.input_history[next_idx].clone();
+        } else {
+            self.history_idx = None;
+            self.input = std::mem::take(&mut self.history_draft);
+        }
+        self.cursor = self.input.len();
+        self.cmd_sel = 0;
+    }
+
+    fn run_task_shortcut(&mut self, cmd: &str) {
+        self.input = cmd.to_string();
+        self.cursor = self.input.len();
+        self.cmd_sel = 0;
+        self.submit();
     }
 
     /// Usage events: the thread on screen closes…
@@ -788,10 +1388,17 @@ impl App {
                 self.begin_thread();
                 self.session = s;
                 self.entries.clear();
+                self.attachments.clear();
+                self.last_sent.clear();
+                self.history_idx = None;
+                self.history_draft.clear();
+                self.cmd_sel = 0;
                 self.always.clear();
                 self.expanded.clear();
                 self.selected = None;
                 self.scroll = 0;
+                self.side_scroll = 0;
+                self.new_below = false;
                 self.status = "New thread.".into();
             }
             Err(e) => self.status = format!("Couldn't start a thread: {e}"),
@@ -810,7 +1417,11 @@ impl App {
             self.status = "No earlier threads in this folder.".into();
             return;
         }
-        self.modal = Some(Modal::Threads { items, sel: 0 });
+        self.modal = Some(Modal::Threads {
+            items,
+            query: String::new(),
+            sel: 0,
+        });
     }
 
     fn submit(&mut self) {
@@ -818,6 +1429,16 @@ impl App {
         if text.is_empty() {
             return;
         }
+        if self.input_history.last() != Some(&text) {
+            self.input_history.push(text.clone());
+            if self.input_history.len() > 200 {
+                let drop = self.input_history.len() - 200;
+                self.input_history.drain(..drop);
+            }
+        }
+        self.history_idx = None;
+        self.history_draft.clear();
+        self.cmd_sel = 0;
         if text.starts_with('/') {
             match commands::parse(&text) {
                 commands::Parsed::Local(cmd, arg) => {
@@ -959,6 +1580,7 @@ impl App {
                 self.modal = Some(Modal::Permission {
                     title,
                     always_key,
+                    sel: None,
                     reply: Some(reply),
                 });
             }
@@ -991,6 +1613,7 @@ impl App {
                             step: ConsentStep::Browser(Some(sign_in)),
                             error: None,
                             busy: false,
+                            scroll: self.consent_max_scroll,
                         },
                         Err(e) => {
                             self.sign_in = None;
@@ -1000,6 +1623,7 @@ impl App {
                                 step: ConsentStep::Choose,
                                 error: Some(e),
                                 busy: false,
+                                scroll: self.consent_max_scroll,
                             }
                         }
                     });
@@ -1035,6 +1659,7 @@ impl App {
                                 },
                                 error: Some(e),
                                 busy: false,
+                                scroll: self.consent_max_scroll,
                             });
                         }
                     }
@@ -1123,6 +1748,8 @@ impl App {
         let Some(modal) = self.modal.take() else {
             return;
         };
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
         let up = matches!(key.code, KeyCode::Up | KeyCode::Char('k'));
         let down = matches!(key.code, KeyCode::Down | KeyCode::Char('j'));
         let step = |sel: usize, len: usize| -> usize {
@@ -1134,26 +1761,119 @@ impl App {
                 sel
             }
         };
+        let resolve_permission = |app: &mut Self,
+                                  always_key: String,
+                                  reply: Option<oneshot::Sender<Permission>>,
+                                  a: Permission| {
+            if let Some(tx) = reply {
+                let said = match a {
+                    Permission::Denied => "✗ You declined this.".to_string(),
+                    Permission::Always => {
+                        app.always.insert(always_key.clone());
+                        format!(
+                            "✓ Allowed, and from now on in this thread for `{}`.",
+                            always_key.rsplit(':').next().unwrap_or(&always_key)
+                        )
+                    }
+                    _ => "✓ Allowed once.".to_string(),
+                };
+                app.entries.push(Entry::Note(said));
+                emit(UsageEvent::Permission {
+                    scope: permission_scope(&always_key),
+                    answer: match a {
+                        Permission::Denied => pathfinder_schema::PermissionAnswer::No,
+                        Permission::Always => pathfinder_schema::PermissionAnswer::Always,
+                        _ => pathfinder_schema::PermissionAnswer::Once,
+                    },
+                });
+                let _ = tx.send(a);
+            }
+        };
+        if ctrl && key.code == KeyCode::Char('c') {
+            match modal {
+                Modal::Permission {
+                    always_key, reply, ..
+                } => {
+                    resolve_permission(self, always_key, reply, Permission::Denied);
+                    if let Some(cancel) = &self.running {
+                        cancel.cancel();
+                    }
+                }
+                Modal::Share { busy, .. } => {
+                    self.status = if busy {
+                        "Cancelled.".into()
+                    } else {
+                        "Nothing was sent.".into()
+                    };
+                }
+                Modal::Consent {
+                    events,
+                    threads,
+                    step: cstep,
+                    ..
+                } => {
+                    if let Some(task) = self.sign_in.take() {
+                        task.abort();
+                    }
+                    let (ev, th) = match cstep {
+                        ConsentStep::Choose => (false, false),
+                        _ => (events, threads),
+                    };
+                    let mut c = crate::telemetry::Consent::load();
+                    c.events = ev;
+                    c.threads = th;
+                    c.stamp();
+                    let _ = c.save();
+                    crate::telemetry::reload();
+                    self.status = if ev || th {
+                        "Saved; nothing is sent until you join: pathfinder data join".into()
+                    } else {
+                        "Nothing is shared. `pathfinder data join` adds the shared gate later."
+                            .into()
+                    };
+                }
+                Modal::Help { .. }
+                | Modal::Threads { .. }
+                | Modal::Settings { .. }
+                | Modal::Choose { .. } => {}
+            }
+            return;
+        }
         self.modal = match modal {
-            Modal::Help { scroll } => match key.code {
-                KeyCode::Down | KeyCode::Char('j') => Some(Modal::Help { scroll: scroll + 1 }),
-                KeyCode::Up | KeyCode::Char('k') => Some(Modal::Help {
-                    scroll: scroll.saturating_sub(1),
-                }),
-                KeyCode::PageDown | KeyCode::Char(' ') => Some(Modal::Help {
-                    scroll: scroll + 10,
-                }),
-                KeyCode::PageUp => Some(Modal::Help {
-                    scroll: scroll.saturating_sub(10),
-                }),
-                _ => None,
-            },
+            Modal::Help { scroll } => {
+                let max = self.help_max_scroll;
+                match key.code {
+                    KeyCode::Down | KeyCode::Char('j') => Some(Modal::Help {
+                        scroll: (scroll + 1).min(max),
+                    }),
+                    KeyCode::Up | KeyCode::Char('k') => Some(Modal::Help {
+                        scroll: scroll.saturating_sub(1),
+                    }),
+                    KeyCode::PageDown | KeyCode::Char(' ') => Some(Modal::Help {
+                        scroll: (scroll + 10).min(max),
+                    }),
+                    KeyCode::PageUp => Some(Modal::Help {
+                        scroll: scroll.saturating_sub(10),
+                    }),
+                    KeyCode::Home | KeyCode::Char('g') => Some(Modal::Help { scroll: 0 }),
+                    KeyCode::End | KeyCode::Char('G') => Some(Modal::Help { scroll: max }),
+                    _ => None,
+                }
+            }
             Modal::Share {
                 outgoing,
                 lines,
                 scroll,
                 busy,
             } => {
+                if key.code == KeyCode::Esc {
+                    self.status = if busy {
+                        "Cancelled.".into()
+                    } else {
+                        "Nothing was sent.".into()
+                    };
+                    return;
+                }
                 if busy {
                     return self.modal = Some(Modal::Share {
                         outgoing,
@@ -1165,7 +1885,7 @@ impl App {
                 let page = 10;
                 let max = lines.len().saturating_sub(1);
                 let scroll = match key.code {
-                    KeyCode::Esc | KeyCode::Char('n') => {
+                    KeyCode::Char('n') => {
                         self.status = "Nothing was sent.".into();
                         return;
                     }
@@ -1213,77 +1933,154 @@ impl App {
                 step,
                 error,
                 busy,
-            } => self.on_consent_key(key, events, threads, step, error, busy),
+                scroll,
+            } => self.on_consent_key(key, events, threads, step, error, busy, scroll),
             Modal::Permission {
                 title,
                 always_key,
+                mut sel,
                 reply,
             } => {
                 let answer = match key.code {
-                    KeyCode::Char('y' | '1') | KeyCode::Enter => Some(Permission::Once),
-                    KeyCode::Char('a' | '2') => Some(Permission::Always),
-                    KeyCode::Char('n' | '3') | KeyCode::Esc => Some(Permission::Denied),
-                    _ => None,
-                };
-                match (answer, reply) {
-                    (Some(a), Some(tx)) => {
-                        // The tool line above already names the command.
-                        let said = match a {
-                            Permission::Denied => "✗ You declined this.".to_string(),
-                            Permission::Always => {
-                                self.always.insert(always_key.clone());
-                                format!(
-                                    "✓ Allowed, and from now on in this thread for `{}`.",
-                                    always_key.rsplit(':').next().unwrap_or(&always_key)
-                                )
-                            }
-                            _ => "✓ Allowed once.".to_string(),
-                        };
-                        self.entries.push(Entry::Note(said));
-                        emit(UsageEvent::Permission {
-                            scope: permission_scope(&always_key),
-                            answer: match a {
-                                Permission::Denied => pathfinder_schema::PermissionAnswer::No,
-                                Permission::Always => pathfinder_schema::PermissionAnswer::Always,
-                                _ => pathfinder_schema::PermissionAnswer::Once,
-                            },
-                        });
-                        let _ = tx.send(a);
+                    KeyCode::PageUp => {
+                        self.scroll = self.scroll.saturating_add(10);
                         None
                     }
-                    (None, reply) => Some(Modal::Permission {
+                    KeyCode::PageDown => {
+                        self.scroll = self.scroll.saturating_sub(10);
+                        if self.scroll == 0 {
+                            self.new_below = false;
+                        }
+                        None
+                    }
+                    KeyCode::Up | KeyCode::Left => {
+                        sel = Some(sel.map_or(0, |i| i.saturating_sub(1)));
+                        None
+                    }
+                    KeyCode::Down | KeyCode::Right => {
+                        sel = Some(sel.map_or(0, |i| (i + 1).min(2)));
+                        None
+                    }
+                    KeyCode::Char('y' | '1') => Some(Permission::Once),
+                    KeyCode::Char('a' | '2') => Some(Permission::Always),
+                    KeyCode::Char('n' | '3') | KeyCode::Esc => Some(Permission::Denied),
+                    KeyCode::Enter => sel.map(|i| match i {
+                        0 => Permission::Once,
+                        1 => Permission::Always,
+                        _ => Permission::Denied,
+                    }),
+                    _ => None,
+                };
+                match answer {
+                    Some(a) => {
+                        resolve_permission(self, always_key, reply, a);
+                        None
+                    }
+                    None => Some(Modal::Permission {
                         title,
                         always_key,
+                        sel,
                         reply,
                     }),
-                    (Some(_), None) => None,
                 }
             }
-            Modal::Threads { items, sel } => match key.code {
-                KeyCode::Esc => None,
-                KeyCode::Enter => {
-                    if let Some((id, _)) = items.get(sel)
-                        && let Ok(Some(s)) = self.rt.load_session(id)
-                    {
-                        self.end_thread();
-                        self.begin_thread();
-                        self.entries = entries_of(&s);
-                        self.always.clear();
-                        self.expanded.clear();
-                        self.selected = None;
-                        self.session = s;
-                        self.scroll = 0;
-                        self.status = "Thread opened.".into();
+            Modal::Threads {
+                items,
+                mut query,
+                mut sel,
+            } => {
+                let filtered = filter_matches(&items, &query);
+                match key.code {
+                    KeyCode::Esc => None,
+                    KeyCode::Enter => {
+                        if let Some(&orig_idx) = filtered.get(sel)
+                            && let Some((id, _)) = items.get(orig_idx)
+                            && let Ok(Some(s)) = self.rt.load_session(id)
+                        {
+                            self.end_thread();
+                            self.begin_thread();
+                            self.entries = entries_of(&s);
+                            self.attachments.clear();
+                            self.last_sent.clear();
+                            self.history_idx = None;
+                            self.history_draft.clear();
+                            self.cmd_sel = 0;
+                            self.always.clear();
+                            self.expanded.clear();
+                            self.selected = None;
+                            self.session = s;
+                            self.scroll = 0;
+                            self.side_scroll = 0;
+                            self.new_below = false;
+                            self.status = "Thread opened.".into();
+                        }
+                        None
                     }
-                    None
+                    KeyCode::Up => {
+                        sel = sel.saturating_sub(1);
+                        Some(Modal::Threads { items, query, sel })
+                    }
+                    KeyCode::Down => {
+                        sel = (sel + 1).min(filtered.len().saturating_sub(1));
+                        Some(Modal::Threads { items, query, sel })
+                    }
+                    KeyCode::PageUp => {
+                        sel = sel.saturating_sub(10);
+                        Some(Modal::Threads { items, query, sel })
+                    }
+                    KeyCode::PageDown => {
+                        sel = (sel + 10).min(filtered.len().saturating_sub(1));
+                        Some(Modal::Threads { items, query, sel })
+                    }
+                    KeyCode::Home => Some(Modal::Threads {
+                        items,
+                        query,
+                        sel: 0,
+                    }),
+                    KeyCode::End => Some(Modal::Threads {
+                        items,
+                        query,
+                        sel: filtered.len().saturating_sub(1),
+                    }),
+                    KeyCode::Char('u') if ctrl => {
+                        query.clear();
+                        Some(Modal::Threads {
+                            items,
+                            query,
+                            sel: 0,
+                        })
+                    }
+                    KeyCode::Backspace => {
+                        query.pop();
+                        Some(Modal::Threads {
+                            items,
+                            query,
+                            sel: 0,
+                        })
+                    }
+                    KeyCode::Char(c) if !ctrl && !alt && !c.is_control() => {
+                        query.push(c);
+                        Some(Modal::Threads {
+                            items,
+                            query,
+                            sel: 0,
+                        })
+                    }
+                    _ => Some(Modal::Threads { items, query, sel }),
                 }
-                _ => {
-                    let sel = step(sel, items.len());
-                    Some(Modal::Threads { items, sel })
-                }
-            },
+            }
             Modal::Settings { sel } => match key.code {
                 KeyCode::Esc => None,
+                KeyCode::Char('s') => {
+                    match self.rt.save_session_defaults(&self.session) {
+                        Ok(()) => {
+                            self.status =
+                                "Current settings saved as defaults for new threads.".into();
+                        }
+                        Err(e) => self.status = format!("Couldn't save defaults: {e}"),
+                    }
+                    Some(Modal::Settings { sel })
+                }
                 KeyCode::Enter => {
                     let (option, name) = SETTINGS[sel];
                     let items = self.choices(option);
@@ -1300,10 +2097,15 @@ impl App {
                             option,
                             title: name.to_string(),
                             items,
+                            query: String::new(),
                             sel: at,
                         })
                     }
                 }
+                KeyCode::PageUp | KeyCode::Home => Some(Modal::Settings { sel: 0 }),
+                KeyCode::PageDown | KeyCode::End => Some(Modal::Settings {
+                    sel: SETTINGS.len().saturating_sub(1),
+                }),
                 _ => Some(Modal::Settings {
                     sel: step(sel, SETTINGS.len()),
                 }),
@@ -1312,36 +2114,161 @@ impl App {
                 option,
                 title,
                 items,
-                sel,
-            } => match key.code {
-                KeyCode::Esc => Some(Modal::Settings { sel: 0 }),
-                KeyCode::Enter => {
-                    let (value, _) = items[sel].clone();
-                    let value = if option == crate::options::DECISIONS {
-                        OptionValue::Bool(value == "on")
-                    } else {
-                        OptionValue::Id(value)
-                    };
-                    match self.rt.set_option(&self.session.id, option, value) {
-                        Ok(s) => {
-                            self.session = s;
-                            self.status = format!("{title} set.");
+                mut query,
+                mut sel,
+            } => {
+                let back = SETTINGS.iter().position(|(o, _)| *o == option).unwrap_or(0);
+                let filtered = filter_matches(&items, &query);
+                let save_as_default = ctrl && key.code == KeyCode::Char('s');
+                match key.code {
+                    KeyCode::Esc => Some(Modal::Settings { sel: back }),
+                    KeyCode::Enter => {
+                        if let Some(&orig_idx) = filtered.get(sel) {
+                            let (raw_val, _) = items[orig_idx].clone();
+                            let value = if option == crate::options::DECISIONS {
+                                OptionValue::Bool(raw_val == "on")
+                            } else {
+                                OptionValue::Id(raw_val)
+                            };
+                            match self.rt.set_option(&self.session.id, option, value) {
+                                Ok(s) => {
+                                    self.session = s;
+                                    self.status = format!("{title} set.");
+                                }
+                                Err(e) => self.status = format!("Couldn't set {title}: {e}"),
+                            }
                         }
-                        Err(e) => self.status = format!("Couldn't set {title}: {e}"),
+                        Some(Modal::Settings { sel: back })
                     }
-                    let back = SETTINGS.iter().position(|(o, _)| *o == option).unwrap_or(0);
-                    Some(Modal::Settings { sel: back })
-                }
-                _ => {
-                    let sel = step(sel, items.len());
-                    Some(Modal::Choose {
+                    _ if save_as_default => {
+                        if let Some(&orig_idx) = filtered.get(sel) {
+                            let (raw_val, _) = items[orig_idx].clone();
+                            let make_value = |v: &str| {
+                                if option == crate::options::DECISIONS {
+                                    OptionValue::Bool(v == "on")
+                                } else {
+                                    OptionValue::Id(v.to_string())
+                                }
+                            };
+                            match self
+                                .rt
+                                .set_option(&self.session.id, option, make_value(&raw_val))
+                            {
+                                Ok(s) => {
+                                    self.session = s;
+                                    match self
+                                        .rt
+                                        .set_default_option(option, make_value(&raw_val))
+                                    {
+                                        Ok(()) => {
+                                            self.status =
+                                                format!("{title} set (saved as default).");
+                                        }
+                                        Err(e) => {
+                                            self.status = format!(
+                                                "{title} set, but couldn't save default: {e}"
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(e) => self.status = format!("Couldn't set {title}: {e}"),
+                            }
+                        }
+                        Some(Modal::Settings { sel: back })
+                    }
+                    KeyCode::Up => {
+                        sel = sel.saturating_sub(1);
+                        Some(Modal::Choose {
+                            option,
+                            title,
+                            items,
+                            query,
+                            sel,
+                        })
+                    }
+                    KeyCode::Down => {
+                        sel = (sel + 1).min(filtered.len().saturating_sub(1));
+                        Some(Modal::Choose {
+                            option,
+                            title,
+                            items,
+                            query,
+                            sel,
+                        })
+                    }
+                    KeyCode::PageUp => {
+                        sel = sel.saturating_sub(10);
+                        Some(Modal::Choose {
+                            option,
+                            title,
+                            items,
+                            query,
+                            sel,
+                        })
+                    }
+                    KeyCode::PageDown => {
+                        sel = (sel + 10).min(filtered.len().saturating_sub(1));
+                        Some(Modal::Choose {
+                            option,
+                            title,
+                            items,
+                            query,
+                            sel,
+                        })
+                    }
+                    KeyCode::Home => Some(Modal::Choose {
                         option,
                         title,
                         items,
+                        query,
+                        sel: 0,
+                    }),
+                    KeyCode::End => Some(Modal::Choose {
+                        option,
+                        title,
+                        items,
+                        query,
+                        sel: filtered.len().saturating_sub(1),
+                    }),
+                    KeyCode::Char('u') if ctrl => {
+                        query.clear();
+                        Some(Modal::Choose {
+                            option,
+                            title,
+                            items,
+                            query,
+                            sel: 0,
+                        })
+                    }
+                    KeyCode::Backspace => {
+                        query.pop();
+                        Some(Modal::Choose {
+                            option,
+                            title,
+                            items,
+                            query,
+                            sel: 0,
+                        })
+                    }
+                    KeyCode::Char(c) if !ctrl && !alt && !c.is_control() => {
+                        query.push(c);
+                        Some(Modal::Choose {
+                            option,
+                            title,
+                            items,
+                            query,
+                            sel: 0,
+                        })
+                    }
+                    _ => Some(Modal::Choose {
+                        option,
+                        title,
+                        items,
+                        query,
                         sel,
-                    })
+                    }),
                 }
-            },
+            }
         };
     }
 }
@@ -1368,6 +2295,7 @@ fn env_says_off() -> bool {
 
 impl App {
     /// Keys on the consent screen. Returns the modal to keep showing.
+    #[allow(clippy::too_many_arguments)]
     fn on_consent_key(
         &mut self,
         key: KeyEvent,
@@ -1376,20 +2304,20 @@ impl App {
         step: ConsentStep,
         error: Option<String>,
         busy: bool,
+        mut scroll: usize,
     ) -> Option<Modal> {
+        let max_scroll = self.consent_max_scroll;
         macro_rules! keep {
-            ($step:expr, $error:expr, $busy:expr) => {
+            ($step:expr, $error:expr, $busy:expr, $scroll:expr) => {
                 Some(Modal::Consent {
                     events,
                     threads,
                     step: $step,
                     error: $error,
                     busy: $busy,
+                    scroll: $scroll,
                 })
             };
-        }
-        if busy {
-            return keep!(step, error, busy);
         }
         let save_answer = |events: bool, threads: bool| {
             let mut c = crate::telemetry::Consent::load();
@@ -1408,17 +2336,75 @@ impl App {
                 "Nothing is shared. `pathfinder data join` adds the shared gate later.".into()
             }
         };
+        if key.code == KeyCode::Esc {
+            if let Some(task) = self.sign_in.take() {
+                task.abort();
+            }
+            match step {
+                ConsentStep::Choose => {
+                    save_answer(false, false);
+                    self.status =
+                        "Nothing is shared. `pathfinder data` can change that later.".into();
+                }
+                _ => {
+                    save_answer(events, threads);
+                    self.status = not_joined(events, threads);
+                }
+            }
+            return None;
+        }
+        match key.code {
+            KeyCode::PageUp => {
+                scroll = scroll.saturating_sub(10);
+                return keep!(step, error, busy, scroll);
+            }
+            KeyCode::PageDown => {
+                scroll = (scroll + 10).min(max_scroll);
+                return keep!(step, error, busy, scroll);
+            }
+            _ => {}
+        }
+        if busy {
+            return keep!(step, error, busy, scroll);
+        }
         match step {
             ConsentStep::Choose => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    keep!(
+                        ConsentStep::Choose,
+                        error,
+                        false,
+                        scroll.saturating_sub(1)
+                    )
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    keep!(
+                        ConsentStep::Choose,
+                        error,
+                        false,
+                        (scroll + 1).min(max_scroll)
+                    )
+                }
+                KeyCode::Home | KeyCode::Char('g') => {
+                    keep!(ConsentStep::Choose, error, false, 0)
+                }
+                KeyCode::End | KeyCode::Char('G') => {
+                    keep!(ConsentStep::Choose, error, false, max_scroll)
+                }
                 KeyCode::Char('e') => {
                     events = !events;
-                    keep!(ConsentStep::Choose, None, false)
+                    keep!(ConsentStep::Choose, None, false, scroll)
                 }
                 KeyCode::Char('t') => {
                     threads = !threads;
-                    keep!(ConsentStep::Choose, None, false)
+                    keep!(ConsentStep::Choose, None, false, scroll)
                 }
-                KeyCode::Char('i') => keep!(ConsentStep::Invite(String::new()), None, false),
+                KeyCode::Char('i') => keep!(
+                    ConsentStep::Invite(String::new()),
+                    None,
+                    false,
+                    max_scroll
+                ),
                 KeyCode::Enter => {
                     let mut consent = crate::telemetry::Consent::load();
                     consent.events = events;
@@ -1428,7 +2414,12 @@ impl App {
                         // just the new answer.
                         consent.stamp();
                         if let Err(e) = consent.save() {
-                            return keep!(ConsentStep::Choose, Some(format!("{e:#}")), false);
+                            return keep!(
+                                ConsentStep::Choose,
+                                Some(format!("{e:#}")),
+                                false,
+                                max_scroll
+                            );
                         }
                         crate::telemetry::reload();
                         tokio::spawn(async move {
@@ -1456,45 +2447,26 @@ impl App {
                         let _ = tx.send(AppEvent::Enrolled(r));
                     });
                     self.sign_in = Some(task.abort_handle());
-                    keep!(ConsentStep::Browser(None), None, false)
+                    keep!(ConsentStep::Browser(None), None, false, max_scroll)
                 }
-                KeyCode::Esc => {
-                    save_answer(false, false);
-                    self.status =
-                        "Nothing is shared. `pathfinder data` can change that later.".into();
-                    None
-                }
-                _ => keep!(ConsentStep::Choose, error, false),
+                _ => keep!(ConsentStep::Choose, error, false, scroll),
             },
             ConsentStep::Browser(sign_in) => match key.code {
-                KeyCode::Esc => {
-                    if let Some(task) = self.sign_in.take() {
-                        task.abort();
-                    }
-                    save_answer(events, threads);
-                    self.status = not_joined(events, threads);
-                    None
-                }
                 KeyCode::Char('i') => {
                     if let Some(task) = self.sign_in.take() {
                         task.abort();
                     }
-                    keep!(ConsentStep::Invite(String::new()), None, false)
+                    keep!(ConsentStep::Invite(String::new()), None, false, max_scroll)
                 }
                 KeyCode::Char('o') => {
                     if let Some(s) = &sign_in {
                         crate::cli::open_browser(&s.url);
                     }
-                    keep!(ConsentStep::Browser(sign_in), error, false)
+                    keep!(ConsentStep::Browser(sign_in), error, false, scroll)
                 }
-                _ => keep!(ConsentStep::Browser(sign_in), error, false),
+                _ => keep!(ConsentStep::Browser(sign_in), error, false, scroll),
             },
             ConsentStep::Invite(mut code) => match key.code {
-                KeyCode::Esc => {
-                    save_answer(events, threads);
-                    self.status = not_joined(events, threads);
-                    None
-                }
                 KeyCode::Enter if !code.trim().is_empty() => {
                     let mut consent = crate::telemetry::Consent::load();
                     consent.events = events;
@@ -1507,17 +2479,22 @@ impl App {
                             .map_err(|e| format!("{e:#}"));
                         let _ = tx.send(AppEvent::Enrolled(r));
                     });
-                    keep!(ConsentStep::Invite(code), None, true)
+                    keep!(ConsentStep::Invite(code), None, true, max_scroll)
                 }
                 KeyCode::Backspace => {
                     code.pop();
-                    keep!(ConsentStep::Invite(code), None, false)
+                    keep!(ConsentStep::Invite(code), None, false, max_scroll)
                 }
-                KeyCode::Char(c) if !c.is_control() && code.len() < 64 => {
+                KeyCode::Char(c)
+                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT)
+                        && !c.is_control()
+                        && code.len() < 64 =>
+                {
                     code.push(c);
-                    keep!(ConsentStep::Invite(code), None, false)
+                    keep!(ConsentStep::Invite(code), None, false, max_scroll)
                 }
-                _ => keep!(ConsentStep::Invite(code), error, false),
+                _ => keep!(ConsentStep::Invite(code), error, false, scroll),
             },
         }
     }
@@ -1580,6 +2557,15 @@ impl App {
                     "Hiding thinking.".into()
                 };
             }
+            Local::Tools => {
+                used(Feature::ToolGrouping);
+                self.show_tools = !self.show_tools;
+                self.status = if self.show_tools {
+                    "Showing every tool call.".into()
+                } else {
+                    "Grouping consecutive reads and searches.".into()
+                };
+            }
             Local::Join => {
                 if env_says_off() {
                     self.status =
@@ -1593,6 +2579,7 @@ impl App {
                     step: ConsentStep::Choose,
                     error: None,
                     busy: false,
+                    scroll: 0,
                 });
             }
             Local::Data => {
@@ -1633,19 +2620,33 @@ impl App {
     }
 
     fn attach(&mut self, path: &str) {
-        if path.is_empty() {
-            self.status = "Say which file: /attach <file>, or drop it onto the window.".into();
+        let trimmed = path.trim();
+        if trimmed.is_empty() {
+            self.status =
+                "Say which file: /attach <file>, /attach clear, or drop it onto the window.".into();
             return;
         }
-        let p = Path::new(path);
-        let p = if p.is_absolute() {
-            p.to_path_buf()
-        } else {
-            self.cwd.join(p)
+        if trimmed.eq_ignore_ascii_case("clear") {
+            let count = self.attachments.len();
+            self.attachments.clear();
+            self.status = if count == 0 {
+                "No attachments to clear.".into()
+            } else {
+                format!("Cleared {count} attachment(s).")
+            };
+            return;
+        }
+        let Some(p) = commands::resolve_attach_path(trimmed, &self.cwd) else {
+            self.status = "Say which file: /attach <file>, or /attach clear.".into();
+            return;
         };
         if p.is_file() {
             self.status = format!("Attached {}.", p.display());
-            self.attachments.push(p);
+            if !self.attachments.contains(&p) {
+                self.attachments.push(p);
+            }
+        } else if p.is_dir() {
+            self.status = format!("{} is a folder; pick a file inside it.", p.display());
         } else {
             self.status = format!("No file at {}.", p.display());
         }
@@ -1755,6 +2756,49 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::{MapChange, Part, PartStatus, PendingCandidate, ProposedPart, TurnRecord};
+    use crate::engine::{BoxFuture, Engine, EngineRequest};
+    use crate::store::Store;
+
+    struct UnusedEngine;
+
+    impl Engine for UnusedEngine {
+        fn run_text<'a>(
+            &'a self,
+            _req: &'a EngineRequest,
+            _sink: StreamSink,
+        ) -> BoxFuture<'a, Result<String>> {
+            Box::pin(async { Ok(String::new()) })
+        }
+    }
+
+    fn test_app() -> (App, mpsc::UnboundedReceiver<AppEvent>, Arc<Store>) {
+        let dir = std::env::temp_dir().join(format!("pf-tui-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let rt = Arc::new(Runtime::new(store.clone(), Arc::new(UnusedEngine)));
+        let session = rt
+            .create_session(uuid::Uuid::new_v4().to_string(), dir.clone())
+            .unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+        (App::new(rt, dir, session, tx), rx, store)
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn ctrl(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::CONTROL)
+    }
+
+    fn alt(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::ALT)
+    }
+
+    fn shift(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::SHIFT)
+    }
 
     #[test]
     fn dropped_paths_are_attached_when_they_exist() {
@@ -1764,5 +2808,418 @@ mod tests {
         std::fs::write(dir.join("notes.txt"), b"x").unwrap();
         let text = format!("look at {}/my\\ sheet.pdf please notes.txt", dir.display());
         assert_eq!(dropped_files(&text, &dir), vec![dir.join("my sheet.pdf")]);
+    }
+
+    #[test]
+    fn readline_alt_and_ctrl_keys_work_without_stray_chars() {
+        let (mut app, _rx, _) = test_app();
+        app.input = "hello world\nsecond line".into();
+        app.cursor = 2; // he|llo world\nsecond line
+
+        // Ctrl+E moves to end of current line (before '\n'), Ctrl+A to start.
+        app.on_key(ctrl(KeyCode::Char('e')));
+        assert_eq!(app.cursor, 11);
+        app.on_key(ctrl(KeyCode::Char('a')));
+        assert_eq!(app.cursor, 0);
+
+        // End / Home also move to line end / line start.
+        app.on_key(key(KeyCode::End));
+        assert_eq!(app.cursor, 11);
+        app.on_key(key(KeyCode::Home));
+        assert_eq!(app.cursor, 0);
+
+        // Alt+f, Alt+b, Alt+d word navigation and delete-word-forward.
+        app.on_key(alt(KeyCode::Char('f')));
+        assert_eq!(app.cursor, 5);
+        app.on_key(alt(KeyCode::Char('d')));
+        assert_eq!(app.input, "hello\nsecond line");
+        app.on_key(alt(KeyCode::Char('b')));
+        assert_eq!(app.cursor, 0);
+
+        // Stray Alt+n / Alt+p must not insert characters.
+        app.on_key(alt(KeyCode::Char('n')));
+        app.on_key(alt(KeyCode::Char('p')));
+        assert_eq!(app.input, "hello\nsecond line");
+
+        // Ctrl+D forward-deletes when non-empty; quits only when empty.
+        app.on_key(ctrl(KeyCode::Char('d')));
+        assert_eq!(app.input, "ello\nsecond line");
+        assert!(!app.quit);
+
+        // Ctrl+G toggles tool grouping; Ctrl+E no longer toggles it.
+        assert!(!app.show_tools);
+        app.on_key(ctrl(KeyCode::Char('g')));
+        assert!(app.show_tools);
+
+        // Shift+Enter inserts newline.
+        app.cursor = app.input.len();
+        app.on_key(shift(KeyCode::Enter));
+        assert!(app.input.ends_with('\n'));
+
+        app.input.clear();
+        app.cursor = 0;
+        app.on_key(ctrl(KeyCode::Char('d')));
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn multiline_up_down_moves_lines_before_history() {
+        let (mut app, _rx, _) = test_app();
+        app.input_width = 10;
+        app.input_history = vec!["first".into(), "second".into()];
+        app.input = "abcde\nfg".into();
+        app.cursor = app.input.len(); // row 1, col 2
+
+        // Up moves from row 1 col 2 to row 0 col 2.
+        app.on_key(key(KeyCode::Up));
+        assert_eq!(app.cursor, 2);
+        assert_eq!(app.input, "abcde\nfg");
+
+        // Up on row 0 recalls previous history and saves draft.
+        app.on_key(key(KeyCode::Up));
+        assert_eq!(app.input, "second");
+        assert_eq!(app.history_idx, Some(1));
+
+        app.on_key(key(KeyCode::Up));
+        assert_eq!(app.input, "first");
+        assert_eq!(app.history_idx, Some(0));
+
+        // Down restores newer history and then original draft.
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(app.input, "second");
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(app.input, "abcde\nfg");
+        assert_eq!(app.history_idx, None);
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_even_with_non_empty_input_and_f2_toggles() {
+        let (mut app, _rx, _) = test_app();
+        app.input = "typing something".into();
+        app.conv_area = Rect::new(0, 0, 80, 20);
+        app.side_area = Rect::new(80, 0, 30, 20);
+        app.side_max_scroll = 10;
+
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 10,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.scroll, 3);
+
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 10,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.scroll, 0);
+
+        // Hovering side panel scrolls side_scroll.
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 85,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.side_scroll, 3);
+
+        assert!(app.mouse_capture);
+        app.on_key(key(KeyCode::F(2)));
+        assert!(!app.mouse_capture);
+        assert!(app.status.contains("selection"));
+    }
+
+    #[test]
+    fn tab_does_not_hijack_mid_typing_and_nav_preserves_scroll() {
+        let (mut app, _rx, _) = test_app();
+        app.items = vec![0, 1];
+        app.entries = vec![Entry::User("hi".into()), Entry::Text("reply".into())];
+        app.input = "hello".into();
+        app.cursor = 5;
+
+        // Tab mid-typing must not enter nav mode.
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(app.selected, None);
+
+        // Ctrl+Up enters nav mode even with non-empty input.
+        app.on_key(ctrl(KeyCode::Up));
+        assert_eq!(app.selected, Some(1));
+
+        // Ctrl+C in nav mode copies without quitting or resetting scroll.
+        app.scroll = 7;
+        app.on_key(ctrl(KeyCode::Char('c')));
+        assert!(!app.quit);
+        assert_eq!(app.scroll, 7);
+
+        // Esc in nav mode exits without resetting scroll.
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(app.selected, None);
+        assert_eq!(app.scroll, 7);
+
+        // Tab enters nav mode when input is empty.
+        app.input.clear();
+        app.cursor = 0;
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(app.selected, Some(1));
+    }
+
+    #[tokio::test]
+    async fn command_palette_navigation_completion_and_status_clearing() {
+        let (mut app, _rx, _) = test_app();
+        app.status = "Stale status".into();
+        app.input = "/he".into();
+        app.cursor = 3;
+
+        // Keystroke clears transient status; Down/Tab navigates palette.
+        app.on_key(key(KeyCode::Char('l')));
+        assert!(app.status.is_empty());
+        assert_eq!(app.input, "/hel");
+
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(app.input, "/help ");
+
+        // Partial prefix + Enter on non-arg command opens Help modal directly.
+        app.input = "/hel".into();
+        app.cursor = 4;
+        app.on_key(key(KeyCode::Enter));
+        assert!(matches!(app.modal, Some(Modal::Help { .. })));
+
+        // Partial prefix + Enter on arg-requiring command completes with trailing space.
+        app.modal = None;
+        app.input = "/focu".into();
+        app.cursor = 5;
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.input, "/focus ");
+    }
+
+    #[test]
+    fn permission_modal_does_not_auto_approve_on_enter_and_allows_scroll_and_ctrl_c() {
+        let (mut app, _rx, _) = test_app();
+        let (tx, mut rx) = oneshot::channel();
+        app.running = Some(CancellationToken::new());
+        app.modal = Some(Modal::Permission {
+            title: "Run `rm -rf`".into(),
+            always_key: "exec:rm".into(),
+            sel: None,
+            reply: Some(tx),
+        });
+
+        // Pressing Enter immediately when modal appears does nothing.
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.modal.is_some());
+        assert!(rx.try_recv().is_err());
+
+        // PageUp scrolls conversation while Permission is open.
+        app.on_key(key(KeyCode::PageUp));
+        assert_eq!(app.scroll, 10);
+        assert!(app.modal.is_some());
+
+        // Arrow down selects choice 0 (Once), then Enter confirms.
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.modal.is_none());
+        assert_eq!(rx.try_recv().unwrap(), Permission::Once);
+
+        // Ctrl+C denies permission and cancels running token.
+        let (tx2, mut rx2) = oneshot::channel();
+        let token = CancellationToken::new();
+        app.running = Some(token.clone());
+        app.modal = Some(Modal::Permission {
+            title: "Run `ls`".into(),
+            always_key: "exec:ls".into(),
+            sel: None,
+            reply: Some(tx2),
+        });
+        app.on_key(ctrl(KeyCode::Char('c')));
+        assert!(app.modal.is_none());
+        assert_eq!(rx2.try_recv().unwrap(), Permission::Denied);
+        assert!(token.is_cancelled());
+    }
+
+    #[test]
+    fn modals_paste_filtering_scroll_clamping_and_settings_sel_preserved() {
+        let (mut app, _rx, _) = test_app();
+
+        // Paste normalizes CRLF -> LF and exits nav mode.
+        app.selected = Some(0);
+        app.on_paste("line1\r\nline2\rline3");
+        assert_eq!(app.selected, None);
+        assert_eq!(app.input, "line1\nline2\nline3");
+
+        // Paste into Consent Invite step.
+        app.modal = Some(Modal::Consent {
+            events: false,
+            threads: false,
+            step: ConsentStep::Invite(String::new()),
+            error: None,
+            busy: false,
+            scroll: 0,
+        });
+        app.on_paste("INVITE-123\r\n");
+        match &app.modal {
+            Some(Modal::Consent {
+                step: ConsentStep::Invite(code),
+                ..
+            }) => assert_eq!(code, "INVITE-123"),
+            _ => panic!("expected Consent Invite"),
+        }
+
+        // Esc closes Consent even when busy == true.
+        app.modal = Some(Modal::Consent {
+            events: true,
+            threads: false,
+            step: ConsentStep::Invite("ABC".into()),
+            error: None,
+            busy: true,
+            scroll: 0,
+        });
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.modal.is_none());
+
+        // Esc and Ctrl+C close Share even when busy == true.
+        let dummy_bug = crate::bugreport::build("test", &app.cwd);
+        app.modal = Some(Modal::Share {
+            outgoing: Outgoing::Bug(dummy_bug.clone()),
+            lines: vec!["line1".into(), "line2".into()],
+            scroll: 0,
+            busy: true,
+        });
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.modal.is_none());
+
+        app.modal = Some(Modal::Share {
+            outgoing: Outgoing::Bug(dummy_bug),
+            lines: vec!["line1".into(), "line2".into()],
+            scroll: 0,
+            busy: true,
+        });
+        app.on_key(ctrl(KeyCode::Char('c')));
+        assert!(app.modal.is_none());
+
+        // Ctrl+End jumps scroll to 0 even when input is non-empty.
+        app.input = "some text".into();
+        app.cursor = 2;
+        app.scroll = 12;
+        app.on_key(ctrl(KeyCode::End));
+        assert_eq!(app.scroll, 0);
+        assert_eq!(app.cursor, 9);
+        app.on_key(ctrl(KeyCode::Home));
+        assert_eq!(app.cursor, 0);
+        app.input.clear();
+
+        // Help scroll clamping.
+        app.help_max_scroll = 15;
+        app.modal = Some(Modal::Help { scroll: 12 });
+        app.on_key(key(KeyCode::PageDown));
+        match app.modal {
+            Some(Modal::Help { scroll }) => assert_eq!(scroll, 15),
+            _ => panic!("expected Help"),
+        }
+
+        // Settings sel preserved on Esc from Choose, plus type-to-filter.
+        app.modal = Some(Modal::Settings { sel: 3 });
+        app.on_key(key(KeyCode::Enter));
+        match &app.modal {
+            Some(Modal::Choose { title, .. }) => assert_eq!(title, "Main model effort"),
+            _ => panic!("expected Choose"),
+        }
+        app.on_key(key(KeyCode::Char('h')));
+        match &app.modal {
+            Some(Modal::Choose { query, items, .. }) => {
+                assert_eq!(query, "h");
+                assert_eq!(filter_matches(items, query).len(), 1);
+            }
+            _ => panic!("expected Choose"),
+        }
+        app.on_key(key(KeyCode::Esc));
+        match app.modal {
+            Some(Modal::Settings { sel }) => assert_eq!(sel, 3),
+            _ => panic!("expected Settings with sel=3"),
+        }
+    }
+
+    #[test]
+    fn attachments_startup_note_and_contextual_shortcuts() {
+        let (mut app, _rx, store) = test_app();
+        app.apply_startup_model_note(true);
+        assert!(app
+            .entries
+            .iter()
+            .any(|e| matches!(e, Entry::Note(n) if n.contains("No models are configured"))));
+
+        // Quoted /attach with spaces, Backspace removal, and /attach clear.
+        let file = app.cwd.join("my doc.pdf");
+        std::fs::write(&file, b"%PDF").unwrap();
+        app.attach("\"my doc.pdf\"");
+        assert_eq!(app.attachments, vec![file.clone()]);
+
+        // Backspace on empty input pops last attachment.
+        app.on_key(key(KeyCode::Backspace));
+        assert!(app.attachments.is_empty());
+
+        // /attach clear + new_thread clears attachments and history state.
+        app.attach("\"my doc.pdf\"");
+        app.last_sent = "prev".into();
+        app.new_thread();
+        assert!(app.attachments.is_empty());
+        assert!(app.last_sent.is_empty());
+
+        // Threads load clears attachments.
+        let mut s2 = app
+            .rt
+            .create_session("t2".into(), app.cwd.clone())
+            .unwrap();
+        s2.history.push(TurnRecord {
+            role: "user".into(),
+            content: "hello".into(),
+        });
+        store.save_session(&s2).unwrap();
+        app.attach("\"my doc.pdf\"");
+        app.modal = Some(Modal::Threads {
+            items: vec![("t2".into(), "hello".into())],
+            query: String::new(),
+            sel: 0,
+        });
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.attachments.is_empty());
+        assert_eq!(app.session.id, "t2");
+
+        // Contextual shortcuts: candidate & InReview pre-fill, pending_change accepts.
+        app.session.pending_candidate = Some(PendingCandidate {
+            part_id: "p1".into(),
+            candidate: "c".into(),
+            key_correct: true,
+            key_reason: String::new(),
+            secret: None,
+            targets: vec![],
+            misconception: None,
+            id: "cand1".into(),
+        });
+        app.on_key(alt(KeyCode::Char('y')));
+        assert_eq!(app.input, "Right, because ");
+        app.session.pending_candidate = None;
+
+        let mut p1 = Part::new("p1".into(), "Part 1".into(), String::new(), vec![]);
+        p1.status = PartStatus::InReview;
+        app.session.map.parts.push(p1);
+        app.session.active = Some("p1".into());
+        app.on_key(alt(KeyCode::Char('o')));
+        assert_eq!(app.input, "/object ");
+        app.session.pending_change = Some(MapChange {
+            brief: "add p2".into(),
+            goal: None,
+            parts: vec![ProposedPart {
+                id: "p2".into(),
+                title: "P2".into(),
+                note: String::new(),
+                depends_on: vec![],
+                concepts: vec![],
+            }],
+            remove: vec![],
+            concepts: vec![],
+        });
+        assert!(app.has_part_in_review());
     }
 }

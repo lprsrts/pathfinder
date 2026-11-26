@@ -41,6 +41,7 @@ pub struct TurnInput {
     pub files: Vec<PathBuf>,
 }
 
+#[derive(Debug, Clone, Default)]
 pub struct TurnOutput {
     pub reply: String,
     pub plan_changed: bool,
@@ -96,6 +97,7 @@ pub struct Runtime {
 }
 
 /// The model pickers' state for one session.
+#[derive(Debug, Clone)]
 pub struct ModelChoices {
     pub catalog: Vec<ModelEntry>,
     pub system1: Option<String>,
@@ -119,9 +121,20 @@ pub const CHECKS: [&str; 3] = ["off", "light", "normal"];
 pub const EFFORTS: [&str; 4] = ["default", "low", "medium", "high"];
 
 /// A value from one of the thread's pickers or switches.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OptionValue {
     Id(String),
     Bool(bool),
+}
+
+enum ValidatedOption {
+    FastModel(String),
+    MainModel(String),
+    FastEffort(Option<String>),
+    MainEffort(Option<String>),
+    Decisions(bool),
+    DecisionModel(String),
+    Checks(Option<String>),
 }
 
 pub const NO_MODEL: &str = "No model is set up yet. Run `pathfinder auth login` in a terminal.";
@@ -197,50 +210,107 @@ impl Runtime {
             .store
             .load_session(session_id)?
             .ok_or_else(|| anyhow!("unknown session `{session_id}`"))?;
+        match self.validate_option(option, value)? {
+            ValidatedOption::FastModel(id) => session.system1 = Some(id),
+            ValidatedOption::MainModel(id) => session.system2 = Some(id),
+            ValidatedOption::FastEffort(level) => session.fast_effort = level,
+            ValidatedOption::MainEffort(level) => session.effort = level,
+            ValidatedOption::Decisions(on) => session.decisions_off = !on,
+            ValidatedOption::DecisionModel(id) => {
+                session.decision_model = Some(id);
+                session.decisions_off = false;
+            }
+            ValidatedOption::Checks(level) => session.checks = level,
+        }
+        self.store.save_session(&session)?;
+        Ok(session)
+    }
+
+    /// Saves one picker or switch as the default in `config.json` for future threads.
+    pub fn set_default_option(&self, option: &str, value: OptionValue) -> Result<()> {
+        let defaults = self.default_settings_for_option(option, value)?;
+        Config::save_defaults(&defaults)
+    }
+
+    /// Saves the session's current model, effort, decision, and check settings
+    /// as defaults in `config.json` for future threads.
+    pub fn save_session_defaults(&self, session: &Session) -> Result<()> {
+        let defaults = crate::config::DefaultSettings {
+            system1: session.system1.as_ref().map(|s| Some(s.clone())),
+            system2: session.system2.as_ref().map(|s| Some(s.clone())),
+            effort: Some(session.effort.clone()),
+            fast_effort: Some(session.fast_effort.clone()),
+            decisions_on: Some(Some(!session.decisions_off)),
+            decision_model: Some(session.decision_model.clone()),
+            checks: Some(session.checks.clone()),
+        };
+        Config::save_defaults(&defaults)
+    }
+
+    fn default_settings_for_option(
+        &self,
+        option: &str,
+        value: OptionValue,
+    ) -> Result<crate::config::DefaultSettings> {
+        let mut d = crate::config::DefaultSettings::default();
+        match self.validate_option(option, value)? {
+            ValidatedOption::FastModel(id) => d.system1 = Some(Some(id)),
+            ValidatedOption::MainModel(id) => d.system2 = Some(Some(id)),
+            ValidatedOption::FastEffort(level) => d.fast_effort = Some(level),
+            ValidatedOption::MainEffort(level) => d.effort = Some(level),
+            ValidatedOption::Decisions(on) => d.decisions_on = Some(Some(on)),
+            ValidatedOption::DecisionModel(id) => {
+                d.decision_model = Some(Some(id));
+                d.decisions_on = Some(Some(true));
+            }
+            ValidatedOption::Checks(level) => d.checks = Some(level),
+        }
+        Ok(d)
+    }
+
+    fn validate_option(&self, option: &str, value: OptionValue) -> Result<ValidatedOption> {
         match (option, value) {
             (crate::options::FAST_MODEL | crate::options::MAIN_MODEL, OptionValue::Id(id)) => {
                 if (self.config)().entry(&id).is_none() {
                     return Err(anyhow!("unknown model `{id}`"));
                 }
-                let slot = if option == crate::options::MAIN_MODEL {
-                    &mut session.system2
+                if option == crate::options::MAIN_MODEL {
+                    Ok(ValidatedOption::MainModel(id))
                 } else {
-                    &mut session.system1
-                };
-                *slot = Some(id);
+                    Ok(ValidatedOption::FastModel(id))
+                }
             }
             (crate::options::MAIN_EFFORT | crate::options::FAST_EFFORT, OptionValue::Id(level)) => {
                 if !EFFORTS.contains(&level.as_str()) {
                     return Err(anyhow!("unknown effort `{level}`"));
                 }
-                let slot = if option == crate::options::MAIN_EFFORT {
-                    &mut session.effort
+                let val = (level != "default").then_some(level);
+                if option == crate::options::MAIN_EFFORT {
+                    Ok(ValidatedOption::MainEffort(val))
                 } else {
-                    &mut session.fast_effort
-                };
-                *slot = (level != "default").then_some(level);
+                    Ok(ValidatedOption::FastEffort(val))
+                }
             }
             // A switch, or an Off/On dropdown where switches aren't supported.
-            (crate::options::DECISIONS, OptionValue::Bool(on)) => session.decisions_off = !on,
+            (crate::options::DECISIONS, OptionValue::Bool(on)) => {
+                Ok(ValidatedOption::Decisions(on))
+            }
             (crate::options::DECISIONS, OptionValue::Id(v)) if v == "on" || v == "off" => {
-                session.decisions_off = v == "off";
+                Ok(ValidatedOption::Decisions(v == "on"))
             }
             (crate::options::DECISION_MODEL, OptionValue::Id(id)) => {
                 if Provider::from_id(&id).is_none() {
                     return Err(anyhow!("unknown decision model `{id}`"));
                 }
-                session.decision_model = Some(id);
-                session.decisions_off = false;
+                Ok(ValidatedOption::DecisionModel(id))
             }
             (crate::options::CHECKS, OptionValue::Id(level))
                 if CHECKS.contains(&level.as_str()) =>
             {
-                session.checks = (level != "light").then_some(level);
+                Ok(ValidatedOption::Checks((level != "light").then_some(level)))
             }
-            (other, _) => return Err(anyhow!("unknown option or value for `{other}`")),
+            (other, _) => Err(anyhow!("unknown option or value for `{other}`")),
         }
-        self.store.save_session(&session)?;
-        Ok(session)
     }
 
     /// Sets a session's System 1 or System 2 model from the picker.
@@ -255,7 +325,13 @@ impl Runtime {
     }
 
     pub fn create_session(&self, id: String, cwd: PathBuf) -> Result<Session> {
-        let session = Session::new(id, cwd);
+        let config = (self.config)();
+        let mut session = Session::new(id, cwd);
+        session.effort = config.effort;
+        session.fast_effort = config.fast_effort;
+        session.decisions_off = config.decisions_on == Some(false);
+        session.decision_model = config.decision_model;
+        session.checks = config.checks.filter(|c| c != "light");
         self.store.save_session(&session)?;
         Ok(session)
     }
@@ -406,10 +482,10 @@ impl Runtime {
         sink: StreamSink,
     ) -> Result<TurnOutput> {
         let mut words = raw.splitn(2, char::is_whitespace);
-        let cmd = words.next().unwrap_or("");
+        let cmd = words.next().unwrap_or("").to_ascii_lowercase();
         let arg = words.next().unwrap_or("").trim();
 
-        match cmd {
+        match cmd.as_str() {
             "/map" => Ok(TurnOutput::text(render_map_and_pending(session))),
             "/plan" => {
                 if !arg.is_empty() {
@@ -751,7 +827,12 @@ fn tool_kind(kind: crate::stream::ToolKind) -> pathfinder_schema::Tool {
 fn turn_step(text: &str, session: &Session, had_candidate: bool) -> pathfinder_schema::Step {
     use pathfinder_schema::Step;
     if let Some(cmd) = text.strip_prefix('/') {
-        return match cmd.split_whitespace().next().unwrap_or("") {
+        let word = cmd
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        return match word.as_str() {
             "plan" | "replan" | "map" => Step::Map,
             "summary" => Step::Summary,
             "delegate" => Step::Delegate,
@@ -773,3 +854,191 @@ fn turn_step(text: &str, session: &Session, had_candidate: bool) -> pathfinder_s
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod command_tests {
+    use super::*;
+    use crate::engine::{BoxFuture, noop_sink};
+
+    struct UnusedEngine;
+
+    impl Engine for UnusedEngine {
+        fn run_text<'a>(
+            &'a self,
+            _req: &'a EngineRequest,
+            _sink: StreamSink,
+        ) -> BoxFuture<'a, Result<String>> {
+            Box::pin(async { unreachable!("command should not call engine") })
+        }
+    }
+
+    fn cfg_with_defaults() -> Config {
+        Config {
+            models: vec![
+                ModelEntry {
+                    id: "fast".into(),
+                    label: "Fast".into(),
+                    route: crate::config::Route::Anthropic,
+                    model: "fast".into(),
+                    effort: None,
+                    endpoint: None,
+                },
+                ModelEntry {
+                    id: "main".into(),
+                    label: "Main".into(),
+                    route: crate::config::Route::Anthropic,
+                    model: "main".into(),
+                    effort: None,
+                    endpoint: None,
+                },
+            ],
+            system1: Some("fast".into()),
+            system2: Some("main".into()),
+            effort: Some("high".into()),
+            fast_effort: Some("low".into()),
+            decisions_on: Some(false),
+            decision_model: Some("openai".into()),
+            checks: Some("normal".into()),
+            discover: false,
+            ..Config::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_commands_are_case_insensitive() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let mut rt = Runtime::new(store, Arc::new(UnusedEngine));
+        rt.config = cfg_with_defaults;
+        let s = rt.create_session("s1".into(), PathBuf::from(".")).unwrap();
+        assert_eq!(s.effort.as_deref(), Some("high"));
+        assert_eq!(s.fast_effort.as_deref(), Some("low"));
+        assert!(s.decisions_off);
+        assert_eq!(s.decision_model.as_deref(), Some("openai"));
+        assert_eq!(s.checks.as_deref(), Some("normal"));
+
+        let out_map = rt
+            .handle_turn(
+                "s1",
+                TurnInput {
+                    text: "/MAP".into(),
+                    files: vec![],
+                },
+                noop_sink(),
+            )
+            .await
+            .unwrap();
+        assert!(!out_map.reply.contains("Commands:"));
+
+        let out_why = rt
+            .handle_turn(
+                "s1",
+                TurnInput {
+                    text: "/Why".into(),
+                    files: vec![],
+                },
+                noop_sink(),
+            )
+            .await
+            .unwrap();
+        assert!(!out_why.reply.contains("Commands:"));
+
+        assert_eq!(
+            turn_step("/MAP", &s, false),
+            pathfinder_schema::Step::Map
+        );
+        assert_eq!(
+            turn_step("/Summary", &s, false),
+            pathfinder_schema::Step::Summary
+        );
+    }
+
+    #[test]
+    fn default_settings_conversion_validates_options() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let mut rt = Runtime::new(store, Arc::new(UnusedEngine));
+        rt.config = cfg_with_defaults;
+
+        let d = rt
+            .default_settings_for_option(
+                crate::options::MAIN_EFFORT,
+                OptionValue::Id("default".into()),
+            )
+            .unwrap();
+        assert_eq!(d.effort, Some(None));
+
+        let d = rt
+            .default_settings_for_option(
+                crate::options::DECISION_MODEL,
+                OptionValue::Id("openai".into()),
+            )
+            .unwrap();
+        assert_eq!(d.decision_model, Some(Some("openai".into())));
+        assert_eq!(d.decisions_on, Some(Some(true)));
+
+        assert!(
+            rt.default_settings_for_option(
+                crate::options::MAIN_MODEL,
+                OptionValue::Id("missing".into()),
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn open_pairs_history_and_does_not_pollute_concepts() {
+        let dir = std::env::temp_dir().join(format!("pf-open-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("my notes.md"), "alpha\nbeta\ngamma\n").unwrap();
+
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let rt = Runtime::new(store.clone(), Arc::new(UnusedEngine));
+        let s = rt.create_session("s-open".into(), dir.clone()).unwrap();
+
+        let out = rt
+            .handle_turn(
+                "s-open",
+                TurnInput {
+                    text: r#"/open "my notes.md":2"#.into(),
+                    files: vec![],
+                },
+                crate::engine::noop_sink(),
+            )
+            .await
+            .unwrap();
+        assert!(out.reply.contains("    2  beta"), "{}", out.reply);
+
+        let reloaded = rt.load_session("s-open").unwrap().unwrap();
+        assert_eq!(reloaded.history.len(), 2);
+        assert_eq!(reloaded.history[0].role, "user");
+        assert_eq!(reloaded.history[1].role, "assistant");
+        assert_eq!(reloaded.history[1].content, out.reply);
+
+        // Error case also keeps user/assistant paired.
+        let err_out = rt
+            .handle_turn(
+                "s-open",
+                TurnInput {
+                    text: "/open missing.md".into(),
+                    files: vec![],
+                },
+                crate::engine::noop_sink(),
+            )
+            .await
+            .unwrap();
+        assert!(err_out.reply.contains("missing.md"), "{}", err_out.reply);
+        let reloaded = rt.load_session("s-open").unwrap().unwrap();
+        assert_eq!(reloaded.history.len(), 4);
+        assert_eq!(reloaded.history[3].role, "assistant");
+
+        // Raw filename does not pollute `concepts` table.
+        let ws = crate::understanding::workspace_key(&s.cwd);
+        assert!(store.concepts(&ws).unwrap().is_empty());
+        // Read event is still recorded under `sources`.
+        let events = store.events(&ws, &["sources".to_string()]).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, EventKind::Read);
+        assert_eq!(events[0].reference.as_deref(), Some("my notes.md#2"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

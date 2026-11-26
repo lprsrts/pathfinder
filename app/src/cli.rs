@@ -448,21 +448,7 @@ async fn login_chatgpt(creds: &Credentials) -> Result<()> {
 /// Opens a URL in the default browser, unless PATHFINDER_NO_BROWSER is set
 /// (e.g. over SSH), in which case the printed URL is used instead.
 pub fn open_browser(url: &str) {
-    if crate::envvar::get_os("PATHFINDER_NO_BROWSER").is_some() {
-        return;
-    }
-    let opener = if cfg!(target_os = "macos") {
-        "open"
-    } else if cfg!(target_os = "windows") {
-        "explorer"
-    } else {
-        "xdg-open"
-    };
-    let _ = std::process::Command::new(opener)
-        .arg(url)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
+    crate::open_browser(url);
 }
 
 /// Refreshes the model list of the one provider a command changed.

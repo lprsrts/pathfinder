@@ -5,17 +5,16 @@
 //! user sees is rendered from this module only, after every quote has been
 //! found in the cited source.
 
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
 /// Longest quote shown by default, in characters (`quote_cap` in the config).
 pub const QUOTE_CAP: usize = 220;
 
-/// The configured quote cap, read once.
+/// The configured quote cap (live from config, clamped to 60..=1000).
 pub fn quote_cap() -> usize {
-    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *CAP.get_or_init(|| crate::config::Config::load().quote_cap.clamp(60, 1000))
+    crate::config::Config::load().quote_cap.clamp(60, 1000)
 }
 /// Most hits in one reply.
 pub const MAX_HITS: usize = 5;
@@ -71,6 +70,72 @@ impl std::fmt::Display for Locator {
 pub struct Hit {
     pub at: Locator,
     pub quote: String,
+}
+
+/// Kind of workspace source targeted by `/open`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceKind {
+    Text,
+    Markdown,
+    Code,
+    Pdf,
+    Image,
+    Video,
+    Directory,
+}
+
+impl SourceKind {
+    pub fn from_path(path: &Path) -> Self {
+        if path.is_dir() {
+            return Self::Directory;
+        }
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_default();
+        match ext.as_str() {
+            "pdf" => Self::Pdf,
+            "md" | "markdown" | "mdx" | "rst" | "org" => Self::Markdown,
+            "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "bmp" | "tiff" | "heic" => {
+                Self::Image
+            }
+            "mp4" | "mov" | "mkv" | "webm" | "avi" | "m4v" => Self::Video,
+            "txt" | "csv" | "tsv" | "log" => Self::Text,
+            "rs" | "py" | "js" | "ts" | "tsx" | "jsx" | "c" | "h" | "cpp" | "hpp" | "cc"
+            | "java" | "go" | "m" | "r" | "jl" | "sh" | "zsh" | "bash" | "tex" | "bib"
+            | "json" | "yaml" | "yml" | "toml" | "html" | "htm" | "css" | "sql" | "ipynb"
+            | "xml" => Self::Code,
+            _ => Self::Text,
+        }
+    }
+}
+
+/// What `/open` opened: the file, page, line range and kind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenTarget {
+    pub path: PathBuf,
+    pub rel: String,
+    pub page: Option<usize>,
+    pub lines: Option<(usize, usize)>,
+    pub quote: Option<String>,
+    pub kind: SourceKind,
+}
+
+/// Result of opening a workspace source: rendered markdown plus structured target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenedSource {
+    pub markdown: String,
+    pub target: OpenTarget,
+}
+
+/// Parsed `/open` argument.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OpenSpec {
+    pub file: String,
+    pub at: Option<usize>,
+    pub end: Option<usize>,
+    pub line: Option<usize>,
 }
 
 // ---------------------------------------------------------------- matching
@@ -310,20 +375,61 @@ pub fn cap_to(quote: &str, limit: usize) -> String {
 // ----------------------------------------------------------------- loading
 
 /// A workspace path the user or model named, confined to the workspace.
+/// Accepts relative paths and workspace-internal absolute paths.
 pub fn confine(cwd: &Path, file: &str) -> Option<PathBuf> {
-    let rel = Path::new(file.trim().trim_start_matches("./"));
-    if rel.is_absolute()
-        || rel
-            .components()
-            .any(|c| matches!(c, Component::ParentDir | Component::Prefix(_)))
-    {
+    let clean = strip_file_uri(file.trim());
+    let clean = clean.trim().trim_start_matches("./");
+    if clean.is_empty() {
         return None;
     }
-    // Symlinks are resolved: a link inside the folder to a file outside it
-    // is outside.
-    crate::agent::confine::confine(cwd, &rel.to_string_lossy(), false, &[]).ok()?;
-    let full = cwd.join(rel);
-    full.is_file().then_some(full)
+    // Symlinks and `..` are resolved through the longest existing ancestor.
+    let resolved = crate::agent::confine::confine(cwd, clean, false, &[]).ok()?;
+    resolved.is_file().then_some(resolved)
+}
+
+fn strip_file_uri(s: &str) -> String {
+    let Some(rest) = s.strip_prefix("file://") else {
+        return s.to_string();
+    };
+    let bytes = rest.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (hex_nibble(bytes[i + 1]), hex_nibble(bytes[i + 2]))
+        {
+            out.push((hi << 4) | lo);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Whether `path` has a file extension that `/open` handles cleanly.
+pub fn is_openable(path: &Path) -> bool {
+    const EXTS: &[&str] = &[
+        "md", "markdown", "mdx", "txt", "tex", "bib", "rst", "org", "csv", "tsv", "log", "json",
+        "yaml", "yml", "toml", "html", "htm", "css", "sql", "xml", "rs", "py", "js", "ts", "tsx",
+        "jsx", "c", "h", "cpp", "hpp", "cc", "java", "go", "m", "r", "jl", "sh", "zsh", "bash",
+        "ipynb", "pdf", "png", "jpg", "jpeg", "gif", "webp", "svg", "mp4", "mov", "mkv", "webm",
+        "avi", "m4v",
+    ];
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| EXTS.contains(&e.to_ascii_lowercase().as_str()))
 }
 
 pub fn is_pdf(p: &Path) -> bool {
@@ -400,8 +506,13 @@ pub fn verify_local(cwd: &Path, p: &ProposedHit) -> Result<Hit, Rejected> {
     if normalise(&p.quote).chars().count() < 8 {
         return Err(Rejected::TooShort);
     }
-    let file = p.file.trim().trim_start_matches("./").to_string();
-    let full = confine(cwd, &file).ok_or_else(|| Rejected::NoSuchFile(file.clone()))?;
+    let raw = p.file.trim().trim_start_matches("./");
+    let full = confine(cwd, raw).ok_or_else(|| Rejected::NoSuchFile(raw.to_string()))?;
+    let root = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let file = full
+        .strip_prefix(&root)
+        .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|_| raw.to_string());
     let pages = pages(&full, &file).map_err(Rejected::Unreadable)?;
     let pdf = is_pdf(&full);
     // The cited page first, then the rest: a wrong page number is corrected,
@@ -558,6 +669,7 @@ pub fn find(cwd: &Path, terms: &[String], limit: usize) -> Vec<Hit> {
         scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
         scored.truncate(limit);
     };
+    let qcap = quote_cap();
     for (full, rel) in source_files(cwd).into_iter().take(MAX_FIND_FILES) {
         let Ok(pages) = pages(&full, &rel) else {
             continue;
@@ -583,7 +695,7 @@ pub fn find(cwd: &Path, terms: &[String], limit: usize) -> Vec<Hit> {
                             page: pdf.then_some(pi + 1),
                             line: li + 1,
                         },
-                        quote: cap(line),
+                        quote: cap_to(line, qcap),
                     },
                 ));
             }
@@ -594,45 +706,478 @@ pub fn find(cwd: &Path, terms: &[String], limit: usize) -> Vec<Hit> {
     scored.into_iter().map(|(_, _, h)| h).collect()
 }
 
-/// `/open`: a numbered view of a file, a PDF page, or lines around a line.
-pub fn open(cwd: &Path, file: &str, at: Option<usize>) -> Result<String, String> {
-    let rel = file.trim().trim_start_matches("./");
-    let full = confine(cwd, rel).ok_or_else(|| format!("No file `{rel}` in this workspace."))?;
-    let pages = pages(&full, rel)?;
+/// Parses `/open` arguments:
+/// - `"my notes.md" 12`, `'my notes.md':10-20`, `my\ notes.md 12`, `` `notes.md:12` ``
+/// - `paper.pdf 3`, `paper.pdf p.3`, `paper.pdf p. 3 l. 12`, `paper.pdf page 3`
+/// - `notes.md:120`, `notes.md:10-20`, `notes.md:10:5`, `notes.md 10-20`, `notes.md: 12`
+pub fn parse_open_spec(raw: &str) -> OpenSpec {
+    let mut s = raw.trim();
+    if s.len() >= 2 && s.starts_with('`') && s.ends_with('`') {
+        s = s[1..s.len() - 1].trim();
+    }
+    if s.is_empty() {
+        return OpenSpec::default();
+    }
+    // Quoted path followed by optional page/line/range suffix.
+    if let Some((quoted_path, rest)) = split_leading_quoted(s) {
+        let mut spec = parse_open_suffix(rest);
+        spec.file = normalize_open_file(&quoted_path);
+        return spec;
+    }
+    // Unquoted: try PDF `p.N [l.M]` suffix first, then `:line`, then ` line`.
+    let (file_raw, spec) = extract_open_suffix(s);
+    let file = normalize_open_file(&crate::commands::unescape_shell_path(file_raw));
+    OpenSpec { file, ..spec }
+}
+
+fn normalize_open_file(raw: &str) -> String {
+    let expanded = crate::commands::expand_tilde(raw.trim());
+    strip_file_uri(&expanded)
+}
+
+fn split_leading_quoted(s: &str) -> Option<(String, &str)> {
+    let quote = s.chars().next().filter(|c| *c == '"' || *c == '\'')?;
+    let mut out = String::new();
+    let mut chars = s[1..].char_indices();
+    while let Some((idx, c)) = chars.next() {
+        if quote == '"'
+            && c == '\\'
+            && let Some((_, next)) = chars.next()
+        {
+            out.push(next);
+            continue;
+        }
+        if c == quote {
+            let rest = &s[1 + idx + c.len_utf8()..];
+            return Some((out, rest.trim()));
+        }
+        out.push(c);
+    }
+    None
+}
+
+fn parse_range_nums(s: &str) -> Option<(usize, Option<usize>)> {
+    let s = s.trim();
+    if let Some((a, b)) = s.split_once(['-', '–']) {
+        let start = a.trim().parse::<usize>().ok()?;
+        let end = b.trim().parse::<usize>().ok()?;
+        return Some((start, Some(end)));
+    }
+    Some((s.parse::<usize>().ok()?, None))
+}
+
+fn parse_open_suffix(rest: &str) -> OpenSpec {
+    let rest = rest.trim();
+    if rest.is_empty() {
+        return OpenSpec::default();
+    }
+    let (_, spec) = extract_open_suffix(&format!("_ {rest}"));
+    if spec.at.is_some() || spec.line.is_some() {
+        return spec;
+    }
+    if let Some(colon) = rest.strip_prefix(':') {
+        let (_, spec) = extract_open_suffix(&format!("_:{colon}"));
+        return spec;
+    }
+    OpenSpec::default()
+}
+
+fn extract_open_suffix(s: &str) -> (&str, OpenSpec) {
+    static PDF_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r"(?i)^(.+?)\s+(?:pp?\.|pages?|seite|s\.)\s*(\d+)(?:\s*[-–]\s*(\d+))?(?:\s+(?:ll?\.|lines?)\s*(\d+)(?:\s*[-–]\s*(\d+))?)?$",
+        )
+        .unwrap()
+    });
+    if let Some(caps) = PDF_RE.captures(s)
+        && let Some(file) = caps.get(1)
+        && let Ok(page) = caps[2].parse::<usize>()
+    {
+        let end = caps.get(3).and_then(|m| m.as_str().parse::<usize>().ok());
+        let line = caps.get(4).and_then(|m| m.as_str().parse::<usize>().ok());
+        let line_end = caps.get(5).and_then(|m| m.as_str().parse::<usize>().ok());
+        return (
+            file.as_str().trim(),
+            OpenSpec {
+                file: String::new(),
+                at: Some(page),
+                end: line_end.or(end),
+                line,
+            },
+        );
+    }
+    // `file:line:col`, `file:start-end`, `file:line`, `file: 12`
+    if let Some((before_last, last)) = s.rsplit_once(':') {
+        let last_trim = last.trim();
+        if let Ok(col_or_line) = last_trim.parse::<usize>() {
+            if let Some((file_part, line_str)) = before_last.rsplit_once(':')
+                && let Ok(line_num) = line_str.trim().parse::<usize>()
+            {
+                let _ = col_or_line;
+                return (
+                    file_part.trim(),
+                    OpenSpec {
+                        file: String::new(),
+                        at: Some(line_num),
+                        end: None,
+                        line: None,
+                    },
+                );
+            }
+            if !before_last.trim().is_empty() {
+                return (
+                    before_last.trim(),
+                    OpenSpec {
+                        file: String::new(),
+                        at: Some(col_or_line),
+                        end: None,
+                        line: None,
+                    },
+                );
+            }
+        } else if let Some((a, Some(b))) = parse_range_nums(last_trim)
+            && !before_last.trim().is_empty()
+        {
+            return (
+                before_last.trim(),
+                OpenSpec {
+                    file: String::new(),
+                    at: Some(a),
+                    end: Some(b),
+                    line: None,
+                },
+            );
+        }
+    }
+    // `file 12` or `file 10-20`
+    if let Some((f, tail)) = s.rsplit_once(char::is_whitespace)
+        && !f.trim().is_empty()
+        && let Some((a, b)) = parse_range_nums(tail)
+    {
+        return (
+            f.trim(),
+            OpenSpec {
+                file: String::new(),
+                at: Some(a),
+                end: b,
+                line: None,
+            },
+        );
+    }
+    (s.trim(), OpenSpec::default())
+}
+
+fn lang_tag(path: &Path) -> &'static str {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    match ext.as_str() {
+        "rs" => "rust",
+        "py" => "python",
+        "js" => "javascript",
+        "ts" => "typescript",
+        "tsx" => "tsx",
+        "jsx" => "jsx",
+        "md" | "markdown" => "markdown",
+        "json" => "json",
+        "toml" => "toml",
+        "yaml" | "yml" => "yaml",
+        "sh" | "zsh" | "bash" => "bash",
+        "c" | "h" => "c",
+        "cpp" | "hpp" | "cc" => "cpp",
+        "go" => "go",
+        "java" => "java",
+        "tex" => "latex",
+        "sql" => "sql",
+        "html" | "htm" => "html",
+        "css" => "css",
+        _ => "text",
+    }
+}
+
+fn safe_fence(body: &str) -> String {
+    let mut max_run = 2usize;
+    let mut run = 0usize;
+    for ch in body.chars() {
+        if ch == '`' {
+            run += 1;
+            max_run = max_run.max(run);
+        } else {
+            run = 0;
+        }
+    }
+    "`".repeat((max_run + 1).max(3))
+}
+
+fn suggest_similar(cwd: &Path, wanted: &str) -> Vec<String> {
+    let want_name = Path::new(wanted)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_lowercase())
+        .unwrap_or_else(|| wanted.to_lowercase());
+    if want_name.is_empty() {
+        return Vec::new();
+    }
+    let stem = want_name
+        .rsplit_once('.')
+        .map_or(want_name.as_str(), |(s, _)| s)
+        .to_string();
+    let Ok(root) = cwd.canonicalize() else {
+        return Vec::new();
+    };
+    let mut near: Vec<(u8, String)> = Vec::new();
+    for entry in ignore::WalkBuilder::new(&root).build().flatten().take(10_000) {
+        if !entry.path().is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_lowercase();
+        let rank = if name == want_name {
+            0
+        } else if stem.len() >= 3 && name.contains(&stem) {
+            1
+        } else if name.len() >= 4
+            && want_name.contains(name.rsplit_once('.').map_or(name.as_str(), |(s, _)| s))
+        {
+            2
+        } else {
+            continue;
+        };
+        if let Ok(rel) = entry.path().strip_prefix(&root) {
+            near.push((rank, rel.to_string_lossy().replace('\\', "/")));
+        }
+    }
+    near.sort();
+    near.dedup();
+    near.into_iter().take(4).map(|(_, p)| p).collect()
+}
+
+/// `/open`: numbered view of a file, PDF page, range, directory, or media hint.
+pub fn open_spec(cwd: &Path, spec: &OpenSpec) -> Result<OpenedSource, String> {
+    let raw_rel = spec.file.trim().trim_start_matches("./");
+    if raw_rel.is_empty() {
+        return Err("`/open <file> [page or line]`".into());
+    }
+    let resolved = crate::agent::confine::confine(cwd, raw_rel, false, &[]).map_err(|_| {
+        format!("No file `{raw_rel}` in this workspace.")
+    })?;
+    if !resolved.exists() {
+        let near = suggest_similar(cwd, raw_rel);
+        let mut msg = format!("No file `{raw_rel}` in this workspace.");
+        if !near.is_empty() {
+            let formatted: Vec<String> = near.into_iter().map(|p| format!("`{p}`")).collect();
+            msg.push_str(&format!(" Did you mean {}?", formatted.join(", ")));
+        }
+        return Err(msg);
+    }
+    let root = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let rel = resolved
+        .strip_prefix(&root)
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|_| raw_rel.to_string());
+    let rel_display = if rel.is_empty() { ".".to_string() } else { rel };
+
+    if resolved.is_dir() {
+        let mut items: Vec<(bool, String)> = Vec::new();
+        for entry in ignore::WalkBuilder::new(&resolved)
+            .max_depth(Some(1))
+            .build()
+            .flatten()
+            .skip(1)
+        {
+            let is_dir = entry.path().is_dir();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            items.push((is_dir, name));
+        }
+        items.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| a.1.to_ascii_lowercase().cmp(&b.1.to_ascii_lowercase()))
+        });
+        let total = items.len();
+        let shown: Vec<String> = items
+            .into_iter()
+            .take(40)
+            .map(|(d, name)| {
+                let prefix = if rel_display == "." {
+                    String::new()
+                } else {
+                    format!("{rel_display}/")
+                };
+                format!("- `{prefix}{name}{}`", if d { "/" } else { "" })
+            })
+            .collect();
+        let mut markdown = if shown.is_empty() {
+            format!("`{rel_display}/` is an empty folder.")
+        } else {
+            format!("`{rel_display}/` ({total} items):\n\n{}", shown.join("\n"))
+        };
+        if total > 40 {
+            markdown.push_str(&format!("\n\n… and {} more.", total - 40));
+        }
+        return Ok(OpenedSource {
+            markdown,
+            target: OpenTarget {
+                path: resolved,
+                rel: rel_display,
+                page: None,
+                lines: None,
+                quote: None,
+                kind: SourceKind::Directory,
+            },
+        });
+    }
+
+    let kind = SourceKind::from_path(&resolved);
+    match kind {
+        SourceKind::Image => {
+            return Ok(OpenedSource {
+                markdown: format!(
+                    "`{rel_display}` is an image. Attach it with `/attach {}`.",
+                    if rel_display.contains(char::is_whitespace) {
+                        format!("\"{rel_display}\"")
+                    } else {
+                        rel_display.clone()
+                    }
+                ),
+                target: OpenTarget {
+                    path: resolved,
+                    rel: rel_display,
+                    page: None,
+                    lines: None,
+                    quote: None,
+                    kind,
+                },
+            });
+        }
+        SourceKind::Video => {
+            return Ok(OpenedSource {
+                markdown: format!(
+                    "`{rel_display}` is a video file, which Pathfinder cannot show as text."
+                ),
+                target: OpenTarget {
+                    path: resolved,
+                    rel: rel_display,
+                    page: None,
+                    lines: None,
+                    quote: None,
+                    kind,
+                },
+            });
+        }
+        _ => {}
+    }
+
+    let pages = pages(&resolved, &rel_display)?;
     const WINDOW: usize = 60;
-    if is_pdf(&full) {
-        let n = at.unwrap_or(1);
+    const MAX_RANGE: usize = 200;
+    if is_pdf(&resolved) {
+        if pages.is_empty() || pages.iter().all(|p| p.trim().is_empty()) {
+            return Ok(OpenedSource {
+                markdown: format!(
+                    "`{rel_display}` has no extractable text (scanned PDF; attach with `/attach {}` or open in the PDF viewer).",
+                    if rel_display.contains(char::is_whitespace) {
+                        format!("\"{rel_display}\"")
+                    } else {
+                        rel_display.clone()
+                    }
+                ),
+                target: OpenTarget {
+                    path: resolved,
+                    rel: rel_display,
+                    page: spec.at.or(Some(1)),
+                    lines: spec.line.map(|l| (l, spec.end.unwrap_or(l))),
+                    quote: None,
+                    kind: SourceKind::Pdf,
+                },
+            });
+        }
+        let n = spec.at.unwrap_or(1);
         let page = pages
             .get(n.wrapping_sub(1))
-            .ok_or_else(|| format!("`{rel}` has {} pages.", pages.len()))?;
-        let mut out = format!("`{rel}` page {n} of {}\n\n```text\n", pages.len());
+            .ok_or_else(|| format!("`{rel_display}` has {} pages.", pages.len()))?;
+        let mut body = String::new();
         for (i, l) in page.lines().enumerate() {
-            out.push_str(&format!("{:>4}  {}\n", i + 1, l.trim_end()));
+            body.push_str(&format!("{:>4}  {}\n", i + 1, l.trim_end()));
         }
-        out.push_str("```");
-        return Ok(out);
+        let fence = safe_fence(&body);
+        let out = format!(
+            "`{rel_display}` page {n} of {}\n\n{fence}text\n{body}{fence}",
+            pages.len()
+        );
+        return Ok(OpenedSource {
+            markdown: out,
+            target: OpenTarget {
+                path: resolved,
+                rel: rel_display,
+                page: Some(n),
+                lines: spec.line.map(|l| (l, spec.end.unwrap_or(l))),
+                quote: None,
+                kind: SourceKind::Pdf,
+            },
+        });
     }
+
     let lines: Vec<&str> = pages[0].lines().collect();
     if lines.is_empty() {
-        return Err(format!("`{rel}` is empty."));
+        return Err(format!("`{rel_display}` is empty."));
     }
-    if let Some(l) = at
+    if let Some(l) = spec.at
         && (l == 0 || l > lines.len())
     {
-        return Err(format!("`{rel}` has {} lines.", lines.len()));
+        return Err(format!("`{rel_display}` has {} lines.", lines.len()));
     }
-    let start = at.map_or(0, |l| l.saturating_sub(WINDOW / 4).saturating_sub(1));
-    let end = start.saturating_add(WINDOW).min(lines.len());
-    let mut out = format!(
-        "`{rel}` lines {}–{end} of {}\n\n```text\n",
+    let (start, end, target_lines) = match (spec.at, spec.end) {
+        (Some(a), Some(b)) => {
+            if b < a {
+                return Err(format!("Invalid line range `{a}–{b}` for `{rel_display}`."));
+            }
+            let s = a - 1;
+            let e = b.min(lines.len()).min(s + MAX_RANGE);
+            (s, e, Some((a, e)))
+        }
+        (Some(l), None) => {
+            let s = l.saturating_sub(WINDOW / 4).saturating_sub(1);
+            let e = s.saturating_add(WINDOW).min(lines.len());
+            (s, e, Some((l, l)))
+        }
+        (None, _) => {
+            let e = WINDOW.min(lines.len());
+            (0, e, Some((1, e)))
+        }
+    };
+    let mut body = String::new();
+    for (i, l) in lines.iter().enumerate().take(end).skip(start) {
+        body.push_str(&format!("{:>5}  {}\n", i + 1, l.trim_end()));
+    }
+    let fence = safe_fence(&body);
+    let lang = lang_tag(&resolved);
+    let out = format!(
+        "`{rel_display}` lines {}–{end} of {}\n\n{fence}{lang}\n{body}{fence}",
         start + 1,
         lines.len()
     );
-    for (i, l) in lines.iter().enumerate().take(end).skip(start) {
-        out.push_str(&format!("{:>5}  {}\n", i + 1, l.trim_end()));
-    }
-    out.push_str("```");
-    Ok(out)
+    Ok(OpenedSource {
+        markdown: out,
+        target: OpenTarget {
+            path: resolved,
+            rel: rel_display,
+            page: None,
+            lines: target_lines,
+            quote: None,
+            kind,
+        },
+    })
+}
+
+/// `/open`: a numbered view of a file, a PDF page, or lines around a line.
+pub fn open(cwd: &Path, file: &str, at: Option<usize>) -> Result<String, String> {
+    let spec = OpenSpec {
+        file: file.to_string(),
+        at,
+        end: None,
+        line: None,
+    };
+    open_spec(cwd, &spec).map(|o| o.markdown)
 }
 
 /// A part's note reduced to a pointer: the first workspace file it names,
@@ -1261,5 +1806,121 @@ mod tests {
         assert_eq!(section.as_deref(), Some("Algorithm"));
         assert!(line.starts_with("The kmeans algorithm"));
         assert!(pick_quote(page, &["laplace".into()]).is_none());
+    }
+
+    #[test]
+    fn parse_open_spec_handles_quotes_escapes_pdf_citations_and_ranges() {
+        assert_eq!(
+            parse_open_spec(r#""my notes.md" 12"#),
+            OpenSpec {
+                file: "my notes.md".into(),
+                at: Some(12),
+                end: None,
+                line: None,
+            }
+        );
+        assert_eq!(
+            parse_open_spec(r#"'my notes.md':10-20"#),
+            OpenSpec {
+                file: "my notes.md".into(),
+                at: Some(10),
+                end: Some(20),
+                line: None,
+            }
+        );
+        assert_eq!(
+            parse_open_spec(r#"my\ notes.md 12"#),
+            OpenSpec {
+                file: "my notes.md".into(),
+                at: Some(12),
+                end: None,
+                line: None,
+            }
+        );
+        assert_eq!(
+            parse_open_spec("`notes.md:12`"),
+            OpenSpec {
+                file: "notes.md".into(),
+                at: Some(12),
+                end: None,
+                line: None,
+            }
+        );
+        assert_eq!(
+            parse_open_spec("slides-4.pdf p. 12"),
+            OpenSpec {
+                file: "slides-4.pdf".into(),
+                at: Some(12),
+                end: None,
+                line: None,
+            }
+        );
+        assert_eq!(
+            parse_open_spec("file.pdf p.3 l.12"),
+            OpenSpec {
+                file: "file.pdf".into(),
+                at: Some(3),
+                end: None,
+                line: Some(12),
+            }
+        );
+        assert_eq!(
+            parse_open_spec("src/main.rs:42:5"),
+            OpenSpec {
+                file: "src/main.rs".into(),
+                at: Some(42),
+                end: None,
+                line: None,
+            }
+        );
+        assert_eq!(
+            parse_open_spec("notes.md: 15"),
+            OpenSpec {
+                file: "notes.md".into(),
+                at: Some(15),
+                end: None,
+                line: None,
+            }
+        );
+    }
+
+    #[test]
+    fn open_spec_handles_ranges_dirs_internal_abs_paths_fences_and_hints() {
+        let body: String = (1..=40).map(|i| format!("line {i}\n")).collect();
+        let md_with_fences = "# Title\n\n```rust\nfn main() {}\n```\n";
+        let d = ws(&[
+            ("sub/notes.md", body.as_str()),
+            ("README.md", md_with_fences),
+            ("pic.png", "png"),
+        ]);
+
+        // Line range + language tag.
+        let r = open_spec(d.path(), &parse_open_spec("sub/notes.md:5-10")).unwrap();
+        assert!(r.markdown.contains("lines 5–10 of 40"), "{}", r.markdown);
+        assert!(r.markdown.contains("```markdown\n"), "{}", r.markdown);
+        assert_eq!(r.target.lines, Some((5, 10)));
+        assert_eq!(r.target.kind, SourceKind::Markdown);
+
+        // Safe fence escaping when markdown contains ```.
+        let fenced = open_spec(d.path(), &parse_open_spec("README.md")).unwrap();
+        assert!(fenced.markdown.contains("````markdown\n"), "{}", fenced.markdown);
+
+        // Directory listing instead of "No file".
+        let dir = open_spec(d.path(), &parse_open_spec("sub")).unwrap();
+        assert_eq!(dir.target.kind, SourceKind::Directory);
+        assert!(dir.markdown.contains("sub/notes.md"), "{}", dir.markdown);
+
+        // Workspace-internal absolute path allowed.
+        let abs = d.path().join("sub/notes.md").display().to_string();
+        let opened_abs = open_spec(d.path(), &parse_open_spec(&abs)).unwrap();
+        assert_eq!(opened_abs.target.rel, "sub/notes.md");
+
+        // Image handled cleanly.
+        let img = open_spec(d.path(), &parse_open_spec("pic.png")).unwrap();
+        assert_eq!(img.target.kind, SourceKind::Image);
+
+        // Missing file suggests near match.
+        let err = open_spec(d.path(), &parse_open_spec("notes.md")).unwrap_err();
+        assert!(err.contains("Did you mean `sub/notes.md`?"), "{err}");
     }
 }
