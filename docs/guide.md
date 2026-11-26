@@ -52,7 +52,7 @@ Passing a candidate or a test question is what puts an idea on your record as sh
 | `/share [note]` | Send this thread (you see it all first) |
 | `/bug [what happened]` | Send a bug report (you see it all first) |
 
-The full list is in the [reference](reference.md#slash-commands-in-zed).
+In the terminal there are also `/help`, `/quit` (or `/exit`), `/new` (or `/clear`), `/resume`, `/model`, `/status`, `/copy`, `/join`, `/data` and `/update`. Type `/` to see what matches, and Tab to complete. `/help` lists everything, keys included.
 
 ## Models
 

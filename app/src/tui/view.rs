@@ -758,6 +758,8 @@ fn footer(f: &mut Frame, app: &App, area: Rect) {
         s2.clone(),
         String::new(),
     ];
+    let completions: String;
+    let completions_hint: [&str; 2];
     let (left, left_style) = if app.status.is_empty() {
         let hints: &[&str] = if app.selected.is_some() && app.modal.is_none() {
             &[
@@ -772,6 +774,10 @@ fn footer(f: &mut Frame, app: &App, area: Rect) {
             &["Your answer is saved; `pathfinder data` changes it later"]
         } else if app.modal.is_some() {
             &["Enter picks · Esc closes"]
+        } else if !super::commands::matches(&app.input).is_empty() {
+            completions = super::commands::matches(&app.input).join("  ");
+            completions_hint = [completions.as_str(), "Tab completes"];
+            &completions_hint
         } else {
             &[
                 "Enter send · Alt+Enter line · ^P settings · ^O threads · F1 keys",
@@ -943,7 +949,7 @@ fn modal(f: &mut Frame, app: &App, area: Rect) {
             error,
             busy,
         } => consent(f, area, *events, *threads, step, error.as_deref(), *busy),
-        Modal::Help => {
+        Modal::Help { scroll } => {
             let keys = [
                 ("Enter", "send"),
                 ("Alt+Enter, Ctrl+J", "new line"),
@@ -952,50 +958,62 @@ fn modal(f: &mut Frame, app: &App, area: Rect) {
                 ("↑↓ (empty input)", "scroll"),
                 ("End (empty input)", "back to the latest"),
                 ("Alt+↑", "your last message again"),
+                ("Ctrl+A, Home / End", "start / end of the line"),
+                ("Ctrl+U / Ctrl+K", "delete to the start / end of the line"),
+                ("Ctrl+W, Alt+Backspace", "delete the previous word"),
+                ("Ctrl+← →, Alt+← →", "move by a word"),
+                ("Tab", "complete a /command; else move between messages"),
                 ("Ctrl+N", "new thread"),
                 ("Ctrl+O", "open an earlier thread here"),
                 ("Ctrl+P", "models, decisions, checks"),
                 ("Ctrl+T", "show or hide thinking"),
                 ("Ctrl+E", "show each read and search, or group them"),
-                ("Tab", "move between messages: ↑↓, Enter expands, y copies"),
                 ("Ctrl+B", "show or hide the plan panel"),
-                ("/attach <file>", "attach a PDF or image (or drop it in)"),
-                ("/why, /map", "your record, the plan"),
-                ("/share [note]", "send this thread (shown in full first)"),
-                (
-                    "/bug [what happened]",
-                    "send a bug report (shown in full first)",
-                ),
                 (
                     "Ctrl+C, Ctrl+D (idle)",
                     "quit; the conversation stays in your terminal",
                 ),
             ];
-            let rect = centered(area, 72, keys.len() as u16 + 4);
-            f.render_widget(Clear, rect);
-            let mut lines: Vec<Line> = keys
-                .iter()
-                .map(|(k, v)| {
-                    Line::from(vec![
-                        Span::styled(
-                            format!("{k:<26}"),
-                            Style::default().add_modifier(Modifier::BOLD),
-                        ),
-                        Span::raw(v.to_string()),
-                    ])
-                })
-                .collect();
+            let bold = Style::default().add_modifier(Modifier::BOLD);
+            let row = |k: String, v: &str| {
+                Line::from(vec![
+                    Span::styled(format!("{k:<26}"), bold),
+                    Span::raw(v.to_string()),
+                ])
+            };
+            let mut lines: Vec<Line> = keys.iter().map(|(k, v)| row(k.to_string(), v)).collect();
             lines.push(Line::default());
-            lines.push(Line::from(Span::styled("Any key closes this.", dim())));
+            lines.push(Line::from(Span::styled("Commands", bold)));
+            for (_, name, aliases, what) in super::commands::LOCAL {
+                let shown = std::iter::once(name)
+                    .chain(aliases.iter().copied())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                lines.push(row(shown, what));
+            }
+            lines.push(Line::default());
+            lines.push(Line::from(Span::styled("In a task", bold)));
+            for (name, what) in super::commands::TASK {
+                lines.push(row(name.to_string(), what));
+            }
+            let height = (lines.len() as u16 + 3).min(area.height.saturating_sub(2));
+            let visible = height.saturating_sub(2) as usize;
+            let max = lines.len().saturating_sub(visible);
+            let scroll = (*scroll).min(max);
+            let hint = if max > 0 {
+                " ↑↓ scroll · any other key closes "
+            } else {
+                " Any key closes this "
+            };
+            let rect = centered(area, 80, height);
+            f.render_widget(Clear, rect);
             f.render_widget(
-                Paragraph::new(lines).block(
+                Paragraph::new(lines).scroll((scroll as u16, 0)).block(
                     Block::default()
                         .borders(Borders::ALL)
                         .border_style(dim())
-                        .title(Span::styled(
-                            " Keys ",
-                            Style::default().add_modifier(Modifier::BOLD),
-                        )),
+                        .title(Span::styled(" Keys and commands ", bold))
+                        .title_bottom(Span::styled(hint, dim())),
                 ),
                 rect,
             );

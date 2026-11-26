@@ -2,6 +2,7 @@
 //! the Zed connection, so threads, the record, checks and exams behave the
 //! same; this is only another front door.
 
+mod commands;
 mod markdown;
 mod view;
 
@@ -59,6 +60,8 @@ pub enum AppEvent {
     UpdateAvailable(String),
     /// A shared thread was sent (or not).
     Shared(std::result::Result<(), String>),
+    /// A line for the status bar, from a background check.
+    Status(String),
 }
 
 /// A dialog over the conversation.
@@ -81,7 +84,10 @@ pub enum Modal {
         always_key: String,
         reply: Option<oneshot::Sender<Permission>>,
     },
-    Help,
+    /// Keys and commands; `scroll` lines down.
+    Help {
+        scroll: usize,
+    },
     /// Asks once whether to share usage data, then signs in.
     /// Exactly what `/share` or `/bug` would send, before it is sent.
     Share {
@@ -509,6 +515,12 @@ impl App {
             return;
         }
         match key.code {
+            KeyCode::Tab if self.input.starts_with('/') => {
+                if let Some(done) = commands::complete(&self.input) {
+                    self.input = done;
+                    self.cursor = self.input.len();
+                }
+            }
             KeyCode::Tab if !self.items.is_empty() => {
                 used(Feature::Navigate);
                 self.selected = self.items.last().copied();
@@ -545,7 +557,7 @@ impl App {
             KeyCode::Char('j') if ctrl => self.insert_char('\n'),
             KeyCode::F(1) => {
                 used(Feature::Help);
-                self.modal = Some(Modal::Help)
+                self.modal = Some(Modal::Help { scroll: 0 })
             }
             KeyCode::Esc if self.side_overlay => self.side_overlay = false,
             KeyCode::Esc => {
@@ -571,6 +583,23 @@ impl App {
             KeyCode::Up if self.input.is_empty() => self.scroll += 1,
             KeyCode::Down if self.input.is_empty() => self.scroll = self.scroll.saturating_sub(1),
             KeyCode::End if self.input.is_empty() || ctrl => self.scroll = 0,
+            // Line editing, the way shells do it.
+            KeyCode::Char('a') if ctrl => self.cursor = self.line_start(),
+            KeyCode::Char('u') if ctrl => {
+                let start = self.line_start();
+                self.input.replace_range(start..self.cursor, "");
+                self.cursor = start;
+            }
+            KeyCode::Char('k') if ctrl => {
+                let end = self.line_end();
+                self.input.replace_range(self.cursor..end, "");
+            }
+            KeyCode::Char('w') if ctrl => self.delete_word_back(),
+            KeyCode::Backspace if alt || ctrl => self.delete_word_back(),
+            KeyCode::Left if alt || ctrl => self.cursor = self.word_left(),
+            KeyCode::Right if alt || ctrl => self.cursor = self.word_right(),
+            // Any other Ctrl+letter isn't typed as the letter.
+            KeyCode::Char(_) if ctrl => {}
             KeyCode::Char(c) => self.insert_char(c),
             KeyCode::Backspace => {
                 if let Some((i, _)) = self.input[..self.cursor].char_indices().next_back() {
@@ -686,6 +715,42 @@ impl App {
         one(first)
     }
 
+    fn line_start(&self) -> usize {
+        self.input[..self.cursor].rfind('\n').map_or(0, |i| i + 1)
+    }
+
+    fn line_end(&self) -> usize {
+        self.input[self.cursor..]
+            .find('\n')
+            .map_or(self.input.len(), |i| self.cursor + i)
+    }
+
+    /// Where the word before the cursor starts (skipping spaces first).
+    fn word_left(&self) -> usize {
+        let before = &self.input[..self.cursor];
+        let trimmed = before.trim_end();
+        trimmed
+            .char_indices()
+            .rev()
+            .find(|(_, c)| c.is_whitespace())
+            .map_or(0, |(i, c)| i + c.len_utf8())
+    }
+
+    /// Where the word after the cursor ends.
+    fn word_right(&self) -> usize {
+        let after = &self.input[self.cursor..];
+        let skip = after.len() - after.trim_start().len();
+        let rest = &after[skip..];
+        let word = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        self.cursor + skip + word
+    }
+
+    fn delete_word_back(&mut self) {
+        let start = self.word_left();
+        self.input.replace_range(start..self.cursor, "");
+        self.cursor = start;
+    }
+
     fn insert_char(&mut self, c: char) {
         self.input.insert(self.cursor, c);
         self.cursor += c.len_utf8();
@@ -753,37 +818,24 @@ impl App {
         if text.is_empty() {
             return;
         }
+        if text.starts_with('/') {
+            match commands::parse(&text) {
+                commands::Parsed::Local(cmd, arg) => {
+                    let arg = arg.to_string();
+                    self.input.clear();
+                    self.cursor = 0;
+                    self.run_local(cmd, &arg);
+                    return;
+                }
+                commands::Parsed::Unknown(word) => {
+                    self.status = format!("Unknown command {word}. /help lists the commands.");
+                    return;
+                }
+                commands::Parsed::Task => {}
+            }
+        }
         if self.running.is_some() {
             self.status = "Wait for the reply, or Esc to stop it.".into();
-            return;
-        }
-        if text == "/share" || text.starts_with("/share ") {
-            self.input.clear();
-            self.cursor = 0;
-            self.start_share(text.trim_start_matches("/share").trim());
-            return;
-        }
-        if text == "/bug" || text.starts_with("/bug ") {
-            self.input.clear();
-            self.cursor = 0;
-            self.start_bug(text.trim_start_matches("/bug").trim());
-            return;
-        }
-        if let Some(path) = text.strip_prefix("/attach ") {
-            let p = Path::new(path.trim());
-            let p = if p.is_absolute() {
-                p.to_path_buf()
-            } else {
-                self.cwd.join(p)
-            };
-            if p.is_file() {
-                self.status = format!("Attached {}.", p.display());
-                self.attachments.push(p);
-            } else {
-                self.status = format!("No file at {}.", p.display());
-            }
-            self.input.clear();
-            self.cursor = 0;
             return;
         }
         let mut files = std::mem::take(&mut self.attachments);
@@ -910,6 +962,7 @@ impl App {
                     reply: Some(reply),
                 });
             }
+            AppEvent::Status(line) => self.status = line,
             AppEvent::Shared(result) => {
                 self.modal = None;
                 self.status = match result {
@@ -1082,7 +1135,19 @@ impl App {
             }
         };
         self.modal = match modal {
-            Modal::Help => None,
+            Modal::Help { scroll } => match key.code {
+                KeyCode::Down | KeyCode::Char('j') => Some(Modal::Help { scroll: scroll + 1 }),
+                KeyCode::Up | KeyCode::Char('k') => Some(Modal::Help {
+                    scroll: scroll.saturating_sub(1),
+                }),
+                KeyCode::PageDown | KeyCode::Char(' ') => Some(Modal::Help {
+                    scroll: scroll + 10,
+                }),
+                KeyCode::PageUp => Some(Modal::Help {
+                    scroll: scroll.saturating_sub(10),
+                }),
+                _ => None,
+            },
             Modal::Share {
                 outgoing,
                 lines,
@@ -1459,6 +1524,173 @@ impl App {
 }
 
 impl App {
+    /// A command the terminal app handles itself.
+    fn run_local(&mut self, cmd: commands::Local, arg: &str) {
+        use commands::Local;
+        match cmd {
+            Local::Help => {
+                used(Feature::Help);
+                self.modal = Some(Modal::Help { scroll: 0 });
+            }
+            Local::Quit => {
+                if let Some(cancel) = &self.running {
+                    cancel.cancel();
+                }
+                self.quit = true;
+            }
+            Local::New => self.new_thread(),
+            Local::Resume => {
+                used(Feature::Threads);
+                self.open_threads();
+            }
+            Local::Model => {
+                used(Feature::Settings);
+                self.modal = Some(Modal::Settings { sel: 0 });
+            }
+            Local::Status => {
+                for line in self.status_lines() {
+                    self.entries.push(Entry::Note(line));
+                }
+                self.scroll = 0;
+            }
+            Local::Copy => {
+                let last = self.entries.iter().rev().find_map(|e| match e {
+                    Entry::Text(t) if !t.trim().is_empty() => Some(t.clone()),
+                    _ => None,
+                });
+                self.status = match last {
+                    Some(text) => {
+                        used(Feature::Copy);
+                        match copy_to_clipboard(&text) {
+                            Ok(()) => format!(
+                                "Copied the last reply ({} characters).",
+                                text.chars().count()
+                            ),
+                            Err(e) => format!("Couldn't copy: {e}"),
+                        }
+                    }
+                    None => "There's no reply to copy yet.".into(),
+                };
+            }
+            Local::Thinking => {
+                self.show_thoughts = !self.show_thoughts;
+                self.status = if self.show_thoughts {
+                    "Showing thinking.".into()
+                } else {
+                    "Hiding thinking.".into()
+                };
+            }
+            Local::Join => {
+                if env_says_off() {
+                    self.status =
+                        "PATHFINDER_TELEMETRY=off is set, so nothing is shared from here.".into();
+                    return;
+                }
+                let saved = crate::telemetry::Consent::load();
+                self.modal = Some(Modal::Consent {
+                    events: saved.events,
+                    threads: saved.threads,
+                    step: ConsentStep::Choose,
+                    error: None,
+                    busy: false,
+                });
+            }
+            Local::Data => {
+                let c = crate::telemetry::Consent::load();
+                let yes = |b: bool| if b { "yes" } else { "no" };
+                self.entries.push(Entry::Note(format!(
+                    "Joined: {} · usage events: {} · thread sharing: {}. /join changes it; `pathfinder data show` prints what's queued; `pathfinder data delete` erases what was sent.",
+                    yes(c.enrolled),
+                    yes(c.events),
+                    yes(c.threads)
+                )));
+                self.scroll = 0;
+            }
+            Local::Update => {
+                self.status = "Checking for a new version…".into();
+                let tx = self.tx.clone();
+                tokio::spawn(async move {
+                    let line = match crate::update::latest().await {
+                        Ok(r) if crate::update::newer(&r.version, env!("CARGO_PKG_VERSION")) => {
+                            format!(
+                                "Pathfinder {} is out: quit and run `pathfinder update`.",
+                                r.version
+                            )
+                        }
+                        Ok(_) => format!(
+                            "Pathfinder {} is the newest version.",
+                            env!("CARGO_PKG_VERSION")
+                        ),
+                        Err(e) => format!("Couldn't check for updates: {e}"),
+                    };
+                    let _ = tx.send(AppEvent::Status(line));
+                });
+            }
+            Local::Attach => self.attach(arg),
+            Local::Share => self.start_share(arg),
+            Local::Bug => self.start_bug(arg),
+        }
+    }
+
+    fn attach(&mut self, path: &str) {
+        if path.is_empty() {
+            self.status = "Say which file: /attach <file>, or drop it onto the window.".into();
+            return;
+        }
+        let p = Path::new(path);
+        let p = if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            self.cwd.join(p)
+        };
+        if p.is_file() {
+            self.status = format!("Attached {}.", p.display());
+            self.attachments.push(p);
+        } else {
+            self.status = format!("No file at {}.", p.display());
+        }
+    }
+
+    /// `/status`: what this Pathfinder is running with.
+    fn status_lines(&self) -> Vec<String> {
+        use crate::options;
+        let c = crate::telemetry::Consent::load();
+        let yes = |b: bool| if b { "yes" } else { "no" };
+        let gate = if self.current(options::DECISIONS) != "on" {
+            "off for this thread".to_string()
+        } else if c.enrolled {
+            "on (your own decision key if you have one, else the shared gate)".to_string()
+        } else {
+            "on if you have a decision key; join the beta (/join) for the shared gate".to_string()
+        };
+        vec![
+            format!(
+                "Pathfinder {} on {} {}",
+                env!("CARGO_PKG_VERSION"),
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            ),
+            format!(
+                "Models: fast {}, main {} · checks {}",
+                self.current(options::FAST_MODEL),
+                self.current(options::MAIN_MODEL),
+                self.current(options::CHECKS)
+            ),
+            format!("Gate: {gate}"),
+            format!(
+                "Joined: {} · usage events: {} · thread sharing: {}",
+                yes(c.enrolled),
+                yes(c.events),
+                yes(c.threads)
+            ),
+            format!(
+                "Settings: {} · log: {}",
+                crate::paths::config_dir().display(),
+                crate::bugreport::tui_log().display()
+            ),
+        ]
+    }
+
     /// `/share [note]`: shows exactly what would be sent; Enter sends it.
     fn start_share(&mut self, note: &str) {
         let consent = crate::telemetry::Consent::load();

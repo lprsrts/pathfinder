@@ -135,7 +135,29 @@ pathfinder ~/projects/thesis   # or: cd there && pathfinder
 
 The same Pathfinder as in Zed, in a full-screen terminal UI: the same threads, record, checks, exams and settings, so a thread started in one can't be told from one started in the other. The conversation streams on the left, with thinking folded into one line (Ctrl+T shows it) and each tool call on one line with its result; the side panel shows what the thread is doing (chat, quick check, exam, task), anything waiting for your answer, and the plan. `/why` and `/map` print their diagrams as indented trees.
 
-Enter sends, Alt+Enter (or Ctrl+J) adds a line, Esc stops a reply. Ctrl+N starts a thread, Ctrl+O reopens an earlier one in the same folder, Ctrl+P changes the models, decisions and checks, F1 lists the keys. Attach a PDF or image with `/attach <file>`, or drop the file onto the terminal: a path in your message that names an image or PDF is attached. During agent work the TUI asks before each command (once, always for that program, or no). Logs go to `tui.log` (`pathfinder paths` shows where; it keeps one older copy).
+Enter sends, Alt+Enter (or Ctrl+J) adds a line, Esc stops a reply. The input edits like a shell: Ctrl+A and Home/End, Ctrl+U and Ctrl+K delete to the start and end of the line, Ctrl+W deletes a word, Ctrl+←/→ move by a word. Ctrl+N starts a thread, Ctrl+O reopens an earlier one in the same folder, Ctrl+P changes the models, decisions and checks, F1 lists the keys. Attach a PDF or image with `/attach <file>`, or drop the file onto the terminal: a path in your message that names an image or PDF is attached. During agent work the TUI asks before each command (once, always for that program, or no). Logs go to `tui.log` (`pathfinder paths` shows where; it keeps one older copy).
+
+### Terminal commands
+
+Typing `/` shows the commands that match, and Tab completes one. `/help` lists them all with the keys.
+
+| Command | What it does |
+|---|---|
+| `/help`, `/?` | These commands and the keys |
+| `/quit`, `/exit`, `/q` | Quit; the conversation stays in your terminal |
+| `/new`, `/clear` | Start a new thread |
+| `/resume`, `/threads` | Open an earlier thread in this folder |
+| `/model`, `/models`, `/settings` | Models, decisions, checks |
+| `/status`, `/version` | Version, models, gate, what you share |
+| `/copy` | Copy the last reply |
+| `/thinking` | Show or hide thinking |
+| `/join` | Join the beta, or change what you share |
+| `/data` | What you share, and how to change it |
+| `/update` | Check for a new version |
+| `/attach <file>` | Attach a PDF or image |
+| `/share [note]`, `/bug [what happened]` | Send this thread or a bug report, shown in full first |
+
+The task commands (`/why`, `/map`, `/handoff` and the rest) work the same as in Zed; see [Slash commands in Zed](#slash-commands-in-zed). An unknown command says so instead of being sent to the model.
 
 ## Just asking
 

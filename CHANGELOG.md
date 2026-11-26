@@ -2,6 +2,12 @@
 
 What changed in each release of Pathfinder, newest first. `pathfinder update` shows the newest section.
 
+## 0.3.2
+
+- **The commands you'd expect.** `/quit` (or `/exit`, `/q`), `/help`, `/new` (or `/clear`), `/resume`, `/model`, `/status`, `/copy`, `/thinking`, `/join`, `/data` and `/update`. Typing `/` shows the commands that match; Tab completes. An unknown command says so instead of going to the model.
+- **The input edits like a shell:** Ctrl+A, Ctrl+U, Ctrl+K, Ctrl+W, Alt+Backspace, and Ctrl+←/→ to move by a word. Ctrl+letters without a meaning no longer type the letter.
+- `/help` shows every key and command, and scrolls.
+
 ## 0.3.1
 
 - **Updates stay consistent while caches catch up.** Each release now has its own signed manifest that never changes, and `pathfinder update` checks that one, so a cache that hasn't caught up can only offer an older release, not a broken one.
