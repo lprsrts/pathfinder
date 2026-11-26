@@ -1,67 +1,157 @@
-//! The HTTP API. Everything under `/v1` except enrolment needs an install
-//! token (`Authorization: Bearer …`).
+//! The HTTP API. Everything under `/v1` except signing in needs an install
+//! token (`Authorization: Bearer …`), checked before the body is read.
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use axum::Json;
-use axum::Router;
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Form, Query, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::extract::{DefaultBodyLimit, Extension, Form, Query, Request, State};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
+use axum::{Json, Router};
 use pathfinder_schema::{
-    Batch, Consent, Enroll, Enrolled, LinkPoll, LinkStart, LinkStarted, NOTICE_VERSION,
-    SharedThread,
+    BugReport, Consent, Enroll, Enrolled, Envelope, LinkPoll, LinkStart, LinkStarted,
+    NOTICE_VERSION, SharedThread,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use tokio::sync::Semaphore;
 use tower_http::services::ServeDir;
 
 use crate::access::Access;
-use crate::db::{Db, Install, LINK_SECS, LinkState};
+use crate::db::{Db, GateCheck, Install, LINK_SECS, LinkState};
+use crate::limit::{RateLimiter, client_addr};
 
 /// Most events one upload may carry.
 const MAX_BATCH: usize = 1_000;
 
-pub struct AppState {
-    pub db: Db,
+/// Body limits: the default, then per route.
+const BODY_DEFAULT: usize = 64 << 10;
+const BODY_EVENTS: usize = 2 << 20;
+const BODY_THREAD: usize = 8 << 20;
+const BODY_GATE: usize = 128 << 10;
+const BODY_REPORT: usize = 256 << 10;
+
+/// Requests handled at once; past it, 503 with Retry-After.
+const MAX_IN_FLIGHT: usize = 64;
+/// Gate checks forwarded at once.
+const MAX_GATE_IN_FLIGHT: usize = 16;
+
+/// Requests per address per minute on the endpoints anyone can reach.
+const PER_MINUTE_ENROLL: u32 = 10;
+const PER_MINUTE_LINK: u32 = 10;
+/// A waiting app checks every 2 seconds.
+const PER_MINUTE_POLL: u32 = 60;
+const PER_MINUTE_JOIN: u32 = 30;
+
+/// A gate request: a Jev question set about one piece of text.
+const GATE_MAX_STATE: usize = 100 << 10;
+const GATE_MAX_QUESTIONS: usize = 8;
+const GATE_MAX_QUESTION: usize = 4 << 10;
+
+pub struct Settings {
     /// TypeSafe's key; without it the gate proxy answers 503.
     pub typesafe_key: Option<String>,
     pub typesafe_base: String,
-    /// Gate checks per install per day.
+    /// The only model the gate proxy forwards to.
+    pub gate_model: String,
+    /// Gate checks per person per day, across all their installs.
     pub gate_cap: u32,
-    pub http: reqwest::Client,
+    /// Gate checks per day for everyone together.
+    pub gate_global_cap: u32,
+    /// How long to wait for TypeSafe; below the app's own 10 s.
+    pub gate_timeout: Duration,
+    /// This service's public address, for the sign-in form's origin check.
+    pub public_url: String,
+    /// Who runs this collector, as people know them ("Ask … to add you").
+    pub operator: String,
     /// `install.sh`, `privacy`, `releases/…`.
     pub public_dir: PathBuf,
+}
+
+pub struct AppState {
+    pub db: Arc<Db>,
+    pub settings: Settings,
+    pub http: reqwest::Client,
     /// Who is signed in on `/join`; without it, browser sign-in is off.
     pub access: Option<Access>,
+    pub limiter: RateLimiter,
+    in_flight: Semaphore,
+    gate_in_flight: Semaphore,
+}
+
+impl AppState {
+    pub fn new(db: Db, settings: Settings, http: reqwest::Client, access: Option<Access>) -> Self {
+        Self {
+            db: Arc::new(db),
+            settings,
+            http,
+            access,
+            limiter: RateLimiter::default(),
+            in_flight: Semaphore::new(MAX_IN_FLIGHT),
+            gate_in_flight: Semaphore::new(MAX_GATE_IN_FLIGHT),
+        }
+    }
+
+    /// Runs a database call off the async workers.
+    async fn db<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&Db) -> anyhow::Result<T> + Send + 'static,
+    ) -> anyhow::Result<T> {
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || f(&db)).await?
+    }
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
-    let public = ServeDir::new(&state.public_dir).append_index_html_on_directories(true);
-    Router::new()
-        .route("/healthz", get(|| async { "ok" }))
-        .route("/v1/enroll", post(enroll))
+    let public = ServeDir::new(&state.settings.public_dir).append_index_html_on_directories(true);
+    let authed = Router::new()
         .route(
             "/v1/events",
-            post(events).layer(DefaultBodyLimit::max(2 << 20)),
+            post(events).layer(DefaultBodyLimit::max(BODY_EVENTS)),
         )
-        .route("/v1/link", post(link_start))
-        .route("/v1/link/poll", post(link_poll))
-        .route("/join", get(join_page).post(join_approve))
         .route("/v1/consent", put(consent))
-        .route("/v1/me", delete(erase))
         .route(
             "/v1/threads",
-            post(threads).layer(DefaultBodyLimit::max(8 << 20)),
+            post(threads).layer(DefaultBodyLimit::max(BODY_THREAD)),
+        )
+        .route(
+            "/v1/reports",
+            post(reports).layer(DefaultBodyLimit::max(BODY_REPORT)),
         )
         .route(
             "/v1/typesafe/systemone",
-            post(gate_proxy).layer(DefaultBodyLimit::max(1 << 20)),
+            post(gate_proxy).layer(DefaultBodyLimit::max(BODY_GATE)),
         )
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_install,
+        ));
+    let erasure =
+        Router::new()
+            .route("/v1/me", delete(erase))
+            .route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_install_even_stopped,
+            ));
+    Router::new()
+        .route("/healthz", get(healthz))
+        .route("/v1/version", get(version))
+        .route("/v1/enroll", post(enroll))
+        .route("/v1/link", post(link_start))
+        .route("/v1/link/poll", post(link_poll))
+        .route("/join", get(join_page).post(join_approve))
+        .merge(authed)
+        .merge(erasure)
         .fallback_service(public)
-        .layer(DefaultBodyLimit::max(64 << 10))
+        .layer(middleware::from_fn_with_state(state.clone(), count_fetches))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            limit_in_flight,
+        ))
+        .layer(DefaultBodyLimit::max(BODY_DEFAULT))
         .with_state(state)
 }
 
@@ -69,86 +159,228 @@ fn err(status: StatusCode, msg: &str) -> Response {
     (status, Json(serde_json::json!({ "error": msg }))).into_response()
 }
 
-/// The install behind the bearer token: 401 if unknown, 410 if stopped.
-fn authed(state: &AppState, headers: &HeaderMap) -> Result<Install, Response> {
-    let token = headers
-        .get(header::AUTHORIZATION)
+fn internal(e: anyhow::Error) -> Response {
+    tracing::error!("{e:#}");
+    err(StatusCode::INTERNAL_SERVER_ERROR, "database error")
+}
+
+fn busy(retry_after_secs: u32) -> Response {
+    let mut res = err(StatusCode::SERVICE_UNAVAILABLE, "busy; try again shortly");
+    res.headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from(retry_after_secs));
+    res
+}
+
+fn too_many() -> Response {
+    let mut res = err(
+        StatusCode::TOO_MANY_REQUESTS,
+        "too many requests; slow down",
+    );
+    res.headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from(60u32));
+    res
+}
+
+async fn limit_in_flight(State(state): State<Arc<AppState>>, req: Request, next: Next) -> Response {
+    let Ok(_permit) = state.in_flight.try_acquire() else {
+        return busy(2);
+    };
+    next.run(req).await
+}
+
+/// Counts downloads of the installer and releases by app version (from the
+/// user agent), so adoption shows without any install id.
+async fn count_fetches(State(state): State<Arc<AppState>>, req: Request, next: Next) -> Response {
+    let path = req.uri().path();
+    let what = match path {
+        "/install.sh" => Some("install.sh"),
+        "/releases/latest.json" => Some("latest.json"),
+        p if p.starts_with("/releases/") && p.ends_with(".tar.gz") => Some("release"),
+        _ => None,
+    };
+    let version = req
+        .headers()
+        .get(header::USER_AGENT)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "no token"))?;
-    match state.db.install_for(token.trim()) {
-        Ok(Some((_, true))) => Err(err(
-            StatusCode::GONE,
-            "collection from this install has stopped",
-        )),
-        Ok(Some((install, false))) => Ok(install),
-        Ok(None) => Err(err(StatusCode::UNAUTHORIZED, "unknown token")),
+        .and_then(|ua| ua.strip_prefix("pathfinder/"))
+        .filter(|v| {
+            v.len() <= 16
+                && v.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+        })
+        .unwrap_or("other")
+        .to_string();
+    let res = next.run(req).await;
+    if let Some(what) = what
+        && res.status().is_success()
+        && let Err(e) = state.db(move |db| db.count_fetch(what, &version)).await
+    {
+        tracing::warn!("counting a download: {e:#}");
+    }
+    res
+}
+
+async fn healthz(State(state): State<Arc<AppState>>) -> Response {
+    match state.db(|db| db.gate_enabled().map(|_| ())).await {
+        Ok(()) => "ok".into_response(),
         Err(e) => {
-            tracing::error!("looking up a token: {e:#}");
-            Err(err(StatusCode::INTERNAL_SERVER_ERROR, "database error"))
+            tracing::error!("health check: {e:#}");
+            err(StatusCode::SERVICE_UNAVAILABLE, "database unavailable")
         }
     }
 }
 
-fn internal(e: anyhow::Error) -> Response {
-    tracing::error!("{e:#}");
-    err(StatusCode::INTERNAL_SERVER_ERROR, "database error")
+/// What this collector accepts and where its source is (AGPL §13).
+async fn version() -> Response {
+    Json(serde_json::json!({
+        "schema": pathfinder_schema::VERSION,
+        "notice": NOTICE_VERSION,
+        "commit": std::env::var("COLLECTOR_COMMIT").unwrap_or_else(|_| "unknown".into()),
+        "source": env!("CARGO_PKG_REPOSITORY"),
+    }))
+    .into_response()
+}
+
+fn bearer(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|t| t.trim().to_string())
+}
+
+/// The install behind the bearer token, before the body is read: 401 if
+/// unknown, 410 if stopped (unless `even_stopped`).
+async fn install_from(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    even_stopped: bool,
+) -> Result<Install, Box<Response>> {
+    let token =
+        bearer(headers).ok_or_else(|| Box::new(err(StatusCode::UNAUTHORIZED, "no token")))?;
+    match state.db(move |db| db.install_for(&token)).await {
+        Ok(Some((install, stopped))) if even_stopped || !stopped => Ok(install),
+        Ok(Some(_)) => Err(Box::new(err(
+            StatusCode::GONE,
+            "collection from this install has stopped",
+        ))),
+        Ok(None) => Err(Box::new(err(StatusCode::UNAUTHORIZED, "unknown token"))),
+        Err(e) => Err(Box::new(internal(e))),
+    }
+}
+
+async fn require_install(
+    State(state): State<Arc<AppState>>,
+    mut req: Request,
+    next: Next,
+) -> Response {
+    match install_from(&state, req.headers(), false).await {
+        Ok(install) => {
+            req.extensions_mut().insert(install);
+            next.run(req).await
+        }
+        Err(res) => *res,
+    }
+}
+
+async fn require_install_even_stopped(
+    State(state): State<Arc<AppState>>,
+    mut req: Request,
+    next: Next,
+) -> Response {
+    match install_from(&state, req.headers(), true).await {
+        Ok(install) => {
+            req.extensions_mut().insert(install);
+            next.run(req).await
+        }
+        Err(res) => *res,
+    }
 }
 
 fn is_install_id(s: &str) -> bool {
     s.len() == 36 && s.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
 }
 
-async fn enroll(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
+async fn enroll(State(state): State<Arc<AppState>>, headers: HeaderMap, body: Bytes) -> Response {
+    if !state
+        .limiter
+        .allow(&client_addr(&headers), "enroll", PER_MINUTE_ENROLL)
+    {
+        return too_many();
+    }
     let Ok(req) = serde_json::from_slice::<Enroll>(&body) else {
         return err(StatusCode::BAD_REQUEST, "bad enrolment");
     };
     if !is_install_id(&req.install) || req.invite.len() > 64 || req.notice > NOTICE_VERSION {
         return err(StatusCode::BAD_REQUEST, "bad enrolment");
     }
-    match state.db.enroll(
-        req.invite.trim(),
-        &req.install,
-        req.notice,
-        req.events,
-        req.threads,
-    ) {
+    match state
+        .db(move |db| {
+            db.enroll(
+                req.invite.trim(),
+                &req.install,
+                req.notice,
+                req.events,
+                req.threads,
+            )
+        })
+        .await
+    {
         Ok(Some(token)) => Json(Enrolled { token }).into_response(),
         Ok(None) => err(StatusCode::FORBIDDEN, "unknown or used invite code"),
         Err(e) => internal(e),
     }
 }
 
-async fn events(State(state): State<Arc<AppState>>, headers: HeaderMap, body: Bytes) -> Response {
-    let install = match authed(&state, &headers) {
-        Ok(i) => i,
-        Err(r) => return r,
-    };
+/// Stores the valid events of a batch and names the ids it refused, so one
+/// event an older collector doesn't know never costs the rest.
+async fn events(
+    State(state): State<Arc<AppState>>,
+    Extension(install): Extension<Install>,
+    body: Bytes,
+) -> Response {
     // Consent withdrawn here (or never given): tell the app to stop.
     if !install.events {
         return err(StatusCode::GONE, "usage events are off for this install");
     }
-    let batch: Batch = match serde_json::from_slice(&body) {
+    #[derive(Deserialize)]
+    struct RawBatch {
+        events: Vec<serde_json::Value>,
+    }
+    let batch: RawBatch = match serde_json::from_slice(&body) {
         Ok(b) => b,
         Err(e) => return err(StatusCode::BAD_REQUEST, &format!("bad batch: {e}")),
     };
     if batch.events.len() > MAX_BATCH {
         return err(StatusCode::PAYLOAD_TOO_LARGE, "too many events");
     }
-    if let Some(bad) = batch.events.iter().find_map(|e| e.validate().err()) {
-        return err(StatusCode::BAD_REQUEST, &bad.to_string());
+    let mut valid = Vec::new();
+    let mut rejected = Vec::new();
+    for raw in batch.events {
+        let id = raw["id"].as_str().unwrap_or("").to_string();
+        match serde_json::from_value::<Envelope>(raw) {
+            Ok(e) if e.validate().is_ok() => valid.push(e),
+            _ => rejected.push(id),
+        }
     }
-    match state.db.add_events(&install.install, &batch.events) {
-        Ok(n) => Json(serde_json::json!({ "stored": n })).into_response(),
+    if !rejected.is_empty() {
+        tracing::warn!(
+            "refused {} event(s) this collector doesn't know",
+            rejected.len()
+        );
+    }
+    let id = install.install.clone();
+    match state.db(move |db| db.add_events(&id, &valid)).await {
+        Ok(n) => Json(serde_json::json!({ "stored": n, "rejected": rejected })).into_response(),
         Err(e) => internal(e),
     }
 }
 
-async fn consent(State(state): State<Arc<AppState>>, headers: HeaderMap, body: Bytes) -> Response {
-    let install = match authed(&state, &headers) {
-        Ok(i) => i,
-        Err(r) => return r,
-    };
+async fn consent(
+    State(state): State<Arc<AppState>>,
+    Extension(install): Extension<Install>,
+    body: Bytes,
+) -> Response {
     let Ok(c) = serde_json::from_slice::<Consent>(&body) else {
         return err(StatusCode::BAD_REQUEST, "bad consent");
     };
@@ -156,32 +388,19 @@ async fn consent(State(state): State<Arc<AppState>>, headers: HeaderMap, body: B
         return err(StatusCode::BAD_REQUEST, "unknown notice");
     }
     match state
-        .db
-        .set_consent(&install.install, c.notice, c.events, c.threads)
+        .db(move |db| db.set_consent(&install.install, c.notice, c.events, c.threads))
+        .await
     {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => internal(e),
     }
 }
 
-async fn erase(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    let install = match authed(&state, &headers) {
-        Ok(i) => i,
-        // A stopped install may still ask for erasure.
-        Err(r) if r.status() == StatusCode::GONE => {
-            let token = headers
-                .get(header::AUTHORIZATION)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.strip_prefix("Bearer "))
-                .unwrap_or("");
-            match state.db.install_for(token.trim()) {
-                Ok(Some((i, _))) => i,
-                _ => return r,
-            }
-        }
-        Err(r) => return r,
-    };
-    match state.db.erase(&install.install) {
+async fn erase(
+    State(state): State<Arc<AppState>>,
+    Extension(install): Extension<Install>,
+) -> Response {
+    match state.db(move |db| db.erase(&install.install)).await {
         Ok(()) => {
             tracing::info!("erased an install on request");
             StatusCode::NO_CONTENT.into_response()
@@ -190,11 +409,11 @@ async fn erase(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respon
     }
 }
 
-async fn threads(State(state): State<Arc<AppState>>, headers: HeaderMap, body: Bytes) -> Response {
-    let install = match authed(&state, &headers) {
-        Ok(i) => i,
-        Err(r) => return r,
-    };
+async fn threads(
+    State(state): State<Arc<AppState>>,
+    Extension(install): Extension<Install>,
+    body: Bytes,
+) -> Response {
     if !install.threads {
         return err(
             StatusCode::FORBIDDEN,
@@ -208,62 +427,180 @@ async fn threads(State(state): State<Arc<AppState>>, headers: HeaderMap, body: B
     if !is_install_id(&thread.id) || thread.note.len() > 2_000 {
         return err(StatusCode::BAD_REQUEST, "bad thread");
     }
-    match state.db.add_thread(&install.install, &thread) {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+    match state
+        .db(move |db| db.add_thread(&install.install, &thread))
+        .await
+    {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => err(
+            StatusCode::INSUFFICIENT_STORAGE,
+            "this install has shared the most threads it can; delete some with `pathfinder data delete`",
+        ),
         Err(e) => internal(e),
     }
 }
 
-/// Forwards a gate check to TypeSafe with the collector's key, within the
-/// install's daily cap. Nothing of the request is stored, only the count.
-async fn gate_proxy(
+/// A bug report needs no data consent: sending it, after seeing it in
+/// full, is the consent.
+async fn reports(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    Extension(install): Extension<Install>,
     body: Bytes,
 ) -> Response {
-    let install = match authed(&state, &headers) {
-        Ok(i) => i,
-        Err(r) => return r,
+    let report: BugReport = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => return err(StatusCode::BAD_REQUEST, &format!("bad report: {e}")),
     };
-    let Some(key) = &state.typesafe_key else {
+    if !is_install_id(&report.id)
+        || report.note.len() > BugReport::MAX_NOTE
+        || report.details.len() > BugReport::MAX_DETAILS
+    {
+        return err(StatusCode::BAD_REQUEST, "bad report");
+    }
+    match state
+        .db(move |db| db.add_report(&install.install, &report))
+        .await
+    {
+        Ok(true) => {
+            tracing::info!("a bug report arrived");
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(false) => err(
+            StatusCode::INSUFFICIENT_STORAGE,
+            "too many reports from this install",
+        ),
+        Err(e) => internal(e),
+    }
+}
+
+/// What the gate proxy forwards: exactly a Jev request, nothing else.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GateRequest {
+    model: String,
+    state: String,
+    /// Questions by name.
+    questions: serde_json::Map<String, serde_json::Value>,
+}
+
+impl GateRequest {
+    fn check(&self, model: &str) -> Result<(), &'static str> {
+        if self.model != model {
+            return Err("unsupported model");
+        }
+        if self.state.len() > GATE_MAX_STATE {
+            return Err("text too long");
+        }
+        if self.questions.is_empty() || self.questions.len() > GATE_MAX_QUESTIONS {
+            return Err("bad number of questions");
+        }
+        if self.questions.iter().any(|(name, q)| {
+            name.len() > 64 || !q.is_object() || q.to_string().len() > GATE_MAX_QUESTION
+        }) {
+            return Err("bad question");
+        }
+        Ok(())
+    }
+}
+
+/// Forwards a gate check to TypeSafe with the collector's key, within the
+/// person's and everyone's daily budget. Nothing of the request is stored
+/// or logged, only counts.
+async fn gate_proxy(
+    State(state): State<Arc<AppState>>,
+    Extension(install): Extension<Install>,
+    body: Bytes,
+) -> Response {
+    let s = &state.settings;
+    let Some(key) = s.typesafe_key.clone() else {
         return err(
             StatusCode::SERVICE_UNAVAILABLE,
             "the gate service isn't set up",
         );
     };
-    match state.db.count_gate_use(&install.install, state.gate_cap) {
-        Ok(true) => {}
-        Ok(false) => {
+    let req: GateRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(_) => return err(StatusCode::BAD_REQUEST, "not a gate request"),
+    };
+    if let Err(why) = req.check(&s.gate_model) {
+        return err(StatusCode::BAD_REQUEST, why);
+    }
+    let (per_person, global) = (s.gate_cap, s.gate_global_cap);
+    let id = install.install.clone();
+    match state
+        .db(move |db| db.gate_check(&id, per_person, global))
+        .await
+    {
+        Ok(GateCheck::Allowed) => {}
+        Ok(GateCheck::Off) => {
+            return err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the shared gate is paused; your own TypeSafe key still works",
+            );
+        }
+        Ok(GateCheck::PersonCapped) => {
             return err(
                 StatusCode::TOO_MANY_REQUESTS,
                 "today's gate checks are used up; it resets at midnight UTC",
             );
         }
+        Ok(GateCheck::GlobalCapped) => {
+            tracing::warn!("the shared gate reached its daily budget ({global})");
+            return err(
+                StatusCode::TOO_MANY_REQUESTS,
+                "today's shared gate checks are used up; it resets at midnight UTC",
+            );
+        }
         Err(e) => return internal(e),
     }
+    if let Ok(today) = state.db(|db| db.gate_today()).await
+        && (today == global / 2 || today == global * 8 / 10)
+    {
+        tracing::warn!("the shared gate has used {today} of its {global} daily checks");
+    }
+    let Ok(_permit) = state.gate_in_flight.try_acquire() else {
+        return busy(1);
+    };
+    let started = Instant::now();
     let res = state
         .http
-        .post(format!("{}/systemone", state.typesafe_base))
+        .post(format!("{}/systemone", s.typesafe_base))
         .bearer_auth(key)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(body)
+        .timeout(s.gate_timeout)
+        .json(&req)
         .send()
         .await;
+    let ms = started.elapsed().as_millis();
     match res {
         Ok(r) => {
             let status =
                 StatusCode::from_u16(r.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+            tracing::info!(status = status.as_u16(), ms, "gate check");
+            if !status.is_success() {
+                state.db(|db| db.gate_upstream_error()).await.ok();
+            }
             let bytes = r.bytes().await.unwrap_or_default();
             (status, [(header::CONTENT_TYPE, "application/json")], bytes).into_response()
         }
         Err(e) => {
-            tracing::warn!("forwarding a gate check: {e}");
+            tracing::warn!(ms, "forwarding a gate check: {e}");
+            state.db(|db| db.gate_upstream_error()).await.ok();
             err(StatusCode::BAD_GATEWAY, "the gate service didn't answer")
         }
     }
 }
 
-async fn link_start(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
+async fn link_start(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if !state
+        .limiter
+        .allow(&client_addr(&headers), "link", PER_MINUTE_LINK)
+    {
+        return too_many();
+    }
     let Ok(req) = serde_json::from_slice::<LinkStart>(&body) else {
         return err(StatusCode::BAD_REQUEST, "bad sign-in request");
     };
@@ -277,8 +614,8 @@ async fn link_start(State(state): State<Arc<AppState>>, body: Bytes) -> Response
         );
     }
     match state
-        .db
-        .start_link(&req.install, req.notice, req.events, req.threads)
+        .db(move |db| db.start_link(&req.install, req.notice, req.events, req.threads))
+        .await
     {
         Ok(Some((code, secret))) => Json(LinkStarted {
             code,
@@ -286,19 +623,26 @@ async fn link_start(State(state): State<Arc<AppState>>, body: Bytes) -> Response
             expires_in: LINK_SECS as u64,
         })
         .into_response(),
-        Ok(None) => err(
-            StatusCode::TOO_MANY_REQUESTS,
-            "too many sign-ins at once; try again in a few minutes",
-        ),
+        Ok(None) => busy(60),
         Err(e) => internal(e),
     }
 }
 
-async fn link_poll(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
+async fn link_poll(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if !state
+        .limiter
+        .allow(&client_addr(&headers), "poll", PER_MINUTE_POLL)
+    {
+        return too_many();
+    }
     let Ok(req) = serde_json::from_slice::<LinkPoll>(&body) else {
         return err(StatusCode::BAD_REQUEST, "bad poll");
     };
-    match state.db.poll_link(req.secret.trim()) {
+    match state.db(move |db| db.poll_link(req.secret.trim())).await {
         Ok(LinkState::Waiting) => (
             StatusCode::ACCEPTED,
             Json(serde_json::json!({ "status": "waiting" })),
@@ -325,13 +669,25 @@ enum Join {
     },
 }
 
-async fn join_check(state: &AppState, headers: &HeaderMap, code: &str) -> Join {
+async fn join_check(state: &Arc<AppState>, headers: &HeaderMap, code: &str) -> Join {
+    let operator = esc(&state.settings.operator);
+    if !state
+        .limiter
+        .allow(&client_addr(headers), "join", PER_MINUTE_JOIN)
+    {
+        return Join::Page(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many tries",
+            "<p>Wait a minute, then reload this page.</p>".into(),
+        );
+    }
     let Some(access) = &state.access else {
         return Join::Page(
             StatusCode::SERVICE_UNAVAILABLE,
             "Not available",
-            "<p>Signing in with the browser isn’t set up yet. Ask Alper for an invite code.</p>"
-                .into(),
+            format!(
+                "<p>Signing in with the browser isn’t set up yet. Ask {operator} for an invite code.</p>"
+            ),
         );
     };
     let email = match access.email(headers).await {
@@ -347,7 +703,8 @@ async fn join_check(state: &AppState, headers: &HeaderMap, code: &str) -> Join {
         }
     };
     let you = format!("<p class=\"meta\">Signed in as {}</p>", esc(&email));
-    match state.db.is_allowed(&email) {
+    let checked = email.clone();
+    match state.db(move |db| db.is_allowed(&checked)).await {
         Ok(true) => {}
         Ok(false) => {
             tracing::info!("a sign-in from an address that isn't on the list");
@@ -356,7 +713,7 @@ async fn join_check(state: &AppState, headers: &HeaderMap, code: &str) -> Join {
                 "Not on the list yet",
                 format!(
                     "{you}<p>Pathfinder is invite-only for now, and this address isn’t on the list. \
-                     Ask Alper to add it, then reload this page.</p>"
+                     Ask {operator} to add it, then reload this page.</p>"
                 ),
             );
         }
@@ -374,19 +731,22 @@ async fn join_check(state: &AppState, headers: &HeaderMap, code: &str) -> Join {
             StatusCode::OK,
             "Start from Pathfinder",
             format!(
-                "{you}<p>You’re on the list. Now run <code>harness tui</code> in a terminal: \
+                "{you}<p>You’re on the list. Now run <code>pathfinder</code> in a terminal: \
                  it opens this page again with a code to link your computer.</p>\
-                 <p>Not installed yet? <code>curl -fsSL https://pathfinder.lprsrts.com/install.sh | sh</code></p>"
+                 <p>Not installed yet? <code>curl -fsSL {base}/install.sh | sh</code></p>",
+                base = esc(&state.settings.public_url),
             ),
         );
     }
-    match state.db.link(code) {
+    let code = code.to_string();
+    match state.db(move |db| db.link(&code)).await {
         Ok(Some(link)) => Join::Ready { email, link },
         Ok(None) => Join::Page(
             StatusCode::GONE,
             "This code has expired",
             format!(
-                "{you}<p>Codes last 15 minutes. Start again in Pathfinder and it opens a new one.</p>"
+                "{you}<p>Codes last {} minutes. Start again in Pathfinder and it opens a new one.</p>",
+                LINK_SECS / 60
             ),
         ),
         Err(e) => {
@@ -418,7 +778,7 @@ async fn join_page(
          <table><tr><td>Usage events</td><td>{events}</td></tr>\
          <tr><td>Sharing threads you choose</td><td>{threads}</td></tr></table>\
          <p class=\"meta\">You chose these in Pathfinder, and can change them there any time \
-         (<code>harness data</code>). Linking also turns on the shared gate. \
+         (<code>pathfinder data</code>). Linking also turns on the shared gate. \
          <a href=\"/privacy/\">Privacy notice</a></p>\
          <form method=\"post\" action=\"/join\"><input type=\"hidden\" name=\"code\" value=\"{code}\">\
          <button type=\"submit\">Link this computer</button></form>",
@@ -435,11 +795,24 @@ async fn join_approve(
     headers: HeaderMap,
     Form(form): Form<JoinForm>,
 ) -> Response {
+    // The form only counts when posted from this service's own page.
+    let origin = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok());
+    if origin != Some(state.settings.public_url.as_str()) {
+        tracing::warn!("a sign-in form posted from another origin");
+        return page(
+            StatusCode::FORBIDDEN,
+            "Start again",
+            "<p>That form didn’t come from this page. Start again in Pathfinder.</p>",
+        );
+    }
     let (email, link) = match join_check(&state, &headers, &form.code).await {
         Join::Page(status, title, body) => return page(status, title, &body),
         Join::Ready { email, link } => (email, link),
     };
-    match state.db.approve_link(&link.code, &email) {
+    match state
+        .db(move |db| db.approve_link(&link.code, &email))
+        .await
+    {
         Ok(true) => page(
             StatusCode::OK,
             "Linked",

@@ -14,8 +14,33 @@ pub const RETENTION_DAYS: i64 = 365;
 /// How long a browser sign-in may take.
 pub const LINK_SECS: i64 = 15 * 60;
 
-/// Most sign-ins waiting at once (they come from unauthenticated requests).
-const MAX_PENDING_LINKS: i64 = 200;
+/// Most sign-ins waiting at once (they come from unauthenticated requests;
+/// each install has at most one, and each address a few per minute).
+const MAX_PENDING_LINKS: i64 = 2_000;
+
+/// Most threads one install may share.
+pub const MAX_THREADS_PER_INSTALL: i64 = 50;
+
+/// Most bug reports one install may send.
+pub const MAX_REPORTS_PER_INSTALL: i64 = 100;
+
+/// One day of gate use: date, forwarded, capped, upstream errors.
+pub type GateDay = (String, u32, u32, u32);
+
+/// Gate use per day, then today's use per person.
+pub type GateStats = (Vec<GateDay>, Vec<(String, u32)>);
+
+/// What the gate proxy may do with one request.
+#[derive(Debug, PartialEq)]
+pub enum GateCheck {
+    Allowed,
+    /// The operator switched the shared gate off.
+    Off,
+    /// This person's checks for today are used up.
+    PersonCapped,
+    /// All checks for today are used up.
+    GlobalCapped,
+}
 
 /// A browser sign-in waiting for its person.
 #[derive(Debug, Clone, PartialEq)]
@@ -153,6 +178,30 @@ impl Db {
                  created_at INTEGER NOT NULL,
                  email TEXT
              );
+             CREATE TABLE IF NOT EXISTS reports (
+                 id TEXT NOT NULL,
+                 install TEXT NOT NULL REFERENCES installs(install) ON DELETE CASCADE,
+                 json TEXT NOT NULL,
+                 received_at INTEGER NOT NULL,
+                 PRIMARY KEY (install, id)
+             );
+             CREATE TABLE IF NOT EXISTS settings (
+                 key TEXT PRIMARY KEY,
+                 value TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS gate_daily (
+                 day TEXT PRIMARY KEY,
+                 forwarded INTEGER NOT NULL DEFAULT 0,
+                 capped INTEGER NOT NULL DEFAULT 0,
+                 upstream_errors INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE IF NOT EXISTS fetches (
+                 day TEXT NOT NULL,
+                 what TEXT NOT NULL,
+                 version TEXT NOT NULL,
+                 count INTEGER NOT NULL,
+                 PRIMARY KEY (day, what, version)
+             );
              CREATE TABLE IF NOT EXISTS gate_use (
                  install TEXT NOT NULL REFERENCES installs(install) ON DELETE CASCADE,
                  day TEXT NOT NULL,
@@ -165,7 +214,7 @@ impl Db {
 
     /// A new single-use invite for `label` (who it's for; only you see it).
     pub fn new_invite(&self, label: &str) -> Result<String> {
-        let code = random_hex(6);
+        let code = random_hex(16);
         self.0.lock().unwrap().execute(
             "INSERT INTO invites (code, label, created_at) VALUES (?1, ?2, ?3)",
             params![code, label, now()],
@@ -196,6 +245,9 @@ impl Db {
         let Some(label) = label else {
             return Ok(None);
         };
+        if held_by_other(&tx, install, &label)? {
+            return Ok(None);
+        }
         let token = random_hex(32);
         let t = now();
         tx.execute(
@@ -270,6 +322,8 @@ impl Db {
             "DELETE FROM links WHERE created_at < ?1",
             params![now() - LINK_SECS],
         )?;
+        // A new sign-in replaces this install's earlier one.
+        conn.execute("DELETE FROM links WHERE install = ?1", params![install])?;
         let pending: i64 = conn.query_row("SELECT COUNT(*) FROM links", [], |r| r.get(0))?;
         if pending >= MAX_PENDING_LINKS {
             return Ok(None);
@@ -350,6 +404,11 @@ impl Db {
                 LinkState::Waiting
             });
         };
+        if held_by_other(&tx, &install, &email)? {
+            tx.execute("DELETE FROM links WHERE code = ?1", params![code])?;
+            tx.commit()?;
+            return Ok(LinkState::Gone);
+        }
         let token = random_hex(32);
         let t = now();
         tx.execute(
@@ -437,16 +496,27 @@ impl Db {
         Ok(added)
     }
 
+    /// Stores a shared thread. False when the install already shared
+    /// [`MAX_THREADS_PER_INSTALL`] (sharing the same thread again replaces it).
     pub fn add_thread(
         &self,
         install: &str,
         thread: &pathfinder_schema::SharedThread,
-    ) -> Result<()> {
-        self.0.lock().unwrap().execute(
+    ) -> Result<bool> {
+        let conn = self.0.lock().unwrap();
+        let (count, again): (i64, bool) = conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(id = ?2), 0) > 0 FROM threads WHERE install = ?1",
+            params![install, thread.id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if count >= MAX_THREADS_PER_INSTALL && !again {
+            return Ok(false);
+        }
+        conn.execute(
             "INSERT OR REPLACE INTO threads (id, install, json, received_at) VALUES (?1, ?2, ?3, ?4)",
             params![thread.id, install, serde_json::to_string(thread)?, now()],
         )?;
-        Ok(())
+        Ok(true)
     }
 
     /// Erases everything from an install, the install itself included.
@@ -458,27 +528,195 @@ impl Db {
         Ok(())
     }
 
-    /// Counts one gate request for today; false once over `cap`.
-    pub fn count_gate_use(&self, install: &str, cap: u32) -> Result<bool> {
-        let day = (now() / 86_400).to_string();
+    /// Stores a bug report. False past [`MAX_REPORTS_PER_INSTALL`].
+    pub fn add_report(&self, install: &str, report: &pathfinder_schema::BugReport) -> Result<bool> {
         let conn = self.0.lock().unwrap();
-        let used: u32 = conn
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM reports WHERE install = ?1",
+            params![install],
+            |r| r.get(0),
+        )?;
+        if count >= MAX_REPORTS_PER_INSTALL {
+            return Ok(false);
+        }
+        conn.execute(
+            "INSERT OR REPLACE INTO reports (id, install, json, received_at) VALUES (?1, ?2, ?3, ?4)",
+            params![report.id, install, serde_json::to_string(report)?, now()],
+        )?;
+        Ok(true)
+    }
+
+    /// The newest `n` bug reports: (date, person, report).
+    pub fn reports(&self, n: i64) -> Result<Vec<(String, String, pathfinder_schema::BugReport)>> {
+        let conn = self.0.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT r.received_at, i.label, r.json FROM reports r JOIN installs i USING (install)
+             ORDER BY r.received_at DESC LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![n], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter()
+            .map(|(t, who, json)| Ok((date(t), who, serde_json::from_str(&json)?)))
+            .collect()
+    }
+
+    /// Whether the shared gate is on (`collector gate on|off`).
+    pub fn gate_enabled(&self) -> Result<bool> {
+        Ok(self.setting("gate")?.as_deref() != Some("off"))
+    }
+
+    pub fn set_gate_enabled(&self, on: bool) -> Result<()> {
+        self.set_setting("gate", if on { "on" } else { "off" })
+    }
+
+    fn setting(&self, key: &str) -> Result<Option<String>> {
+        Ok(self
+            .0
+            .lock()
+            .unwrap()
             .query_row(
-                "SELECT count FROM gate_use WHERE install = ?1 AND day = ?2",
-                params![install, day],
+                "SELECT value FROM settings WHERE key = ?1",
+                params![key],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        self.0.lock().unwrap().execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = ?2",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    /// Counts one gate request for today, if allowed: within `per_person`
+    /// for everyone with this install's label (all their installs together)
+    /// and within `global` for everyone.
+    pub fn gate_check(&self, install: &str, per_person: u32, global: u32) -> Result<GateCheck> {
+        if !self.gate_enabled()? {
+            return Ok(GateCheck::Off);
+        }
+        let day = (now() / 86_400).to_string();
+        let mut conn = self.0.lock().unwrap();
+        let tx = conn.transaction()?;
+        let person: u32 = tx.query_row(
+            "SELECT COALESCE(SUM(g.count), 0) FROM gate_use g JOIN installs i USING (install)
+             WHERE g.day = ?2 AND i.label = (SELECT label FROM installs WHERE install = ?1)",
+            params![install, day],
+            |r| r.get(0),
+        )?;
+        let all: u32 = tx
+            .query_row(
+                "SELECT forwarded FROM gate_daily WHERE day = ?1",
+                params![day],
                 |r| r.get(0),
             )
             .optional()?
             .unwrap_or(0);
-        if used >= cap {
-            return Ok(false);
+        let check = if all >= global {
+            GateCheck::GlobalCapped
+        } else if person >= per_person {
+            GateCheck::PersonCapped
+        } else {
+            GateCheck::Allowed
+        };
+        if check == GateCheck::Allowed {
+            tx.execute(
+                "INSERT INTO gate_use (install, day, count) VALUES (?1, ?2, 1)
+                 ON CONFLICT(install, day) DO UPDATE SET count = count + 1",
+                params![install, day],
+            )?;
+            tx.execute(
+                "INSERT INTO gate_daily (day, forwarded) VALUES (?1, 1)
+                 ON CONFLICT(day) DO UPDATE SET forwarded = forwarded + 1",
+                params![day],
+            )?;
+        } else {
+            tx.execute(
+                "INSERT INTO gate_daily (day, capped) VALUES (?1, 1)
+                 ON CONFLICT(day) DO UPDATE SET capped = capped + 1",
+                params![day],
+            )?;
         }
-        conn.execute(
-            "INSERT INTO gate_use (install, day, count) VALUES (?1, ?2, 1)
-             ON CONFLICT(install, day) DO UPDATE SET count = count + 1",
-            params![install, day],
+        tx.commit()?;
+        Ok(check)
+    }
+
+    /// Today's forwarded gate checks, for the budget alarm.
+    pub fn gate_today(&self) -> Result<u32> {
+        let day = (now() / 86_400).to_string();
+        Ok(self
+            .0
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT forwarded FROM gate_daily WHERE day = ?1",
+                params![day],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(0))
+    }
+
+    pub fn gate_upstream_error(&self) -> Result<()> {
+        let day = (now() / 86_400).to_string();
+        self.0.lock().unwrap().execute(
+            "INSERT INTO gate_daily (day, upstream_errors) VALUES (?1, 1)
+             ON CONFLICT(day) DO UPDATE SET upstream_errors = upstream_errors + 1",
+            params![day],
         )?;
-        Ok(true)
+        Ok(())
+    }
+
+    /// The last `days` days of gate use: date, forwarded, capped, upstream
+    /// errors; then today's use per person.
+    pub fn gate_stats(&self, days: i64) -> Result<GateStats> {
+        let today = now() / 86_400;
+        let conn = self.0.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT day, forwarded, capped, upstream_errors FROM gate_daily
+             WHERE CAST(day AS INTEGER) > ?1 ORDER BY CAST(day AS INTEGER)",
+        )?;
+        let daily = stmt
+            .query_map(params![today - days], |r| {
+                let day: String = r.get(0)?;
+                Ok((
+                    date(day.parse::<i64>().unwrap_or(0) * 86_400),
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut stmt = conn.prepare(
+            "SELECT i.label, SUM(g.count) FROM gate_use g JOIN installs i USING (install)
+             WHERE g.day = ?1 GROUP BY i.label ORDER BY 2 DESC",
+        )?;
+        let people = stmt
+            .query_map(params![today.to_string()], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok((daily, people))
+    }
+
+    /// Counts a download of `what` (`latest.json`, `install.sh`, a release)
+    /// by the app version in its user agent: no install, no address.
+    pub fn count_fetch(&self, what: &str, version: &str) -> Result<()> {
+        let day = (now() / 86_400).to_string();
+        self.0.lock().unwrap().execute(
+            "INSERT INTO fetches (day, what, version, count) VALUES (?1, ?2, ?3, 1)
+             ON CONFLICT(day, what, version) DO UPDATE SET count = count + 1",
+            params![day, what, version],
+        )?;
+        Ok(())
     }
 
     /// Deletes events past the retention period and old gate counts.
@@ -486,10 +724,12 @@ impl Db {
         let cutoff = now() - RETENTION_DAYS * 86_400;
         let conn = self.0.lock().unwrap();
         let n = conn.execute("DELETE FROM events WHERE at < ?1", params![cutoff])?;
-        conn.execute(
-            "DELETE FROM gate_use WHERE CAST(day AS INTEGER) < ?1",
-            params![cutoff / 86_400],
-        )?;
+        for table in ["gate_use", "gate_daily", "fetches"] {
+            conn.execute(
+                &format!("DELETE FROM {table} WHERE CAST(day AS INTEGER) < ?1"),
+                params![cutoff / 86_400],
+            )?;
+        }
         Ok(n)
     }
 
@@ -525,11 +765,19 @@ impl Db {
         Ok(rows)
     }
 
-    /// Writes `events.jsonl` and `threads.jsonl` into `dir`, each row with
-    /// the install's label.
-    pub fn export(&self, dir: &Path) -> Result<(usize, usize)> {
+    /// Writes `events.jsonl`, `threads.jsonl` and `installs.jsonl` into
+    /// `dir`. Each row names its person by a pseudonym (a hash of the
+    /// label, stable across exports) unless `with_labels`.
+    pub fn export(&self, dir: &Path, with_labels: bool) -> Result<(usize, usize)> {
         use std::io::Write;
         std::fs::create_dir_all(dir)?;
+        let who = |label: &str| -> String {
+            if with_labels {
+                label.to_string()
+            } else {
+                format!("p-{}", &hash(label)[..12])
+            }
+        };
         let conn = self.0.lock().unwrap();
         let out = |file: &str, sql: &str| -> Result<usize> {
             let mut f = std::io::BufWriter::new(std::fs::File::create(dir.join(file))?);
@@ -539,7 +787,7 @@ impl Db {
             while let Some(r) = rows.next()? {
                 let label: String = r.get(0)?;
                 let mut v: serde_json::Value = serde_json::from_str(&r.get::<_, String>(1)?)?;
-                v["label"] = label.into();
+                v["person"] = who(&label).into();
                 writeln!(f, "{v}")?;
                 n += 1;
             }
@@ -553,6 +801,159 @@ impl Db {
             "threads.jsonl",
             "SELECT i.label, t.json FROM threads t JOIN installs i USING (install) ORDER BY t.received_at",
         )?;
+        out(
+            "reports.jsonl",
+            "SELECT i.label, r.json FROM reports r JOIN installs i USING (install) ORDER BY r.received_at",
+        )?;
+        out(
+            "installs.jsonl",
+            "SELECT label, json_object('install', install, 'enrolled_at', enrolled_at,
+                 'consent_at', consent_at, 'notice', notice, 'events', events,
+                 'threads', threads, 'stopped', stopped) FROM installs ORDER BY enrolled_at",
+        )?;
         Ok((e, t))
     }
+}
+
+impl Db {
+    /// A plain-text summary for analysis: active people, retention, turn
+    /// latency, gate outcomes, errors, versions, models and downloads.
+    pub fn report(&self) -> Result<String> {
+        use std::fmt::Write;
+        let conn = self.0.lock().unwrap();
+        let t = now();
+        let mut out = String::new();
+        let one = |sql: &str, p: &[&dyn rusqlite::ToSql]| -> Result<i64> {
+            Ok(conn
+                .query_row(sql, p, |r| r.get::<_, Option<i64>>(0))?
+                .unwrap_or(0))
+        };
+        let people = "SELECT COUNT(DISTINCT i.label) FROM events e JOIN installs i USING (install) WHERE e.at >= ?1";
+        writeln!(
+            out,
+            "Active people: {} today, {} in 7 days, {} in 28 days (of {} who joined)",
+            one(people, &[&(t - 86_400)])?,
+            one(people, &[&(t - 7 * 86_400)])?,
+            one(people, &[&(t - 28 * 86_400)])?,
+            one("SELECT COUNT(DISTINCT label) FROM installs", &[])?
+        )?;
+
+        // Day-N retention: of the people who joined at least N days ago,
+        // how many used Pathfinder on day N or later.
+        for n in [1i64, 7, 28] {
+            let cohort = one(
+                "SELECT COUNT(DISTINCT label) FROM installs WHERE enrolled_at <= ?1",
+                &[&(t - n * 86_400)],
+            )?;
+            let kept = one(
+                "SELECT COUNT(DISTINCT i.label) FROM installs i JOIN events e USING (install)
+                 WHERE i.enrolled_at <= ?1 AND e.at >= i.enrolled_at + ?2",
+                &[&(t - n * 86_400), &(n * 86_400)],
+            )?;
+            writeln!(out, "Day-{n} retention: {kept} of {cohort}")?;
+        }
+
+        let mut ms: Vec<i64> = conn
+            .prepare("SELECT json_extract(json, '$.event.ms') FROM events WHERE kind = 'turn' AND at >= ?1")?
+            .query_map(params![t - 7 * 86_400], |r| r.get::<_, Option<i64>>(0))?
+            .filter_map(|r| r.ok().flatten())
+            .collect();
+        ms.sort_unstable();
+        let pct = |p: usize| {
+            ms.get(ms.len().saturating_sub(1) * p / 100)
+                .copied()
+                .unwrap_or(0)
+        };
+        writeln!(
+            out,
+            "Turns in 7 days: {}, reply time p50 {} ms, p95 {} ms",
+            ms.len(),
+            pct(50),
+            pct(95)
+        )?;
+
+        let mut tally = |title: &str, sql: &str| -> Result<()> {
+            let rows: Vec<(String, i64)> = conn
+                .prepare(sql)?
+                .query_map(params![t - 7 * 86_400], |r| {
+                    Ok((
+                        r.get::<_, Option<String>>(0)?.unwrap_or_else(|| "?".into()),
+                        r.get(1)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<_>>()?;
+            let line: Vec<String> = rows.iter().map(|(k, n)| format!("{k} {n}")).collect();
+            writeln!(
+                out,
+                "{title}: {}",
+                if line.is_empty() {
+                    "none".into()
+                } else {
+                    line.join(", ")
+                }
+            )?;
+            Ok(())
+        };
+        tally(
+            "Gate outcomes (7 days)",
+            "SELECT json_extract(json, '$.event.outcome'), COUNT(*) FROM events WHERE kind = 'gate' AND at >= ?1 GROUP BY 1 ORDER BY 2 DESC",
+        )?;
+        tally(
+            "Check outcomes (7 days)",
+            "SELECT json_extract(json, '$.event.outcome'), COUNT(*) FROM events WHERE kind = 'check' AND at >= ?1 GROUP BY 1 ORDER BY 2 DESC",
+        )?;
+        tally(
+            "Errors (7 days)",
+            "SELECT json_extract(json, '$.event.code'), COUNT(*) FROM events WHERE kind = 'error' AND at >= ?1 GROUP BY 1 ORDER BY 2 DESC",
+        )?;
+        tally(
+            "Crashes (7 days)",
+            "SELECT json_extract(json, '$.app'), COUNT(*) FROM events WHERE kind = 'crash' AND at >= ?1 GROUP BY 1 ORDER BY 2 DESC",
+        )?;
+        tally(
+            "Models (7 days)",
+            "SELECT json_extract(json, '$.event.model'), COUNT(*) FROM events WHERE kind = 'turn' AND at >= ?1 GROUP BY 1 ORDER BY 2 DESC",
+        )?;
+        tally(
+            "Features (7 days)",
+            "SELECT json_extract(json, '$.event.feature'), COUNT(*) FROM events WHERE kind = 'ui' AND at >= ?1 GROUP BY 1 ORDER BY 2 DESC",
+        )?;
+        tally(
+            "App versions in use (7 days)",
+            "SELECT json_extract(json, '$.app'), COUNT(DISTINCT install) FROM events WHERE at >= ?1 GROUP BY 1 ORDER BY 1 DESC",
+        )?;
+        tally(
+            "Downloads by app version (7 days)",
+            "SELECT what || ' from ' || version, SUM(count) FROM fetches WHERE CAST(day AS INTEGER) * 86400 >= ?1 GROUP BY 1 ORDER BY 2 DESC",
+        )?;
+        Ok(out)
+    }
+}
+
+/// `held_by_other`: whether `install` is already enrolled under another
+/// label (a guessed or copied install id must not take an install over).
+fn held_by_other(conn: &Connection, install: &str, label: &str) -> Result<bool> {
+    let held: Option<String> = conn
+        .query_row(
+            "SELECT label FROM installs WHERE install = ?1",
+            params![install],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(held.is_some_and(|l| l != label))
+}
+
+/// A Unix time as `YYYY-MM-DD` (UTC).
+pub fn date(t: i64) -> String {
+    // Days since 1970-01-01 to a civil date (Howard Hinnant's algorithm).
+    let z = t.div_euclid(86_400) + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02}")
 }

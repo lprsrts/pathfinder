@@ -15,7 +15,7 @@ pub const VERSION: u32 = 1;
 
 /// The privacy notice version the consent was given for. Changing what is
 /// collected means a new notice, and asking again.
-pub const NOTICE_VERSION: u32 = 2;
+pub const NOTICE_VERSION: u32 = 3;
 
 /// One event with what every event carries.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -106,6 +106,15 @@ pub enum Event {
         /// or no decision service).
         score: Option<f64>,
         outcome: GateOutcome,
+        /// Which service checked it (absent from apps before 0.3).
+        #[serde(default)]
+        via: Option<GateVia>,
+        /// How long the check took.
+        #[serde(default)]
+        ms: Option<u64>,
+        /// Why the check failed, when `outcome` is `failed`.
+        #[serde(default)]
+        cause: Option<ErrorCode>,
     },
     /// A candidate was judged.
     Check {
@@ -124,6 +133,41 @@ pub enum Event {
     Error { code: ErrorCode },
     /// A feature was used.
     Ui { feature: Feature },
+    /// The app crashed. No message or backtrace: those can hold paths.
+    Crash { surface: Surface },
+    /// `pathfinder update` finished (the envelope carries the version it
+    /// updated from).
+    Update { outcome: UpdateOutcome },
+    /// A first time: how far new users get.
+    Milestone { step: Milestone },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GateVia {
+    /// The user's own decision key.
+    Own,
+    /// The shared gate service.
+    Shared,
+    /// A model on the user's own endpoint.
+    Local,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateOutcome {
+    Installed,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Milestone {
+    FirstTurn,
+    FirstMap,
+    FirstCandidate,
+    FirstCheck,
+    FirstShare,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -213,6 +257,10 @@ pub enum ErrorCode {
     Timeout,
     BadOutput,
     Tool,
+    /// The gate's decision service failed or was capped.
+    Gate,
+    /// The app couldn't reach Pathfinder's server.
+    Collector,
     Other,
 }
 
@@ -229,6 +277,7 @@ pub enum Feature {
     Share,
     Exam,
     QuickCheck,
+    Bug,
 }
 
 /// A batch as uploaded.
@@ -292,6 +341,26 @@ pub struct Consent {
     pub threads: bool,
 }
 
+/// A bug report the user chose to send, after seeing exactly this.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BugReport {
+    /// Random per report.
+    pub id: String,
+    pub app: String,
+    pub os: Os,
+    pub arch: Arch,
+    /// What happened, in their words.
+    pub note: String,
+    /// Settings, recent log lines and the last crash, paths shortened.
+    pub details: String,
+}
+
+impl BugReport {
+    pub const MAX_NOTE: usize = 4_000;
+    pub const MAX_DETAILS: usize = 128 << 10;
+}
+
 /// A thread the user chose to share, after seeing exactly this.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -313,11 +382,14 @@ pub struct Release {
     pub files: BTreeMap<String, ReleaseFile>,
     #[serde(default)]
     pub notes: String,
+    /// The source commit this release was built from.
+    #[serde(default)]
+    pub commit: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReleaseFile {
-    /// Relative to the manifest, e.g. `0.1.1/harness-universal-apple-darwin.tar.gz`.
+    /// Relative to the manifest, e.g. `0.3.0/pathfinder-0.3.0-universal-apple-darwin.tar.gz`.
     pub path: String,
     pub sha256: String,
     pub size: u64,

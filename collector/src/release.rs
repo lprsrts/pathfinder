@@ -32,29 +32,32 @@ fn keychain_key() -> Result<SigningKey> {
 }
 
 /// Makes a key, stores it in the login keychain and prints the public key
-/// for `harness/src/update.rs`. Refuses to replace an existing key.
+/// for `app/src/update.rs`. Refuses to replace an existing key. The key
+/// reaches `security` on its standard input, never on a command line.
 pub fn keygen() -> Result<()> {
+    use std::io::Write;
     if keychain_key().is_ok() {
         bail!("a signing key already exists in the keychain; delete it first to rotate");
     }
     let mut secret = [0u8; 32];
     rand::RngCore::fill_bytes(&mut rand::rng(), &mut secret);
     let key = SigningKey::from_bytes(&secret);
-    let status = std::process::Command::new("security")
-        .args([
-            "add-generic-password",
-            "-s",
-            KEYCHAIN_SERVICE,
-            "-a",
-            "alper",
-            "-l",
-            "Pathfinder release signing key",
-            "-w",
-            &B64.encode(secret),
-        ])
-        .status()?;
-    if !status.success() {
+    let mut child = std::process::Command::new("security")
+        .arg("-i")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .context("running `security`")?;
+    writeln!(
+        child.stdin.take().context("no stdin for `security`")?,
+        "add-generic-password -s {KEYCHAIN_SERVICE} -a pathfinder -l \"Pathfinder release signing key\" -w {}",
+        B64.encode(secret)
+    )?;
+    if !child.wait()?.success() {
         bail!("`security add-generic-password` failed");
+    }
+    if keychain_key().is_err() {
+        bail!("the key didn't reach the keychain");
     }
     println!("{}", B64.encode(key.verifying_key().to_bytes()));
     Ok(())

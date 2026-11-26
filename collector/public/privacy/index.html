@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Pathfinder privacy</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <style>
   :root { color-scheme: light dark; --fg: #1d1d1f; --bg: #fff; --muted: #6e6e73; --rule: #e5e5ea; }
   @media (prefers-color-scheme: dark) { :root { --fg: #f5f5f7; --bg: #111; --muted: #a1a1a6; --rule: #333; } }
@@ -20,34 +21,37 @@
 <body>
 <main>
 <h1>Pathfinder and your data</h1>
-<p class="meta">Version 2 · 25 November 2026 · Alper Sarıtaş, Karlsruhe · <a href="mailto:alper@saritas.io">alper@saritas.io</a></p>
+<p class="meta">Version 3 · 26 November 2026 · Alper Sarıtaş, Karlsruhe · <a href="mailto:alper@saritas.io">alper@saritas.io</a></p>
 
-<p>Pathfinder makes sure you understand the work you do with AI. It runs on your computer, with your own model account. I’m building it, and I’d like to learn how it works for people other than me. If you agree, it sends me usage data. If you don’t, nothing is sent and Pathfinder works the same.</p>
+<p>Pathfinder makes sure you understand the work you do with AI. It runs on your computer, with your own model account. I’m building it, and I’d like to learn how it works for people other than me. Joining the beta and sharing data are separate choices. Without joining, nothing is sent to me.</p>
+
+<h2>Joining</h2>
+<p>You join by signing in with your email, or with an invite code I gave you. Joining links your computer to my server: it turns on the shared gate (below) and lets you send bug reports and threads when you choose to. Your address, or the name I gave the invite code, is stored with anything your computer sends, so I know it’s yours. Your address is also on the list of people who may sign in until you ask me to remove it.</p>
 
 <h2>What I get, if you say yes</h2>
-<p><strong>Usage events</strong> are counts and timings. They cover what kind of step each turn was and how long it took, how many model and tool calls it made, which model was used, whether the gate held a reply back, whether a check was answered right or wrong, permission answers, error codes, and which features you use. Each event also carries the app version, your operating system, the conversation’s language and the time to the minute.</p>
-<p>Usage events never include your messages, the model’s answers, file or folder names, or what you work on. <code>harness data show</code> prints exactly what is waiting to be sent.</p>
+<p><strong>Usage events</strong> are counts and timings. They cover what kind of step each turn was and how long it took, how many model and tool calls it made, which model was used, whether the gate held a reply back and how it checked, whether a check was answered right or wrong, permission answers, error codes, crashes (that one happened, not what it said), whether an update worked, the first time you reach a step such as your first check, and which features you use. Each event also carries the app version, your operating system, the conversation’s language and the time to the minute.</p>
+<p>Usage events never include your messages, the model’s answers, file or folder names, or what you work on. The list is fixed in the app’s code: <a href="https://github.com/lprsrts/pathfinder/blob/main/schema/src/lib.rs">schema/src/lib.rs</a>, and my server refuses anything else. <code>pathfinder data show</code> prints exactly what is waiting to be sent.</p>
 <p><strong>A thread you share</strong> is sent only when you type <code>/share</code> in it, see the whole thread, and press Enter. It’s that thread as you saw it, with paths shortened to <code>./</code> and <code>~</code>, plus your note.</p>
 <p>These are two separate yes/no answers.</p>
-<p><strong>Your email address.</strong> You join by signing in with your email, so what you send is stored with that address and I know it’s yours. (If I gave you an invite code instead, I know which code I gave to whom.) Your address is also on the list of people who may sign in. It stays there until you ask me to remove it.</p>
+<p><strong>A bug report</strong> is sent only when you type <code>/bug</code> (or run <code>pathfinder bug</code>), see the whole report, and confirm. It holds your note, the app version and settings (model names, sandbox, what you share), the last lines of the app’s log and the last crash, with paths shortened. Log lines can include error messages from your model provider. If you haven’t joined, the report is saved to a file for you to send yourself.</p>
 
 <h2>What goes elsewhere</h2>
 <ul>
-<li><strong>Your work and the model.</strong> Your messages and files go straight from your computer to your model provider (e.g. OpenAI when you sign in with ChatGPT), under your account. They never go through my server.</li>
+<li><strong>Your work and the model.</strong> Your messages and files go straight from your computer to your model provider (e.g. OpenAI when you sign in with ChatGPT), under your account. They never go through my server, with one exception, the shared gate.</li>
+<li><strong>The shared gate.</strong> Pathfinder has a check that stops the model from giving away an answer while you’re judging a candidate. Once you’ve joined, if you have no decision key of your own, that check goes through my server to TypeSafe. It carries the candidate, the conversation since it was shown, and the draft reply. Only this check uses it. My server passes it on without storing or logging it, and counts checks per person per day. With your own key the check goes straight to the provider. To turn the shared gate off, set <code>PATHFINDER_DECISION_PROXY=off</code>.</li>
 <li><strong>Signing in.</strong> Cloudflare Access runs the sign-in page. It emails you a one-time code and tells my server your address. Cloudflare keeps a record of sign-ins (address, IP address and time).</li>
-<li><strong>The shared gate.</strong> Pathfinder has a check that stops the model from giving away an answer while you’re judging a candidate. Once you’ve joined, if you have no TypeSafe key of your own, that check goes through my server to TypeSafe. It carries the candidate, the conversation since it was shown, and the draft reply. My server passes it on without storing it, and only counts checks per day. To turn this off, set <code>HARNESS_DECISION_PROXY=off</code>.</li>
-<li><strong>Update check.</strong> Once a day the app asks my server for the newest version number. To turn this off, set <code>HARNESS_NO_UPDATE_CHECK=1</code>.</li>
+<li><strong>Updates.</strong> Once a day the app asks my server for the newest version number. My server counts downloads of the installer and of updates by app version, with nothing that identifies you. To turn the check off, set <code>PATHFINDER_NO_UPDATE_CHECK=1</code>.</li>
 </ul>
 
 <h2>Where and how long</h2>
-<p>Data is stored on my own server in Germany and reached through Cloudflare. The server doesn’t log IP addresses. Usage events are deleted after 12 months, and shared threads when you delete them. Encrypted backups are kept in Cloudflare R2 in Western Europe for up to 12 months, so deleted data leaves the backups within that time. I use the data only to improve Pathfinder. I don’t sell it or share it. If I ever want to use it for research or a publication, I’ll ask you first.</p>
+<p>Data is stored on my own server in Germany and reached through Cloudflare. The server doesn’t log IP addresses. To slow down abuse it keeps the address a request came from in memory for one minute, and never writes it down. Usage events are deleted after 12 months. Shared threads and bug reports stay until you delete them. Encrypted backups are kept in Cloudflare R2 in Western Europe for up to 12 months, so deleted data leaves the backups within that time. I use the data only to improve Pathfinder. I don’t sell it or share it. If I ever want to use it for research or a publication, I’ll ask you first.</p>
 
 <h2>Changing your mind</h2>
 <table>
-<tr><td><code>harness data</code></td><td>see your settings</td></tr>
-<tr><td><code>harness data off</code></td><td>stop sending; the queue is cleared</td></tr>
-<tr><td><code>harness data delete</code></td><td>erase everything this computer sent, immediately</td></tr>
-<tr><td><code>harness data on --events</code> / <code>--threads</code></td><td>start again</td></tr>
+<tr><td><code>pathfinder data</code></td><td>see your settings</td></tr>
+<tr><td><code>pathfinder data off</code></td><td>stop sending; the queue is cleared</td></tr>
+<tr><td><code>pathfinder data delete</code></td><td>erase everything this computer sent, immediately</td></tr>
+<tr><td><code>pathfinder data on --events</code> / <code>--threads</code></td><td>start again</td></tr>
 </table>
 <p>You can also email me for a copy of your data, a correction or erasure. The legal basis is your consent (GDPR Art. 6(1)(a)). You may complain to a data protection authority, such as the LfDI Baden-Württemberg. If what Pathfinder collects changes, it asks you again first.</p>
 </main>

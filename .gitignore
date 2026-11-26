@@ -5,3 +5,14 @@
 *.sqlite-shm
 .DS_Store
 /dist/
+# The maintainer's release settings (see scripts/release.env.example).
+/scripts/release.env
+.env
+*.env
+# Pathfinder's own record in a folder it works in.
+.pathfinder/
+.vscode/
+.idea/
+# docs/ is tracked here even where a global ignore drops it.
+!/docs/
+!/docs/**
