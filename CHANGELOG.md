@@ -2,7 +2,7 @@
 
 What changed in each release of Pathfinder, newest first. `pathfinder update` shows the newest section.
 
-## Unreleased
+## 0.4.0
 
 - **Sources, not answers.** A question gets the places in your folder that address it, each with a short line quoted from there and checked against the file by code; the model's own words are never shown. If the folder has nothing, OpenAlex, arXiv and (with a key) Brave Search are searched the same way. Otherwise the reply says **Not found** and suggests terms.
 - **`/tell <question>`** gives a model's answer, recorded as *told*.
