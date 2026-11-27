@@ -1,6 +1,6 @@
 # Pathfinder theory
 
-*2026-11-24. This is the canonical theory. Prompts, critics and code follow from it. A feature that can't point to a section here doesn't belong, and a change to the theory is made here first.*
+*2026-11-27. This is the canonical theory. Prompts, critics and code follow from it. A feature that can't point to a section here doesn't belong, and a change to the theory is made here first.*
 
 ## 1. Purpose
 
@@ -89,7 +89,7 @@ It is used, not just kept:
 
 ## 11. What each model sees, and what reaches you
 
-No model answers your questions in its own words. A question gets the places in your sources (or online) that address it, each with a short line quoted from there and checked by code against the source; you read and conclude. `/tell` is the one way to get a model's answer, and it is recorded as told, never as understood (section 10).
+No model answers your questions in its own words. A question gets the places in your sources (or online) that address it, each with a short line quoted from there and checked by code against the source; you read and conclude. Asking to be told (`/tell`, or in plain words, section 15) is the one way to get a model's answer, and it is recorded as told, never as understood (section 10).
 
 Some things must not reach you yet: whether a candidate is right and why, and an answer you are meant to produce yourself. These are kept from you in two ways:
 
@@ -122,6 +122,34 @@ Handoff runs in an isolated staging copy, and live diffs and prose summaries of 
 - **Local integrity is not cryptographic proof.** The hash chain and tool boundaries keep the agent from altering the record (as far as command permissions and routes enforce them). Proving the record to an untrusting third party requires external signing.
 - **Separation has a boundary.** Without the reply check (or on external CLI routes that keep their own transcripts), Pathfinder can mask history, but cannot stop a quoted line or a told answer from settling a candidate you paraphrase back to it.
 - **Checks have a cost.** How often reviews are checked (section 13) is a visible setting of the session. A check you can't see is not allowed.
+
+## 15. You work in plain language
+
+Everything in sections 1–14 can be done by saying it. "Where does the gate decide what to hold back?", "show me that file", "I think I get this part now", "just tell me", "let the agent do the tests": decision models read what you mean, and the harness acts on it. Commands are shortcuts for people who want them, never the only way in.
+
+Two kinds of message are treated differently:
+
+- **Intent**: asking, looking something up, opening a source, exploring. Pathfinder acts on it directly.
+- **A commitment**: something that changes what the record says about you. Claiming you know a part, asking to be told (section 11), handing a part off or delegating it (sections 6 and 7), giving a verdict on a candidate.
+
+A commitment read from plain language is still a model's proposal (section 9). Before it counts, it is shown back to you in one line, saying what will be recorded, and it can be undone in one step. Pathfinder never records a commitment you didn't see, so the record stays something you said, not something a model guessed about you. When a decision model is unsure whether you meant a commitment, it asks instead of guessing.
+
+## 16. The path: an exact next step, a loose horizon
+
+People come to understanding by different routes: purpose first or mechanism first, an example before the principle or the reverse, reading or trying. Most don't know which route is theirs, and it changes from task to task.
+
+So Pathfinder doesn't lay out the route. It shows two things:
+
+- **The next step, exactly.** Where to look (the exact source and lines; finding them is Pathfinder's job, not yours) and an open question to take there.
+- **The horizon, loosely.** The map's parts and what each depends on (section 3): where you're heading, not the order of the steps that will get you there.
+
+The route between them stays loose for three reasons:
+
+- **It depends on you.** Each next step is chosen from what you just did: your log, your summaries, and the understanding model's state (section 10). A concept you have never touched gets an orienting step; a shaky one gets a narrower one.
+- **A precise route gives part of the answer away.** The order of insights that leads to understanding is much of the understanding. Laying it all out in advance does that reasoning for you.
+- **You can steer.** "Give me an example first" or "start from what it's for" changes the next step. Over a task, Pathfinder learns which kinds of step work for you and leans on them, and the record of how you got there stays yours to read.
+
+Being exact about where and open about what to conclude is the same rule as section 11, applied to the path: Pathfinder finds your sources but leaves the conclusions to you.
 
 ---
 
@@ -203,19 +231,24 @@ The Agent never sees concept states or the ledger, so it can't shape its work to
 
 ## A3. A turn
 
-*§4–§7: every message becomes one step; writes happen once, at the end.*
+*§4–§7, §15: every message becomes one step; a commitment read from plain words is shown back and can be undone (a typed command is already explicit and skips this); writes happen once, at the end.*
 
 ```mermaid
 flowchart TD
     M[message] --> R{Router<br/>p ≥ 0.6?}
     R -->|no| F[Tutor decides the step itself]
+    R -->|"commitment, unsure"| Q[ask which you meant · §15] --> OUT
     R -->|log| X[Extractor] & T[Tutor]
     R -->|summary| S[choose targets · A5] --> E[Examiner] --> K[register key · A6]
-    R -->|"verdict, or log < 0.9 while a candidate waits"| J[Judge] --> RT[write pass/fail · retire key]
-    R -->|known| C[claim events] --> GP[walk prerequisites · gaps]
+    R -->|"verdict · known · handoff · delegate · tell"| SB[shown back in one line<br/>undoable in one step · §15]
+    R -->|"log < 0.9 while a candidate waits"| J
+    SB -->|verdict| J[Judge] --> RT[write pass/fail · retire key]
+    SB -->|known| C[claim events] --> GP[walk prerequisites · gaps]
+    SB -->|tell| TL[Tutor answers · told events · §11]
     R -->|move · replan · accept · reject| MV[map and focus]
-    R -->|handoff| AH[Agent in staging] --> TH[Tagger] --> LH[ledger] --> RV[review · A8]
-    R -->|delegate| AD[Agent] --> TD[Tagger] --> LD[ledger: all delegated]
+    SB -->|handoff| AH[Agent in staging] --> TH[Tagger] --> LH[ledger] --> RV[review · A8]
+    SB -->|delegate| AD[Agent] --> TD[Tagger] --> LD[ledger: all delegated]
+    TL --> AS
     T --> V[code checks each quote against its source · renders the reply] --> AS{active secret?}
     AS -->|no| OUT
     AS -->|yes: buffer| GT{Gate · A6}
@@ -533,6 +566,8 @@ flowchart LR
     S1 --> S2[2. secrets and the gate]
     S2 --> S3["3. ledger, tagging, coverage<br/>+ git-ai pairing"]
     S3 --> S4["4. staging copy for /handoff<br/>+ checked review"]
+    S4 --> S5["5. plain-language commitments shown back<br/>and undoable · §15"]
+    S5 --> S6["6. next step chosen from concept state<br/>and your steering · §16"]
 ```
 
 ## A10. How we know it works
