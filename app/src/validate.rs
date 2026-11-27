@@ -129,7 +129,8 @@ pub fn check_change(change: &MapChange, current: &Map) -> Vec<Violation> {
 /// `change_waiting`: whether a map change is waiting for the user's OK, the
 /// only time `accept` or `reject` makes sense.
 /// `decided_log`: a decision model already classified the message as a log
-/// entry, so a reply is required whatever `intent` says.
+/// entry, so a reply is required whatever `intent` says. `agent` and `tell`
+/// need no reply: Pathfinder shows them back and takes the step (§15).
 pub fn check_log_reply(
     r: &LogReply,
     current: &Map,
@@ -266,6 +267,19 @@ mod tests {
             "no_change_waiting"
         );
         assert!(check_log_reply(&reply, &map, true, false).is_empty());
+    }
+
+    #[test]
+    fn agent_and_tell_are_intents_that_need_no_reply() {
+        let map = Map { parts: vec![] };
+        for (raw, intent) in [("agent", Intent::Agent), ("tell", Intent::Tell)] {
+            let reply: LogReply = serde_json::from_str(&format!(
+                r#"{{"intent":"{raw}","reply":"","map_change":null}}"#
+            ))
+            .unwrap();
+            assert_eq!(reply.intent, intent);
+            assert!(check_log_reply(&reply, &map, false, false).is_empty());
+        }
     }
 
     #[test]

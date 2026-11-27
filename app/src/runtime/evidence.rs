@@ -1,6 +1,22 @@
 //! §5 of docs/theory.md: evidence of understanding (the log, the summary, the candidate and its judgment).
 
 use super::*;
+use crate::domain::CommitKind;
+use crate::understanding::Angle;
+
+/// What the Router read a chat message as.
+pub(super) enum Routed {
+    /// A step, the part it names, who decided, and how you steered the
+    /// next step (§16).
+    Step {
+        step: String,
+        part: Option<String>,
+        by: String,
+        steer: Option<Angle>,
+    },
+    /// Unsure, but leaning toward a commitment: the two likeliest (§15).
+    Unsure { top: Vec<&'static str> },
+}
 
 impl Runtime {
     /// `decided_by`: the decision model that already classified the message
@@ -12,6 +28,22 @@ impl Runtime {
         files: &[PathBuf],
         sink: StreamSink,
         decided_by: Option<&str>,
+    ) -> Result<TurnOutput> {
+        self.handle_log_steered(session, text, files, sink, decided_by, None)
+            .await
+    }
+
+    /// `handle_log`, with how you asked the next step to start ("give me an
+    /// example first"): the message is logged and answered as any other,
+    /// and the next step after the reply is re-chosen with your steer.
+    pub(super) async fn handle_log_steered(
+        &self,
+        session: &mut Session,
+        text: &str,
+        files: &[PathBuf],
+        sink: StreamSink,
+        decided_by: Option<&str>,
+        steer: Option<Angle>,
     ) -> Result<TurnOutput> {
         let Some(part) = session.active_part_mut() else {
             return Ok(TurnOutput::text(
@@ -127,6 +159,13 @@ impl Runtime {
         }
         let mut visible = String::new();
         let mut full = decision.reply;
+        // §16: the next step, when it changed since the last one shown, or
+        // always when you steered it.
+        if let Some(next) = self.next_step(session, steer, steer.is_none()) {
+            let next = format!("\n\n{next}");
+            sink(StreamEvent::TextDelta(next.clone()));
+            full.push_str(&next);
+        }
         if let Some(change) = decision.map_change {
             let rendered = format!(
                 "\n\n{}",
@@ -143,6 +182,7 @@ impl Runtime {
     /// A chat message while working. The decision model, when configured,
     /// first says which step it is; the LLM then only does that step. With no
     /// decision model, or an unsure one, the LLM decides as part of its reply.
+    /// A commitment read from plain words is shown back first (§15).
     pub(super) async fn handle_chat(
         &self,
         session: &mut Session,
@@ -153,27 +193,91 @@ impl Runtime {
         if session.active_part().is_none() {
             return self.handle_log(session, text, files, sink, None).await;
         }
-        match self.decide_step(session, text, &sink).await {
-            Some((step, _, _)) if step == VERDICT => {
-                self.handle_judgment(session, text, files, sink).await
+        let routed = self.decide_step(session, text, &sink).await;
+        // Something waits for your OK: only a clear yes runs it; any other
+        // message drops it, and nothing ever runs on its own.
+        let mut dropped = None;
+        if session.pending_commitment.is_some() {
+            if matches!(&routed, Some(Routed::Step { step, .. }) if step == CONFIRM) {
+                if session
+                    .pending_commitment
+                    .as_ref()
+                    .is_some_and(|p| p.kind != CommitKind::Verdict)
+                {
+                    session.push_turn("user", text);
+                }
+                return self.confirm(session, sink).await;
             }
-            Some((_, _, _))
-                if (session.quick_check || session.exam) && session.pending_candidate.is_some() =>
-            {
-                // Not a verdict on the quick check: the judge decides whether
-                // it is one, and drops the check if not.
-                self.handle_judgment(session, text, files, sink).await
+            if let Some(line) = self.drop_pending(session) {
+                sink(StreamEvent::TextDelta(format!("{line}\n\n")));
+                dropped = Some(line);
             }
-            Some((step, _, by)) if step == "log" => {
+        }
+        let before = session.history.len();
+        let out = self.route_chat(session, routed, text, files, sink).await?;
+        if let Some(line) = dropped
+            && let Some(reply) = session
+                .history
+                .iter_mut()
+                .skip(before)
+                .find(|t| t.role == "assistant")
+        {
+            reply.content = format!("{line}\n\n{}", reply.content);
+        }
+        Ok(out)
+    }
+
+    /// Carries out the step the Router read.
+    async fn route_chat(
+        &self,
+        session: &mut Session,
+        routed: Option<Routed>,
+        text: &str,
+        files: &[PathBuf],
+        sink: StreamSink,
+    ) -> Result<TurnOutput> {
+        let checking = (session.quick_check || session.exam) && session.pending_candidate.is_some();
+        match routed {
+            Some(Routed::Unsure { top }) => {
+                session.push_turn("user", text);
+                Ok(self.ask_which(session, &top))
+            }
+            // A quick check or an exam question you chose to be asked: the
+            // judge decides whether it is an answer, and drops the check if
+            // not (the one place a verdict isn't shown back first).
+            Some(_) | None if checking => self.handle_judgment(session, text, files, sink).await,
+            Some(Routed::Step { step, .. }) if step == VERDICT => {
+                session.push_turn("user", text);
+                Ok(self.propose(session, CommitKind::Verdict, text, files))
+            }
+            Some(Routed::Step {
+                step,
+                by,
+                steer: Some(angle),
+                ..
+            }) if step == "log" => {
+                // "Give me an example first": logged and answered as any
+                // message (a question still gets its sources), and the next
+                // step re-chosen with your steer.
+                self.handle_log_steered(session, text, files, sink, Some(&by), Some(angle))
+                    .await
+            }
+            Some(Routed::Step { step, by, .. }) if step == "log" || step == CONFIRM => {
                 self.handle_log(session, text, files, sink, Some(&by)).await
             }
-            Some((step, part, _)) => {
+            Some(Routed::Step { step, .. }) if step == UNDO => {
+                session.push_turn("user", text);
+                self.undo(session)
+            }
+            Some(Routed::Step { step, part, .. }) => {
                 let intent = match step.as_str() {
                     "summary" => Intent::Summary,
                     "known" => Intent::Known,
                     "move" => Intent::Move,
                     "accept" => Intent::Accept,
                     "replan" => Intent::Replan,
+                    AGENT => Intent::Agent,
+                    TELL => Intent::Tell,
                     _ => Intent::Reject,
                 };
                 let had_log = session.active_part().is_some_and(|p| !p.log.is_empty());
@@ -181,22 +285,25 @@ impl Runtime {
                 self.route_intent(session, intent, part.as_deref(), text, had_log, files, sink)
                     .await
             }
+            // Unsure while a candidate waits: whether it's your verdict is
+            // shown back for your OK, never guessed.
             None if session.pending_candidate.is_some() => {
-                self.handle_judgment(session, text, files, sink).await
+                session.push_turn("user", text);
+                Ok(self.propose(session, CommitKind::Verdict, text, files))
             }
             None => self.handle_log(session, text, files, sink, None).await,
         }
     }
 
-    /// Asks the decision model which step `text` is: (step, part for a move,
-    /// who decided). `None` when there's no decision model, it fails, or it
-    /// isn't sure enough.
+    /// Asks the decision model which step `text` is. `None` when there's no
+    /// decision model, it fails, or it isn't sure enough: the LLM decides.
+    /// `Unsure` when it isn't sure but leans toward a commitment (§15).
     pub(super) async fn decide_step(
         &self,
         session: &Session,
         text: &str,
         sink: &StreamSink,
-    ) -> Option<(String, Option<String>, String)> {
+    ) -> Option<Routed> {
         if session.decisions_off {
             return None;
         }
@@ -207,6 +314,8 @@ impl Runtime {
             ("known".into(), "They clearly say they already know this whole part and want to skip it.".into()),
             ("move".into(), "They want to go on to the next part, or to another named part.".into()),
             ("replan".into(), "They ask to change the plan, or say something that changes the whole task's scope or purpose (a new constraint, requirement or aim).".into()),
+            (AGENT.into(), "They ask for the agent to do this part (do it for them, hand it off, delegate it).".into()),
+            (TELL.into(), "They ask to be told the answer or an explanation outright, rather than pointed to sources.".into()),
         ];
         if session.pending_change.is_some() {
             steps.push((
@@ -218,14 +327,40 @@ impl Runtime {
                 "They turn down the waiting map change.".into(),
             ));
         }
+        if session.undoable() {
+            steps.push((UNDO.into(), "They take back what they just claimed.".into()));
+        }
+        if let Some(p) = &session.pending_commitment {
+            let title = session
+                .map
+                .get(&p.part)
+                .map(|p| p.title.clone())
+                .unwrap_or_default();
+            let what = match p.kind {
+                CommitKind::Verdict => {
+                    "judge their last message as their verdict on the candidate for"
+                }
+                CommitKind::Handoff => "hand off to the agent",
+                CommitKind::Delegate => "delegate to the agent without understanding it",
+            };
+            steps.push((
+                CONFIRM.into(),
+                format!("They agree to the step waiting for their OK: {what} **{title}**."),
+            ));
+        }
         if session.pending_candidate.is_some() {
             for (step, text) in steps.iter_mut() {
-                if step == "move" || step == "known" {
+                if step == "move" || step == "known" || step == AGENT {
                     text.push_str(" Only when they ask to leave the waiting candidate unjudged and ask nothing about it; a message that asks about the candidate is `log` or a verdict, even if they add that they want to move on.");
                 }
             }
             steps.push((VERDICT.into(), "They give their verdict on the waiting candidate: whether it's right, ideally why (\"I don't know\" counts).".into()));
         }
+        let n_steps = steps.len();
+        let offered: Vec<&'static str> = COMMITMENTS
+            .into_iter()
+            .filter(|c| steps.iter().any(|(s, _)| s == c))
+            .collect();
         let mut questions = vec![Question {
             name: "step".into(),
             instructions: "What is the user's latest message, given the session state?".into(),
@@ -250,6 +385,25 @@ impl Runtime {
                 options,
             });
         }
+        questions.push(Question {
+            name: "steer".into(),
+            instructions: "Do they ask for a particular way into what to look at next?".into(),
+            options: vec![
+                ("none".into(), "No such request.".into()),
+                (
+                    "example".into(),
+                    "They want a concrete example first.".into(),
+                ),
+                (
+                    "purpose".into(),
+                    "They want to start from what it's for.".into(),
+                ),
+                (
+                    "mechanism".into(),
+                    "They want to start from how it works.".into(),
+                ),
+            ],
+        });
 
         let mut input = format!(
             "Goal: {}\nCurrent part: {} (`{}`): {}\nLog entries on this part so far: {}\n",
@@ -300,15 +454,29 @@ impl Runtime {
             step.probability * 100.0
         )));
         if step.probability < DECISION_THRESHOLD {
+            // Unsure, but it leans toward something that changes your
+            // record: ask which you meant, never guess (§15). While a
+            // candidate waits, the verdict's show-back is that question.
+            let mass: f64 = offered.iter().map(|c| step.p(c, n_steps)).sum();
+            if session.pending_candidate.is_none() && mass >= UNSURE_COMMITMENT {
+                let mut top = offered.clone();
+                top.sort_by(|a, b| step.p(b, n_steps).total_cmp(&step.p(a, n_steps)));
+                top.truncate(2);
+                return Some(Routed::Unsure { top });
+            }
             return None;
         }
         tracing::debug!(step = %step.choice, p = step.probability, text, "decided step");
-        // While a candidate waits, only a confident "log", move or skip
-        // passes the judge: a move or skip drops the candidate, and the judge
-        // sends anything that isn't a verdict back to chat anyway.
         let mut choice = step.choice.clone();
+        // Agreeing to what waits needs a clear yes.
+        if choice == CONFIRM && step.probability < CONFIDENT_STEP {
+            return None;
+        }
+        // While a candidate waits, only a confident "log", move, skip or
+        // agent step passes the verdict: those drop the candidate, and the
+        // judge sends anything that isn't a verdict back to chat anyway.
         if session.pending_candidate.is_some()
-            && matches!(choice.as_str(), "log" | "move" | "known")
+            && matches!(choice.as_str(), "log" | "move" | "known" | AGENT)
             && step.probability < CONFIDENT_STEP
         {
             choice = VERDICT.to_string();
@@ -318,10 +486,21 @@ impl Runtime {
             .get("part")
             .filter(|a| a.probability >= DECISION_THRESHOLD)
             .map(|a| a.choice.clone());
-        Some((choice, part, decision.by))
+        let steer = decision
+            .answers
+            .get("steer")
+            .filter(|a| a.probability >= DECISION_THRESHOLD)
+            .and_then(|a| Angle::parse(&a.choice));
+        Some(Routed::Step {
+            step: choice,
+            part,
+            by: decision.by,
+            steer,
+        })
     }
 
-    /// Carries out what a chat message meant, the way its command would.
+    /// Carries out what a chat message meant, the way its command would. A
+    /// commitment is shown back first (§15).
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn route_intent(
         &self,
@@ -347,7 +526,9 @@ impl Runtime {
                 session.push_turn("assistant", reply);
                 Ok(TurnOutput::text(reply))
             }
-            Intent::Known => self.handle_known(session, part),
+            Intent::Known => self.claim_shown_back(session, part),
+            Intent::Agent => Ok(self.propose_agent(session, text, files)),
+            Intent::Tell => self.tell(session, text, files, sink, true).await,
             Intent::Move => Ok(match part.filter(|p| !p.is_empty() && *p != "next") {
                 Some(id) => self.handle_focus(session, id),
                 None => self.handle_next(session),
@@ -616,9 +797,11 @@ impl Runtime {
                 pending.key_reason,
             )
         };
+        // The Judge holds the key, so it gets no tools (§11): only the
+        // candidate, the key, your verdict and the files you attached.
         let req = EngineRequest {
             tier: EngineTier::System2,
-            tools: ToolAccess::ReadOnly,
+            tools: ToolAccess::None,
             cwd: session.cwd.clone(),
             system_prompt: if session.exam {
                 EXAM_JUDGE_SYSTEM
@@ -699,6 +882,10 @@ impl Runtime {
             let at = ids.iter().position(|id| *id == part.id).unwrap_or(0);
             let next_id = ids[(at + 1) % ids.len().max(1)].clone();
             session.active = Some(next_id.clone());
+            // Judged and recorded: saved before the next question, so an
+            // error writing it can't leave this one waiting to be judged
+            // (and passed) again.
+            self.store.save_session(session)?;
             sink(StreamEvent::TextDelta("\n\n".into()));
             let ask = self.write_candidate(session, &next_id, files, sink).await?;
             return Ok(TurnOutput::text(ask));
@@ -718,6 +905,8 @@ impl Runtime {
                 i18n::line(session.language.as_deref(), i18n::Line::PassedOneMore)
             );
             session.push_turn("assistant", format!("{}{next}", verdict.feedback));
+            // Saved before the next candidate, as for an exam.
+            self.store.save_session(session)?;
             sink(StreamEvent::TextDelta(next.to_string()));
             let ask = self.write_candidate(session, &part.id, files, sink).await?;
             return Ok(TurnOutput::text(ask));

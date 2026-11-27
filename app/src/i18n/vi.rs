@@ -73,6 +73,63 @@ fn line(l: Line) -> &'static str {
         FindHits => "**{n}** kết quả cho {terms}:",
         FindNone => "Không có dòng nào trong thư mục này chứa {terms}.",
         WebNone => "Không có kết quả trực tuyến nào khớp với {terms}.",
+        ShowKnown => {
+            "Đã ghi: bạn đã biết **{title}**. Một lời tự nhận, không phải bằng chứng. `/undo` (Esc) rút lại."
+        }
+        ShowTell => {
+            "Sẽ nói cho bạn, như bạn yêu cầu. Ghi là đã được nói, không bao giờ là đã hiểu. Esc trước khi câu trả lời đến sẽ hủy."
+        }
+        ShowHandoff => {
+            "Giao **{title}** cho tác tử? Nó làm trong một bản sao staging và bạn xem lại kết quả. Enter chạy · Esc hủy."
+        }
+        ShowHandoffInPlace => {
+            "Giao **{title}** cho tác tử? Đây không phải kho git: nó sửa trực tiếp tệp của bạn, không có staging hay xem xét có kiểm tra. Enter chạy · Esc hủy."
+        }
+        ShowDelegate => {
+            "Giao **{title}** đi mà chưa hiểu? Sẽ ghi là đã giao: bạn không bảo đảm cho kết quả. Enter chạy · Esc hủy."
+        }
+        ShowVerdict => {
+            "Xem đây là phán quyết của bạn về ứng viên? “{words}” Enter chấm · Esc giữ làm ghi chú."
+        }
+        NotRunVerdict => "Không chấm như phán quyết: giữ làm ghi chú.",
+        NotRunHandoff => "Chưa chạy: **{title}** chưa được giao cho tác tử.",
+        NotRunDelegate => "Chưa chạy: **{title}** chưa được giao đi.",
+        NotRunStale => "Chưa chạy: điều đang chờ bạn đồng ý không còn áp dụng.",
+        AskWhich => {
+            "Ý bạn là {choices}? Chưa ghi gì cho đến khi bạn nói. Nếu không thì cứ tiếp tục."
+        }
+        AskKnown => "rằng bạn đã biết **{title}** (`/known`)",
+        AskTell => "được nói cho biết (`/tell <question>`)",
+        AskAgent => "giao phần này cho tác tử (`/handoff` hoặc `/delegate`)",
+        Or => " hay ",
+        Undone => "Đã hoàn tác: lời tự nhận về **{title}** đã rút lại. Hồ sơ giữ nó ở dạng đã rút.",
+        NothingToUndo => {
+            "Không có gì để hoàn tác. Chỉ lời tự nhận ở bước vừa rồi mới rút lại được. Phán quyết đã chấm, lần xem xét, lần giao, lần giao khi chưa hiểu và câu trả lời bạn được nói vẫn giữ nguyên."
+        }
+        NothingWaiting => "Không có gì đang chờ bạn đồng ý.",
+        NextStep => "Tiếp theo: {at} · {question}",
+        NextStepNoPlace => {
+            "Tiếp theo: chưa chỗ nào trong nguồn của bạn nhắc **{concept}**; `/find <terms>` tìm trong đó. · {question}"
+        }
+        StepWideExample => "Tìm một chỗ dùng {concept}. Nó làm gì ở đó?",
+        StepWidePurpose => "{concept} dùng để làm gì trong phần này, theo lời bạn?",
+        StepWideMechanism => "{concept} hoạt động thế nào, từng bước?",
+        StepNarrowExample => {
+            "Chọn một dòng nơi {concept} quan trọng. Nếu nó khác đi thì điều gì thay đổi?"
+        }
+        StepNarrowPurpose => "Vì sao cần {concept} đúng ở đó, và thiếu nó thì hỏng gì?",
+        StepNarrowMechanism => "Lần theo {concept} từng bước: điều gì xảy ra trước, rồi gì tiếp?",
+        Horizon => "Chân trời: {what}.",
+        HorizonNeeds => "cần {parts}",
+        HorizonLeads => "dẫn tới {parts}",
+        EvidenceRatio => "Đạt: {passes} · tự nhận: {claims}.",
+        ClaimWithdrawn => "Lời tự nhận về **{concept}** đã rút ({date}).",
+        StepHistory => "Bạn đến đây thế nào: {kinds}.",
+        StepKindRate => "{kind} {passes} trên {judged} dẫn tới đạt",
+        SteeredTimes => "bạn tự định hướng {n} lần",
+        StepHistoryNote => {
+            "Đó là tất cả những gì Pathfinder giữ về cách bạn học, trong hồ sơ cục bộ của thư mục này."
+        }
     }
 }
 

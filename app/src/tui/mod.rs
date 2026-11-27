@@ -27,7 +27,6 @@ static KEYBOARD_ENHANCED: AtomicBool = AtomicBool::new(false);
 use crate::domain::Session;
 use crate::engine::{BoxFuture, Host, Permission, RunContext, StreamEvent, StreamSink, with_turn};
 use crate::runtime::{CHECKS, EFFORTS, OptionValue, Runtime, TurnInput, TurnOutput};
-use crate::stream::ToolContent;
 
 /// One thing in the conversation as shown.
 #[derive(Debug, Clone)]
@@ -42,6 +41,103 @@ pub enum Entry {
         detail: String,
     },
     Note(String),
+    /// A source `/open` showed: its path, the part shown (`lines 20–24 of
+    /// 391`) and its numbered block in markdown, with the footer.
+    Source {
+        title: String,
+        range: String,
+        body: String,
+    },
+    /// `/find` hits, the best first, and how many lines matched in all.
+    Search {
+        query: String,
+        hits: Vec<crate::sources::Hit>,
+        total: usize,
+    },
+    /// Facts as rows with aligned keys (`/status`). A value may span lines.
+    Info(Vec<(String, String)>),
+}
+
+impl Entry {
+    /// What a turn's reply becomes on screen.
+    fn of_reply(reply: String, shown: crate::runtime::Shown) -> Self {
+        use crate::runtime::Shown;
+        match shown {
+            Shown::Reply => Self::Text(reply),
+            Shown::Source { title, range, body } => Self::Source { title, range, body },
+            Shown::Search { query, hits, total } => Self::Search { query, hits, total },
+            Shown::Notice => Self::Note(reply),
+        }
+    }
+
+    /// The text `y` copies: a reply as written, a source's code without
+    /// its gutter or fence, search hits as `path:line  text`.
+    fn copy_text(&self) -> String {
+        match self {
+            Entry::User(t) | Entry::Text(t) | Entry::Thought(t) | Entry::Note(t) => t.clone(),
+            Entry::Tool { title, detail, .. } => {
+                if detail.is_empty() {
+                    title.clone()
+                } else {
+                    format!("{title}\n{detail}")
+                }
+            }
+            Entry::Source { body, .. } => source_code(body),
+            Entry::Search { hits, .. } => hits
+                .iter()
+                .map(|h| format!("{}  {}", h.at, h.quote.trim()))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            Entry::Info(rows) => rows
+                .iter()
+                .map(|(k, v)| format!("{k}: {}", v.replace('\n', "; ")))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        }
+    }
+
+    /// What `Y` copies: a source's code under its `path:lines`; else as `y`.
+    fn copy_with_place(&self) -> String {
+        match self {
+            Entry::Source { title, range, body } => {
+                let place = match source_lines(range) {
+                    Some((a, b)) if a == b => format!("{title}:{a}"),
+                    Some((a, b)) => format!("{title}:{a}-{b}"),
+                    None => title.clone(),
+                };
+                format!("{place}\n{}", source_code(body))
+            }
+            _ => self.copy_text(),
+        }
+    }
+}
+
+/// A numbered block's code: the lines inside the fence without their
+/// number gutter. Anything else (a folder's list) as it is.
+fn source_code(body: &str) -> String {
+    let mut lines = body.lines();
+    let Some(open) = lines.next() else {
+        return String::new();
+    };
+    let fence: String = open
+        .chars()
+        .take_while(|c| *c == '`' || *c == '~')
+        .collect();
+    if fence.len() < 3 {
+        return body.to_string();
+    }
+    lines
+        .take_while(|l| l.trim() != fence)
+        .map(|l| markdown::split_gutter(l).1)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// `lines 20–24 of 391` → (20, 24).
+fn source_lines(range: &str) -> Option<(usize, usize)> {
+    let span = range.strip_prefix("lines ")?.split(" of ").next()?;
+    let (a, b) = span.split_once('–')?;
+    Some((a.parse().ok()?, b.parse().ok()?))
 }
 
 /// What the background turn tells the screen.
@@ -66,12 +162,29 @@ pub enum AppEvent {
     Shared(std::result::Result<(), String>),
     /// A line for the status bar, from a background check.
     Status(String),
+    /// The startup refresh of the model list finished.
+    ModelsRefreshed(crate::catalog::RefreshOutcome),
+    /// The `/login` or `/logout` job has news.
+    Login(LoginEvent),
+}
+
+/// What a running `/login` or `/logout` job says, tagged with the job's
+/// number: news from a job cancelled meanwhile is dropped.
+#[derive(Debug, Clone)]
+pub enum LoginEvent {
+    /// The browser sign-in's address, shown in case the browser doesn't open.
+    Url(u64, String),
+    /// Finished: what to say, or why it failed.
+    Done(u64, std::result::Result<String, crate::auth::flow::Failure>),
 }
 
 /// A dialog over the conversation.
 pub enum Modal {
+    /// Earlier threads: (id, title), and beside each its dim
+    /// `mode · turns · age` (and whether it is the open one).
     Threads {
         items: Vec<(String, String)>,
+        meta: Vec<String>,
         query: String,
         sel: usize,
     },
@@ -91,9 +204,11 @@ pub enum Modal {
         sel: Option<usize>,
         reply: Option<oneshot::Sender<Permission>>,
     },
-    /// Keys and commands; `scroll` lines down.
+    /// How it works, the commands and the keys, filtered by `query`;
+    /// `scroll` lines down.
     Help {
         scroll: usize,
+        query: String,
     },
     /// Asks once whether to share usage data, then signs in.
     /// Exactly what `/share` or `/bug` would send, before it is sent.
@@ -111,22 +226,20 @@ pub enum Modal {
         busy: bool,
         scroll: usize,
     },
+    /// `/login` and `/logout`: the account list and its steps.
+    Login(Box<crate::auth::flow::Flow>),
 }
 
-/// Indices into `items` matching `query` (case-insensitive substring on id or label).
-pub fn filter_matches(items: &[(String, String)], query: &str) -> Vec<usize> {
-    let q = query.trim().to_ascii_lowercase();
-    if q.is_empty() {
-        return (0..items.len()).collect();
+pub use crate::picker::{display_rows, filter_matches, is_header};
+
+impl Modal {
+    /// Help, at its top with nothing typed.
+    pub fn help() -> Self {
+        Modal::Help {
+            scroll: 0,
+            query: String::new(),
+        }
     }
-    items
-        .iter()
-        .enumerate()
-        .filter(|(_, (id, label))| {
-            label.to_ascii_lowercase().contains(&q) || id.to_ascii_lowercase().contains(&q)
-        })
-        .map(|(i, _)| i)
-        .collect()
 }
 
 /// Something you may send, shown in full first.
@@ -156,14 +269,46 @@ pub enum ConsentStep {
     Invite(String),
 }
 
+/// The gate key's row in [`SETTINGS`].
+fn gate_row() -> usize {
+    SETTINGS
+        .iter()
+        .position(|(o, _)| *o == GATE_KEY)
+        .unwrap_or(0)
+}
+
+/// A turn's error, pointing at `/login` where it says to sign in or add a
+/// key from a terminal.
+fn login_hint(e: &str) -> String {
+    if e.contains("`pathfinder auth") {
+        format!("{e} Here, /login does it.")
+    } else {
+        e.to_string()
+    }
+}
+
+/// Said when a background refresh asked for model lists and got none.
+const UNLISTED: &str =
+    "Couldn't list the models your accounts offer; `pathfinder models --refresh` shows why.";
+
+/// A model id without its `provider:` prefix, as in a short note.
+fn bare_model(id: &str) -> &str {
+    id.split_once(':').map_or(id, |(_, model)| model)
+}
+
+/// Not a thread option: the gate's own key (TypeSafe Jev), set, replaced
+/// or removed from its Settings row.
+pub const GATE_KEY: &str = "gate_key";
+
 /// The thread settings Ctrl+P offers: (option id, name).
-pub const SETTINGS: [(&str, &str); 7] = [
+pub const SETTINGS: [(&str, &str); 8] = [
     (crate::options::FAST_MODEL, "Fast model"),
     (crate::options::FAST_EFFORT, "Fast model effort"),
     (crate::options::MAIN_MODEL, "Main model"),
     (crate::options::MAIN_EFFORT, "Main model effort"),
     (crate::options::DECISIONS, "Decisions"),
     (crate::options::DECISION_MODEL, "Decision service"),
+    (GATE_KEY, "Gate key"),
     (crate::options::CHECKS, "Review checks"),
 ];
 
@@ -199,6 +344,20 @@ pub struct App {
     pub input_history: Vec<String>,
     pub history_idx: Option<usize>,
     pub history_draft: String,
+    /// The input when Esc closed its menu: the menu stays closed until the
+    /// input changes.
+    pub palette_dismissed: Option<String>,
+    /// The input when ↑↓ last moved in its path menu: Tab then completes the
+    /// row the user chose, never a row nobody picked.
+    pub menu_moved: Option<String>,
+    /// The last key was ^D at the bottom with nothing typed: another quits.
+    pub quit_armed: bool,
+    /// Rows the inline menu takes under the input (0 while it is closed):
+    /// the empty-state card is laid out as if they were the conversation's,
+    /// so opening the menu covers it instead of moving it.
+    pub menu_rows: u16,
+    /// Rows of Help's body in view, for PgUp/PgDn.
+    pub help_page: usize,
     pub side_scroll: usize,
     pub side_max_scroll: usize,
     pub mouse_capture: bool,
@@ -216,6 +375,13 @@ pub struct App {
     pub new_below: bool,
     /// The plan panel over the conversation, in a window too narrow to dock it.
     pub side_overlay: bool,
+    /// The window's width at the last draw.
+    pub screen_width: u16,
+    /// Earlier threads in this folder, for the empty conversation.
+    pub earlier_threads: usize,
+    /// The status message on screen and when it came: it goes after
+    /// `STATUS_FOR`.
+    status_seen: Option<(String, std::time::Instant)>,
     /// Kinds of command the user allowed for the rest of this thread.
     pub always: std::collections::HashSet<String>,
     /// When this thread was opened here, and its turns since (usage events).
@@ -224,6 +390,23 @@ pub struct App {
     tx: mpsc::UnboundedSender<AppEvent>,
     /// A browser sign-in waiting for its approval.
     sign_in: Option<tokio::task::AbortHandle>,
+    /// The credentials the engine uses: signing out here reaches it too.
+    pub creds: Arc<crate::auth::Credentials>,
+    /// The running `/login` or `/logout` job, by number.
+    login_task: Option<(u64, tokio::task::AbortHandle)>,
+    /// The last `/login` job's number.
+    login_jobs: u64,
+    /// Open `/login` once the dialog in front closes (first run).
+    pub login_pending: bool,
+    /// Permission questions that came while the sign-in dialog was open:
+    /// asked once it closes, so keys typed for a key never answer them.
+    pending_asks: std::collections::VecDeque<Modal>,
+    /// The model list is being refreshed in the background.
+    pub refreshing_models: bool,
+    /// The last background refresh asked for model lists and got none.
+    pub models_unlisted: bool,
+    /// The last note that a tier runs another model than the one asked for.
+    pub model_note: Option<String>,
     pub quit: bool,
 }
 
@@ -274,6 +457,11 @@ impl App {
             input_history: Vec::new(),
             history_idx: None,
             history_draft: String::new(),
+            palette_dismissed: None,
+            menu_moved: None,
+            quit_armed: false,
+            menu_rows: 0,
+            help_page: 10,
             side_scroll: 0,
             side_max_scroll: 0,
             mouse_capture: true,
@@ -287,13 +475,109 @@ impl App {
             last_total: 0,
             new_below: false,
             side_overlay: false,
+            screen_width: 0,
+            earlier_threads: 0,
+            status_seen: None,
             always: Default::default(),
             thread_started: std::time::Instant::now(),
             thread_turns: 0,
             tx,
             sign_in: None,
+            creds: Arc::new(crate::auth::Credentials::system()),
+            login_task: None,
+            login_jobs: 0,
+            login_pending: false,
+            pending_asks: Default::default(),
+            refreshing_models: false,
+            models_unlisted: false,
+            model_note: None,
             quit: false,
         }
+    }
+
+    /// Refreshes the model list in the background when the cache is empty
+    /// or a day old: at most once per launch, never waiting for it.
+    fn start_model_refresh(&mut self) {
+        let cfg = self.rt.config();
+        let creds = self.creds.clone();
+        let plan =
+            crate::catalog::plan_refresh(&cfg, &crate::catalog::ModelCache::load(), |route| {
+                crate::catalog::signed_in(&creds, route)
+            });
+        if plan.is_empty() {
+            return;
+        }
+        self.refreshing_models = true;
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let outcome = crate::catalog::run_plan(&cfg, &creds, &plan).await;
+            let _ = tx.send(AppEvent::ModelsRefreshed(outcome));
+        });
+    }
+
+    fn on_models_refreshed(&mut self, outcome: crate::catalog::RefreshOutcome) {
+        self.refreshing_models = false;
+        self.models_unlisted = outcome.asked > 0 && outcome.listed == 0;
+        self.note_model_fallback();
+        if self.models_unlisted && self.model_note.is_none() {
+            self.status = UNLISTED.into();
+        }
+    }
+
+    /// Why a tier's model isn't listed, in a few words.
+    fn missing_reason(&self) -> &'static str {
+        if self.refreshing_models {
+            " not listed yet"
+        } else if self.models_unlisted {
+            ": list refresh failed · /status"
+        } else {
+            " not offered · /model"
+        }
+    }
+
+    /// Says once when a tier runs another model than the thread or config
+    /// asks for, and clears that note once it no longer applies. Short, as
+    /// it shares the footer with the model summary; /status says more.
+    fn note_model_fallback(&mut self) {
+        let falls: Vec<(&str, String, crate::config::ModelEntry)> = self
+            .rt
+            .tier_picks(&self.session)
+            .into_iter()
+            .zip(["Fast", "Main"])
+            .filter(|(t, _)| t.fallback)
+            .filter_map(|(t, name)| Some((name, t.wanted?, t.entry?)))
+            .collect();
+        let reason = self.missing_reason();
+        let note = match falls.as_slice() {
+            [] => None,
+            [(name, wanted, using)] => Some(format!(
+                "{name}: {} ({}) — {}{reason}",
+                using.label,
+                crate::config::Account::of(using).short(),
+                bare_model(wanted),
+            )),
+            [(_, _, fast), (_, _, main)] => Some(format!(
+                "Fast: {}, Main: {} — chosen models{reason}{}",
+                fast.label,
+                main.label,
+                if reason.contains('·') {
+                    ""
+                } else {
+                    " · /status"
+                }
+            )),
+            _ => None,
+        };
+        if note == self.model_note {
+            return;
+        }
+        if self.model_note.as_ref() == Some(&self.status) {
+            self.status.clear();
+        }
+        if let Some(n) = &note {
+            self.status = n.clone();
+        }
+        self.model_note = note;
     }
 
     fn check_models_on_startup(&mut self) {
@@ -304,21 +588,201 @@ impl App {
     fn apply_startup_model_note(&mut self, catalog_empty: bool) {
         if catalog_empty {
             self.entries.push(Entry::Note(
-                "No models are configured yet. Run `pathfinder auth login` (or `pathfinder auth set <provider>`) in a terminal to connect an account or API key, then open /model (Ctrl+P)."
+                "No models are configured yet. /login connects an account or API key (as does `pathfinder auth login` in a terminal); then /model (Ctrl+P) picks one."
                     .into(),
             ));
             if self.status.is_empty() {
-                self.status = "No models configured — run `pathfinder auth login` first.".into();
+                self.status = "No models configured — /login connects one.".into();
+            }
+            // Only when nothing at all can run: a key the refresh is still
+            // listing models for doesn't need it.
+            if !crate::auth::accounts::any_model_account(&self.account_rows()) {
+                self.login_pending = true;
+            }
+        }
+    }
+
+    /// The account list with each account's state and model count (as the
+    /// pickers list them), for `/login`.
+    fn account_rows(&self) -> Vec<crate::auth::accounts::RowView> {
+        let cfg = self.rt.config();
+        crate::auth::accounts::with_models(
+            crate::auth::accounts::rows(
+                &self.creds,
+                &cfg,
+                crate::config::CliAccounts::detect(&cfg),
+                &crate::auth::accounts::process_env,
+            ),
+            &self.rt.model_choices(&self.session).catalog,
+        )
+    }
+
+    /// What comes up once nothing is in front: a permission question that
+    /// waited for the sign-in dialog, else the first-run `/login`.
+    fn next_modal(&mut self) {
+        if self.modal.is_some() {
+            return;
+        }
+        if let Some(ask) = self.pending_asks.pop_front() {
+            self.modal = Some(ask);
+        } else if self.login_pending && self.running.is_none() {
+            self.open_login(false, "");
+        }
+    }
+
+    /// Opens `/login` (or `/logout`, with `logout`), or goes straight to a
+    /// named account's step.
+    fn open_login(&mut self, logout: bool, name: &str) {
+        use crate::auth::flow::{Action, Flow, Mode};
+        self.login_pending = false;
+        if self.running.is_some() {
+            // A tool may ask for permission meanwhile: its keys aren't for
+            // a key field.
+            self.status = format!(
+                "Wait for the reply, or Esc to stop it, then /{}.",
+                if logout { "logout" } else { "login" }
+            );
+            return;
+        }
+        let views = self.account_rows();
+        // Only the first word is an account name; the rest is never shown.
+        let name = name.split_whitespace().next().unwrap_or("");
+        if !name.is_empty() {
+            let cfg = self.rt.config();
+            let Some(row) = crate::auth::accounts::parse_account(name, &cfg) else {
+                self.status = format!(
+                    "{} /{} alone picks.",
+                    crate::auth::accounts::unknown_account(name),
+                    if logout { "logout" } else { "login" }
+                );
+                return;
+            };
+            let mode = if logout { Mode::Logout } else { Mode::Login };
+            let (flow, action) = Flow::at(mode, views, &row);
+            self.modal = Some(Modal::Login(Box::new(flow)));
+            if let Action::Run(job) = action {
+                self.start_login_job(job);
+            }
+            return;
+        }
+        let flow = if logout {
+            Flow::logout(views)
+        } else {
+            Flow::login(views)
+        };
+        if flow.is_empty() {
+            self.status = flow.empty_text();
+            return;
+        }
+        self.modal = Some(Modal::Login(Box::new(flow)));
+    }
+
+    /// The gate key's Settings row: its own steps in the sign-in panel. Not
+    /// while a reply runs (a tool may ask for permission meanwhile).
+    fn open_gate_key(&mut self) -> Option<Modal> {
+        if self.running.is_some() {
+            self.status = "Wait for the reply, or Esc to stop it, then set the gate key.".into();
+            return Some(Modal::Settings { sel: gate_row() });
+        }
+        let flow = crate::auth::flow::Flow::gate(self.account_rows());
+        Some(Modal::Login(Box::new(flow)))
+    }
+
+    /// What comes back once a sign-in flow closes: Settings for the gate
+    /// key, which was opened from there; else nothing.
+    fn after_login(mode: crate::auth::flow::Mode) -> Option<Modal> {
+        (mode == crate::auth::flow::Mode::Gate).then(|| Modal::Settings { sel: gate_row() })
+    }
+
+    /// Runs a `/login` job in the background; it reports through
+    /// [`AppEvent::Login`].
+    fn start_login_job(&mut self, job: crate::auth::flow::Job) {
+        self.stop_login_job();
+        self.login_jobs += 1;
+        let id = self.login_jobs;
+        let tx = self.tx.clone();
+        let creds = self.creds.clone();
+        let task = tokio::spawn(async move {
+            let url_tx = tx.clone();
+            let result = crate::auth::connect::run(&creds, job, move |url| {
+                let _ = url_tx.send(AppEvent::Login(LoginEvent::Url(id, url.to_string())));
+            })
+            .await
+            .map_err(|e| crate::auth::flow::Failure::of(&e));
+            let _ = tx.send(AppEvent::Login(LoginEvent::Done(id, result)));
+        });
+        self.login_task = Some((id, task.abort_handle()));
+    }
+
+    /// Stops the running `/login` job; what it says later is dropped.
+    fn stop_login_job(&mut self) {
+        if let Some((_, task)) = self.login_task.take() {
+            task.abort();
+        }
+    }
+
+    fn on_login_event(&mut self, ev: LoginEvent) {
+        let current = self.login_task.as_ref().map(|(id, _)| *id);
+        let id = match &ev {
+            LoginEvent::Url(id, _) | LoginEvent::Done(id, _) => *id,
+        };
+        // From a job cancelled meanwhile, or replaced by a newer one.
+        if current != Some(id) {
+            return;
+        }
+        let Some(Modal::Login(flow)) = self.modal.as_mut() else {
+            self.login_task = None;
+            return;
+        };
+        match ev {
+            LoginEvent::Url(_, url) => flow.set_url(&url),
+            LoginEvent::Done(_, result) => {
+                self.login_task = None;
+                if !flow.busy() {
+                    return;
+                }
+                let mode = flow.mode;
+                match result {
+                    Ok(msg) => {
+                        self.modal = Self::after_login(mode);
+                        self.entries.push(Entry::Note(msg));
+                        self.scroll = 0;
+                        // The model list changed: the footer and pickers
+                        // read it again.
+                        self.models_unlisted = false;
+                        if self.model_note.is_none() && self.status.starts_with("No models") {
+                            self.status.clear();
+                        }
+                        self.note_model_fallback();
+                        if self.rt.model_choices(&self.session).catalog.is_empty() {
+                            self.status =
+                                "Connected; no models listed yet. /status shows the accounts."
+                                    .into();
+                        }
+                    }
+                    Err(e) => {
+                        let text = e.text.clone();
+                        if !flow.fail(e) {
+                            self.modal = Self::after_login(mode);
+                            self.status = text;
+                        }
+                    }
+                }
             }
         }
     }
 }
 
-pub async fn run(rt: Arc<Runtime>, cwd: PathBuf) -> Result<()> {
+pub async fn run(
+    rt: Arc<Runtime>,
+    cwd: PathBuf,
+    creds: Arc<crate::auth::Credentials>,
+) -> Result<()> {
     let cwd = dunce::canonicalize(&cwd).unwrap_or(cwd);
     let (tx, mut rx) = mpsc::unbounded_channel();
     let session = rt.create_session(uuid::Uuid::new_v4().to_string(), cwd.clone())?;
     let mut app = App::new(rt, cwd, session, tx);
+    app.creds = creds;
     emit(UsageEvent::SessionStart {
         surface: pathfinder_schema::Surface::Tui,
     });
@@ -342,16 +806,12 @@ pub async fn run(rt: Arc<Runtime>, cwd: PathBuf) -> Result<()> {
             scroll: 0,
         });
     }
-    if app
-        .rt
-        .sessions_in(&app.cwd)
-        .iter()
-        .any(|s| !s.history.is_empty())
-    {
-        app.status = "Ctrl+O opens an earlier thread in this folder.".into();
-    }
+    app.count_earlier_threads();
     app.check_models_on_startup();
+    app.start_model_refresh();
+    app.note_model_fallback();
 
+    app.next_modal();
     let mut terminal = ratatui::init();
     // Each may be missing (a legacy Windows console has no bracketed
     // paste); the TUI works without either, and an early return here would
@@ -369,6 +829,7 @@ pub async fn run(rt: Arc<Runtime>, cwd: PathBuf) -> Result<()> {
     }
     let mut events = EventStream::new();
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(120));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut paste_until: Option<std::time::Instant> = None;
     let result: Result<()> = async {
         loop {
@@ -419,11 +880,16 @@ pub async fn run(rt: Arc<Runtime>, cwd: PathBuf) -> Result<()> {
                     None => break,
                 },
                 Some(ev) = rx.recv() => app.on_event(ev),
-                _ = ticker.tick(), if app.running.is_some() => app.tick += 1,
+                _ = ticker.tick(), if app.running.is_some() || !app.status.is_empty() => {
+                    app.on_tick(std::time::Instant::now());
+                }
             }
             if app.quit {
                 break;
             }
+            // A question that waited, or on a first run with no account
+            // /login, once nothing is in front.
+            app.next_modal();
         }
         Ok(())
     }
@@ -490,6 +956,9 @@ fn print_transcript(app: &App) {
 }
 
 /// How long after a paste further keys still belong to it.
+/// How long a status message stays before the key hints come back.
+pub const STATUS_FOR: std::time::Duration = std::time::Duration::from_secs(4);
+
 const PASTE_GAP: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// A paste that arrived as key presses, as on Windows, where each line
@@ -526,7 +995,7 @@ fn paste_burst(batch: &[Event], continuing: bool) -> Option<String> {
 /// Puts `text` on the system clipboard: the platform's clipboard (the
 /// Windows clipboard API, else pbcopy, wl-copy, xclip or xsel), else OSC 52,
 /// which most terminals pass to the clipboard (over SSH too).
-fn copy_to_clipboard(text: &str) -> std::result::Result<(), String> {
+pub(crate) fn copy_to_clipboard(text: &str) -> std::result::Result<(), String> {
     use std::io::Write;
     // Not clip.exe: it reads stdin in the console code page and mangles
     // anything outside ASCII.
@@ -586,33 +1055,175 @@ impl Host for TuiHost {
     }
 }
 
-/// The conversation a stored thread shows.
+/// The conversation a stored thread shows: each reply after the thoughts
+/// and tool calls kept with it.
 fn entries_of(session: &Session) -> Vec<Entry> {
-    session
-        .history
-        .iter()
-        .map(|t| match t.role.as_str() {
-            "user" => Entry::User(t.content.clone()),
-            _ => Entry::Text(t.content.clone()),
-        })
-        .collect()
+    use crate::domain::Step;
+    let mut asked = "";
+    let mut out = Vec::new();
+    for t in &session.history {
+        if t.role == "user" {
+            asked = &t.content;
+            out.push(Entry::User(t.content.clone()));
+            continue;
+        }
+        out.extend(t.steps.iter().map(|step| match step {
+            Step::Thought { text } => Entry::Thought(text.clone()),
+            Step::Tool {
+                id,
+                title,
+                ok,
+                detail,
+            } => Entry::Tool {
+                id: id.clone(),
+                title: title.clone(),
+                // Stopped before it ended: it didn't finish.
+                ok: Some(ok.unwrap_or(false)),
+                detail: detail.clone(),
+            },
+        }));
+        out.push(stored_reply(asked, &t.content));
+    }
+    out
 }
 
-/// A thread's name in the list: its goal, else its first message.
-pub fn thread_title(s: &Session) -> String {
-    let raw = s.goal.clone().unwrap_or_else(|| {
+/// A stored reply as it showed live: `/open` and `/find` replies read back
+/// into a source or hits (else a notice), the rest as text.
+fn stored_reply(asked: &str, reply: &str) -> Entry {
+    let command = asked.split_whitespace().next().unwrap_or("");
+    match command {
+        "/open" => match crate::sources::split_source(reply) {
+            Some((title, range, body)) => Entry::Source { title, range, body },
+            None => Entry::Note(reply.to_string()),
+        },
+        "/find" => {
+            let hits: Vec<_> = reply
+                .lines()
+                .filter_map(crate::sources::parse_hit)
+                .collect();
+            if hits.is_empty() {
+                Entry::Note(reply.to_string())
+            } else {
+                Entry::Search {
+                    query: asked["/find".len()..].trim().to_string(),
+                    total: crate::sources::find_total(reply)
+                        .unwrap_or(0)
+                        .max(hits.len()),
+                    hits,
+                }
+            }
+        }
+        _ => Entry::Text(reply.to_string()),
+    }
+}
+
+/// A thread's name: its goal, else its first message that isn't a
+/// command, else the sources it opened (`Sources: README.md, gate.rs`),
+/// else its first command.
+pub fn thread_name(s: &Session) -> Option<String> {
+    let said = s.goal.clone().or_else(|| {
         s.history
             .iter()
-            .find(|t| t.role == "user")
+            .find(|t| t.role == "user" && !t.content.trim_start().starts_with('/'))
             .map(|t| t.content.clone())
-            .unwrap_or_else(|| "(empty thread)".into())
     });
-    let one_line = raw.replace('\n', " ");
+    if let Some(raw) = said {
+        let one = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+        return (!one.is_empty()).then_some(one);
+    }
+    let mut names: Vec<String> = Vec::new();
+    for t in s.history.iter().filter(|t| t.role == "user") {
+        let Some(arg) = ["/open ", "/attach ", "/check "]
+            .iter()
+            .find_map(|c| t.content.trim_start().strip_prefix(c))
+        else {
+            continue;
+        };
+        let path = commands::parse_path_arg(arg.trim());
+        // `/open f.rs:20-24` and `/open f.pdf 3` name the file.
+        let path = match path.rsplit_once(' ') {
+            Some((p, page)) if !page.is_empty() && page.chars().all(|c| c.is_ascii_digit()) => p,
+            _ => path.as_str(),
+        };
+        let path = match path.rsplit_once(':') {
+            Some((p, lines)) if lines.chars().all(|c| c.is_ascii_digit() || c == '-') => p,
+            _ => path,
+        };
+        let name = Path::new(path)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if !name.is_empty() && name != "clear" && !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    if !names.is_empty() {
+        return Some(format!("Sources: {}", names.join(", ")));
+    }
+    // Only other commands: the first, as typed (`/find wrap_hanging`).
+    s.history
+        .iter()
+        .find(|t| t.role == "user")
+        .map(|t| t.content.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|t| !t.is_empty())
+}
+
+/// A thread's name in the list, on one line of at most 70 characters.
+pub fn thread_title(s: &Session) -> String {
+    let Some(one_line) = thread_name(s) else {
+        return "(empty thread)".into();
+    };
     let mut title: String = one_line.chars().take(70).collect();
     if one_line.chars().count() > 70 {
         title.push('…');
     }
     title
+}
+
+/// What the thread list shows beside a title: `chat · 12 · 2h`, the
+/// mode, the messages you sent and how long ago it last changed.
+pub fn thread_meta(s: &Session, age_secs: u64) -> String {
+    let turns = s.history.iter().filter(|t| t.role == "user").count();
+    format!("{} · {turns} · {}", view::mode_of(s), age(age_secs))
+}
+
+/// `now`, `5m`, `2h`, `3d`, `4mo`.
+pub fn age(secs: u64) -> String {
+    match secs {
+        0..60 => "now".into(),
+        60..3600 => format!("{}m", secs / 60),
+        3600..86_400 => format!("{}h", secs / 3600),
+        86_400..5_184_000 => format!("{}d", secs / 86_400),
+        _ => format!("{}mo", secs / 2_592_000),
+    }
+}
+
+/// Settings with at most this many values change in place.
+pub const CYCLE_MAX: usize = 6;
+
+/// The current value's mark in a chooser.
+const CURRENT_MARK: &str = "  ✓";
+
+/// Where a chooser's cursor goes when its filter changes: it stays on the
+/// current value (marked ✓) while that matches, else the best match.
+/// Where the chooser's cursor goes for `query`: on the current value while
+/// it matches as well as anything does (by its own name, never only by its
+/// section), else on the best match.
+fn chooser_sel(items: &[(String, String)], query: &str) -> usize {
+    let q = query.trim().to_lowercase();
+    let matched = filter_matches(items, query);
+    let own = |i: usize| crate::picker::own_rank(items, i, &q);
+    let best = matched.iter().filter_map(|&i| own(i)).min();
+    let current = matched
+        .iter()
+        .position(|&i| !is_header(&items[i]) && items[i].1.ends_with(CURRENT_MARK));
+    if let Some(at) = current
+        && (q.is_empty() || own(matched[at]).is_some_and(|r| Some(r) <= best && r < 3))
+    {
+        return at;
+    }
+    best.and_then(|b| matched.iter().position(|&i| own(i) == Some(b)))
+        .unwrap_or(0)
 }
 
 /// Files a message names that exist and can go to the model: a path the
@@ -661,18 +1272,57 @@ impl App {
         }
     }
 
-    fn is_attach_arg(&self) -> bool {
-        commands::path_arg_slice(&self.input).is_some_and(|(cmd, _)| cmd == "/attach")
-    }
-
     fn is_path_arg(&self) -> bool {
         commands::path_arg_slice(&self.input).is_some()
     }
 
+    /// Menus stay closed while ↑↓ walk the input history, and after Esc
+    /// until the input changes.
+    fn menu_hidden(&self) -> bool {
+        self.history_idx.is_some() || self.palette_dismissed.as_deref() == Some(self.input.as_str())
+    }
+
+    /// Whether Enter runs `cmd`, the palette's selected row, as it is:
+    /// typed in full, or a command without required arguments whose name
+    /// starts with what was typed or that was picked with ↑↓. A looser
+    /// match only fills in.
+    fn enter_runs(&self, cmd: &commands::CommandInfo) -> bool {
+        let typed = self.input.trim().to_ascii_lowercase();
+        let moved = self.menu_moved.as_deref() == Some(self.input.as_str());
+        !cmd.args.contains('<')
+            && (cmd.name == typed
+                || cmd.aliases.contains(&typed.as_str())
+                || moved
+                || commands::starts(cmd, &typed))
+    }
+
     fn palette_open(&self) -> bool {
-        self.input.starts_with('/')
+        !self.menu_hidden()
+            && self.input.starts_with('/')
             && !self.input.contains(char::is_whitespace)
             && !commands::search_for(&self.input, Some(&self.session)).is_empty()
+    }
+
+    /// The files and folders the path menu of `/open`, `/check` or `/attach`
+    /// shows; empty while it is closed.
+    fn path_menu(&self) -> Vec<commands::AttachCandidate> {
+        if self.menu_hidden() || self.input.contains('\n') {
+            return Vec::new();
+        }
+        commands::path_matches(&self.input, &self.cwd)
+    }
+
+    /// The input with its unknown command word replaced by the closest one.
+    fn unknown_fix(&self) -> Option<String> {
+        let word = self.input.split(char::is_whitespace).next()?;
+        if !word.starts_with('/') {
+            return None;
+        }
+        let commands::Parsed::Unknown(_) = commands::parse(word) else {
+            return None;
+        };
+        let closest = commands::closest(word)?;
+        Some(format!("{closest}{}", &self.input[word.len()..]))
     }
 
     fn has_part_in_review(&self) -> bool {
@@ -699,11 +1349,26 @@ impl App {
         self.status = if self.mouse_capture {
             "Mouse scroll/click on (F2 for terminal text selection).".into()
         } else {
-            "Terminal text selection on (F2 restores mouse scroll).".into()
+            "Terminal text selection on (F2 restores mouse scroll) · Tab then Y copies a source with its path.".into()
         };
     }
 
     fn on_paste(&mut self, text: &str) {
+        let before = self.input.clone();
+        self.paste(text);
+        self.after_edit(&before);
+    }
+
+    /// An Esc dismissal and a row picked with ↑↓ hold only for the input
+    /// they were made on: any edit forgets both.
+    fn after_edit(&mut self, before: &str) {
+        if self.input != before {
+            self.palette_dismissed = None;
+            self.menu_moved = None;
+        }
+    }
+
+    fn paste(&mut self, text: &str) {
         let clean = text.replace("\r\n", "\n").replace('\r', "\n");
         self.selected = None;
         self.status.clear();
@@ -724,13 +1389,20 @@ impl App {
                     *error = None;
                     *scroll = self.consent_max_scroll;
                 }
-                Modal::Threads { query, sel, .. } | Modal::Choose { query, sel, .. } => {
-                    for c in clean.chars() {
-                        if !c.is_control() {
-                            query.push(c);
-                        }
-                    }
+                Modal::Login(flow) => flow.on_paste(text),
+                Modal::Threads { query, sel, .. } => {
+                    query.extend(clean.chars().filter(|c| !c.is_control()));
                     *sel = 0;
+                }
+                Modal::Choose {
+                    items, query, sel, ..
+                } => {
+                    query.extend(clean.chars().filter(|c| !c.is_control()));
+                    *sel = chooser_sel(items, query);
+                }
+                Modal::Help { query, scroll } => {
+                    query.extend(clean.chars().filter(|c| !c.is_control()));
+                    *scroll = 0;
                 }
                 _ => {}
             }
@@ -767,7 +1439,7 @@ impl App {
                                 }
                             }
                         }
-                        Modal::Help { scroll } => {
+                        Modal::Help { scroll, .. } => {
                             *scroll = if up {
                                 scroll.saturating_sub(3)
                             } else {
@@ -789,7 +1461,9 @@ impl App {
                                 (*scroll + 3).min(self.consent_max_scroll)
                             };
                         }
-                        Modal::Threads { items, query, sel } => {
+                        Modal::Threads {
+                            items, query, sel, ..
+                        } => {
                             let len = filter_matches(items, query).len();
                             *sel = if up {
                                 sel.saturating_sub(1)
@@ -813,6 +1487,10 @@ impl App {
                             } else {
                                 (*sel + 1).min(SETTINGS.len().saturating_sub(1))
                             };
+                        }
+                        Modal::Login(flow) => {
+                            let code = if up { KeyCode::Up } else { KeyCode::Down };
+                            flow.on_key(KeyEvent::new(code, KeyModifiers::NONE));
                         }
                     }
                     return;
@@ -849,6 +1527,13 @@ impl App {
         if matches!(key.code, KeyCode::Modifier(_)) {
             return;
         }
+        let before = self.input.clone();
+        let armed = std::mem::take(&mut self.quit_armed);
+        self.key(key, armed);
+        self.after_edit(&before);
+    }
+
+    fn key(&mut self, key: KeyEvent, quit_armed: bool) {
         self.status.clear();
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
@@ -867,27 +1552,51 @@ impl App {
                 self.selected = self.items.last().copied();
                 self.reveal_selected = true;
             }
-            KeyCode::Tab if self.is_path_arg() => {
-                let matches = commands::path_matches(&self.input, &self.cwd);
-                if !matches.is_empty() {
-                    let completed = if self.cmd_sel == 0 && matches.len() > 1 {
-                        commands::complete_path(&self.input, &self.cwd)
-                            .or_else(|| commands::complete_path_at(&self.input, 0, &self.cwd))
-                    } else {
-                        commands::complete_path_at(&self.input, self.cmd_sel, &self.cwd)
-                    };
-                    if let Some(done) = completed {
+            KeyCode::Tab if self.is_path_arg() && !self.input.contains('\n') => {
+                // Tab opens a closed menu; it completes the one match, the
+                // matches' common start, or the row picked with ↑↓, and
+                // otherwise leaves the menu open to pick from.
+                let hidden = self.menu_hidden();
+                self.palette_dismissed = None;
+                if hidden && self.history_idx.is_none() {
+                    return;
+                }
+                self.history_idx = None;
+                self.history_draft.clear();
+                let matches = self.path_menu();
+                let picked = self.menu_moved.as_deref() == Some(self.input.as_str());
+                let completed = if matches.is_empty() {
+                    None
+                } else if picked {
+                    commands::complete_path_at(&self.input, self.cmd_sel, &self.cwd)
+                } else {
+                    commands::complete_path(&self.input, &self.cwd)
+                };
+                match completed {
+                    Some(done) => {
                         self.input = done;
                         self.cursor = self.input.len();
                         self.cmd_sel = 0;
-                        self.history_idx = None;
-                        self.history_draft.clear();
                     }
+                    None if matches.len() > 1 => {
+                        self.status = format!("{} matches · ↑↓ picks one", matches.len());
+                    }
+                    None => {}
+                }
+            }
+            KeyCode::Tab if !self.palette_open() && self.unknown_fix().is_some() => {
+                if let Some(fixed) = self.unknown_fix() {
+                    self.cursor = fixed.find(char::is_whitespace).unwrap_or(fixed.len());
+                    self.input = fixed;
+                    self.cmd_sel = 0;
+                    self.history_idx = None;
+                    self.history_draft.clear();
                 }
             }
             KeyCode::Tab
                 if self.input.starts_with('/') && !self.input.contains(char::is_whitespace) =>
             {
+                self.palette_dismissed = None;
                 let matches = commands::search_for(&self.input, Some(&self.session));
                 if !matches.is_empty()
                     && let Some(done) =
@@ -910,12 +1619,26 @@ impl App {
                 Some(cancel) => cancel.cancel(),
                 None => self.quit = true,
             },
+            // With nothing typed: half a page down; at the bottom a second
+            // ^D in a row quits, so paging down never ends the session.
             KeyCode::Char('d') if ctrl => {
-                if self.input.is_empty() {
+                if !self.input.is_empty() {
+                    self.delete_char_forward();
+                } else if self.scroll > 0 {
+                    self.scroll = self.scroll.saturating_sub(self.half_page());
+                    if self.scroll == 0 {
+                        self.new_below = false;
+                    }
+                } else if quit_armed {
                     self.quit = true;
                 } else {
-                    self.delete_char_forward();
+                    self.quit_armed = true;
+                    self.status = "Press ^D again to quit".into();
                 }
+            }
+            // With nothing typed: half a page up; else it clears the line.
+            KeyCode::Char('u') if ctrl && self.input.is_empty() => {
+                self.scroll = self.scroll.saturating_add(self.half_page());
             }
             KeyCode::Char('n') if ctrl => self.new_thread(),
             KeyCode::Char('o') if ctrl => {
@@ -926,16 +1649,20 @@ impl App {
                 used(Feature::Settings);
                 self.modal = Some(Modal::Settings { sel: 0 });
             }
-            KeyCode::Char('t') if ctrl => self.show_thoughts = !self.show_thoughts,
-            KeyCode::Char('g') if ctrl => {
-                used(Feature::ToolGrouping);
-                self.show_tools = !self.show_tools;
+            KeyCode::Char('t') if ctrl => self.run_local(commands::Local::Thinking, ""),
+            KeyCode::Char('g') if ctrl => self.run_local(commands::Local::Tools, ""),
+            KeyCode::Char('b') if ctrl && !self.mouse_capture => {
+                self.status =
+                    "The plan panel stays hidden while you select text · F2 ends it.".into();
             }
             KeyCode::Char('b') if ctrl => {
                 used(Feature::SidePanel);
-                let wide = crossterm::terminal::size().is_ok_and(|(w, _)| w >= view::DOCK_FROM);
-                if wide {
+                // Docked, it hides and shows again; otherwise (too narrow,
+                // or nothing to dock yet) it opens over the conversation.
+                let wide = self.screen_width >= view::DOCK_FROM;
+                if wide && view::panel_earns(self) {
                     self.show_side = !self.show_side;
+                    self.side_overlay = false;
                 } else {
                     self.side_overlay = !self.side_overlay;
                 }
@@ -944,39 +1671,59 @@ impl App {
             KeyCode::Char('j') if ctrl => self.insert_char('\n'),
             KeyCode::F(1) => {
                 used(Feature::Help);
-                self.modal = Some(Modal::Help { scroll: 0 });
+                self.modal = Some(Modal::help());
             }
+            // Esc closes what is open, then stops a running reply. It never
+            // clears the draft (Ctrl+U does).
             KeyCode::Esc if self.side_overlay => self.side_overlay = false,
+            KeyCode::Esc if self.palette_open() || !self.path_menu().is_empty() => {
+                self.palette_dismissed = Some(self.input.clone());
+                self.cmd_sel = 0;
+            }
+            // Then, with nothing running and nothing typed, it answers what
+            // you said in plain words (§15): it cancels what waits for your
+            // OK, or takes back the claim you just made.
             KeyCode::Esc => {
                 if let Some(cancel) = &self.running {
                     cancel.cancel();
+                } else if self.input.trim().is_empty() {
+                    if self.session.pending_commitment.is_some() {
+                        self.run_task_shortcut("/cancel");
+                    } else if self.session.undoable() {
+                        self.run_task_shortcut("/undo");
+                    }
                 }
             }
             KeyCode::Enter if alt || shift => self.insert_char('\n'),
+            // Enter on an empty input runs what waits for your OK (§15).
+            KeyCode::Enter
+                if self.input.trim().is_empty()
+                    && self.running.is_none()
+                    && self.session.pending_commitment.is_some() =>
+            {
+                self.run_task_shortcut("/confirm");
+            }
             KeyCode::Enter => {
-                if self.is_attach_arg() {
-                    let arg = self
-                        .input
-                        .split_once(char::is_whitespace)
-                        .map(|(_, a)| a.trim())
-                        .unwrap_or("");
-                    let ready = arg.eq_ignore_ascii_case("clear")
+                let menu = self.path_menu();
+                if let Some((cmd, arg)) = commands::path_arg_slice(&self.input)
+                    && !menu.is_empty()
+                {
+                    // A path that is already whole runs; otherwise the picked
+                    // row: a folder opens in the menu, a file fills in (and
+                    // `/open` and `/attach` run it).
+                    let arg = arg.trim();
+                    let ready = (cmd == "/attach" && arg.eq_ignore_ascii_case("clear"))
                         || commands::resolve_attach_path(arg, &self.cwd)
                             .is_some_and(|p| p.is_file());
                     if ready {
                         self.submit();
-                    } else if let Some(cand) = commands::attach_matches(&self.input, &self.cwd)
-                        .get(self.cmd_sel)
-                        .cloned()
-                    {
-                        self.input = format!("/attach {}", cand.arg);
+                    } else if let Some(cand) = menu.get(self.cmd_sel.min(menu.len() - 1)) {
+                        self.input = format!("{cmd} {}", cand.arg);
                         self.cursor = self.input.len();
                         self.cmd_sel = 0;
-                        if !cand.is_dir {
+                        if !cand.is_dir && cmd != "/check" {
                             self.submit();
                         }
-                    } else {
-                        self.submit();
                     }
                 } else if self.palette_open() {
                     let matches = commands::search_for(&self.input, Some(&self.session));
@@ -991,11 +1738,20 @@ impl App {
                             self.cmd_sel = 0;
                             self.history_idx = None;
                             self.history_draft.clear();
-                        } else {
+                        } else if self.enter_runs(&cmd) {
                             self.input = cmd.name.to_string();
                             self.cursor = self.input.len();
                             self.cmd_sel = 0;
                             self.submit();
+                        } else {
+                            // A loose match (a word, letters in order, the
+                            // description) only fills in: Enter again runs
+                            // it, so a typo never starts a model turn.
+                            self.input = cmd.name.to_string();
+                            self.cursor = self.input.len();
+                            self.cmd_sel = 0;
+                            self.history_idx = None;
+                            self.history_draft.clear();
                         }
                     } else {
                         self.submit();
@@ -1004,9 +1760,9 @@ impl App {
                     self.submit();
                 }
             }
-            KeyCode::PageUp => self.scroll = self.scroll.saturating_add(10),
+            KeyCode::PageUp => self.scroll = self.scroll.saturating_add(self.page_rows()),
             KeyCode::PageDown => {
-                self.scroll = self.scroll.saturating_sub(10);
+                self.scroll = self.scroll.saturating_sub(self.page_rows());
                 if self.scroll == 0 {
                     self.new_below = false;
                 }
@@ -1026,16 +1782,16 @@ impl App {
                 }
             }
             KeyCode::Up if !ctrl && !alt => {
-                if self.is_attach_arg() {
-                    let len = commands::attach_matches(&self.input, &self.cwd).len();
-                    if len > 0 {
-                        self.cmd_sel = commands::step_selection(self.cmd_sel, len, -1);
-                        return;
-                    }
+                let menu = self.path_menu().len();
+                if menu > 0 {
+                    self.cmd_sel = commands::step_selection(self.cmd_sel, menu, -1);
+                    self.menu_moved = Some(self.input.clone());
+                    return;
                 } else if self.palette_open() {
                     let len = commands::search_for(&self.input, Some(&self.session)).len();
                     if len > 0 {
                         self.cmd_sel = commands::step_selection(self.cmd_sel, len, -1);
+                        self.menu_moved = Some(self.input.clone());
                         return;
                     }
                 }
@@ -1048,16 +1804,16 @@ impl App {
                 }
             }
             KeyCode::Down if !ctrl && !alt => {
-                if self.is_attach_arg() {
-                    let len = commands::attach_matches(&self.input, &self.cwd).len();
-                    if len > 0 {
-                        self.cmd_sel = commands::step_selection(self.cmd_sel, len, 1);
-                        return;
-                    }
+                let menu = self.path_menu().len();
+                if menu > 0 {
+                    self.cmd_sel = commands::step_selection(self.cmd_sel, menu, 1);
+                    self.menu_moved = Some(self.input.clone());
+                    return;
                 } else if self.palette_open() {
                     let len = commands::search_for(&self.input, Some(&self.session)).len();
                     if len > 0 {
                         self.cmd_sel = commands::step_selection(self.cmd_sel, len, 1);
+                        self.menu_moved = Some(self.input.clone());
                         return;
                     }
                 }
@@ -1242,6 +1998,15 @@ impl App {
                     Err(e) => format!("Couldn't copy: {e}"),
                 };
             }
+            // A source with its `path:lines` above the code.
+            KeyCode::Char('Y') if !ctrl => {
+                let text = self.entry_text_placed(sel);
+                used(Feature::Copy);
+                self.status = match copy_to_clipboard(&text) {
+                    Ok(()) => format!("Copied {} characters.", text.chars().count()),
+                    Err(e) => format!("Couldn't copy: {e}"),
+                };
+            }
             KeyCode::Char('c') if ctrl => {
                 let text = self.entry_text(sel);
                 used(Feature::Copy);
@@ -1270,16 +2035,7 @@ impl App {
 
     /// An entry as plain text, for the clipboard: a group copies each step.
     fn entry_text(&self, index: usize) -> String {
-        let one = |e: &Entry| match e {
-            Entry::User(t) | Entry::Text(t) | Entry::Thought(t) | Entry::Note(t) => t.clone(),
-            Entry::Tool { title, detail, .. } => {
-                if detail.is_empty() {
-                    title.clone()
-                } else {
-                    format!("{title}\n{detail}")
-                }
-            }
-        };
+        let one = Entry::copy_text;
         let Some(first) = self.entries.get(index) else {
             return String::new();
         };
@@ -1298,6 +2054,14 @@ impl App {
                 .join("\n");
         }
         one(first)
+    }
+
+    /// What `Y` copies: a source under its `path:lines`, else as `y`.
+    fn entry_text_placed(&self, index: usize) -> String {
+        match self.entries.get(index) {
+            Some(e @ Entry::Source { .. }) => e.copy_with_place(),
+            _ => self.entry_text(index),
+        }
     }
 
     fn line_start(&self) -> usize {
@@ -1387,6 +2151,16 @@ impl App {
         self.cursor = if idx > 0 { slice[idx - 1] } else { slice[0] };
     }
 
+    /// PageUp/PageDown: the visible conversation less two rows of context.
+    fn page_rows(&self) -> usize {
+        (self.conv_area.height as usize).saturating_sub(2).max(1)
+    }
+
+    /// Ctrl+U/Ctrl+D with nothing typed: half the visible conversation.
+    fn half_page(&self) -> usize {
+        (self.conv_area.height as usize / 2).max(1)
+    }
+
     fn history_prev(&mut self) {
         if self.input_history.is_empty() {
             return;
@@ -1446,6 +2220,37 @@ impl App {
         });
     }
 
+    /// A tick of the clock: the spinner turns while a reply runs, and a
+    /// status message goes once it has been on screen for `STATUS_FOR`.
+    pub fn on_tick(&mut self, now: std::time::Instant) {
+        if self.running.is_some() {
+            self.tick += 1;
+        }
+        if self.status.is_empty() {
+            self.status_seen = None;
+            return;
+        }
+        match &self.status_seen {
+            Some((text, at)) if *text == self.status => {
+                if now.saturating_duration_since(*at) >= STATUS_FOR {
+                    self.status.clear();
+                    self.status_seen = None;
+                }
+            }
+            _ => self.status_seen = Some((self.status.clone(), now)),
+        }
+    }
+
+    /// Counts the other threads in this folder that have messages.
+    pub fn count_earlier_threads(&mut self) {
+        self.earlier_threads = self
+            .rt
+            .sessions_in(&self.cwd)
+            .iter()
+            .filter(|s| s.id != self.session.id && !s.history.is_empty())
+            .count();
+    }
+
     fn new_thread(&mut self) {
         if self.running.is_some() {
             self.status = "A reply is still running; Esc stops it.".into();
@@ -1471,34 +2276,86 @@ impl App {
                 self.scroll = 0;
                 self.side_scroll = 0;
                 self.new_below = false;
+                self.count_earlier_threads();
                 self.status = "New thread.".into();
             }
             Err(e) => self.status = format!("Couldn't start a thread: {e}"),
         }
     }
 
+    /// Ctrl+O: the threads in this folder, the most recent first, the
+    /// open one marked.
     fn open_threads(&mut self) {
-        let items: Vec<(String, String)> = self
+        let threads: Vec<(Session, u64)> = self
             .rt
-            .sessions_in(&self.cwd)
-            .iter()
-            .filter(|s| !s.history.is_empty())
-            .map(|s| (s.id.clone(), thread_title(s)))
+            .threads_in(&self.cwd)
+            .into_iter()
+            .filter(|(s, _)| !s.history.is_empty())
             .collect();
-        if items.is_empty() {
+        if threads.iter().all(|(s, _)| s.id == self.session.id) {
             self.status = "No earlier threads in this folder.".into();
             return;
         }
+        let items = threads
+            .iter()
+            .map(|(s, _)| (s.id.clone(), thread_title(s)))
+            .collect();
+        let meta = threads
+            .iter()
+            .map(|(s, age)| {
+                let meta = thread_meta(s, *age);
+                if s.id == self.session.id {
+                    format!("(open) {meta}")
+                } else {
+                    meta
+                }
+            })
+            .collect();
         self.modal = Some(Modal::Threads {
             items,
+            meta,
             query: String::new(),
             sel: 0,
         });
     }
 
+    /// Shows a stored thread in place of this one.
+    fn open_thread(&mut self, s: Session) {
+        self.end_thread();
+        self.begin_thread();
+        self.entries = entries_of(&s);
+        self.attachments.clear();
+        self.last_sent.clear();
+        self.history_idx = None;
+        self.history_draft.clear();
+        self.cmd_sel = 0;
+        self.always.clear();
+        self.expanded.clear();
+        self.selected = None;
+        self.status = format!("Opened \"{}\"", view::fit(&thread_title(&s), 60));
+        self.session = s;
+        self.scroll = 0;
+        self.side_scroll = 0;
+        self.new_below = false;
+        self.count_earlier_threads();
+        self.model_note = None;
+        self.note_model_fallback();
+    }
+
     fn submit(&mut self) {
         let text = self.input.trim().to_string();
         if text.is_empty() {
+            return;
+        }
+        if text.starts_with('/')
+            && let commands::Parsed::Unknown(_) = commands::parse(&text)
+        {
+            // Kept in the input to fix, and out of the history.
+            let word = text.split(char::is_whitespace).next().unwrap_or(&text);
+            self.status = match commands::closest(word) {
+                Some(c) => format!("No such command · Tab → {c}"),
+                None => "No such command · /help lists them".into(),
+            };
             return;
         }
         if self.input_history.last() != Some(&text) {
@@ -1520,11 +2377,7 @@ impl App {
                     self.run_local(cmd, &arg);
                     return;
                 }
-                commands::Parsed::Unknown(word) => {
-                    self.status = format!("Unknown command {word}. /help lists the commands.");
-                    return;
-                }
-                commands::Parsed::Task => {}
+                commands::Parsed::Unknown(_) | commands::Parsed::Task => {}
             }
         }
         if self.running.is_some() {
@@ -1532,7 +2385,13 @@ impl App {
             return;
         }
         let mut files = std::mem::take(&mut self.attachments);
-        for f in dropped_files(&text, &self.cwd) {
+        // A path in a command is the command's argument, not a dropped file.
+        let dropped = if text.starts_with('/') {
+            Vec::new()
+        } else {
+            dropped_files(&text, &self.cwd)
+        };
+        for f in dropped {
             if !files.contains(&f) {
                 files.push(f);
             }
@@ -1610,20 +2469,7 @@ impl App {
             }),
             AppEvent::Stream(StreamEvent::ToolUpdate { id, content }) => {
                 if let Some(Entry::Tool { detail, .. }) = self.tool_mut(&id) {
-                    *detail = match content {
-                        ToolContent::Diff { path, old, new } => {
-                            let before = old.as_deref().map_or(0, |o| o.lines().count());
-                            format!(
-                                "{}: {} lines, was {before}",
-                                path.display(),
-                                new.lines().count()
-                            )
-                        }
-                        ToolContent::Text(t) => {
-                            let tail: Vec<&str> = t.lines().rev().take(6).collect();
-                            tail.into_iter().rev().collect::<Vec<_>>().join("\n")
-                        }
-                    };
+                    *detail = content.summary();
                 }
             }
             AppEvent::Stream(StreamEvent::ToolEnd { id, ok: done }) => {
@@ -1649,14 +2495,25 @@ impl App {
                     Some(Entry::Tool { title, .. }) => title.clone(),
                     _ => format!("Run `{always_key}`"),
                 };
-                self.modal = Some(Modal::Permission {
+                let ask = Modal::Permission {
                     title,
                     always_key,
                     sel: None,
                     reply: Some(reply),
-                });
+                };
+                // Never over the sign-in dialog: keys typed there would
+                // answer it, and the rest would land in the composer.
+                if matches!(self.modal, Some(Modal::Login(_))) {
+                    self.pending_asks.push_back(ask);
+                    self.status =
+                        "A tool asks for permission; it is asked once this dialog closes.".into();
+                } else {
+                    self.modal = Some(ask);
+                }
             }
             AppEvent::Status(line) => self.status = line,
+            AppEvent::ModelsRefreshed(outcome) => self.on_models_refreshed(outcome),
+            AppEvent::Login(ev) => self.on_login_event(ev),
             AppEvent::Shared(result) => {
                 self.modal = None;
                 self.status = match result {
@@ -1739,17 +2596,26 @@ impl App {
             }
             AppEvent::Done { result, stopped } => {
                 self.running = None;
+                // The turn is over: questions it left waiting have no one
+                // to answer.
+                self.pending_asks.clear();
                 self.thread_turns += 1;
                 match result {
-                    Ok(out) if !out.reply.is_empty() => match self.entries.last_mut() {
-                        Some(Entry::Text(s)) => s.push_str(&out.reply),
-                        _ => self.entries.push(Entry::Text(out.reply)),
-                    },
+                    Ok(out) if !out.reply.is_empty() => {
+                        match (
+                            self.entries.last_mut(),
+                            Entry::of_reply(out.reply, out.shown),
+                        ) {
+                            (Some(Entry::Text(s)), Entry::Text(more)) => s.push_str(&more),
+                            (_, entry) => self.entries.push(entry),
+                        }
+                    }
                     Ok(_) => {}
                     Err(_) if stopped => self.entries.push(Entry::Note("Stopped.".into())),
-                    Err(e) => self
-                        .entries
-                        .push(Entry::Note(format!("Something went wrong: {e}"))),
+                    Err(e) => self.entries.push(Entry::Note(format!(
+                        "Something went wrong: {}",
+                        login_hint(&e)
+                    ))),
                 }
                 self.reload();
             }
@@ -1763,15 +2629,25 @@ impl App {
             .find(|e| matches!(e, Entry::Tool { id: i, .. } if i == id))
     }
 
-    /// The values a setting can take: (value, label).
+    /// The values a setting can take: (value, label). Models come in
+    /// sections by account, each after a header row (an empty value).
     fn choices(&self, option: &str) -> Vec<(String, String)> {
         let choices = self.rt.model_choices(&self.session);
         match option {
-            crate::options::FAST_MODEL | crate::options::MAIN_MODEL => choices
-                .catalog
-                .iter()
-                .map(|m| (m.id.clone(), format!("{}  ({})", m.label, m.route.label())))
-                .collect(),
+            crate::options::FAST_MODEL | crate::options::MAIN_MODEL => {
+                crate::config::by_account(&choices.catalog)
+                    .into_iter()
+                    .flat_map(|(account, entries)| {
+                        // A CLI that keeps its own login says where it is.
+                        let header = match account.own_login() {
+                            Some(note) => format!("{} · {note}", account.header()),
+                            None => account.header(),
+                        };
+                        std::iter::once((String::new(), header))
+                            .chain(entries.into_iter().map(|m| (m.id.clone(), m.label.clone())))
+                    })
+                    .collect()
+            }
             crate::options::MAIN_EFFORT | crate::options::FAST_EFFORT => EFFORTS
                 .iter()
                 .map(|e| (e.to_string(), e.to_string()))
@@ -1792,7 +2668,145 @@ impl App {
         }
     }
 
+    /// A setting (not a model) with at most `CYCLE_MAX` values: Enter,
+    /// Space and ←→ step through them in place instead of a chooser.
+    pub fn cycles(&self, option: &str) -> bool {
+        // Models keep their chooser: its sections say which account runs
+        // and pays for each.
+        if matches!(
+            option,
+            GATE_KEY | crate::options::FAST_MODEL | crate::options::MAIN_MODEL
+        ) {
+            return false;
+        }
+        let n = self
+            .choices(option)
+            .iter()
+            .filter(|i| !is_header(i))
+            .count();
+        (1..=CYCLE_MAX).contains(&n)
+    }
+
+    /// A setting's values and which is current, for the settings list.
+    pub fn cycle_values(&self, option: &str) -> (Vec<String>, Option<usize>) {
+        let items: Vec<(String, String)> = self
+            .choices(option)
+            .into_iter()
+            .filter(|i| !is_header(i))
+            .collect();
+        let current = self.current_value(option);
+        let at = items.iter().position(|(v, _)| *v == current);
+        (items.into_iter().map(|(_, label)| label).collect(), at)
+    }
+
+    /// Sets the settings row `row` to its next value (`delta` 1) or the
+    /// one before (-1), for this thread.
+    fn cycle_setting(&mut self, row: usize, delta: isize) {
+        let (option, title) = SETTINGS[row];
+        let items: Vec<String> = self
+            .choices(option)
+            .into_iter()
+            .filter(|i| !is_header(i))
+            .map(|(v, _)| v)
+            .collect();
+        if items.is_empty() {
+            self.status = format!("No choices for {title}.");
+            return;
+        }
+        let current = self.current_value(option);
+        let n = items.len() as isize;
+        let next = match items.iter().position(|v| *v == current) {
+            Some(i) => (i as isize + delta).rem_euclid(n) as usize,
+            None => 0,
+        };
+        let value = if option == crate::options::DECISIONS {
+            OptionValue::Bool(items[next] == "on")
+        } else {
+            OptionValue::Id(items[next].clone())
+        };
+        match self.rt.set_option(&self.session.id, option, value) {
+            Ok(s) => {
+                self.session = s;
+                self.status = self.set_message(title, option, "");
+                self.note_model_fallback();
+            }
+            Err(e) => self.status = format!("Couldn't set {title}: {e}"),
+        }
+    }
+
+    /// A setting's current value as its picker's value: the model id for
+    /// models.
+    fn current_value(&self, option: &str) -> String {
+        let c = self.rt.model_choices(&self.session);
+        match option {
+            crate::options::FAST_MODEL => c.system1.unwrap_or_default(),
+            crate::options::MAIN_MODEL => c.system2.unwrap_or_default(),
+            crate::options::DECISION_MODEL => c
+                .decision_model
+                .map(|p| p.id().to_string())
+                .unwrap_or_default(),
+            _ => self.current(option),
+        }
+    }
+
     /// A setting's current value, for the settings list.
+    /// The model a tier option runs, if it is a model option.
+    fn tier_model(&self, option: &str) -> Option<crate::config::ModelEntry> {
+        let c = self.rt.model_choices(&self.session);
+        let id = match option {
+            crate::options::FAST_MODEL => c.system1,
+            crate::options::MAIN_MODEL => c.system2,
+            _ => None,
+        }?;
+        c.catalog.into_iter().find(|m| m.id == id)
+    }
+
+    /// A setting's value for the settings list: models with their account,
+    /// as the same label can come from several.
+    pub fn current_setting(&self, option: &str) -> String {
+        if option == GATE_KEY {
+            return crate::auth::accounts::gate_key_label(
+                &self.creds,
+                &crate::auth::accounts::process_env,
+            );
+        }
+        match self.tier_model(option) {
+            Some(m) => format!("{} · {}", m.label, crate::config::Account::of(&m).short()),
+            None => self.current(option),
+        }
+    }
+
+    /// A model for the footer: its label with the account's short name
+    /// (`GPT-6 Luna·ChatGPT`), or without it, `$` when billed per use.
+    pub fn footer_model(&self, option: &str, with_account: bool) -> String {
+        match self.tier_model(option) {
+            Some(m) if with_account => {
+                format!("{}·{}", m.label, crate::config::Account::of(&m).short())
+            }
+            _ => self.current_short(option),
+        }
+    }
+
+    /// A model's label for the footer, with `$` when it is billed per use.
+    pub fn current_short(&self, option: &str) -> String {
+        match self.tier_model(option) {
+            Some(m) if crate::config::Account::of(&m).pay_per_use() => format!("{} $", m.label),
+            _ => self.current(option),
+        }
+    }
+
+    /// The status after setting an option: a model names its account.
+    fn set_message(&self, title: &str, option: &str, saved: &str) -> String {
+        match self.tier_model(option) {
+            Some(m) => format!(
+                "{title} set{saved}: {} ({}).",
+                m.label,
+                crate::config::Account::of(&m).header()
+            ),
+            None => format!("{title} set{saved}."),
+        }
+    }
+
     pub fn current(&self, option: &str) -> String {
         let c = self.rt.model_choices(&self.session);
         let label = |id: &Option<String>| {
@@ -1904,6 +2918,11 @@ impl App {
                             .into()
                     };
                 }
+                Modal::Login(flow) => {
+                    self.stop_login_job();
+                    self.status = login_cancelled(flow.mode).into();
+                    self.modal = Self::after_login(flow.mode);
+                }
                 Modal::Help { .. }
                 | Modal::Threads { .. }
                 | Modal::Settings { .. }
@@ -1912,25 +2931,37 @@ impl App {
             return;
         }
         self.modal = match modal {
-            Modal::Help { scroll } => {
+            Modal::Help {
+                mut scroll,
+                mut query,
+            } => {
+                // Typing filters; only Esc, F1 and q (with nothing typed)
+                // close it.
                 let max = self.help_max_scroll;
                 match key.code {
-                    KeyCode::Down | KeyCode::Char('j') => Some(Modal::Help {
-                        scroll: (scroll + 1).min(max),
-                    }),
-                    KeyCode::Up | KeyCode::Char('k') => Some(Modal::Help {
-                        scroll: scroll.saturating_sub(1),
-                    }),
-                    KeyCode::PageDown | KeyCode::Char(' ') => Some(Modal::Help {
-                        scroll: (scroll + 10).min(max),
-                    }),
-                    KeyCode::PageUp => Some(Modal::Help {
-                        scroll: scroll.saturating_sub(10),
-                    }),
-                    KeyCode::Home | KeyCode::Char('g') => Some(Modal::Help { scroll: 0 }),
-                    KeyCode::End | KeyCode::Char('G') => Some(Modal::Help { scroll: max }),
-                    _ => None,
+                    KeyCode::Esc | KeyCode::F(1) => return,
+                    KeyCode::Char('q') if query.is_empty() && !ctrl && !alt => return,
+                    KeyCode::Down => scroll = (scroll + 1).min(max),
+                    KeyCode::Up => scroll = scroll.saturating_sub(1),
+                    KeyCode::PageDown => scroll = (scroll + self.help_page).min(max),
+                    KeyCode::PageUp => scroll = scroll.saturating_sub(self.help_page),
+                    KeyCode::Home => scroll = 0,
+                    KeyCode::End => scroll = max,
+                    KeyCode::Char('u') if ctrl => {
+                        query.clear();
+                        scroll = 0;
+                    }
+                    KeyCode::Backspace => {
+                        query.pop();
+                        scroll = 0;
+                    }
+                    KeyCode::Char(c) if !ctrl && !alt && !c.is_control() => {
+                        query.push(c);
+                        scroll = 0;
+                    }
+                    _ => {}
                 }
+                Some(Modal::Help { scroll, query })
             }
             Modal::Share {
                 outgoing,
@@ -2007,6 +3038,39 @@ impl App {
                 busy,
                 scroll,
             } => self.on_consent_key(key, events, threads, step, error, busy, scroll),
+            Modal::Login(mut flow) => {
+                use crate::auth::flow::Action;
+                match flow.on_key(key) {
+                    Action::None => Some(Modal::Login(flow)),
+                    Action::Close => {
+                        self.status = login_cancelled(flow.mode).into();
+                        Self::after_login(flow.mode)
+                    }
+                    Action::Cancel => {
+                        self.stop_login_job();
+                        if flow.is_closed() {
+                            // It was the first step: close now, so the next
+                            // key reaches the composer.
+                            self.status = login_cancelled(flow.mode).into();
+                            Self::after_login(flow.mode)
+                        } else {
+                            flow.error = Some("Cancelled.".into());
+                            Some(Modal::Login(flow))
+                        }
+                    }
+                    Action::Run(job) => {
+                        self.start_login_job(job);
+                        Some(Modal::Login(flow))
+                    }
+                    Action::Copy(url) => {
+                        self.status = match copy_to_clipboard(&url) {
+                            Ok(()) => "Copied the sign-in address.".into(),
+                            Err(e) => format!("Couldn't copy: {e}"),
+                        };
+                        Some(Modal::Login(flow))
+                    }
+                }
+            }
             Modal::Permission {
                 title,
                 always_key,
@@ -2058,88 +3122,52 @@ impl App {
             }
             Modal::Threads {
                 items,
+                meta,
                 mut query,
                 mut sel,
             } => {
                 let filtered = filter_matches(&items, &query);
+                let last = filtered.len().saturating_sub(1);
                 match key.code {
-                    KeyCode::Esc => None,
+                    KeyCode::Esc => return,
                     KeyCode::Enter => {
                         if let Some(&orig_idx) = filtered.get(sel)
                             && let Some((id, _)) = items.get(orig_idx)
-                            && let Ok(Some(s)) = self.rt.load_session(id)
                         {
-                            self.end_thread();
-                            self.begin_thread();
-                            self.entries = entries_of(&s);
-                            self.attachments.clear();
-                            self.last_sent.clear();
-                            self.history_idx = None;
-                            self.history_draft.clear();
-                            self.cmd_sel = 0;
-                            self.always.clear();
-                            self.expanded.clear();
-                            self.selected = None;
-                            self.session = s;
-                            self.scroll = 0;
-                            self.side_scroll = 0;
-                            self.new_below = false;
-                            self.status = "Thread opened.".into();
+                            if *id == self.session.id {
+                                self.status = "That thread is already open.".into();
+                            } else if let Ok(Some(s)) = self.rt.load_session(id) {
+                                self.open_thread(s);
+                            }
                         }
-                        None
+                        return;
                     }
-                    KeyCode::Up => {
-                        sel = sel.saturating_sub(1);
-                        Some(Modal::Threads { items, query, sel })
-                    }
-                    KeyCode::Down => {
-                        sel = (sel + 1).min(filtered.len().saturating_sub(1));
-                        Some(Modal::Threads { items, query, sel })
-                    }
-                    KeyCode::PageUp => {
-                        sel = sel.saturating_sub(10);
-                        Some(Modal::Threads { items, query, sel })
-                    }
-                    KeyCode::PageDown => {
-                        sel = (sel + 10).min(filtered.len().saturating_sub(1));
-                        Some(Modal::Threads { items, query, sel })
-                    }
-                    KeyCode::Home => Some(Modal::Threads {
-                        items,
-                        query,
-                        sel: 0,
-                    }),
-                    KeyCode::End => Some(Modal::Threads {
-                        items,
-                        query,
-                        sel: filtered.len().saturating_sub(1),
-                    }),
+                    KeyCode::Up => sel = sel.saturating_sub(1),
+                    KeyCode::Down => sel = (sel + 1).min(last),
+                    KeyCode::PageUp => sel = sel.saturating_sub(10),
+                    KeyCode::PageDown => sel = (sel + 10).min(last),
+                    KeyCode::Home => sel = 0,
+                    KeyCode::End => sel = last,
                     KeyCode::Char('u') if ctrl => {
                         query.clear();
-                        Some(Modal::Threads {
-                            items,
-                            query,
-                            sel: 0,
-                        })
+                        sel = 0;
                     }
                     KeyCode::Backspace => {
                         query.pop();
-                        Some(Modal::Threads {
-                            items,
-                            query,
-                            sel: 0,
-                        })
+                        sel = 0;
                     }
                     KeyCode::Char(c) if !ctrl && !alt && !c.is_control() => {
                         query.push(c);
-                        Some(Modal::Threads {
-                            items,
-                            query,
-                            sel: 0,
-                        })
+                        sel = 0;
                     }
-                    _ => Some(Modal::Threads { items, query, sel }),
+                    _ => {}
                 }
+                Some(Modal::Threads {
+                    items,
+                    meta,
+                    query,
+                    sel,
+                })
             }
             Modal::Settings { sel } => match key.code {
                 KeyCode::Esc => None,
@@ -2153,24 +3181,38 @@ impl App {
                     }
                     Some(Modal::Settings { sel })
                 }
-                KeyCode::Enter => {
+                KeyCode::Enter if SETTINGS[sel].0 == GATE_KEY => self.open_gate_key(),
+                // A few values: they change in place.
+                KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Right | KeyCode::Left
+                    if self.cycles(SETTINGS[sel].0) =>
+                {
+                    let delta = if key.code == KeyCode::Left { -1 } else { 1 };
+                    self.cycle_setting(sel, delta);
+                    Some(Modal::Settings { sel })
+                }
+                KeyCode::Enter | KeyCode::Char(' ') => {
                     let (option, name) = SETTINGS[sel];
-                    let items = self.choices(option);
-                    if items.is_empty() {
+                    let mut items = self.choices(option);
+                    if items.iter().all(is_header) {
                         self.status = format!("No choices for {name}.");
                         Some(Modal::Settings { sel })
                     } else {
-                        let current = self.current(option);
+                        let current = self.current_value(option);
                         let at = items
                             .iter()
-                            .position(|(v, l)| *v == current || l.starts_with(&current))
+                            .position(|item| !is_header(item) && item.0 == current);
+                        if let Some(i) = at {
+                            items[i].1.push_str(CURRENT_MARK);
+                        }
+                        let sel = at
+                            .and_then(|i| filter_matches(&items, "").iter().position(|&m| m == i))
                             .unwrap_or(0);
                         Some(Modal::Choose {
                             option,
                             title: name.to_string(),
                             items,
                             query: String::new(),
-                            sel: at,
+                            sel,
                         })
                     }
                 }
@@ -2205,7 +3247,8 @@ impl App {
                             match self.rt.set_option(&self.session.id, option, value) {
                                 Ok(s) => {
                                     self.session = s;
-                                    self.status = format!("{title} set.");
+                                    self.status = self.set_message(&title, option, "");
+                                    self.note_model_fallback();
                                 }
                                 Err(e) => self.status = format!("Couldn't set {title}: {e}"),
                             }
@@ -2230,8 +3273,11 @@ impl App {
                                     self.session = s;
                                     match self.rt.set_default_option(option, make_value(&raw_val)) {
                                         Ok(()) => {
-                                            self.status =
-                                                format!("{title} set (saved as default).");
+                                            self.status = self.set_message(
+                                                &title,
+                                                option,
+                                                " (saved as default)",
+                                            );
                                         }
                                         Err(e) => {
                                             self.status = format!(
@@ -2245,8 +3291,29 @@ impl App {
                         }
                         Some(Modal::Settings { sel: back })
                     }
-                    KeyCode::Up => {
-                        sel = sel.saturating_sub(1);
+                    _ => {
+                        let last = filtered.len().saturating_sub(1);
+                        match key.code {
+                            KeyCode::Up => sel = sel.saturating_sub(1),
+                            KeyCode::Down => sel = (sel + 1).min(last),
+                            KeyCode::PageUp => sel = sel.saturating_sub(10),
+                            KeyCode::PageDown => sel = (sel + 10).min(last),
+                            KeyCode::Home => sel = 0,
+                            KeyCode::End => sel = last,
+                            KeyCode::Char('u') if ctrl => {
+                                query.clear();
+                                sel = chooser_sel(&items, &query);
+                            }
+                            KeyCode::Backspace => {
+                                query.pop();
+                                sel = chooser_sel(&items, &query);
+                            }
+                            KeyCode::Char(c) if !ctrl && !alt && !c.is_control() => {
+                                query.push(c);
+                                sel = chooser_sel(&items, &query);
+                            }
+                            _ => {}
+                        }
                         Some(Modal::Choose {
                             option,
                             title,
@@ -2255,90 +3322,19 @@ impl App {
                             sel,
                         })
                     }
-                    KeyCode::Down => {
-                        sel = (sel + 1).min(filtered.len().saturating_sub(1));
-                        Some(Modal::Choose {
-                            option,
-                            title,
-                            items,
-                            query,
-                            sel,
-                        })
-                    }
-                    KeyCode::PageUp => {
-                        sel = sel.saturating_sub(10);
-                        Some(Modal::Choose {
-                            option,
-                            title,
-                            items,
-                            query,
-                            sel,
-                        })
-                    }
-                    KeyCode::PageDown => {
-                        sel = (sel + 10).min(filtered.len().saturating_sub(1));
-                        Some(Modal::Choose {
-                            option,
-                            title,
-                            items,
-                            query,
-                            sel,
-                        })
-                    }
-                    KeyCode::Home => Some(Modal::Choose {
-                        option,
-                        title,
-                        items,
-                        query,
-                        sel: 0,
-                    }),
-                    KeyCode::End => Some(Modal::Choose {
-                        option,
-                        title,
-                        items,
-                        query,
-                        sel: filtered.len().saturating_sub(1),
-                    }),
-                    KeyCode::Char('u') if ctrl => {
-                        query.clear();
-                        Some(Modal::Choose {
-                            option,
-                            title,
-                            items,
-                            query,
-                            sel: 0,
-                        })
-                    }
-                    KeyCode::Backspace => {
-                        query.pop();
-                        Some(Modal::Choose {
-                            option,
-                            title,
-                            items,
-                            query,
-                            sel: 0,
-                        })
-                    }
-                    KeyCode::Char(c) if !ctrl && !alt && !c.is_control() => {
-                        query.push(c);
-                        Some(Modal::Choose {
-                            option,
-                            title,
-                            items,
-                            query,
-                            sel: 0,
-                        })
-                    }
-                    _ => Some(Modal::Choose {
-                        option,
-                        title,
-                        items,
-                        query,
-                        sel,
-                    }),
                 }
             }
         };
+    }
+}
+
+/// What the footer says when the sign-in panel closes without a change.
+fn login_cancelled(mode: crate::auth::flow::Mode) -> &'static str {
+    use crate::auth::flow::Mode;
+    match mode {
+        Mode::Login => "Sign-in cancelled",
+        Mode::Logout => "Sign-out cancelled",
+        Mode::Gate => "Nothing changed.",
     }
 }
 
@@ -2577,7 +3573,7 @@ impl App {
         match cmd {
             Local::Help => {
                 used(Feature::Help);
-                self.modal = Some(Modal::Help { scroll: 0 });
+                self.modal = Some(Modal::help());
             }
             Local::Quit => {
                 if let Some(cancel) = &self.running {
@@ -2595,9 +3591,8 @@ impl App {
                 self.modal = Some(Modal::Settings { sel: 0 });
             }
             Local::Status => {
-                for line in self.status_lines() {
-                    self.entries.push(Entry::Note(line));
-                }
+                self.entries.push(Entry::User("/status".into()));
+                self.entries.push(Entry::Info(self.status_rows()));
                 self.scroll = 0;
             }
             Local::Copy => {
@@ -2615,6 +3610,14 @@ impl App {
                             ),
                             Err(e) => format!("Couldn't copy: {e}"),
                         }
+                    }
+                    // Sources aren't replies: say how to copy one.
+                    None if self
+                        .entries
+                        .iter()
+                        .any(|e| matches!(e, Entry::Source { .. } | Entry::Search { .. })) =>
+                    {
+                        "There's no reply to copy yet · Tab selects a source, y copies it".into()
                     }
                     None => "There's no reply to copy yet.".into(),
                 };
@@ -2686,6 +3689,8 @@ impl App {
             Local::Attach => self.attach(arg),
             Local::Share => self.start_share(arg),
             Local::Bug => self.start_bug(arg),
+            Local::Login => self.open_login(false, arg),
+            Local::Logout => self.open_login(true, arg),
         }
     }
 
@@ -2722,44 +3727,104 @@ impl App {
         }
     }
 
-    /// `/status`: what this Pathfinder is running with.
-    fn status_lines(&self) -> Vec<String> {
+    /// `/status`: what this Pathfinder is running with, as key/value rows.
+    fn status_rows(&self) -> Vec<(String, String)> {
         use crate::options;
         let c = crate::telemetry::Consent::load();
         let yes = |b: bool| if b { "yes" } else { "no" };
         let gate = if self.current(options::DECISIONS) != "on" {
             "off for this thread".to_string()
         } else if c.enrolled {
-            "on (your own decision key if you have one, else the shared gate)".to_string()
+            "on · your own decision key if you have one, else the shared gate".to_string()
         } else {
             "on if you have a decision key; join the beta (/join) for the shared gate".to_string()
         };
+        let tiers = self.rt.tier_picks(&self.session);
+        // One account a line, as `pathfinder auth status` prints them.
+        let mut accounts = vec!["/login adds one · /logout removes one".to_string()];
+        accounts.extend(crate::auth::accounts::status_lines(&self.account_rows()));
+        let row = |k: &str, v: String| (k.to_string(), v);
         vec![
-            format!(
-                "Pathfinder {} on {} {}",
-                env!("CARGO_PKG_VERSION"),
-                std::env::consts::OS,
-                std::env::consts::ARCH
+            row(
+                "Version",
+                format!(
+                    "Pathfinder {} · {} {}",
+                    env!("CARGO_PKG_VERSION"),
+                    std::env::consts::OS,
+                    std::env::consts::ARCH
+                ),
             ),
-            format!(
-                "Models: fast {}, main {} · checks {}",
-                self.current(options::FAST_MODEL),
-                self.current(options::MAIN_MODEL),
-                self.current(options::CHECKS)
+            row("Fast model", self.tier_line(&tiers[0])),
+            row("Main model", self.tier_line(&tiers[1])),
+            row("Checks", self.current(options::CHECKS).to_string()),
+            row("Gate", gate),
+            row("Accounts", accounts.join("\n")),
+            row(
+                "Display",
+                format!(
+                    "thinking {} · tool calls {}",
+                    if self.show_thoughts {
+                        "shown"
+                    } else {
+                        "hidden"
+                    },
+                    if self.show_tools {
+                        "each shown"
+                    } else {
+                        "grouped"
+                    }
+                ),
             ),
-            format!("Gate: {gate}"),
-            format!(
-                "Joined: {} · usage events: {} · thread sharing: {}",
-                yes(c.enrolled),
-                yes(c.events),
-                yes(c.threads)
+            row(
+                "Sharing",
+                format!(
+                    "{} · usage events {} · threads {}",
+                    if c.enrolled { "joined" } else { "not joined" },
+                    yes(c.events),
+                    yes(c.threads)
+                ),
             ),
-            format!(
-                "Settings: {} · log: {}",
-                crate::paths::config_dir().display(),
-                crate::bugreport::tui_log().display()
+            row(
+                "Paths",
+                format!(
+                    "settings {}\nlog {}",
+                    commands::tilde_path(&crate::paths::config_dir()),
+                    commands::tilde_path(&crate::bugreport::tui_log())
+                ),
             ),
         ]
+    }
+
+    /// `/status` as lines of `key: value`, as the clipboard gets it.
+    #[cfg(test)]
+    fn status_lines(&self) -> Vec<String> {
+        Entry::Info(self.status_rows())
+            .copy_text()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// A `/status` line for one tier: the model that runs, and the one
+    /// configured when that differs.
+    fn tier_line(&self, tier: &crate::config::TierPick) -> String {
+        let using = tier.entry.as_ref().map_or_else(
+            || "none (/login connects an account)".to_string(),
+            |m| format!("{} ({})", m.label, crate::config::Account::of(m).header()),
+        );
+        match (&tier.wanted, tier.fallback) {
+            (Some(wanted), true) if self.refreshing_models => format!(
+                "{using} · configured {wanted}, not available until the model list refreshes"
+            ),
+            (Some(wanted), true) if self.models_unlisted => format!(
+                "{using} · configured {wanted}, not listed: the model list couldn't refresh (`pathfinder models --refresh` shows why)"
+            ),
+            (Some(wanted), true) => {
+                format!("{using} · configured {wanted}, which your accounts don't offer")
+            }
+            (Some(wanted), false) => format!("{using} · configured {wanted}"),
+            (None, _) => format!("{using} · picked automatically"),
+        }
     }
 
     /// `/share [note]`: shows exactly what would be sent; Enter sends it.
@@ -2826,7 +3891,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{MapChange, Part, PartStatus, PendingCandidate, ProposedPart, TurnRecord};
+    use crate::domain::{MapChange, Part, PartStatus, PendingCandidate, ProposedPart};
     use crate::engine::{BoxFuture, Engine, EngineRequest};
     use crate::store::Store;
 
@@ -2878,6 +3943,106 @@ mod tests {
                 [Event::Key(*k), Event::Key(up)]
             })
             .collect()
+    }
+
+    fn a_source() -> Entry {
+        Entry::Source {
+            title: "app/x.rs".into(),
+            range: "lines 20–21 of 391".into(),
+            body: "```rust numbered\n   20      name: \"probe\",\n   21  },\n```\n22–391 not shown · `/open app/x.rs:22-81`".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn status_is_one_info_block_after_the_command() {
+        let (mut app, _rx, _store) = test_app();
+        app.input = "/status".into();
+        app.cursor = app.input.len();
+        app.on_key(key(KeyCode::Enter));
+        assert!(matches!(&app.entries[0], Entry::User(t) if t == "/status"));
+        let Some(Entry::Info(rows)) = app.entries.get(1) else {
+            panic!("no info block");
+        };
+        let keys: Vec<&str> = rows.iter().map(|(k, _)| k.as_str()).collect();
+        for k in [
+            "Version",
+            "Fast model",
+            "Main model",
+            "Gate",
+            "Display",
+            "Paths",
+        ] {
+            assert!(keys.contains(&k), "{keys:?}");
+        }
+        assert_eq!(app.entries.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn copy_takes_replies_only_and_says_how_to_copy_a_source() {
+        let (mut app, _rx, _store) = test_app();
+        app.entries = vec![
+            Entry::User("/open app/x.rs:20-21".into()),
+            a_source(),
+            Entry::Note("No file `y` in this workspace.".into()),
+        ];
+        app.run_local(commands::Local::Copy, "");
+        assert_eq!(
+            app.status,
+            "There's no reply to copy yet · Tab selects a source, y copies it"
+        );
+        app.entries.clear();
+        app.run_local(commands::Local::Copy, "");
+        assert_eq!(app.status, "There's no reply to copy yet.");
+    }
+
+    #[test]
+    fn a_source_copies_its_code_and_hits_copy_as_places() {
+        let source = a_source();
+        assert_eq!(source.copy_text(), "    name: \"probe\",\n},");
+        assert_eq!(
+            source.copy_with_place(),
+            "app/x.rs:20-21\n    name: \"probe\",\n},"
+        );
+        let hits = Entry::Search {
+            query: "gate".into(),
+            hits: vec![crate::sources::Hit {
+                at: crate::sources::Locator::Local {
+                    file: "a.rs".into(),
+                    page: None,
+                    line: 3,
+                },
+                quote: "    let gate = 1;".into(),
+            }],
+            total: 1,
+        };
+        assert_eq!(hits.copy_text(), "a.rs:3  let gate = 1;");
+        assert_eq!(hits.copy_with_place(), hits.copy_text());
+    }
+
+    #[tokio::test]
+    async fn a_resumed_thread_shows_sources_and_hits_again() {
+        let (mut app, _rx, _store) = test_app();
+        std::fs::write(app.cwd.join("x.rs"), "fn a() {}\n").unwrap();
+        let opened = crate::sources::open(&app.cwd, "x.rs", None).unwrap();
+        let s = &mut app.session;
+        s.push_turn("user", "/open x.rs");
+        s.push_turn("assistant", &opened);
+        s.push_turn("user", "/open nope.rs");
+        s.push_turn("assistant", "No file `nope.rs` in this workspace.");
+        s.push_turn("user", "/find gate here");
+        s.push_turn(
+            "assistant",
+            "**1/31** for `gate here`:\n\n- `x.rs:1`  gate here",
+        );
+        s.push_turn("user", "why?");
+        s.push_turn("assistant", "Because.");
+        let entries = entries_of(&app.session);
+        assert!(matches!(&entries[1], Entry::Source { title, range, .. }
+                if title == "x.rs" && range == "lines 1–1 of 1"));
+        assert!(matches!(&entries[3], Entry::Note(_)));
+        assert!(matches!(&entries[5], Entry::Search { query, hits, total }
+                if query == "gate here" && hits.len() == 1 && *total == 31));
+        assert!(matches!(&entries[7], Entry::Text(t) if t == "Because."));
     }
 
     #[test]
@@ -2972,6 +4137,8 @@ mod tests {
         app.input.clear();
         app.cursor = 0;
         app.on_key(ctrl(KeyCode::Char('d')));
+        assert!(!app.quit, "the first ^D at the bottom only asks");
+        app.on_key(ctrl(KeyCode::Char('d')));
         assert!(app.quit);
     }
 
@@ -3003,6 +4170,409 @@ mod tests {
         app.on_key(key(KeyCode::Down));
         assert_eq!(app.input, "abcde\nfg");
         assert_eq!(app.history_idx, None);
+    }
+
+    #[test]
+    fn history_walks_past_commands_without_the_palette_taking_the_arrows() {
+        let (mut app, _rx, _) = test_app();
+        app.input_history = vec!["/status".into(), "/help".into()];
+        app.on_key(key(KeyCode::Up));
+        assert_eq!(app.input, "/help");
+        // A recalled command opens no menu, so the arrows keep walking.
+        assert!(!app.palette_open());
+        app.on_key(key(KeyCode::Up));
+        assert_eq!(app.input, "/status");
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(app.input, "/help");
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(app.input, "");
+        assert_eq!(app.history_idx, None);
+        // Editing a recalled command brings the palette back.
+        app.on_key(key(KeyCode::Up));
+        app.on_key(key(KeyCode::Backspace));
+        assert_eq!(app.input, "/hel");
+        assert!(app.palette_open());
+    }
+
+    #[tokio::test]
+    async fn one_path_menu_for_open_check_and_attach_and_tab_never_guesses() {
+        let (mut app, _rx, _) = test_app();
+        std::fs::create_dir_all(app.cwd.join("apps")).unwrap();
+        std::fs::write(app.cwd.join("apps/x.rs"), "fn x() {}\n").unwrap();
+        std::fs::write(app.cwd.join("apple.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(app.cwd.join("apricot.md"), "# A\n").unwrap();
+        let type_in = |app: &mut App, text: &str| {
+            app.input = text.into();
+            app.cursor = app.input.len();
+            app.cmd_sel = 0;
+        };
+
+        // Three matches, no common start: Tab keeps the input and the menu.
+        type_in(&mut app, "/open ap");
+        assert_eq!(app.path_menu().len(), 3);
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(app.input, "/open ap");
+        assert!(app.status.contains("3 matches"), "{}", app.status);
+        // A row picked with ↑↓ is what Tab completes.
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(app.input, "/open apple.rs");
+
+        // /check has the same menu; a file fills in and waits.
+        type_in(&mut app, "/check ap");
+        app.on_key(key(KeyCode::Up));
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.input, "/check apricot.md");
+        assert!(app.entries.is_empty());
+
+        // Enter on a folder goes into it; on a file /open runs.
+        type_in(&mut app, "/open ap");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.input, "/open apps/");
+        assert!(app.entries.is_empty());
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.input, "");
+        assert!(
+            matches!(app.entries.first(), Some(Entry::User(t)) if t == "/open apps/x.rs"),
+            "{:?}",
+            app.entries.first().map(|_| ())
+        );
+
+        // Esc closes the menu and keeps the text; Tab opens it again.
+        type_in(&mut app, "/attach ap");
+        assert!(!app.path_menu().is_empty());
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(app.input, "/attach ap");
+        assert!(app.path_menu().is_empty());
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(app.input, "/attach ap");
+        assert!(!app.path_menu().is_empty());
+    }
+
+    #[tokio::test]
+    async fn enter_on_a_loose_palette_match_fills_in_and_never_runs_a_model_command() {
+        for typed in ["/ask", "/explain", "/agent", "/smry"] {
+            let (mut app, _rx, _) = test_app();
+            for c in typed.chars() {
+                app.on_key(key(KeyCode::Char(c)));
+            }
+            assert!(app.palette_open(), "{typed}");
+            app.on_key(key(KeyCode::Enter));
+            assert!(app.entries.is_empty(), "{typed} ran something");
+            assert!(app.running.is_none(), "{typed} started a turn");
+            assert!(app.input.starts_with('/') && app.input != typed, "{typed}");
+            assert!(
+                app.palette_open(),
+                "{typed} -> {:?}: the filled command stays in view",
+                app.input
+            );
+        }
+        // A prefix of a local command still runs on Enter.
+        let (mut app, _rx, _) = test_app();
+        for c in "/stat".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.input.is_empty());
+        assert!(!app.entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_esc_dismissal_and_a_picked_row_end_with_the_next_edit() {
+        let (mut app, _rx, _) = test_app();
+        std::fs::write(app.cwd.join("apple.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(app.cwd.join("apricot.md"), "# A\n").unwrap();
+        std::fs::write(app.cwd.join("apz.md"), "# Z\n").unwrap();
+        let typed = |app: &mut App, text: &str| {
+            for c in text.chars() {
+                app.on_key(key(KeyCode::Char(c)));
+            }
+        };
+        // `/`, Esc, Backspace, `/` again: the palette is back.
+        typed(&mut app, "/");
+        app.on_key(key(KeyCode::Esc));
+        assert!(!app.palette_open());
+        app.on_key(key(KeyCode::Backspace));
+        typed(&mut app, "/");
+        assert!(app.palette_open());
+        // The same with the path menu and ^U.
+        app.on_key(key(KeyCode::Backspace));
+        typed(&mut app, "/open ap");
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.path_menu().is_empty());
+        app.on_key(ctrl(KeyCode::Char('u')));
+        typed(&mut app, "/open ap");
+        assert_eq!(app.path_menu().len(), 3);
+        // A row picked with ↑↓, then an edit back to the same text: Tab
+        // doesn't complete the old pick.
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Backspace));
+        typed(&mut app, "p");
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(app.input, "/open ap");
+        assert!(app.status.contains("3 matches"), "{}", app.status);
+    }
+
+    #[test]
+    fn the_chooser_cursor_leaves_the_current_value_for_a_better_match() {
+        let (mut app, _rx, _) = test_app();
+        let items: Vec<(String, String)> = [
+            ("", "Claude Code · Claude subscription · own login"),
+            ("haiku", "Haiku  ✓"),
+            ("sonnet", "Sonnet"),
+            ("opus", "Opus"),
+        ]
+        .iter()
+        .map(|(a, b)| (a.to_string(), b.to_string()))
+        .collect();
+        app.modal = Some(Modal::Choose {
+            option: crate::options::FAST_MODEL,
+            title: "Fast model".into(),
+            sel: chooser_sel(&items, ""),
+            items,
+            query: String::new(),
+        });
+        for c in "son".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        let Some(Modal::Choose {
+            items, query, sel, ..
+        }) = &app.modal
+        else {
+            panic!("expected the chooser");
+        };
+        let matched = filter_matches(items, query);
+        // The header's letters in order don't pull in every model.
+        assert_eq!(matched.len(), 1);
+        assert_eq!(items[matched[*sel]].0, "sonnet");
+    }
+
+    #[test]
+    fn help_pages_by_its_height_and_q_filters_once_something_is_typed() {
+        let (mut app, _rx, _) = test_app();
+        app.modal = Some(Modal::help());
+        app.help_max_scroll = 100;
+        app.help_page = 20;
+        app.on_key(key(KeyCode::PageDown));
+        assert!(matches!(app.modal, Some(Modal::Help { scroll: 20, .. })));
+        for c in "scroll".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        app.on_key(key(KeyCode::Char('q')));
+        assert!(
+            matches!(&app.modal, Some(Modal::Help { query, .. }) if query == "scrollq"),
+            "q filters while something is typed"
+        );
+        app.on_key(ctrl(KeyCode::Char('u')));
+        app.on_key(key(KeyCode::Char('q')));
+        assert!(app.modal.is_none(), "q closes with nothing typed");
+    }
+
+    #[tokio::test]
+    async fn a_file_named_in_a_command_is_not_attached_as_dropped() {
+        let (mut app, _rx, _) = test_app();
+        std::fs::write(app.cwd.join("x.pdf"), b"%PDF").unwrap();
+        app.input = "/open x.pdf".into();
+        app.cursor = app.input.len();
+        app.palette_dismissed = Some(app.input.clone());
+        app.on_key(key(KeyCode::Enter));
+        let Some(Entry::User(shown)) = app.entries.first() else {
+            panic!("the command is echoed");
+        };
+        assert_eq!(shown, "/open x.pdf");
+    }
+
+    #[test]
+    fn the_palette_keys_walk_its_sections_and_rank_as_typed() {
+        let (mut app, _rx, _) = test_app();
+        app.on_key(key(KeyCode::Char('/')));
+        assert!(app.palette_open());
+        // Bare `/`: what the fresh thread asks for first (/find, /plan),
+        // then the sections; ↑↓ skip the headers.
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(app.cmd_sel, 1);
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(app.input, "/open ");
+        // ↑ from the top wraps to the last row.
+        app.on_key(ctrl(KeyCode::Char('u')));
+        app.on_key(key(KeyCode::Char('/')));
+        app.on_key(key(KeyCode::Up));
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(app.input, "/quit ");
+        // Typed: a prefix leads; a word of what it does when no name fits.
+        app.on_key(ctrl(KeyCode::Char('u')));
+        for c in "/sear".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.input, "/web ", "a command with arguments fills in");
+        assert!(app.entries.is_empty());
+    }
+
+    #[test]
+    fn esc_closes_menus_and_stops_but_never_clears_the_draft() {
+        let (mut app, _rx, _) = test_app();
+        app.input = "/he".into();
+        app.cursor = 3;
+        assert!(app.palette_open());
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(app.input, "/he");
+        assert!(!app.palette_open());
+        // Dismissed until the next edit.
+        app.on_key(key(KeyCode::Left));
+        assert!(!app.palette_open());
+        app.on_key(key(KeyCode::End));
+        app.on_key(key(KeyCode::Char('l')));
+        assert!(app.palette_open());
+
+        app.input = "half a thought".into();
+        app.cursor = app.input.len();
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(app.input, "half a thought");
+        let cancel = CancellationToken::new();
+        app.running = Some(cancel.clone());
+        app.on_key(key(KeyCode::Esc));
+        assert!(cancel.is_cancelled());
+        assert_eq!(app.input, "half a thought");
+        // Ctrl+U still clears the line.
+        app.on_key(ctrl(KeyCode::Char('u')));
+        assert_eq!(app.input, "");
+    }
+
+    fn pending_handoff() -> crate::domain::PendingCommitment {
+        crate::domain::PendingCommitment {
+            kind: crate::domain::CommitKind::Handoff,
+            part: "p".into(),
+            text: "do it".into(),
+            files: vec![],
+            candidate: None,
+        }
+    }
+
+    fn last_sent(app: &App) -> Option<&str> {
+        app.entries.iter().rev().find_map(|e| match e {
+            Entry::User(t) => Some(t.as_str()),
+            _ => None,
+        })
+    }
+
+    #[tokio::test]
+    async fn enter_on_empty_input_confirms_a_pending_commitment() {
+        let (mut app, _rx, _) = test_app();
+        // Nothing waits: Enter on nothing sends nothing.
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.entries.is_empty() && app.running.is_none());
+        app.session.pending_commitment = Some(pending_handoff());
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(last_sent(&app), Some("/confirm"));
+        assert!(app.running.is_some());
+        // While it runs, Enter on nothing sends nothing more.
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.entries.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn enter_with_text_still_submits_it() {
+        let (mut app, _rx, _) = test_app();
+        app.session.pending_commitment = Some(pending_handoff());
+        app.input = "wait, which part?".into();
+        app.cursor = app.input.len();
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(last_sent(&app), Some("wait, which part?"));
+    }
+
+    #[tokio::test]
+    async fn esc_closes_a_menu_before_cancelling() {
+        let (mut app, _rx, _) = test_app();
+        app.session.pending_commitment = Some(pending_handoff());
+        app.input = "/he".into();
+        app.cursor = 3;
+        assert!(app.palette_open());
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.entries.is_empty());
+        // A draft is never cancelled away: Esc leaves it and what waits.
+        app.input = "half a thought".into();
+        app.cursor = app.input.len();
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.entries.is_empty());
+        assert_eq!(app.input, "half a thought");
+        // A running reply is stopped first; nothing is sent.
+        app.input.clear();
+        app.cursor = 0;
+        let cancel = CancellationToken::new();
+        app.running = Some(cancel.clone());
+        app.on_key(key(KeyCode::Esc));
+        assert!(cancel.is_cancelled());
+        assert!(app.entries.is_empty());
+        app.running = None;
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(last_sent(&app), Some("/cancel"));
+    }
+
+    #[tokio::test]
+    async fn esc_takes_back_a_claim_only_in_the_next_turn() {
+        let (mut app, _rx, _) = test_app();
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.entries.is_empty());
+        app.session.turn = 2;
+        app.session.last_commitment = Some(crate::domain::Undoable {
+            part: "p".into(),
+            events: vec![(1, "c".into())],
+            turn: 0,
+            prev_active: None,
+            prev_mode: crate::domain::SessionMode::Working,
+            prev_change: None,
+            prev_gaps: vec![],
+        });
+        // Too late: a step has passed since the claim.
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.entries.is_empty());
+        app.session.last_commitment.as_mut().unwrap().turn = 1;
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(last_sent(&app), Some("/undo"));
+    }
+
+    #[test]
+    fn pages_follow_the_visible_height_and_toggles_say_what_they_did() {
+        let (mut app, _rx, _) = test_app();
+        app.conv_area = Rect::new(0, 0, 80, 20);
+        app.on_key(key(KeyCode::PageUp));
+        assert_eq!(app.scroll, 18);
+        app.on_key(key(KeyCode::PageUp));
+        assert_eq!(app.scroll, 36);
+        app.on_key(key(KeyCode::PageDown));
+        assert_eq!(app.scroll, 18);
+
+        app.on_key(ctrl(KeyCode::Char('t')));
+        assert!(app.show_thoughts);
+        assert_eq!(app.status, "Showing thinking.");
+        app.on_key(ctrl(KeyCode::Char('t')));
+        assert_eq!(app.status, "Hiding thinking.");
+        app.on_key(ctrl(KeyCode::Char('g')));
+        assert!(app.show_tools);
+        assert_eq!(app.status, "Showing every tool call.");
+    }
+
+    #[test]
+    fn unknown_commands_point_at_the_closest_and_stay_out_of_history() {
+        let (mut app, _rx, _) = test_app();
+        app.input = "/opne README.md".into();
+        app.cursor = app.input.len();
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.status, "No such command · Tab → /open");
+        assert_eq!(app.input, "/opne README.md");
+        assert!(app.input_history.is_empty());
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(app.input, "/open README.md");
+        assert_eq!(app.cursor, "/open".len());
+
+        app.input = "/frobnicate".into();
+        app.cursor = app.input.len();
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.status, "No such command · /help lists them");
+        assert!(app.input_history.is_empty());
     }
 
     #[test]
@@ -3224,20 +4794,46 @@ mod tests {
 
         // Help scroll clamping.
         app.help_max_scroll = 15;
-        app.modal = Some(Modal::Help { scroll: 12 });
+        app.modal = Some(Modal::Help {
+            scroll: 12,
+            query: String::new(),
+        });
         app.on_key(key(KeyCode::PageDown));
         match app.modal {
-            Some(Modal::Help { scroll }) => assert_eq!(scroll, 15),
+            Some(Modal::Help { scroll, .. }) => assert_eq!(scroll, 15),
             _ => panic!("expected Help"),
         }
 
-        // Settings sel preserved on Esc from Choose, plus type-to-filter.
+        // A setting with a few values changes in place: Enter, Space and
+        // → step forward, ← back, and the row stays selected.
         app.modal = Some(Modal::Settings { sel: 3 });
+        assert_eq!(SETTINGS[3].0, crate::options::MAIN_EFFORT);
+        let before = app.current(crate::options::MAIN_EFFORT);
         app.on_key(key(KeyCode::Enter));
-        match &app.modal {
-            Some(Modal::Choose { title, .. }) => assert_eq!(title, "Main model effort"),
-            _ => panic!("expected Choose"),
-        }
+        assert!(matches!(app.modal, Some(Modal::Settings { sel: 3 })));
+        let after = app.current(crate::options::MAIN_EFFORT);
+        assert_ne!(before, after);
+        assert!(
+            app.status.starts_with("Main model effort set"),
+            "{}",
+            app.status
+        );
+        app.on_key(key(KeyCode::Left));
+        assert_eq!(app.current(crate::options::MAIN_EFFORT), before);
+        app.on_key(key(KeyCode::Char(' ')));
+        app.on_key(key(KeyCode::Right));
+        app.on_key(key(KeyCode::Left));
+        app.on_key(key(KeyCode::Left));
+        assert_eq!(app.current(crate::options::MAIN_EFFORT), before);
+
+        // Settings sel preserved on Esc from Choose, plus type-to-filter.
+        app.modal = Some(Modal::Choose {
+            option: crate::options::MAIN_EFFORT,
+            title: "Main model effort".into(),
+            items: app.choices(crate::options::MAIN_EFFORT),
+            query: String::new(),
+            sel: 0,
+        });
         app.on_key(key(KeyCode::Char('h')));
         match &app.modal {
             Some(Modal::Choose { query, items, .. }) => {
@@ -3251,6 +4847,491 @@ mod tests {
             Some(Modal::Settings { sel }) => assert_eq!(sel, 3),
             _ => panic!("expected Settings with sel=3"),
         }
+    }
+
+    #[test]
+    fn login_commands_open_the_dialog_and_errors_point_at_it() {
+        use commands::{Local, Parsed};
+        assert_eq!(commands::parse("/login"), Parsed::Local(Local::Login, ""));
+        assert_eq!(
+            commands::parse("/logout openai"),
+            Parsed::Local(Local::Logout, "openai")
+        );
+        let (mut app, _rx, _) = test_app();
+        app.run_local(Local::Login, "nope");
+        assert!(app.modal.is_none());
+        assert!(app.status.contains("No account `nope`"), "{}", app.status);
+        app.run_local(Local::Login, "");
+        assert!(matches!(app.modal, Some(Modal::Login(_))));
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.modal.is_none());
+        assert!(
+            login_hint("OpenAI needs an API key. Run `pathfinder auth set openai` in a terminal.")
+                .ends_with("Here, /login does it.")
+        );
+        assert_eq!(login_hint("timeout"), "timeout");
+    }
+
+    /// Stands in for a running `/login` job (nothing real runs), as job `id`.
+    fn fake_login_job(app: &mut App, id: u64) {
+        let handle = tokio::spawn(std::future::pending::<()>()).abort_handle();
+        app.login_jobs = id;
+        app.login_task = Some((id, handle));
+    }
+
+    #[tokio::test]
+    async fn a_finished_login_job_closes_or_goes_back_with_why() {
+        use crate::auth::accounts::{Row, RowView, State};
+        use crate::auth::flow::{Action, Flow, Job, Mode};
+        let views = vec![RowView {
+            stored: Some("…ABCD".into()),
+            ..RowView::new(Row::Gate, State::NotSet)
+        }];
+        let (mut app, _rx, _) = test_app();
+        // Signing out asks first.
+        let (mut flow, action) = Flow::at(Mode::Logout, views.clone(), &Row::Gate);
+        assert_eq!(action, Action::None);
+        assert_eq!(
+            flow.on_key(key(KeyCode::Enter)),
+            Action::Run(Job::SignOut(Row::Gate))
+        );
+        app.modal = Some(Modal::Login(Box::new(flow)));
+        fake_login_job(&mut app, 1);
+        app.on_event(AppEvent::Login(LoginEvent::Done(
+            1,
+            Ok("Removed it.".into()),
+        )));
+        assert!(app.modal.is_none());
+        assert!(matches!(app.entries.last(), Some(Entry::Note(n)) if n == "Removed it."));
+
+        let (mut flow, _) = Flow::at(Mode::Login, views, &Row::Gate);
+        flow.on_paste("ts-0123456789abcdefghij");
+        assert!(matches!(flow.on_key(key(KeyCode::Enter)), Action::Run(_)));
+        app.modal = Some(Modal::Login(Box::new(flow)));
+        fake_login_job(&mut app, 2);
+        app.on_event(AppEvent::Login(LoginEvent::Url(
+            2,
+            "https://x.example".into(),
+        )));
+        app.on_event(AppEvent::Login(LoginEvent::Done(
+            2,
+            Err("401: bad key".to_string().into()),
+        )));
+        let Some(Modal::Login(flow)) = &app.modal else {
+            panic!("closed")
+        };
+        assert_eq!(flow.error.as_deref(), Some("401: bad key"));
+        assert!(!flow.busy());
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_sign_in_closes_and_the_next_key_reaches_the_input() {
+        use crate::auth::accounts::{Row, RowView, State};
+        use crate::auth::flow::{Action, Flow, Job, Mode};
+        let views = vec![RowView::new(Row::Chatgpt, State::NotSignedIn)];
+        let (mut app, _rx, _) = test_app();
+        let (flow, action) = Flow::at(Mode::Login, views.clone(), &Row::Chatgpt);
+        assert_eq!(action, Action::Run(Job::SignInChatgpt));
+        app.modal = Some(Modal::Login(Box::new(flow)));
+        fake_login_job(&mut app, 1);
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.modal.is_none());
+        assert!(app.login_task.is_none());
+        // The cancelled job's late answer changes nothing.
+        app.on_event(AppEvent::Login(LoginEvent::Done(1, Ok("Signed in".into()))));
+        app.on_key(key(KeyCode::Char('/')));
+        assert_eq!(app.input, "/");
+
+        // A cancelled job's answer never lands on a newer job.
+        app.input.clear();
+        app.cursor = 0;
+        let mut flow = Flow::login(views);
+        assert_eq!(
+            flow.on_key(key(KeyCode::Enter)),
+            Action::Run(Job::SignInChatgpt)
+        );
+        app.modal = Some(Modal::Login(Box::new(flow)));
+        fake_login_job(&mut app, 2);
+        app.on_key(key(KeyCode::Esc));
+        let Some(Modal::Login(flow)) = &mut app.modal else {
+            panic!("back at the list")
+        };
+        assert_eq!(flow.error.as_deref(), Some("Cancelled."));
+        assert_eq!(
+            flow.on_key(key(KeyCode::Enter)),
+            Action::Run(Job::SignInChatgpt)
+        );
+        fake_login_job(&mut app, 3);
+        app.on_event(AppEvent::Login(LoginEvent::Done(2, Ok("stale".into()))));
+        assert!(matches!(&app.modal, Some(Modal::Login(f)) if f.busy()));
+        assert!(app.login_task.is_some());
+        app.on_event(AppEvent::Login(LoginEvent::Done(3, Ok("Signed in".into()))));
+        assert!(app.modal.is_none());
+        assert!(matches!(app.entries.last(), Some(Entry::Note(n)) if n == "Signed in"));
+    }
+
+    #[test]
+    fn a_permission_question_waits_for_the_sign_in_dialog() {
+        use crate::auth::accounts::{Row, RowView, State};
+        use crate::auth::flow::{Flow, Mode};
+        use crate::commands::Local;
+        let (mut app, _rx, _) = test_app();
+        let views = vec![RowView::new(Row::AnthropicApi, State::NotSet)];
+        let (flow, _) = Flow::at(Mode::Login, views, &Row::AnthropicApi);
+        app.modal = Some(Modal::Login(Box::new(flow)));
+        app.on_paste("sk-ant-api03-");
+        let (reply, mut answer) = oneshot::channel();
+        app.on_event(AppEvent::Ask {
+            call_id: "c1".into(),
+            always_key: "bash:ls".into(),
+            reply,
+        });
+        // 'a' would be "always", '1' "once": here they are the key's.
+        for c in "a1y-rest".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        assert!(matches!(app.modal, Some(Modal::Login(_))));
+        assert!(answer.try_recv().is_err(), "nothing answered");
+        assert!(app.input.is_empty());
+        assert!(app.always.is_empty());
+        // Closed, the question comes up.
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.modal.is_none());
+        app.next_modal();
+        assert!(matches!(app.modal, Some(Modal::Permission { .. })));
+
+        // While a reply runs, /login waits for it.
+        app.modal = None;
+        app.running = Some(CancellationToken::new());
+        app.run_local(Local::Login, "");
+        assert!(app.modal.is_none());
+        assert!(app.status.contains("Wait for the reply"), "{}", app.status);
+    }
+
+    #[tokio::test]
+    async fn the_gate_key_is_set_from_settings_and_comes_back_there() {
+        use crate::auth::flow::Mode;
+        let (mut app, _rx, _) = test_app();
+        let row = gate_row();
+        assert_eq!(SETTINGS[row - 1].1, "Decision service");
+        assert_eq!(SETTINGS[row], (GATE_KEY, "Gate key"));
+        app.modal = Some(Modal::Settings { sel: row });
+        app.on_key(key(KeyCode::Enter));
+        let Some(Modal::Login(flow)) = &app.modal else {
+            panic!("the gate key's steps")
+        };
+        assert_eq!(flow.mode, Mode::Gate);
+        // Esc (back through a replace/remove choice if a key is stored)
+        // returns to Settings on the same row.
+        for _ in 0..2 {
+            if matches!(app.modal, Some(Modal::Login(_))) {
+                app.on_key(key(KeyCode::Esc));
+            }
+        }
+        assert!(
+            matches!(app.modal, Some(Modal::Settings { sel }) if sel == row),
+            "back in Settings"
+        );
+        assert_eq!(app.status, "Nothing changed.");
+        // A finished job comes back there too, with what it did.
+        app.modal = Some(Modal::Login(Box::new(crate::auth::flow::Flow::gate(
+            Vec::new(),
+        ))));
+        if let Some(Modal::Login(flow)) = &mut app.modal {
+            flow.on_paste("ts-0123456789abcdefghij");
+            assert!(matches!(
+                flow.on_key(key(KeyCode::Enter)),
+                crate::auth::flow::Action::Run(_)
+            ));
+        }
+        fake_login_job(&mut app, 7);
+        app.on_event(AppEvent::Login(LoginEvent::Done(7, Ok("Saved it.".into()))));
+        assert!(matches!(app.modal, Some(Modal::Settings { sel }) if sel == row));
+        assert!(matches!(app.entries.last(), Some(Entry::Note(n)) if n == "Saved it."));
+        // Not while a reply runs.
+        app.running = Some(CancellationToken::new());
+        app.on_key(key(KeyCode::Enter));
+        assert!(matches!(app.modal, Some(Modal::Settings { .. })));
+        assert!(app.status.contains("Wait for the reply"), "{}", app.status);
+    }
+
+    #[test]
+    fn logout_lists_only_what_login_creates() {
+        use crate::auth::accounts::{Row, RowView, State};
+        use crate::auth::flow::Flow;
+        let stored = |row| RowView {
+            stored: Some("…ABCD".into()),
+            ..RowView::new(row, State::NotSet)
+        };
+        let flow = Flow::logout(vec![
+            stored(Row::Chatgpt),
+            stored(Row::AnthropicApi),
+            RowView::new(Row::ClaudeCode, State::Installed),
+            RowView::new(Row::Endpoint("lab".into()), State::NoKeyNeeded),
+            stored(Row::Gate),
+        ]);
+        let ids: Vec<&str> = flow
+            .picker()
+            .unwrap()
+            .items
+            .iter()
+            .map(|i| i.0.as_str())
+            .collect();
+        assert_eq!(ids, ["chatgpt", "anthropic", "endpoint:lab"]);
+    }
+
+    #[test]
+    fn a_key_given_as_the_account_name_is_never_shown() {
+        use crate::commands::Local;
+        let (mut app, _rx, _) = test_app();
+        app.run_local(Local::Login, "openai sk-proj-SECRETVALUE-0123456789");
+        assert!(!app.status.contains("SECRETVALUE"), "{}", app.status);
+        app.modal = None;
+        app.run_local(Local::Login, "sk-proj-SECRETVALUE-0123456789");
+        assert!(app.modal.is_none());
+        assert!(!app.status.contains("SECRETVALUE"), "{}", app.status);
+        assert!(app.status.contains("looks like a key"), "{}", app.status);
+    }
+
+    #[test]
+    fn section_headers_are_shown_but_skipped_and_filtered() {
+        let items: Vec<(String, String)> = [
+            ("", "ChatGPT sign-in · ChatGPT plan"),
+            ("chatgpt:gpt-6-luna", "GPT-6 Luna"),
+            ("", "Claude Code · Claude subscription"),
+            ("claude-haiku", "Haiku"),
+            ("claude-sonnet", "Sonnet"),
+            ("", "Anthropic API · pay per use"),
+            ("anthropic:claude-haiku-5-5", "Claude Haiku 5.5"),
+        ]
+        .iter()
+        .map(|(a, b)| (a.to_string(), b.to_string()))
+        .collect();
+        assert_eq!(filter_matches(&items, ""), [1, 3, 4, 6]);
+        assert_eq!(display_rows(&items, ""), (0..7).collect::<Vec<_>>());
+        // A section's header goes only when one of its models matches.
+        assert_eq!(filter_matches(&items, "haiku"), [3, 6]);
+        assert_eq!(display_rows(&items, "haiku"), [2, 3, 5, 6]);
+        // Typing an account's name keeps its whole section.
+        assert_eq!(filter_matches(&items, "pay per use"), [6]);
+        assert_eq!(filter_matches(&items, "claude code"), [3, 4]);
+        assert!(display_rows(&items, "nothing").is_empty());
+
+        // Keys step over the headers: `sel` counts models only.
+        let (mut app, _rx, _store) = test_app();
+        app.modal = Some(Modal::Choose {
+            option: crate::options::MAIN_MODEL,
+            title: "Main model".into(),
+            items: items.clone(),
+            query: String::new(),
+            sel: 0,
+        });
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Down));
+        match &app.modal {
+            Some(Modal::Choose {
+                sel, items, query, ..
+            }) => {
+                assert_eq!(*sel, 3);
+                let idx = filter_matches(items, query)[*sel];
+                assert_eq!(items[idx].0, "anthropic:claude-haiku-5-5");
+            }
+            _ => panic!("expected Choose"),
+        }
+        app.on_key(key(KeyCode::Home));
+        match &app.modal {
+            Some(Modal::Choose {
+                sel, items, query, ..
+            }) => {
+                assert!(!is_header(&items[filter_matches(items, query)[*sel]]));
+            }
+            _ => panic!("expected Choose"),
+        }
+    }
+
+    fn two_model_config() -> crate::config::Config {
+        let entry = |id: &str, label: &str| crate::config::ModelEntry {
+            id: id.into(),
+            label: label.into(),
+            route: crate::config::Route::Anthropic,
+            model: id.into(),
+            effort: None,
+            endpoint: None,
+        };
+        crate::config::Config {
+            models: vec![entry("fast", "Fast One"), entry("main", "Main One")],
+            discover: false,
+            ..crate::config::Config::default()
+        }
+    }
+
+    #[test]
+    fn the_model_picker_opens_on_the_current_model_in_its_section() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let rt =
+            Arc::new(Runtime::new(store, Arc::new(UnusedEngine)).with_config(two_model_config));
+        let session = rt.create_session("s".into(), PathBuf::from(".")).unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(rt, PathBuf::from("."), session, tx);
+        let main = SETTINGS
+            .iter()
+            .position(|(o, _)| *o == crate::options::MAIN_MODEL)
+            .unwrap();
+        app.modal = Some(Modal::Settings { sel: main });
+        app.on_key(key(KeyCode::Enter));
+        match &app.modal {
+            Some(Modal::Choose {
+                items, sel, query, ..
+            }) => {
+                assert_eq!(
+                    items[0],
+                    (String::new(), "Anthropic API · pay per use".into())
+                );
+                let idx = filter_matches(items, query)[*sel];
+                assert_eq!(items[idx], ("main".into(), "Main One  ✓".into()));
+                assert_eq!(items[1].1, "Fast One");
+            }
+            _ => panic!("expected Choose"),
+        }
+    }
+
+    #[test]
+    fn a_fallback_note_shows_once_and_clears() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let rt =
+            Arc::new(Runtime::new(store, Arc::new(UnusedEngine)).with_config(two_model_config));
+        let session = rt.create_session("s".into(), PathBuf::from(".")).unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(rt, PathBuf::from("."), session, tx);
+
+        // Nothing asked for: nothing to say.
+        app.note_model_fallback();
+        assert!(app.model_note.is_none() && app.status.is_empty());
+        assert!(
+            app.status_lines().iter().any(|l| l
+                == "Main model: Main One (Anthropic API · pay per use) · picked automatically")
+        );
+
+        // A thread asking for a model no account lists: one note.
+        app.session.system2 = Some("chatgpt:gpt-6.2-sol".into());
+        app.refreshing_models = true;
+        app.note_model_fallback();
+        assert_eq!(
+            app.status,
+            "Main: Main One (Anthropic API) — gpt-6.2-sol not listed yet"
+        );
+        let status = app.status_lines().join("\n");
+        assert!(status.contains("Main model: Main One (Anthropic API · pay per use) · configured chatgpt:gpt-6.2-sol, not available until the model list refreshes"), "{status}");
+        app.status.clear();
+        app.note_model_fallback();
+        assert!(app.status.is_empty(), "said once");
+
+        // Once the model is there (here: picked), the note goes away.
+        app.status = app.model_note.clone().unwrap();
+        app.session.system2 = Some("main".into());
+        app.on_models_refreshed(crate::catalog::RefreshOutcome {
+            asked: 1,
+            listed: 1,
+        });
+        assert!(app.model_note.is_none());
+        assert!(app.status.is_empty());
+        assert!(!app.refreshing_models);
+
+        // Nothing could be listed: a one-line note.
+        app.on_models_refreshed(crate::catalog::RefreshOutcome {
+            asked: 2,
+            listed: 0,
+        });
+        assert!(
+            app.status.starts_with("Couldn't list the models"),
+            "{}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn a_failed_refresh_keeps_its_cause_in_the_fallback_note() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let rt =
+            Arc::new(Runtime::new(store, Arc::new(UnusedEngine)).with_config(two_model_config));
+        let session = rt.create_session("s".into(), PathBuf::from(".")).unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(rt, PathBuf::from("."), session, tx);
+        app.session.system2 = Some("chatgpt:gpt-6.2-sol".into());
+        app.refreshing_models = true;
+        app.note_model_fallback();
+
+        // Offline, or a key was rejected: nothing listed.
+        app.on_models_refreshed(crate::catalog::RefreshOutcome {
+            asked: 1,
+            listed: 0,
+        });
+        assert_eq!(
+            app.status,
+            "Main: Main One (Anthropic API) — gpt-6.2-sol: list refresh failed · /status"
+        );
+        assert!(!app.status.contains("not offered"));
+        let status = app.status_lines().join("\n");
+        assert!(
+            status.contains(
+                "the model list couldn't refresh (`pathfinder models --refresh` shows why)"
+            ),
+            "{status}"
+        );
+        // Fits an 80-column footer.
+        assert!(app.status.chars().count() <= 79, "{}", app.status);
+
+        // A refresh that listed something but not this model: not offered.
+        app.on_models_refreshed(crate::catalog::RefreshOutcome {
+            asked: 1,
+            listed: 1,
+        });
+        assert_eq!(
+            app.status,
+            "Main: Main One (Anthropic API) — gpt-6.2-sol not offered · /model"
+        );
+
+        // Both tiers fall back: one short note.
+        app.session.system1 = Some("chatgpt:gpt-6-luna".into());
+        app.note_model_fallback();
+        assert_eq!(
+            app.status,
+            "Fast: Fast One, Main: Main One — chosen models not offered · /model"
+        );
+    }
+
+    #[test]
+    fn settings_and_confirmations_name_the_account() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let rt =
+            Arc::new(Runtime::new(store, Arc::new(UnusedEngine)).with_config(two_model_config));
+        let session = rt.create_session("s".into(), PathBuf::from(".")).unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let app = App::new(rt, PathBuf::from("."), session, tx);
+        assert_eq!(
+            app.current_setting(crate::options::MAIN_MODEL),
+            "Main One · Anthropic API"
+        );
+        assert_eq!(app.current_short(crate::options::MAIN_MODEL), "Main One $");
+        assert_eq!(app.current(crate::options::MAIN_MODEL), "Main One");
+        assert_eq!(
+            app.current_setting(crate::options::CHECKS),
+            app.current(crate::options::CHECKS)
+        );
+        assert_eq!(
+            app.set_message("Main model", crate::options::MAIN_MODEL, ""),
+            "Main model set: Main One (Anthropic API · pay per use)."
+        );
+        assert_eq!(
+            app.set_message(
+                "Review checks",
+                crate::options::CHECKS,
+                " (saved as default)"
+            ),
+            "Review checks set (saved as default)."
+        );
     }
 
     #[test]
@@ -3282,14 +5363,12 @@ mod tests {
 
         // Threads load clears attachments.
         let mut s2 = app.rt.create_session("t2".into(), app.cwd.clone()).unwrap();
-        s2.history.push(TurnRecord {
-            role: "user".into(),
-            content: "hello".into(),
-        });
+        s2.push_turn("user", "hello");
         store.save_session(&s2).unwrap();
         app.attach("\"my doc.pdf\"");
         app.modal = Some(Modal::Threads {
             items: vec![("t2".into(), "hello".into())],
+            meta: vec!["chat · 1 · now".into()],
             query: String::new(),
             sel: 0,
         });
@@ -3332,5 +5411,254 @@ mod tests {
             concepts: vec![],
         });
         assert!(app.has_part_in_review());
+    }
+
+    #[test]
+    fn a_resumed_thread_shows_its_tool_calls_and_thoughts_before_each_reply() {
+        use crate::domain::Step;
+        let (mut app, _rx, _store) = test_app();
+        let s = &mut app.session;
+        s.push_turn("user", "What does the gate check?");
+        s.push_turn("assistant", "The draft.");
+        s.history[1].steps = vec![
+            Step::Thought {
+                text: "Look first.".into(),
+            },
+            Step::Tool {
+                id: "t1".into(),
+                title: "Read gate.rs".into(),
+                ok: Some(true),
+                detail: "a".into(),
+            },
+            // Stopped before it ended.
+            Step::Tool {
+                id: "t2".into(),
+                title: "Grep verdict".into(),
+                ok: None,
+                detail: String::new(),
+            },
+        ];
+        // An older reply, stored without steps.
+        s.push_turn("user", "and then?");
+        s.push_turn("assistant", "It waits.");
+        let entries = entries_of(&app.session);
+        assert!(matches!(&entries[0], Entry::User(_)));
+        assert!(matches!(&entries[1], Entry::Thought(t) if t == "Look first."));
+        assert!(
+            matches!(&entries[2], Entry::Tool { title, ok: Some(true), .. } if title == "Read gate.rs")
+        );
+        assert!(matches!(
+            &entries[3],
+            Entry::Tool {
+                ok: Some(false),
+                ..
+            }
+        ));
+        assert!(matches!(&entries[4], Entry::Text(t) if t == "The draft."));
+        assert!(matches!(&entries[5], Entry::User(_)));
+        assert!(matches!(&entries[6], Entry::Text(t) if t == "It waits."));
+        assert_eq!(entries.len(), 7);
+    }
+
+    #[test]
+    fn threads_are_named_by_goal_message_or_sources_with_mode_turns_and_age() {
+        let mut s = Session::new("a".into(), PathBuf::from("."));
+        assert_eq!(thread_name(&s), None);
+        assert_eq!(thread_title(&s), "(empty thread)");
+        s.push_turn("user", "/find  wrap_hanging");
+        assert_eq!(thread_name(&s).as_deref(), Some("/find wrap_hanging"));
+        s.push_turn("user", "/open app/src/x.rs:20-24");
+        s.push_turn("user", "/attach \"my notes.pdf\"");
+        s.push_turn("user", "/open app/src/x.rs");
+        s.push_turn("user", "/open book.pdf 3");
+        s.push_turn("user", "/attach clear");
+        assert_eq!(
+            thread_name(&s).as_deref(),
+            Some("Sources: x.rs, my notes.pdf, book.pdf")
+        );
+        s.push_turn("user", "What does\n the gate check?");
+        assert_eq!(
+            thread_name(&s).as_deref(),
+            Some("What does the gate check?")
+        );
+        s.goal = Some("How the gate decides".into());
+        assert_eq!(thread_title(&s), "How the gate decides");
+        assert_eq!(thread_meta(&s, 7200), "chat · 7 · 2h");
+        assert_eq!(
+            [0, 59, 60, 3599, 86_399, 86_400, 5_184_000].map(age),
+            ["now", "now", "1m", "59m", "23h", "1d", "2mo"].map(String::from)
+        );
+    }
+
+    #[test]
+    fn the_thread_list_marks_the_open_one_and_opening_names_the_thread() {
+        let (mut app, _rx, store) = test_app();
+        app.on_key(ctrl(KeyCode::Char('o')));
+        assert!(app.modal.is_none());
+        assert_eq!(app.status, "No earlier threads in this folder.");
+
+        app.session.push_turn("user", "this one");
+        store.save_session(&app.session).unwrap();
+        app.on_key(ctrl(KeyCode::Char('o')));
+        assert!(app.modal.is_none(), "only the open thread: nothing to list");
+
+        let mut other = app
+            .rt
+            .create_session("other".into(), app.cwd.clone())
+            .unwrap();
+        other.goal = Some("Understand the gate".into());
+        other.push_turn("user", "hi");
+        store.save_session(&other).unwrap();
+        app.on_key(ctrl(KeyCode::Char('o')));
+        let (items, meta) = match &app.modal {
+            Some(Modal::Threads { items, meta, .. }) => (items.clone(), meta.clone()),
+            _ => panic!("expected the thread list"),
+        };
+        assert_eq!(items.len(), 2);
+        let mine = items
+            .iter()
+            .position(|(id, _)| *id == app.session.id)
+            .unwrap();
+        assert!(meta[mine].starts_with("(open) chat · 1 · "), "{meta:?}");
+        let theirs = 1 - mine;
+        assert_eq!(items[theirs].1, "Understand the gate");
+        assert!(meta[theirs].starts_with("chat · 1 · "), "{meta:?}");
+
+        // Enter on the open one keeps it; on the other opens it by name.
+        for _ in 0..mine {
+            app.on_key(key(KeyCode::Down));
+        }
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.status, "That thread is already open.");
+        app.on_key(ctrl(KeyCode::Char('o')));
+        app.on_key(key(KeyCode::Home));
+        for _ in 0..theirs {
+            app.on_key(key(KeyCode::Down));
+        }
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.session.id, "other");
+        assert_eq!(app.status, "Opened \"Understand the gate\"");
+    }
+
+    #[test]
+    fn help_filters_as_you_type_and_only_esc_f1_or_q_close_it() {
+        let (mut app, _rx, _store) = test_app();
+        app.on_key(key(KeyCode::F(1)));
+        assert!(matches!(app.modal, Some(Modal::Help { .. })));
+        // q with nothing typed closes; F1 and Esc always do.
+        app.on_key(key(KeyCode::Char('q')));
+        assert!(app.modal.is_none());
+        app.on_key(key(KeyCode::F(1)));
+        app.on_key(key(KeyCode::F(1)));
+        assert!(app.modal.is_none());
+        app.on_key(key(KeyCode::F(1)));
+        for c in "jkgq".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        app.on_key(key(KeyCode::Down));
+        match &app.modal {
+            Some(Modal::Help { query, .. }) => assert_eq!(query, "jkgq"),
+            _ => panic!("typing must not close help"),
+        }
+        app.on_key(key(KeyCode::Backspace));
+        app.on_key(ctrl(KeyCode::Char('u')));
+        match &app.modal {
+            Some(Modal::Help { query, scroll }) => {
+                assert!(query.is_empty());
+                assert_eq!(*scroll, 0);
+            }
+            _ => panic!("expected help"),
+        }
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.modal.is_none());
+    }
+
+    #[test]
+    fn the_model_chooser_keeps_its_cursor_on_the_current_model_while_filtering() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let rt =
+            Arc::new(Runtime::new(store, Arc::new(UnusedEngine)).with_config(two_model_config));
+        let session = rt.create_session("s".into(), PathBuf::from(".")).unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(rt, PathBuf::from("."), session, tx);
+        let main = SETTINGS
+            .iter()
+            .position(|(o, _)| *o == crate::options::MAIN_MODEL)
+            .unwrap();
+        app.modal = Some(Modal::Settings { sel: main });
+        app.on_key(key(KeyCode::Enter));
+        let on = |app: &App| match &app.modal {
+            Some(Modal::Choose {
+                items, query, sel, ..
+            }) => items[filter_matches(items, query)[*sel]].0.clone(),
+            _ => panic!("expected the chooser"),
+        };
+        assert_eq!(on(&app), "main");
+        // Both match "one": the cursor stays on the current model.
+        for c in "one".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+            assert_eq!(on(&app), "main", "after {c:?}");
+        }
+        // It doesn't match "fast": the best match.
+        app.on_key(ctrl(KeyCode::Char('u')));
+        assert_eq!(on(&app), "main");
+        app.on_key(key(KeyCode::Char('f')));
+        assert_eq!(on(&app), "fast");
+        app.on_key(key(KeyCode::Backspace));
+        assert_eq!(on(&app), "main");
+        // Model rows keep the chooser even with two models.
+        assert!(!app.cycles(crate::options::MAIN_MODEL));
+        assert!(app.cycles(crate::options::CHECKS));
+        assert!(!app.cycles(GATE_KEY));
+    }
+
+    #[test]
+    fn ctrl_u_and_ctrl_d_page_by_half_with_nothing_typed() {
+        let (mut app, _rx, _store) = test_app();
+        app.conv_area = Rect::new(0, 0, 80, 20);
+        app.on_key(ctrl(KeyCode::Char('u')));
+        app.on_key(ctrl(KeyCode::Char('u')));
+        assert_eq!(app.scroll, 20);
+        app.on_key(ctrl(KeyCode::Char('d')));
+        assert_eq!(app.scroll, 10);
+        assert!(!app.quit);
+        app.on_key(ctrl(KeyCode::Char('d')));
+        assert_eq!(app.scroll, 0);
+        assert!(!app.quit, "the press that reaches the bottom doesn't quit");
+        app.on_key(ctrl(KeyCode::Char('d')));
+        assert!(!app.quit, "paging down past the bottom never quits");
+        assert_eq!(app.status, "Press ^D again to quit");
+        // Another key in between disarms it.
+        app.on_key(key(KeyCode::Right));
+        app.on_key(ctrl(KeyCode::Char('d')));
+        assert!(!app.quit);
+        app.on_key(ctrl(KeyCode::Char('d')));
+        assert!(app.quit, "a second ^D in a row quits");
+
+        // With text: Ctrl+U clears the line, Ctrl+D deletes forward.
+        app.quit = false;
+        app.scroll = 4;
+        app.input = "abc".into();
+        app.cursor = 1;
+        app.on_key(ctrl(KeyCode::Char('d')));
+        assert_eq!(app.input, "ac");
+        app.cursor = 2;
+        app.on_key(ctrl(KeyCode::Char('u')));
+        assert_eq!(app.input, "");
+        assert_eq!(app.scroll, 4);
+    }
+
+    #[test]
+    fn selecting_text_hides_the_plan_panel_and_ctrl_b_says_why() {
+        let (mut app, _rx, _store) = test_app();
+        app.session.goal = Some("g".into());
+        assert!(view::docks(&app, 140));
+        app.on_key(key(KeyCode::F(2)));
+        assert!(!view::docks(&app, 140));
+        app.on_key(ctrl(KeyCode::Char('b')));
+        assert!(app.status.contains("F2"), "{}", app.status);
+        assert!(!app.side_overlay);
+        app.on_key(key(KeyCode::F(2)));
+        assert!(view::docks(&app, 140));
     }
 }

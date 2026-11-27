@@ -1,6 +1,7 @@
 pub use pathfinder::*;
 
 mod cli;
+mod prompt;
 mod tui;
 mod update;
 
@@ -25,9 +26,9 @@ fn usage() -> String {
 Usage: pathfinder [command]
 
   pathfinder [tui] [folder]   Work in a folder (default: here)
-  pathfinder auth login       Connect models (do this first)
-  pathfinder auth [status|set|remove]
-                              Your model accounts and API keys
+  pathfinder auth login       Connect a model account (do this first)
+  pathfinder auth [status|logout]
+                              Your model accounts and keys
   pathfinder data [status|show|join|on|off|delete]
                               Joining the beta and the data you share
   pathfinder bug [what happened]
@@ -111,9 +112,11 @@ fn explain(e: &anyhow::Error) -> String {
         );
     }
     let mut text = e.to_string();
-    if let Some(cause) = e.chain().nth(1) {
-        text.push_str(&format!(": {cause}"));
-    }
+    // A single message (a usage error, say) has no more detail to show.
+    let Some(cause) = e.chain().nth(1) else {
+        return text;
+    };
+    text.push_str(&format!(": {cause}"));
     format!("{text}\n(More detail: PATHFINDER_DEBUG=1)")
 }
 
@@ -171,7 +174,7 @@ async fn run(args: Vec<String>) -> Result<()> {
                 None => env::current_dir()?,
             };
             start_telemetry(&cfg_db);
-            let result = tui::run(runtime, cwd).await;
+            let result = tui::run(runtime, cwd, creds).await;
             stop_telemetry().await;
             result
         }

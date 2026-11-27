@@ -71,6 +71,55 @@ fn line(l: Line) -> &'static str {
         FindHits => "**{n}** نتيجة لـ {terms}:",
         FindNone => "لا يحتوي أي سطر في هذا المجلد على {terms}.",
         WebNone => "لا شيء على الإنترنت يطابق {terms}.",
+        ShowKnown => "سُجّل: أنت تعرف **{title}** مسبقًا. ادعاء، لا دليل. `/undo` (Esc) يتراجع عنه.",
+        ShowTell => {
+            "سأخبرك كما طلبت. يُسجّل على أنه أُخبرت به، لا على أنك فهمته أبدًا. Esc قبل وصول الإجابة يلغيها."
+        }
+        ShowHandoff => {
+            "تسليم **{title}** للوكيل؟ يعمل في نسخة تجهيز وأنت تراجع النتيجة. Enter للتنفيذ · Esc للإلغاء."
+        }
+        ShowHandoffInPlace => {
+            "تسليم **{title}** للوكيل؟ هذا ليس مستودع git: سيعدّل ملفاتك مباشرة، دون نسخة تجهيز أو مراجعة مُتحقّق منها. Enter للتنفيذ · Esc للإلغاء."
+        }
+        ShowDelegate => {
+            "تسليم **{title}** دون فهمه؟ سيُسجّل على أنه مُسلّم: لن تكفل النتيجة. Enter للتنفيذ · Esc للإلغاء."
+        }
+        ShowVerdict => "أأحكم على هذا كحكمك على المرشّح؟ «{words}» Enter للحكم · Esc لإبقائه ملاحظة.",
+        NotRunVerdict => "لم يُحكم عليه كحكم: أُبقي ملاحظة.",
+        NotRunHandoff => "لم يُنفّذ: لم يُسلَّم **{title}** للوكيل.",
+        NotRunDelegate => "لم يُنفّذ: لم يُسلَّم **{title}**.",
+        NotRunStale => "لم يُنفّذ: ما كان ينتظر موافقتك لم يعد قائمًا.",
+        AskWhich => "هل قصدت {choices}؟ لا يُسجّل شيء حتى تقول. وإلا فتابع.",
+        AskKnown => "أنك تعرف **{title}** مسبقًا (`/known`)",
+        AskTell => "أن تُخبَر بالإجابة (`/tell <question>`)",
+        AskAgent => "أن يتولى الوكيل هذا الجزء (`/handoff` أو `/delegate`)",
+        Or => " أم ",
+        Undone => "تم التراجع: سُحب ادعاؤك بشأن **{title}**. يحتفظ السجل به على أنه مسحوب.",
+        NothingToUndo => {
+            "لا شيء للتراجع عنه. يمكن سحب ادعاء من خطوتك الأخيرة فقط. الحكم المُقيَّم والمراجعة والتسليم والتسليم دون فهم والإجابة التي أُخبرت بها تبقى كما هي."
+        }
+        NothingWaiting => "لا شيء ينتظر موافقتك.",
+        NextStep => "التالي: {at} · {question}",
+        NextStepNoPlace => {
+            "التالي: لا موضع في مصادرك يذكر **{concept}** بعد؛ `/find <terms>` يبحث فيها. · {question}"
+        }
+        StepWideExample => "اعثر على موضع يُستخدم فيه {concept}. ماذا يفعل هناك؟",
+        StepWidePurpose => "ما الغرض من {concept} في هذا الجزء، بكلماتك؟",
+        StepWideMechanism => "كيف يعمل {concept}، خطوة بخطوة؟",
+        StepNarrowExample => "اختر سطرًا يهم فيه {concept}. ما الذي سيتغير لو كان مختلفًا؟",
+        StepNarrowPurpose => "لماذا يلزم {concept} هناك تحديدًا، وما الذي ينكسر بدونه؟",
+        StepNarrowMechanism => "تتبّع {concept} خطوة بخطوة: ماذا يحدث أولًا، ثم ماذا؟",
+        Horizon => "الأفق: {what}.",
+        HorizonNeeds => "يحتاج {parts}",
+        HorizonLeads => "يقود إلى {parts}",
+        EvidenceRatio => "النجاحات: {passes} · الادعاءات: {claims}.",
+        ClaimWithdrawn => "سُحب الادعاء بشأن **{concept}** ({date}).",
+        StepHistory => "كيف وصلت إلى هنا: {kinds}.",
+        StepKindRate => "{kind} {passes} من {judged} قادت إلى نجاح",
+        SteeredTimes => "وجّهته أنت {n} مرات",
+        StepHistoryNote => {
+            "هذا كل ما يحتفظ به Pathfinder عن طريقة تعلّمك، في السجل المحلي لهذا المجلد."
+        }
     }
 }
 

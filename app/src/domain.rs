@@ -50,6 +50,17 @@ impl PartStatus {
         }
     }
 
+    /// One mark for the status, as the side panel and `/map` show it.
+    pub fn mark(self) -> &'static str {
+        match self {
+            Self::Open => "○",
+            Self::Understood | Self::Done => "✓",
+            Self::InReview => "⧗",
+            Self::Known => "~",
+            Self::Delegated => "⇢",
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Open => "open",
@@ -315,12 +326,12 @@ impl Map {
         let mut out = String::from("```mermaid\nflowchart TD\n");
         for part in &self.parts {
             let mark = if Some(part.id.as_str()) == active {
-                "▶ "
+                "▶"
             } else {
-                ""
+                part.status.mark()
             };
             out.push_str(&format!(
-                "    {}[\"{mark}{}<br/><small>{} · {}</small>\"]\n",
+                "    {}[\"{mark} {}<br/><small>{} · {}</small>\"]\n",
                 mermaid_id(&part.id),
                 mermaid_text(&part.title),
                 mermaid_text(&part.id),
@@ -401,6 +412,96 @@ pub struct PendingCandidate {
 pub struct TurnRecord {
     pub role: String,
     pub content: String,
+    /// What showed before a reply while it ran: thoughts and tool calls,
+    /// so a reopened thread shows them again. Older threads have none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<Step>,
+}
+
+/// A thought or tool call from a turn, as kept with its reply.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Step {
+    Thought {
+        text: String,
+    },
+    Tool {
+        id: String,
+        title: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ok: Option<bool>,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        detail: String,
+    },
+}
+
+/// Most steps kept with one reply, and most characters of a thought or a
+/// tool's output: enough to show what ran, not a copy of every output.
+pub const STEPS_KEPT: usize = 200;
+pub const STEP_CHARS: usize = 2000;
+
+/// The steps of a running turn, gathered as its stream events come.
+#[derive(Debug, Default)]
+pub struct StepLog {
+    pub steps: Vec<Step>,
+}
+
+impl StepLog {
+    pub fn thought(&mut self, text: &str) {
+        if let Some(Step::Thought { text: t }) = self.steps.last_mut() {
+            if t.chars().count() < STEP_CHARS {
+                t.push_str(text);
+            }
+            return;
+        }
+        if self.steps.len() < STEPS_KEPT {
+            self.steps.push(Step::Thought { text: text.into() });
+        }
+    }
+
+    pub fn tool_start(&mut self, id: &str, title: &str) {
+        if self.steps.len() < STEPS_KEPT {
+            self.steps.push(Step::Tool {
+                id: id.into(),
+                title: title.into(),
+                ok: None,
+                detail: String::new(),
+            });
+        }
+    }
+
+    pub fn tool_detail(&mut self, id: &str, text: String) {
+        if let Some(Step::Tool { detail, .. }) = self.tool(id) {
+            *detail = text.chars().take(STEP_CHARS).collect();
+        }
+    }
+
+    pub fn tool_end(&mut self, id: &str, done: bool) {
+        if let Some(Step::Tool { ok, .. }) = self.tool(id) {
+            *ok = Some(done);
+        }
+    }
+
+    fn tool(&mut self, id: &str) -> Option<&mut Step> {
+        self.steps
+            .iter_mut()
+            .rev()
+            .find(|s| matches!(s, Step::Tool { id: i, .. } if i == id))
+    }
+
+    /// Thoughts cut to `STEP_CHARS`, then the steps, for keeping.
+    pub fn take(&mut self) -> Vec<Step> {
+        let mut steps = std::mem::take(&mut self.steps);
+        for s in &mut steps {
+            if let Step::Thought { text } = s
+                && text.chars().count() > STEP_CHARS
+            {
+                *text = text.chars().take(STEP_CHARS).collect();
+                text.push('…');
+            }
+        }
+        steps
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -455,6 +556,76 @@ pub struct Session {
     /// Gap concepts already raised in this thread, so each is raised once.
     #[serde(default)]
     pub gaps_raised: Vec<String>,
+    /// Turns this thread has finished (§15): a claim is undoable only in
+    /// the turn right after it.
+    #[serde(default)]
+    pub turn: u64,
+    /// A commitment read from plain words that has side effects (a verdict,
+    /// a handoff, a delegation), shown back and waiting for your OK (§15).
+    /// Nothing runs until you confirm it.
+    #[serde(default)]
+    pub pending_commitment: Option<PendingCommitment>,
+    /// The last claim read from plain words, undoable for one turn (§15).
+    #[serde(default)]
+    pub last_commitment: Option<Undoable>,
+    /// The last next step shown (§16), so it isn't repeated every message.
+    #[serde(default)]
+    pub last_step: Option<StepShown>,
+    /// What a confirmation ran in this turn, for the usage count: a
+    /// `/confirm` that ran nothing is not a verdict. Never saved.
+    #[serde(skip)]
+    pub ran_commitment: Option<CommitKind>,
+}
+
+/// What a commitment from plain words will do once you confirm it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommitKind {
+    /// Judge your message as your verdict on the waiting candidate.
+    Verdict,
+    /// Hand the understood part to the agent (§7).
+    Handoff,
+    /// Hand the part off without understanding it (§6).
+    Delegate,
+}
+
+/// A commitment shown back and waiting for Enter (run) or Esc (cancel).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingCommitment {
+    pub kind: CommitKind,
+    /// The part it applies to; confirming checks it is still active.
+    pub part: String,
+    /// Your message: the verdict, or the agent's instructions.
+    pub text: String,
+    #[serde(default)]
+    pub files: Vec<PathBuf>,
+    /// For a verdict: the id of the candidate it was shown back for.
+    /// Confirming judges it only against that same candidate.
+    #[serde(default)]
+    pub candidate: Option<String>,
+}
+
+/// A claim from plain words and what it changed, so `/undo` can take it
+/// back with compensating events (the log stays append-only, A4).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Undoable {
+    pub part: String,
+    /// The claim events: (event id, concept).
+    pub events: Vec<(i64, String)>,
+    /// The turn it was made in.
+    pub turn: u64,
+    pub prev_active: Option<String>,
+    pub prev_mode: SessionMode,
+    pub prev_change: Option<MapChange>,
+    pub prev_gaps: Vec<String>,
+}
+
+/// A next step that was shown (§16).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StepShown {
+    pub concept: String,
+    /// `wide-example`, `narrow-mechanism`, …
+    pub kind: String,
 }
 
 impl Session {
@@ -480,13 +651,39 @@ impl Session {
             history: Vec::new(),
             gaps_raised: Vec::new(),
             checks: None,
+            turn: 0,
+            pending_commitment: None,
+            last_commitment: None,
+            last_step: None,
+            ran_commitment: None,
         }
+    }
+
+    /// What waits for your OK (§15) and the title of its part, for a
+    /// frontend's "waiting" line: Enter sends `/confirm`, Esc `/cancel`.
+    pub fn waiting_for_ok(&self) -> Option<(CommitKind, &str)> {
+        let p = self.pending_commitment.as_ref()?;
+        let title = self
+            .map
+            .get(&p.part)
+            .map(|part| part.title.as_str())
+            .unwrap_or(p.part.as_str());
+        Some((p.kind, title))
+    }
+
+    /// Whether `/undo` (or Esc) can take back the last claim now: only in
+    /// the turn right after it was made.
+    pub fn undoable(&self) -> bool {
+        self.last_commitment
+            .as_ref()
+            .is_some_and(|u| u.turn + 1 == self.turn)
     }
 
     pub fn push_turn(&mut self, role: &str, content: impl Into<String>) {
         self.history.push(TurnRecord {
             role: role.to_string(),
             content: content.into(),
+            steps: Vec::new(),
         });
     }
 
@@ -629,6 +826,11 @@ pub enum Intent {
     /// They ask to change the plan, or say something that changes the
     /// task's scope or purpose: the main model proposes a map change.
     Replan,
+    /// They ask for the agent to do this part: a handoff when it's
+    /// understood, a delegation when it's open (§15). Code picks which.
+    Agent,
+    /// They ask to be told outright, as `/tell` (§11).
+    Tell,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -720,7 +922,7 @@ mod tests {
         assert!(m.starts_with("```mermaid\nflowchart TD\n") && m.ends_with("```"));
         assert!(
             m.contains(
-                "n_fwd_pass[\"Forward #quot;pass#quot;<br/><small>fwd-pass · understood</small>\"]"
+                "n_fwd_pass[\"✓ Forward #quot;pass#quot;<br/><small>fwd-pass · understood</small>\"]"
             ),
             "{m}"
         );
@@ -880,5 +1082,51 @@ mod tests {
             concepts: vec![],
         };
         assert!(m.with_change(&cycle).is_err());
+    }
+
+    #[test]
+    fn steps_are_gathered_cut_and_optional_in_stored_turns() {
+        let mut log = StepLog::default();
+        log.thought("a");
+        log.thought("b");
+        log.tool_start("1", "Read x");
+        log.tool_detail("1", "y".repeat(STEP_CHARS + 50));
+        log.tool_end("1", false);
+        log.tool_end("nope", true);
+        log.thought(&"z".repeat(STEP_CHARS + 10));
+        let steps = log.take();
+        assert_eq!(steps[0], Step::Thought { text: "ab".into() });
+        match &steps[1] {
+            Step::Tool { ok, detail, .. } => {
+                assert_eq!(*ok, Some(false));
+                assert_eq!(detail.chars().count(), STEP_CHARS);
+            }
+            other => panic!("{other:?}"),
+        }
+        match &steps[2] {
+            Step::Thought { text } => assert_eq!(text.chars().count(), STEP_CHARS + 1),
+            other => panic!("{other:?}"),
+        }
+        for _ in 0..STEPS_KEPT + 5 {
+            log.tool_start("n", "t");
+        }
+        assert_eq!(log.take().len(), STEPS_KEPT);
+
+        // A turn stored before steps were kept still loads, and a turn
+        // without steps stores as it did.
+        let old: TurnRecord =
+            serde_json::from_str(r#"{"role":"assistant","content":"hi"}"#).unwrap();
+        assert!(old.steps.is_empty());
+        assert_eq!(
+            serde_json::to_string(&old).unwrap(),
+            r#"{"role":"assistant","content":"hi"}"#
+        );
+        let kept = TurnRecord {
+            steps: steps[..2].to_vec(),
+            ..old
+        };
+        let back: TurnRecord =
+            serde_json::from_str(&serde_json::to_string(&kept).unwrap()).unwrap();
+        assert_eq!(back.steps, kept.steps);
     }
 }

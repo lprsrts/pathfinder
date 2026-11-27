@@ -466,11 +466,33 @@ impl Store {
         Ok(out)
     }
 
+    /// Every session with the seconds since it was last saved, the oldest
+    /// first.
+    pub fn all_sessions_aged(&self) -> Result<Vec<(Session, u64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT state_json, CAST(strftime('%s','now') - strftime('%s', updated_at) AS INTEGER)
+             FROM sessions ORDER BY updated_at",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (json, age) = row?;
+            if let Ok(s) = serde_json::from_str(&json) {
+                out.push((s, age.unwrap_or(0).max(0) as u64));
+            }
+        }
+        Ok(out)
+    }
+
     /// (concept, kind) → count of a session's events.
     pub fn event_counts(&self, session_id: &str) -> Result<HashMap<(String, String), usize>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT concept, kind, COUNT(*) FROM events WHERE session_id = ?1 GROUP BY concept, kind",
+            // A claim withdrawn by `/undo` no longer counts (§15).
+            "SELECT concept, kind, COUNT(*) FROM events WHERE session_id = ?1 AND NOT (kind = 'claim' AND EXISTS (SELECT 1 FROM events r WHERE r.kind = 'retracted' AND r.workspace = events.workspace AND r.ref = CAST(events.id AS TEXT))) GROUP BY concept, kind",
         )?;
         let rows = stmt.query_map(params![session_id], |row| {
             Ok((
@@ -626,5 +648,38 @@ mod understanding_tests {
         let conn = store.conn.lock().unwrap();
         assert!(conn.execute("DELETE FROM events", []).is_err());
         assert!(conn.execute("UPDATE events SET kind = 'pass'", []).is_err());
+    }
+
+    #[test]
+    fn event_counts_skip_retracted_claims() {
+        let store = Store::open_in_memory().unwrap();
+        let ids = store
+            .append_events(
+                "/w",
+                "s",
+                &[
+                    NewEvent::new("c", EventKind::Claim),
+                    NewEvent::new("d", EventKind::Claim),
+                    NewEvent::new("c", EventKind::Pass),
+                ],
+                5,
+            )
+            .unwrap();
+        // One claim withdrawn; a retraction aimed at the pass does nothing.
+        store
+            .append_events(
+                "/w",
+                "s",
+                &[
+                    NewEvent::new("c", EventKind::Retracted).reference(ids[0].to_string()),
+                    NewEvent::new("c", EventKind::Retracted).reference(ids[2].to_string()),
+                ],
+                6,
+            )
+            .unwrap();
+        let counts = store.event_counts("s").unwrap();
+        assert_eq!(counts.get(&("c".into(), "claim".into())), None);
+        assert_eq!(counts.get(&("d".into(), "claim".into())), Some(&1));
+        assert_eq!(counts.get(&("c".into(), "pass".into())), Some(&1));
     }
 }

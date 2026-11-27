@@ -27,6 +27,27 @@ pub enum ToolContent {
     Text(String),
 }
 
+impl ToolContent {
+    /// What a tool row shows of it: a diff as its size, text as its last
+    /// six lines.
+    pub fn summary(&self) -> String {
+        match self {
+            ToolContent::Diff { path, old, new } => {
+                let before = old.as_deref().map_or(0, |o| o.lines().count());
+                format!(
+                    "{}: {} lines, was {before}",
+                    path.display(),
+                    new.lines().count()
+                )
+            }
+            ToolContent::Text(t) => {
+                let tail: Vec<&str> = t.lines().rev().take(6).collect();
+                tail.into_iter().rev().collect::<Vec<_>>().join("\n")
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolStart {
     pub id: String,

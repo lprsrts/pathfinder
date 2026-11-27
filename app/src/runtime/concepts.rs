@@ -35,35 +35,22 @@ impl Runtime {
         Ok(understanding::views(&events, understanding::now()))
     }
 
-    /// Records `told` on the concepts a question plainly names and returns
-    /// their labels.
-    pub(super) fn record_told(&self, session: &Session, text: &str) -> Vec<String> {
-        let concepts = self
-            .store
-            .concepts(&Self::workspace(session))
-            .unwrap_or_default();
-        let named = crate::understanding::named_in(text, &concepts);
-        self.append_events(
-            session,
-            named
-                .iter()
-                .map(|c| NewEvent::new(&c.id, EventKind::Told))
-                .collect(),
-        );
-        named.iter().map(|c| c.label.clone()).collect()
-    }
-
-    pub(super) fn append_events(&self, session: &Session, events: Vec<NewEvent>) {
+    /// Appends events and returns their ids (empty if recording failed).
+    pub(super) fn append_events(&self, session: &Session, events: Vec<NewEvent>) -> Vec<i64> {
         if events.is_empty() {
-            return;
+            return Vec::new();
         }
-        if let Err(e) = self.store.append_events(
+        match self.store.append_events(
             &Self::workspace(session),
             &session.id,
             &events,
             understanding::now(),
         ) {
-            tracing::warn!("recording understanding events: {e:#}");
+            Ok(ids) => ids,
+            Err(e) => {
+                tracing::warn!("recording understanding events: {e:#}");
+                Vec::new()
+            }
         }
     }
 
@@ -498,22 +485,49 @@ impl Runtime {
         self.append_events(session, events);
     }
 
-    /// `claim` or `delegated` on every core concept of a part (§6).
-    pub(super) fn record_skip(&self, session: &Session, part_id: &str, kind: EventKind) {
+    /// `claim` or `delegated` on every core concept of a part (§6). Returns
+    /// (event id, concept) for each, so a claim can be undone (§15).
+    pub(super) fn record_skip(
+        &self,
+        session: &Session,
+        part_id: &str,
+        kind: EventKind,
+    ) -> Vec<(i64, String)> {
         let Some(part) = session.map.get(part_id) else {
-            return;
+            return Vec::new();
         };
-        let events = part
-            .concepts
+        let concepts = part.concepts.clone();
+        let events = concepts
             .iter()
             .map(|c| NewEvent::new(c, kind).reference(part_id.to_string()))
             .collect();
-        self.append_events(session, events);
+        self.append_events(session, events)
+            .into_iter()
+            .zip(concepts)
+            .collect()
     }
 
-    /// The active part as you enter it: its card, what it rests on, and any
-    /// gaps underneath it (A5), each raised once, proposed as small parts.
+    /// The active part as you enter it: its card, what it rests on, any
+    /// gaps underneath it (A5), then the horizon and the next step (§16).
     pub(super) fn enter_part(&self, session: &mut Session, hint: bool) -> String {
+        let mut out = self.part_card(session, hint);
+        if session.quick_check || session.exam {
+            return out;
+        }
+        if let Some(part) = session.active_part().cloned()
+            && let Some(h) = super::path::horizon(session, &part)
+        {
+            out.push_str(&format!("\n\n{h}"));
+        }
+        if let Some(next) = self.next_step(session, None, false) {
+            out.push_str(&format!("\n\n{next}"));
+        }
+        out
+    }
+
+    /// The part's card, what it rests on, and any gaps underneath it (A5),
+    /// each raised once, proposed as small parts.
+    fn part_card(&self, session: &mut Session, hint: bool) -> String {
         let Some(part) = session.active_part().cloned() else {
             return String::new();
         };
@@ -718,7 +732,71 @@ impl Runtime {
             out.push_str(&format!("\n\n{n}"));
         }
         out.push_str(&format!("\n\n{}", line(lang, Line::EvidenceNote)));
+        // A10: passes against claims; a withdrawn claim no longer counts
+        // but stays visible as withdrawn (§15).
+        let events = self.store.events(&ws, &part.concepts).unwrap_or_default();
+        let withdrawn = understanding::retracted_claims(&events);
+        let claims = events
+            .iter()
+            .filter(|e| e.kind == EventKind::Claim && !withdrawn.contains(&e.id))
+            .count();
+        let passes: usize = part
+            .concepts
+            .iter()
+            .filter_map(|c| views.get(c))
+            .map(|v| v.passes)
+            .sum();
+        out.push_str(&format!(
+            "\n\n{}",
+            line(lang, Line::EvidenceRatio)
+                .replace("{passes}", &passes.to_string())
+                .replace("{claims}", &claims.to_string())
+        ));
+        for w in withdrawn_lines(&events, lang, &name) {
+            out.push_str(&format!("\n{w}"));
+        }
+        if let Some(h) = self.step_history(session) {
+            out.push_str(&format!("\n\n{h}"));
+        }
         out
+    }
+
+    /// §16: what Pathfinder keeps about how you learn, all of it: which
+    /// kinds of step led you to passes, and how often you steered.
+    pub(super) fn step_history(&self, session: &Session) -> Option<String> {
+        use crate::i18n::{Line, line};
+        let lang = session.language.as_deref();
+        let ws = Self::workspace(session);
+        let ids: Vec<String> = self
+            .store
+            .concepts(&ws)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|c| c.id)
+            .collect();
+        let events = self.store.events(&ws, &ids).unwrap_or_default();
+        let stats = understanding::step_stats(&events);
+        if stats.is_empty() {
+            return None;
+        }
+        let mut kinds: Vec<String> = stats
+            .iter()
+            .map(|(kind, (passes, judged))| {
+                line(lang, Line::StepKindRate)
+                    .replace("{kind}", &kind.replace('-', "·"))
+                    .replace("{passes}", &passes.to_string())
+                    .replace("{judged}", &judged.to_string())
+            })
+            .collect();
+        let steered = understanding::steered_steps(&events);
+        if steered > 0 {
+            kinds.push(line(lang, Line::SteeredTimes).replace("{n}", &steered.to_string()));
+        }
+        Some(format!(
+            "{}\n{}",
+            line(lang, Line::StepHistory).replace("{kinds}", &kinds.join(" · ")),
+            line(lang, Line::StepHistoryNote)
+        ))
     }
 
     /// Most ideas the folder-wide record draws.
@@ -738,8 +816,11 @@ impl Runtime {
         let mut active: Vec<(&Concept, i64, Option<Line>)> = concepts
             .iter()
             .filter_map(|c| {
-                let mine: Vec<&crate::understanding::Event> =
-                    events.iter().filter(|e| e.concept == c.id).collect();
+                // A step shown is Pathfinder's activity, not yours.
+                let mine: Vec<&crate::understanding::Event> = events
+                    .iter()
+                    .filter(|e| e.concept == c.id && e.kind != EventKind::Step)
+                    .collect();
                 let last = mine.iter().map(|e| e.id).max()?;
                 let told = if mine.iter().any(|e| e.kind == EventKind::Told) {
                     Some(Line::ToldOnly)
@@ -808,8 +889,80 @@ impl Runtime {
                 .replace("{told}", &told_only.to_string())
                 .replace("{shaky}", &shaky.to_string()),
         );
+        let withdrawn = understanding::retracted_claims(&events);
+        let claims = events
+            .iter()
+            .filter(|e| e.kind == EventKind::Claim && !withdrawn.contains(&e.id))
+            .count();
+        let passes = events.iter().filter(|e| e.kind == EventKind::Pass).count();
+        out.push_str(&format!(
+            "\n\n{}",
+            line(lang, Line::EvidenceRatio)
+                .replace("{passes}", &passes.to_string())
+                .replace("{claims}", &claims.to_string())
+        ));
+        let labels: HashMap<&str, &str> = concepts
+            .iter()
+            .map(|c| (c.id.as_str(), c.label.as_str()))
+            .collect();
+        let name = |c: &str| {
+            labels
+                .get(c)
+                .map(|l| l.to_string())
+                .unwrap_or(c.to_string())
+        };
+        for w in withdrawn_lines(&events, lang, &name) {
+            out.push_str(&format!("\n{w}"));
+        }
+        if let Some(h) = self.step_history(session) {
+            out.push_str(&format!("\n\n{h}"));
+        }
         out
     }
+}
+
+/// Most withdrawn claims `/why` lists, the newest first.
+const WITHDRAWN_MAX: usize = 5;
+
+/// "Claim on **X** withdrawn (2026-11-27)" for each claim `/undo` took
+/// back: never silently erased (§15).
+fn withdrawn_lines(
+    events: &[understanding::Event],
+    lang: Option<&str>,
+    name: &dyn Fn(&str) -> String,
+) -> Vec<String> {
+    use crate::i18n::{Line, line};
+    let withdrawn = understanding::retracted_claims(events);
+    let mut out: Vec<(i64, String)> = events
+        .iter()
+        .filter(|e| e.kind == EventKind::Retracted)
+        .filter(|e| {
+            e.reference
+                .as_deref()
+                .and_then(|r| r.parse::<i64>().ok())
+                .is_some_and(|id| withdrawn.contains(&id))
+        })
+        .map(|e| {
+            let date = jiff::Timestamp::from_second(e.at)
+                .map(|t| {
+                    let local = t.to_zoned_datetime(jiff::tz::TimeZone::system());
+                    jiff::fmt::strtime::format("%Y-%m-%d", &local).unwrap_or_default()
+                })
+                .unwrap_or_default();
+            (
+                e.id,
+                line(lang, Line::ClaimWithdrawn)
+                    .replace("{concept}", &name(&e.concept))
+                    .replace("{date}", &date),
+            )
+        })
+        .collect();
+    out.sort_by_key(|(id, _)| std::cmp::Reverse(*id));
+    out.dedup_by(|a, b| a.1 == b.1);
+    out.into_iter()
+        .take(WITHDRAWN_MAX)
+        .map(|(_, l)| l)
+        .collect()
 }
 
 /// A part id (≤ 12 characters) for a gap concept, unique on the map.

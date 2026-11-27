@@ -173,14 +173,39 @@ impl Runtime {
         files: &[PathBuf],
         sink: StreamSink,
     ) -> Result<TurnOutput> {
+        self.tell(session, arg, files, sink, false).await
+    }
+
+    /// The answer you asked to be told, recorded as told (§11). `plain`:
+    /// asked in plain words (§15): shown back first, and the answer is
+    /// always held until it is whole, so stopping the turn before it
+    /// arrives cancels it with nothing recorded.
+    pub(super) async fn tell(
+        &self,
+        session: &mut Session,
+        arg: &str,
+        files: &[PathBuf],
+        sink: StreamSink,
+        plain: bool,
+    ) -> Result<TurnOutput> {
         if arg.is_empty() {
             return Ok(TurnOutput::text("`/tell <question>`"));
         }
-        session.push_turn("user", format!("/tell {arg}"));
-        // As for any reply: a waiting candidate is hidden from the model, and
-        // the answer is held for the gate before you see it.
+        let lang = session.language.clone();
+        let shown_back = if plain {
+            let line = format!("{}\n\n", i18n::line(lang.as_deref(), i18n::Line::ShowTell));
+            sink(StreamEvent::TextDelta(line.clone()));
+            line
+        } else {
+            session.push_turn("user", format!("/tell {arg}"));
+            String::new()
+        };
+        // As for any reply: a waiting candidate is hidden from the model,
+        // and while any secret is active (a candidate's key, a review's
+        // planted hunk, an exam key) the answer is held for the gate
+        // before you see it (A6).
         let mut history = format_history(session);
-        let waiting = session.pending_candidate.is_some();
+        let held = plain || !matches!(self.gate_mode(session), gate::GateMode::Open);
         if let Some(pending) = &session.pending_candidate {
             history = history.replace(&pending.candidate, CANDIDATE_HIDDEN);
         }
@@ -191,49 +216,61 @@ impl Runtime {
             system_prompt: TELL_SYSTEM.to_string(),
             prompt: format!("Conversation so far:\n{history}\n\nAnswer: {arg}"),
             files: files.to_vec(),
-            stream_text: !waiting,
+            stream_text: !held,
             models: self.models(session)?,
             ctx: crate::engine::turn_ctx(),
         };
-        let header = format!(
-            "{}\n\n",
-            i18n::line(session.language.as_deref(), i18n::Line::Told)
-        );
-        let answer = if waiting {
+        let header = format!("{}\n\n", i18n::line(lang.as_deref(), i18n::Line::Told));
+        // Recorded as told the moment the answer is shown: a turn stopped
+        // or failed after you read it still leaves the told mark (§11).
+        let marked: Arc<std::sync::Mutex<Option<Vec<String>>>> = Arc::default();
+        let mark = {
+            let store = self.store.clone();
+            let workspace = Self::workspace(session);
+            let session_id = session.id.clone();
+            let arg = arg.to_string();
+            let marked = marked.clone();
+            move || {
+                let mut marked = marked.lock().unwrap();
+                if marked.is_none() {
+                    *marked = Some(mark_told(&store, &workspace, &session_id, &arg));
+                }
+                marked.clone().unwrap_or_default()
+            }
+        };
+        let answer = if held {
             let draft = self.engine.run_text(&req, gate::held(&sink)).await?;
             let shown = self.gate_strict(session, draft.clone()).await;
             if shown != draft {
                 sink(StreamEvent::TextDelta(shown.clone()));
-                session.push_turn("assistant", &shown);
+                session.push_turn("assistant", format!("{shown_back}{shown}"));
                 return Ok(TurnOutput::text(String::new()));
             }
+            mark();
             sink(StreamEvent::TextDelta(format!("{header}{draft}")));
             draft
         } else {
             sink(StreamEvent::TextDelta(header.clone()));
-            self.engine.run_text(&req, sink.clone()).await?
+            let streamed: StreamSink = {
+                let sink = sink.clone();
+                let mark = mark.clone();
+                Arc::new(move |event: StreamEvent| {
+                    if matches!(&event, StreamEvent::TextDelta(t) if !t.is_empty()) {
+                        mark();
+                    }
+                    sink(event)
+                })
+            };
+            self.engine.run_text(&req, streamed).await?
         };
-        let mut told = self.record_told(session, arg);
-        if told.is_empty() {
-            // Nothing on the record is named: file it under the question, so
-            // the told mark shows on the record and graph.
-            let label = sources::keywords(arg)
-                .into_iter()
-                .take(4)
-                .collect::<Vec<_>>()
-                .join(" ");
-            if let Some(id) = self.own_concept(session, &label) {
-                self.append_events(session, vec![NewEvent::new(&id, EventKind::Told)]);
-                told.push(label);
-            }
-        }
+        let told = mark();
         let tail = format!(
             "\n\n{}",
             i18n::line(session.language.as_deref(), i18n::Line::ToldNotShown)
                 .replace("{labels}", &told.join(", "))
         );
         sink(StreamEvent::TextDelta(tail.clone()));
-        session.push_turn("assistant", format!("{header}{answer}{tail}"));
+        session.push_turn("assistant", format!("{shown_back}{header}{answer}{tail}"));
         Ok(TurnOutput::text(String::new()))
     }
 
@@ -361,12 +398,13 @@ impl Runtime {
     pub(super) async fn handle_find(&self, session: &mut Session, arg: &str) -> TurnOutput {
         let terms = split_search_terms(arg);
         if terms.is_empty() {
-            return TurnOutput::text("`/find <terms>`");
+            return TurnOutput::notice("`/find <terms>`");
         }
         let cwd = session.cwd.clone();
-        let hits = tokio::task::spawn_blocking(move || sources::find(&cwd, &terms, 12))
-            .await
-            .unwrap_or_default();
+        let (hits, total) =
+            tokio::task::spawn_blocking(move || sources::find_counted(&cwd, &terms, 12))
+                .await
+                .unwrap_or_default();
         self.record_source(session, arg, EventKind::Searched, &format!("find:{arg}"));
         let reply = if hits.is_empty() {
             i18n::line(session.language.as_deref(), i18n::Line::FindNone)
@@ -375,7 +413,15 @@ impl Runtime {
             let mut out = format!(
                 "{}\n",
                 i18n::line(session.language.as_deref(), i18n::Line::FindHits)
-                    .replace("{n}", &hits.len().to_string())
+                    // `12/48`: the best 12 of 48 matching lines.
+                    .replace(
+                        "{n}",
+                        &if total > hits.len() {
+                            format!("{}/{total}", hits.len())
+                        } else {
+                            hits.len().to_string()
+                        }
+                    )
                     .replace("{terms}", &format!("`{arg}`"))
             );
             for h in &hits {
@@ -385,7 +431,16 @@ impl Runtime {
         };
         session.push_turn("user", format!("/find {arg}"));
         session.push_turn("assistant", &reply);
-        TurnOutput::text(reply)
+        let shown = if hits.is_empty() {
+            Shown::Notice
+        } else {
+            Shown::Search {
+                query: arg.to_string(),
+                total: total.max(hits.len()),
+                hits,
+            }
+        };
+        TurnOutput { reply, shown }
     }
 
     /// `/open <file> [page|line]`, also `file:line`, `file p.N`, `file:start-end`:
@@ -393,7 +448,7 @@ impl Runtime {
     pub(super) async fn handle_open(&self, session: &mut Session, arg: &str) -> TurnOutput {
         let spec = sources::parse_open_spec(arg);
         if spec.file.is_empty() {
-            return TurnOutput::text("`/open <file> [page or line]`");
+            return TurnOutput::notice("`/open <file> [page or line]`");
         }
         let cwd = session.cwd.clone();
         let opened = tokio::task::spawn_blocking(move || sources::open_spec(&cwd, &spec))
@@ -410,11 +465,18 @@ impl Runtime {
                 };
                 self.record_source(session, &opened.target.rel, EventKind::Read, &reference);
                 session.push_turn("assistant", &opened.markdown);
-                TurnOutput::text(opened.markdown)
+                let shown = match sources::split_source(&opened.markdown) {
+                    Some((title, range, body)) => Shown::Source { title, range, body },
+                    None => Shown::Notice,
+                };
+                TurnOutput {
+                    reply: opened.markdown,
+                    shown,
+                }
             }
             Err(e) => {
                 session.push_turn("assistant", &e);
-                TurnOutput::text(e)
+                TurnOutput::notice(e)
             }
         }
     }
@@ -580,25 +642,60 @@ impl Runtime {
     }
 }
 
-impl Runtime {
-    /// A user-made idea labelled `label`, created if new; its id.
-    fn own_concept(&self, session: &Session, label: &str) -> Option<String> {
-        let label = label.trim();
-        let id = slugify(label);
-        if id.is_empty() {
-            return None;
+/// Records that you were told the answer to `question`: a told event on
+/// each concept it names, or, if it names none, on a concept of its own
+/// filed under the question, so the mark shows on the record and graph.
+/// Returns the labels marked.
+fn mark_told(
+    store: &crate::store::Store,
+    workspace: &str,
+    session_id: &str,
+    question: &str,
+) -> Vec<String> {
+    let concepts = store.concepts(workspace).unwrap_or_default();
+    let mut named: Vec<(String, String)> = crate::understanding::named_in(question, &concepts)
+        .iter()
+        .map(|c| (c.id.clone(), c.label.clone()))
+        .collect();
+    if named.is_empty() {
+        let label = sources::keywords(question)
+            .into_iter()
+            .take(4)
+            .collect::<Vec<_>>()
+            .join(" ");
+        if let Some(id) = own_concept(store, workspace, &label) {
+            named.push((id, label));
         }
-        let concept = Concept {
-            id: id.clone(),
-            label: label.to_string(),
-            aliases: Vec::new(),
-            created_by: "user".into(),
-        };
-        self.store
-            .upsert_concept(&Self::workspace(session), &concept)
-            .ok()?;
-        Some(id)
     }
+    let events: Vec<NewEvent> = named
+        .iter()
+        .map(|(id, _)| NewEvent::new(id, EventKind::Told))
+        .collect();
+    if !events.is_empty()
+        && let Err(e) =
+            store.append_events(workspace, session_id, &events, crate::understanding::now())
+    {
+        tracing::warn!("recording told events: {e:#}");
+    }
+    named.into_iter().map(|(_, label)| label).collect()
+}
+
+/// A concept of your own, named by `label`, for a told mark that names
+/// nothing on the record.
+fn own_concept(store: &crate::store::Store, workspace: &str, label: &str) -> Option<String> {
+    let label = label.trim();
+    let id = slugify(label);
+    if id.is_empty() {
+        return None;
+    }
+    let concept = Concept {
+        id: id.clone(),
+        label: label.to_string(),
+        aliases: Vec::new(),
+        created_by: "user".into(),
+    };
+    store.upsert_concept(workspace, &concept).ok()?;
+    Some(id)
 }
 
 /// Verified hits from the model's reply, or, if it broke the contract or

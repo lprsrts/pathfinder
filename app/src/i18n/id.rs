@@ -73,6 +73,69 @@ fn line(l: Line) -> &'static str {
         FindHits => "**{n}** untuk {terms}:",
         FindNone => "Tidak ada baris di folder ini yang memuat {terms}.",
         WebNone => "Tidak ada hasil daring untuk {terms}.",
+        ShowKnown => {
+            "Dicatat: kamu sudah tahu **{title}**. Sebuah klaim, bukan bukti. `/undo` (Esc) membatalkannya."
+        }
+        ShowTell => {
+            "Aku beri tahu, seperti yang kamu minta. Dicatat sebagai diberi tahu, tidak pernah sebagai dipahami. Esc sebelum jawabannya tiba membatalkannya."
+        }
+        ShowHandoff => {
+            "Serahkan **{title}** ke agen? Ia bekerja di salinan staging dan kamu meninjau hasilnya. Enter jalankan · Esc batal."
+        }
+        ShowHandoffInPlace => {
+            "Serahkan **{title}** ke agen? Ini bukan repositori git: ia mengubah berkasmu langsung, tanpa staging atau tinjauan yang diperiksa. Enter jalankan · Esc batal."
+        }
+        ShowDelegate => {
+            "Serahkan **{title}** tanpa memahaminya? Dicatat sebagai diserahkan: kamu tidak menjamin hasilnya. Enter jalankan · Esc batal."
+        }
+        ShowVerdict => {
+            "Nilai ini sebagai putusanmu atas kandidat? “{words}” Enter menilai · Esc menyimpannya sebagai catatan."
+        }
+        NotRunVerdict => "Tidak dinilai sebagai putusan: disimpan sebagai catatan.",
+        NotRunHandoff => "Tidak dijalankan: **{title}** tidak diserahkan ke agen.",
+        NotRunDelegate => "Tidak dijalankan: **{title}** tidak diserahkan.",
+        NotRunStale => "Tidak dijalankan: yang menunggu OK-mu sudah tidak berlaku.",
+        AskWhich => {
+            "Maksudmu {choices}? Tidak ada yang dicatat sampai kamu bilang. Kalau tidak, lanjut saja."
+        }
+        AskKnown => "mengklaim sudah tahu **{title}** (`/known`)",
+        AskTell => "diberi tahu (`/tell <question>`)",
+        AskAgent => "menyerahkan bagian ini ke agen (`/handoff` atau `/delegate`)",
+        Or => " atau ",
+        Undone => {
+            "Dibatalkan: klaimmu atas **{title}** ditarik. Catatan menyimpannya sebagai ditarik."
+        }
+        NothingToUndo => {
+            "Tidak ada yang bisa dibatalkan. Hanya klaim dari langkah terakhirmu yang bisa ditarik. Putusan yang sudah dinilai, tinjauan, penyerahan, delegasi, dan jawaban yang diberitahukan padamu tetap seperti adanya."
+        }
+        NothingWaiting => "Tidak ada yang menunggu OK-mu.",
+        NextStep => "Berikutnya: {at} · {question}",
+        NextStepNoPlace => {
+            "Berikutnya: belum ada tempat di sumbermu yang menyebut **{concept}**; `/find <terms>` mencarinya. · {question}"
+        }
+        StepWideExample => "Temukan satu tempat di mana {concept} dipakai. Apa fungsinya di sana?",
+        StepWidePurpose => "Untuk apa {concept} di bagian ini, dengan kata-katamu sendiri?",
+        StepWideMechanism => "Bagaimana {concept} bekerja, langkah demi langkah?",
+        StepNarrowExample => {
+            "Pilih satu baris di mana {concept} penting. Apa yang berubah jika berbeda?"
+        }
+        StepNarrowPurpose => {
+            "Mengapa {concept} diperlukan tepat di sana, dan apa yang rusak tanpanya?"
+        }
+        StepNarrowMechanism => {
+            "Telusuri {concept} langkah demi langkah: apa yang terjadi dulu, lalu apa?"
+        }
+        Horizon => "Cakrawala: {what}.",
+        HorizonNeeds => "perlu {parts}",
+        HorizonLeads => "menuju {parts}",
+        EvidenceRatio => "Lulus: {passes} · klaim: {claims}.",
+        ClaimWithdrawn => "Klaim atas **{concept}** ditarik ({date}).",
+        StepHistory => "Bagaimana kamu sampai di sini: {kinds}.",
+        StepKindRate => "{kind} {passes} dari {judged} berujung lulus",
+        SteeredTimes => "diarahkan olehmu {n} kali",
+        StepHistoryNote => {
+            "Hanya itu yang disimpan Pathfinder tentang caramu belajar, di catatan lokal folder ini."
+        }
     }
 }
 

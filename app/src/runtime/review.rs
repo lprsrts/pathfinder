@@ -22,7 +22,6 @@ use crate::domain::{Part, Session, Staging};
 use crate::engine::{EngineRequest, EngineTier, StreamEvent, StreamSink, ToolAccess, run_gated};
 use crate::ledger::{self, Hunk};
 use crate::secrets::Secret;
-use crate::stream::ToolContent;
 use crate::understanding::{self, ConceptState, EventKind, NewEvent};
 use crate::validate::Violation;
 
@@ -100,16 +99,14 @@ const CAUGHT_SYSTEM: &str = r#"A review contained one deliberately planted flaw.
 Return ONLY a JSON object:
 {"caught": true}"#;
 
-/// Shows the agent's tool calls and command output but holds back its
-/// prose and diffs, which would show the real result before the review.
+/// Shows which tools the agent calls (their titles and whether they
+/// worked) but holds back everything else it streams: its prose, its
+/// thinking, diffs and tool output, any of which could show the real
+/// result, and so the planted hunk, before the review (A6).
 fn staged(sink: &StreamSink) -> StreamSink {
     let inner = sink.clone();
     Arc::new(move |ev| match ev {
-        StreamEvent::TextDelta(_) => {}
-        StreamEvent::ToolUpdate {
-            content: ToolContent::Diff { .. },
-            ..
-        } => {}
+        StreamEvent::TextDelta(_) | StreamEvent::Thought(_) | StreamEvent::ToolUpdate { .. } => {}
         other => inner(other),
     })
 }
@@ -590,6 +587,7 @@ impl Runtime {
             Some(id) => self.store.secret(id)?,
             None => None,
         };
+        let mut reveal = String::new();
         if let Some(planted) = secret.as_ref().filter(|s| s.kind == "planted_flaw") {
             if self.caught(session, planted, reason).await? {
                 let events = concepts_of(planted)
@@ -625,10 +623,17 @@ impl Runtime {
                     self.after_resolution(session, format!("{lead}\n\n**{}** done.", part.title))
                 );
             }
-            // A real objection on a checked review: never a miss.
+            // A real objection on a checked review: never a miss. The plant
+            // is retired now, so it's revealed: you shouldn't go on
+            // believing the agent wrote it.
             sink(StreamEvent::Thought(
                 "That objection is about the agent's own work; sending it back.\n".into(),
             ));
+            reveal = format!(
+                "One hunk you saw was a planted check, not the agent's work.\n\n{}\nThe flaw: {}\n\nYour objection goes back to the agent.\n\n",
+                planted.candidate(),
+                planted.reason()
+            );
         }
         if let Some(id) = &staging.secret {
             self.store.retire_secret(id).ok();
@@ -653,8 +658,22 @@ impl Runtime {
         let mut next = staging;
         next.secret = None;
         next.result = None;
-        self.run_staged(session, part, &root, next, "", files, sink)
-            .await
+        let turns = session.history.len();
+        let mut out = self
+            .run_staged(session, part, &root, next, "", files, sink)
+            .await?;
+        if !reveal.is_empty() {
+            out.reply = format!("{reveal}{}", out.reply);
+            if let Some(reply) = session
+                .history
+                .iter_mut()
+                .skip(turns)
+                .find(|t| t.role == "assistant")
+            {
+                reply.content = format!("{reveal}{}", reply.content);
+            }
+        }
+        Ok(out)
     }
 
     pub(super) async fn caught(
@@ -767,6 +786,43 @@ fn concepts_of(secret: &Secret) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_staged_sink_drops_thoughts_and_output() {
+        use crate::stream::{ToolContent, ToolKind, ToolStart};
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = seen.clone();
+        let sink: StreamSink = Arc::new(move |ev| record.lock().unwrap().push(ev));
+        let staged = staged(&sink);
+        staged(StreamEvent::TextDelta("the real result".into()));
+        staged(StreamEvent::Thought("I'll return HANDLERS[name]".into()));
+        staged(StreamEvent::ToolStart(ToolStart {
+            id: "t1".into(),
+            title: "Edit app.py".into(),
+            kind: ToolKind::Edit,
+            path: None,
+        }));
+        staged(StreamEvent::ToolUpdate {
+            id: "t1".into(),
+            content: ToolContent::Text("return HANDLERS[name]".into()),
+        });
+        staged(StreamEvent::ToolUpdate {
+            id: "t1".into(),
+            content: ToolContent::Diff {
+                path: "app.py".into(),
+                old: None,
+                new: "return HANDLERS[name]".into(),
+            },
+        });
+        staged(StreamEvent::ToolEnd {
+            id: "t1".into(),
+            ok: true,
+        });
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert!(matches!(&seen[0], StreamEvent::ToolStart(t) if t.title == "Edit app.py"));
+        assert!(matches!(&seen[1], StreamEvent::ToolEnd { ok: true, .. }));
+    }
 
     #[test]
     fn rates_and_splicing() {
@@ -1007,6 +1063,20 @@ mod tests {
         turn(&rt, "/handoff").await;
         let again = turn(&rt, "/object add a docstring").await;
         assert!(again.contains("Review"), "{again}");
+        // The missed plant is revealed: you shouldn't think the agent wrote it.
+        assert!(
+            again.starts_with("One hunk you saw was a planted check, not the agent's work."),
+            "{again}"
+        );
+        assert!(again.contains("HANDLERS.get(name"), "{again}");
+        assert!(again.contains("Your objection goes back to the agent."));
+        let s = rt.store.load_session("s").unwrap().unwrap();
+        assert!(
+            s.history.iter().any(|t| t
+                .content
+                .starts_with("One hunk you saw was a planted check")),
+            "the reveal is kept in the thread"
+        );
         assert_eq!(state(&rt), ConceptState::Shown, "never scored as a miss");
         assert_eq!(
             std::fs::read_to_string(dir.join("app.py")).unwrap(),

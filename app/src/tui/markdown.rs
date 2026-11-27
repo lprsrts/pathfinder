@@ -14,6 +14,24 @@ pub fn render(text: &str, width: u16, base: Style) -> Vec<Line<'static>> {
     render_lines(&raw, width, base)
 }
 
+thread_local! {
+    /// Rendering for terminal text selection: no bars or frames to copy.
+    static PLAIN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// As [`render`], or with `plain` without the `│ ` bars and frames of
+/// code blocks and quotes, so a terminal drag copies only the text.
+pub fn render_as(text: &str, width: u16, base: Style, plain: bool) -> Vec<Line<'static>> {
+    let was = PLAIN.with(|p| p.replace(plain));
+    let out = render(text, width, base);
+    PLAIN.with(|p| p.set(was));
+    out
+}
+
+fn plain() -> bool {
+    PLAIN.with(|p| p.get())
+}
+
 fn render_lines(raw: &[&str], width: u16, base: Style) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     let mut i = 0;
@@ -34,13 +52,16 @@ fn render_lines(raw: &[&str], width: u16, base: Style) -> Vec<Line<'static>> {
                 i += 1;
             }
             let lang = info.split_whitespace().next().unwrap_or("");
-            if lang == "mermaid" {
-                for l in mermaid_to_text(&block.join("\n")) {
-                    // Continuations line up under the text, past "- " or "← ".
-                    let lead = l.len() - l.trim_start().len();
-                    let hang = lead + 2;
-                    out.extend(wrap_hanging(&inline(&l, base), width, hang));
+            let numbered = info.split_whitespace().any(|w| w == "numbered");
+            if numbered {
+                // `/open` puts what wasn't shown on the line after the block.
+                let footer = raw.get(i).and_then(|l| source_footer(l));
+                if footer.is_some() {
+                    i += 1;
                 }
+                render_numbered_block(&block, lang, footer.as_deref(), width, base, &mut out);
+            } else if lang == "mermaid" {
+                render_mermaid(&block.join("\n"), width, base, &mut out);
             } else {
                 render_code_block(&block, lang, width, base, &mut out);
             }
@@ -166,6 +187,22 @@ fn render_code_block(
     out: &mut Vec<Line<'static>>,
 ) {
     let total_w = (width as usize).max(4);
+    if plain() {
+        // The code alone, every character kept, wrapped as below.
+        for raw_line in block {
+            let expanded = raw_line.replace('\t', "    ");
+            let mut rest = expanded.as_str();
+            if rest.is_empty() {
+                out.push(Line::default());
+            }
+            while !rest.is_empty() {
+                let (head, tail) = split_row(rest, total_w, false);
+                out.push(Line::from(Span::styled(head.to_string(), base)));
+                rest = tail;
+            }
+        }
+        return;
+    }
     let border = base.fg(Color::DarkGray);
     let lang_style = base.fg(Color::Cyan).add_modifier(Modifier::DIM);
     if !lang.is_empty() {
@@ -183,27 +220,189 @@ fn render_code_block(
             out.push(Line::from(Span::styled("│ ", border)));
             continue;
         }
-        // Preserve all leading whitespace and hard-break only when wider than content_w.
-        let mut chunk = String::new();
-        let mut chunk_w = 0usize;
-        for ch in expanded.chars() {
-            let cw = ch.width().unwrap_or(0);
-            if !chunk.is_empty() && chunk_w + cw > content_w {
-                out.push(Line::from(vec![
-                    Span::styled("│ ", border),
-                    Span::styled(std::mem::take(&mut chunk), base),
-                ]));
-                chunk_w = 0;
-            }
-            chunk.push(ch);
-            chunk_w += cw;
-        }
-        if !chunk.is_empty() {
+        // Every character is kept (indent included): rows rejoin to the line.
+        let mut rest = expanded.as_str();
+        while !rest.is_empty() {
+            let (head, tail) = split_row(rest, content_w, false);
             out.push(Line::from(vec![
                 Span::styled("│ ", border),
-                Span::styled(chunk, base),
+                Span::styled(head.to_string(), base),
             ]));
+            rest = tail;
         }
+    }
+    out.push(Line::from(Span::styled("└─", border)));
+}
+
+/// Where a row of `text` ends at `avail` columns: all of it when it fits;
+/// else, for prose, after the last space; for code, after the last space or
+/// punctuation within 20 columns of the edge; else a hard cut. Never empty.
+fn split_row(text: &str, avail: usize, prose: bool) -> (&str, &str) {
+    let avail = avail.max(1);
+    let mut used = 0usize;
+    let mut cut = text.len();
+    let mut soft_space: Option<usize> = None;
+    let mut soft_mark: Option<usize> = None;
+    let mut seen_text = false;
+    for (idx, ch) in text.char_indices() {
+        let w = ch.width().unwrap_or(0);
+        if used + w > avail {
+            cut = idx;
+            break;
+        }
+        used += w;
+        let end = idx + ch.len_utf8();
+        let near_edge = prose || used + 20 >= avail;
+        if seen_text && near_edge && ch == ' ' {
+            soft_space = Some(end);
+        } else if seen_text && near_edge && !prose && is_break_mark(ch) {
+            soft_mark = Some(end);
+        }
+        if !ch.is_whitespace() {
+            seen_text = true;
+        }
+    }
+    if cut == text.len() {
+        return (text, "");
+    }
+    // A space beats a mark: `{probe}` and `what's` stay whole.
+    let at = soft_space.or(soft_mark).unwrap_or(cut);
+    // A character wider than the row still moves forward.
+    let at = if at == 0 {
+        text.chars().next().map_or(text.len(), char::len_utf8)
+    } else {
+        at
+    };
+    text.split_at(at)
+}
+
+/// Punctuation a code row may end after (not quotes, brackets that open,
+/// or `_` inside names).
+fn is_break_mark(ch: char) -> bool {
+    matches!(
+        ch,
+        ',' | ';' | ')' | ']' | '}' | '.' | ':' | '=' | '>' | '|' | '&' | '+' | '-' | '/'
+    )
+}
+
+/// The `└─` text `/open` leaves after a cut block (`11–40 not shown ·
+/// \`/open f:11-70\``), without its backticks.
+fn source_footer(line: &str) -> Option<String> {
+    let plain = line.trim().replace('`', "");
+    plain.contains(" not shown · /open ").then_some(plain)
+}
+
+/// A source with its line numbers (`/open`): the numbers in a dim gutter,
+/// long lines wrapped under the code with a dim `┆` and the code's own
+/// indent, and a `└─` row that says what wasn't shown.
+fn render_numbered_block(
+    block: &[&str],
+    lang: &str,
+    footer: Option<&str>,
+    width: u16,
+    base: Style,
+    out: &mut Vec<Line<'static>>,
+) {
+    let total_w = (width as usize).max(4);
+    let gutter_style = base.add_modifier(Modifier::DIM);
+    let prose = matches!(lang, "markdown" | "text" | "");
+    if plain() {
+        // For terminal selection: the code alone, wrapped the same way, so
+        // a drag copies no numbers or marks.
+        for raw_line in block {
+            let expanded = raw_line.replace('\t', "    ");
+            let (_, mut rest) = split_gutter(&expanded);
+            if rest.is_empty() {
+                out.push(Line::default());
+            }
+            while !rest.is_empty() {
+                let (head, tail) = split_row(rest, total_w, prose);
+                out.push(Line::from(Span::styled(head.to_string(), base)));
+                rest = tail;
+            }
+        }
+        if let Some(text) = footer {
+            out.extend(wrap(&[Span::styled(text.to_string(), gutter_style)], width));
+        }
+        return;
+    }
+    for raw_line in block {
+        let expanded = raw_line.replace('\t', "    ");
+        let (gutter, code) = split_gutter(&expanded);
+        let g = gutter.width();
+        let code_w = total_w.saturating_sub(g);
+        if code_w < 8 {
+            // Too narrow for a gutter: the line as it is, cut to fit.
+            let mut rest = expanded.as_str();
+            while !rest.is_empty() {
+                let (head, tail) = split_row(rest, total_w, prose);
+                out.push(Line::from(Span::styled(head.to_string(), base)));
+                rest = tail;
+            }
+            continue;
+        }
+        let (head, mut rest) = split_row(code, code_w, prose);
+        out.push(Line::from(vec![
+            Span::styled(gutter.to_string(), gutter_style),
+            Span::styled(head.to_string(), base),
+        ]));
+        if rest.is_empty() {
+            continue;
+        }
+        let cont = format!("{}┆  ", " ".repeat(g.saturating_sub(3)));
+        let lead = code.len() - code.trim_start().len();
+        let indent = code[..lead].width().min(code_w / 2);
+        while !rest.is_empty() {
+            let trimmed = rest.trim_start();
+            if trimmed.is_empty() {
+                break;
+            }
+            let (head, tail) = split_row(trimmed, code_w - indent, prose);
+            out.push(Line::from(vec![
+                Span::styled(cont.clone(), gutter_style),
+                Span::styled(format!("{}{head}", " ".repeat(indent)), base),
+            ]));
+            rest = tail;
+        }
+    }
+    let mut spans = vec![Span::styled("└─", gutter_style)];
+    if let Some(text) = footer {
+        match text.split_once("/open ") {
+            Some((what, cmd)) => {
+                spans.push(Span::styled(format!(" {what}"), gutter_style));
+                spans.push(Span::styled(format!("/open {cmd}"), base.fg(Color::Cyan)));
+            }
+            None => spans.push(Span::styled(format!(" {text}"), gutter_style)),
+        }
+    }
+    out.extend(wrap_hanging(&spans, width, 3));
+}
+
+/// `   12  code` → (`   12  `, `code`); a line without a number has no gutter.
+pub(crate) fn split_gutter(line: &str) -> (&str, &str) {
+    let spaces = line.len() - line.trim_start_matches(' ').len();
+    let digits = line[spaces..]
+        .bytes()
+        .take_while(u8::is_ascii_digit)
+        .count();
+    if digits == 0 {
+        return ("", line);
+    }
+    let after = spaces + digits;
+    let rest = &line[after..];
+    if rest.is_empty() || rest.trim().is_empty() {
+        // Up to two more columns, on a char boundary (the rest may be any
+        // whitespace, such as U+3000).
+        let end = line
+            .char_indices()
+            .map(|(i, _)| i)
+            .find(|&i| i >= after + 2)
+            .unwrap_or(line.len());
+        return (&line[..end], &line[end..]);
+    }
+    match rest.strip_prefix("  ") {
+        Some(code) => (&line[..after + 2], code),
+        None => ("", line),
     }
 }
 
@@ -219,7 +418,8 @@ fn render_blockquote(
     base: Style,
     out: &mut Vec<Line<'static>>,
 ) {
-    let prefix = format!("{}│ ", " ".repeat(lead_spaces));
+    let bar = if plain() { "  " } else { "│ " };
+    let prefix = format!("{}{bar}", " ".repeat(lead_spaces));
     let prefix_w = prefix.width() as u16;
     let bar_style = base.fg(Color::Cyan);
     if width <= prefix_w + 1 {
@@ -531,7 +731,7 @@ pub fn inline(text: &str, base: Style) -> Vec<Span<'static>> {
         {
             flush_buf(&mut buf, &mut spans);
             let inner = &after[..end];
-            spans.push(Span::styled(inner.to_string(), base.fg(Color::Yellow)));
+            spans.push(Span::styled(inner.to_string(), base.fg(Color::Cyan)));
             prev_char = Some('`');
             rest = &after[end + 1..];
             continue;
@@ -546,7 +746,7 @@ pub fn inline(text: &str, base: Style) -> Vec<Span<'static>> {
                 label.to_string(),
                 base.fg(Color::Cyan).add_modifier(Modifier::UNDERLINED),
             ));
-            if label != url && url != format!("mailto:{label}") {
+            if label != url && url != format!("mailto:{label}") && !link_repeats(label, url) {
                 spans.push(Span::styled(
                     format!(" ({url})"),
                     base.add_modifier(Modifier::DIM),
@@ -621,6 +821,30 @@ pub fn inline(text: &str, base: Style) -> Vec<Span<'static>> {
         spans.push(Span::styled(buf, base));
     }
     spans
+}
+
+/// A relative link whose label already names its target
+/// (`[gate.rs:20](app/src/runtime/gate.rs#L20)`): the url adds nothing.
+fn link_repeats(label: &str, url: &str) -> bool {
+    if url.contains("://") || url.starts_with("mailto:") {
+        return false;
+    }
+    // The path alone, without `#L20`, `:20-24` or a query.
+    let path = |s: &str| -> String {
+        let s = s.trim().trim_matches('`');
+        let s = s.split(['#', '?']).next().unwrap_or(s);
+        let s = match s.split_once(':') {
+            Some((p, rest)) if rest.chars().all(|c| c.is_ascii_digit() || c == '-') => p,
+            _ => s,
+        };
+        s.trim_start_matches("./").to_string()
+    };
+    let (l, u) = (path(label), path(url));
+    if l.is_empty() || u.is_empty() {
+        return false;
+    }
+    let base = |s: &str| s.rsplit('/').next().unwrap_or(s).to_string();
+    l == u || u.ends_with(&format!("/{l}")) || base(&l) == base(&u)
 }
 
 fn parse_link(text: &str) -> Option<(&str, &str, usize)> {
@@ -893,8 +1117,23 @@ pub fn wrap_input(text: &str, cursor_byte: usize, width: u16) -> (Vec<String>, u
     (visual_lines, row, col)
 }
 
-/// A Mermaid flowchart as text: each node, then the nodes feeding into it.
-pub fn mermaid_to_text(source: &str) -> Vec<String> {
+/// A node of a Mermaid flowchart, as a row: its status mark (`✓`, `▶`,
+/// `○`, … when the label starts with one), its title, the rest of the
+/// label, and the numbers of the nodes feeding into it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlowRow {
+    pub mark: Option<String>,
+    pub title: String,
+    pub meta: String,
+    pub feeds: Vec<usize>,
+}
+
+/// Marks a node label may start with: the part statuses and the active part.
+const FLOW_MARKS: [&str; 6] = ["▶", "✓", "○", "⧗", "~", "⇢"];
+
+/// A Mermaid flowchart as rows: each node, numbered in order, then the
+/// numbers of the nodes feeding into it.
+pub fn mermaid_rows(source: &str) -> Vec<FlowRow> {
     let mut nodes: Vec<(String, String)> = Vec::new();
     let mut edges: Vec<(String, String)> = Vec::new();
     for raw in source.lines() {
@@ -910,26 +1149,108 @@ pub fn mermaid_to_text(source: &str) -> Vec<String> {
             upsert(&mut nodes, node);
         }
     }
-    let label = |id: &str| {
-        nodes
-            .iter()
-            .find(|(n, _)| n == id)
-            .map(|(_, l)| l.split(" · ").next().unwrap_or(l).to_string())
-            .unwrap_or_else(|| id.to_string())
-    };
+    nodes
+        .iter()
+        .map(|(id, label)| {
+            let (mark, label) = match FLOW_MARKS
+                .iter()
+                .find_map(|m| label.strip_prefix(m).and_then(|r| r.strip_prefix(' ')))
+            {
+                Some(rest) => (
+                    Some(label[..label.len() - rest.len() - 1].to_string()),
+                    rest,
+                ),
+                None => (None, label.as_str()),
+            };
+            let (title, meta) = label.split_once(" · ").unwrap_or((label, ""));
+            let feeds = edges
+                .iter()
+                .filter(|(_, to)| to == id)
+                .filter_map(|(from, _)| nodes.iter().position(|(n, _)| n == from))
+                .map(|i| i + 1)
+                .collect();
+            FlowRow {
+                mark,
+                title: title.to_string(),
+                meta: meta.to_string(),
+                feeds,
+            }
+        })
+        .collect()
+}
+
+/// A Mermaid flowchart as text: `✓ 1 Title · meta`, then `← 2, 3` for
+/// the nodes that feed it.
+#[cfg(test)]
+pub fn mermaid_to_text(source: &str) -> Vec<String> {
     let mut out = Vec::new();
-    for (id, text) in &nodes {
-        out.push(format!("- {text}"));
-        let feeds: Vec<String> = edges
-            .iter()
-            .filter(|(_, to)| to == id)
-            .map(|(from, _)| label(from))
-            .collect();
-        if !feeds.is_empty() {
-            out.push(format!("    ← {}", feeds.join(", ")));
+    for (i, r) in mermaid_rows(source).iter().enumerate() {
+        let mark = r.mark.as_deref().unwrap_or("·");
+        let meta = if r.meta.is_empty() {
+            String::new()
+        } else {
+            format!(" · {}", r.meta)
+        };
+        out.push(format!("{mark} {} {}{meta}", i + 1, r.title));
+        if !r.feeds.is_empty() {
+            out.push(format!("    ← {}", join_numbers(&r.feeds)));
         }
     }
     out
+}
+
+fn join_numbers(ns: &[usize]) -> String {
+    ns.iter()
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The flowchart's rows: the mark in its status colour, the number and the
+/// meta dim, and continuations under the title.
+fn render_mermaid(source: &str, width: u16, base: Style, out: &mut Vec<Line<'static>>) {
+    let rows = mermaid_rows(source);
+    let num_w = rows.len().to_string().len();
+    for (i, r) in rows.iter().enumerate() {
+        let mark = r.mark.as_deref().unwrap_or("·");
+        let color = match mark {
+            "▶" => Some(Color::Cyan),
+            "✓" => Some(Color::Green),
+            "⧗" => Some(Color::Yellow),
+            "⇢" => Some(Color::Magenta),
+            _ => None,
+        };
+        let mark_style = match color {
+            Some(c) => base.fg(c),
+            None => base.add_modifier(Modifier::DIM),
+        };
+        let dim = base.add_modifier(Modifier::DIM);
+        let mut spans = vec![
+            Span::styled(format!("{mark} "), mark_style),
+            Span::styled(format!("{:>num_w$} ", i + 1), dim),
+        ];
+        let title_style = if mark == "▶" {
+            base.add_modifier(Modifier::BOLD)
+        } else {
+            base
+        };
+        spans.extend(inline(&r.title, title_style));
+        if !r.meta.is_empty() {
+            spans.push(Span::styled(format!(" · {}", r.meta), dim));
+        }
+        let hang = 2 + num_w + 1;
+        out.extend(wrap_hanging(&spans, width, hang));
+        if !r.feeds.is_empty() {
+            out.extend(wrap_hanging(
+                &[Span::styled(
+                    format!("{}← {}", " ".repeat(hang), join_numbers(&r.feeds)),
+                    dim,
+                )],
+                width,
+                hang + 2,
+            ));
+        }
+    }
 }
 
 fn upsert(nodes: &mut Vec<(String, String)>, node: (String, String)) {
@@ -966,6 +1287,13 @@ fn node_def(part: &str) -> Option<(String, String)> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_number_followed_by_wide_whitespace_does_not_panic() {
+        assert_eq!(split_gutter("12\u{3000}"), ("12\u{3000}", ""));
+        let lines = render("```text numbered\n12\u{3000}\n```", 40, Style::default());
+        assert!(!lines.is_empty());
+    }
+
     fn plain(lines: &[Line]) -> Vec<String> {
         lines
             .iter()
@@ -979,9 +1307,9 @@ mod tests {
         assert_eq!(
             mermaid_to_text(src),
             vec![
-                "- ▶ Forward · fwd · open",
-                "- Loss · loss · open",
-                "    ← ▶ Forward"
+                "▶ 1 Forward · fwd · open",
+                "· 2 Loss · loss · open",
+                "    ← 1"
             ]
         );
     }
@@ -997,15 +1325,15 @@ mod tests {
         assert_eq!(text[0], "Title");
         assert!(text[1].starts_with("• P is U·I·cos φ"), "{text:?}");
         assert!(text[2].starts_with("  "), "hanging indent: {text:?}");
-        assert!(text.contains(&"    ← A".to_string()), "{text:?}");
+        assert!(text.contains(&"    ← 1".to_string()), "{text:?}");
         let tree = plain(&render(
             "```mermaid\nflowchart LR\n    a[\"Alpha\"]\n    b[\"Beta gamma delta epsilon zeta eta\"]\n    a --> b\n    b --> a\n```",
             20,
             Style::default(),
         ));
-        let at = tree.iter().position(|l| l.starts_with("- Beta")).unwrap();
+        let at = tree.iter().position(|l| l.starts_with("· 2 Beta")).unwrap();
         assert!(
-            tree[at + 1].starts_with("  ") && !tree[at + 1].starts_with("   "),
+            tree[at + 1].starts_with("    ") && !tree[at + 1].starts_with("     "),
             "{tree:?}"
         );
         let bold = lines[1]
@@ -1019,7 +1347,7 @@ mod tests {
             .iter()
             .find(|s| s.content.contains("U·I·cos"))
             .unwrap();
-        assert_eq!(code.style.fg, Some(Color::Yellow));
+        assert_eq!(code.style.fg, Some(Color::Cyan));
         for l in &lines {
             let w: usize = l.spans.iter().map(|s| s.content.width()).sum();
             assert!(w <= 24, "{l:?} is {w} wide");
@@ -1091,12 +1419,13 @@ mod tests {
         assert_eq!(text[3], "│ ");
         assert!(text[4].starts_with("│     let long_ident"), "{text:?}");
         assert!(text[5].starts_with("│ "), "{text:?}");
-        assert_eq!(*text.last().unwrap(), "│ }");
+        assert_eq!(text[text.len() - 2], "│ }");
+        assert_eq!(*text.last().unwrap(), "└─");
         for l in &text {
             assert!(l.width() <= 24, "{l:?} width={}", l.width());
         }
         // Rejoining code after `│ ` preserves exact characters without dropping spaces.
-        let rejoined: String = text[4..text.len() - 1]
+        let rejoined: String = text[4..text.len() - 2]
             .iter()
             .map(|l| l.strip_prefix("│ ").unwrap())
             .collect();
@@ -1104,6 +1433,84 @@ mod tests {
             rejoined,
             "    let long_ident = \"abcdefghijklmnopqrstuvwxyz\";"
         );
+    }
+
+    #[test]
+    fn code_breaks_after_a_space_or_punctuation_near_the_edge() {
+        let src = "```rust\nlet value = compute(alpha, beta, gamma_delta);\n```";
+        let text = plain(&render(src, 32, Style::default()));
+        // 30 columns of code: the break falls after `, ` rather than mid-word.
+        assert_eq!(text[1], "│ let value = compute(alpha, ");
+        assert_eq!(text[2], "│ beta, gamma_delta);");
+        // Far from the edge, a long word is cut hard.
+        let src = "```text\nx abcdefghijklmnopqrstuvwxyzabcdefghij\n```";
+        let text = plain(&render(src, 32, Style::default()));
+        assert_eq!(text[1], "│ x abcdefghijklmnopqrstuvwxyzab");
+    }
+
+    #[test]
+    fn numbered_sources_keep_the_gutter_and_wrap_under_the_code() {
+        let src = "```rust numbered\n   20          name: name.to_string(),\n   22              \"Candidate {n} is waiting for the user's verdict. Would sending the draft reply below reveal it?\",\n   23\n   24      ),\n```\n25–391 not shown · `/open app/src/runtime/gate.rs:25-84`";
+        let lines = render(src, 60, Style::default());
+        let text = plain(&lines);
+        assert_eq!(text[0], "   20          name: name.to_string(),");
+        // The gutter is dim; the code is not.
+        assert!(lines[0].spans[0].style.add_modifier.contains(Modifier::DIM));
+        assert_eq!(lines[0].spans[0].content, "   20  ");
+        assert!(
+            text[1].starts_with("   22              \"Candidate"),
+            "{text:?}"
+        );
+        // Continuations: `┆` under the number, then the code's own indent.
+        assert!(text[2].starts_with("    ┆              "), "{text:?}");
+        assert!(
+            !text[2]["    ┆              ".len()..].starts_with(' '),
+            "{text:?}"
+        );
+        for l in &text {
+            assert!(l.width() <= 60, "{l:?} is {} wide", l.width());
+        }
+        // Rows of a line hold all its words, cut only after a space or mark.
+        let blank = text.iter().position(|l| l.trim() == "23").unwrap();
+        let words: Vec<&str> = text[1..blank]
+            .iter()
+            .flat_map(|l| l.split_whitespace())
+            .filter(|w| *w != "┆" && *w != "22")
+            .collect();
+        assert_eq!(
+            words.join(" "),
+            "\"Candidate {n} is waiting for the user's verdict. Would sending the draft reply below reveal it?\","
+        );
+        assert_eq!(text[blank + 1], "   24      ),");
+        assert_eq!(
+            text.last().unwrap(),
+            "└─ 25–391 not shown · /open app/src/runtime/gate.rs:25-84"
+        );
+        let last = &lines.last().unwrap().spans;
+        let cmd = last.iter().find(|s| s.content.contains("/open")).unwrap();
+        assert_eq!(cmd.style.fg, Some(Color::Cyan));
+        let note = last.iter().find(|s| s.content.contains("shown")).unwrap();
+        assert!(note.style.add_modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn numbered_prose_breaks_at_words_and_every_block_closes() {
+        let src = "```markdown numbered\n    7  Pathfinder makes sure you understand what you are working on, at the moments that matter.\n    8\n```";
+        let text = plain(&render(src, 50, Style::default()));
+        assert_eq!(text[0], "    7  Pathfinder makes sure you understand what ");
+        assert_eq!(text[1], "    ┆  you are working on, at the moments that ");
+        assert_eq!(text[2], "    ┆  matter.");
+        assert_eq!(text[3].trim_end(), "    8");
+        // A block shown whole still gets its closing row.
+        assert_eq!(text[4], "└─");
+        assert_eq!(text.len(), 5);
+        // A line after a block that isn't a footer stays a paragraph.
+        let text = plain(&render(
+            "```text numbered\n    1  a\n```\nafter",
+            40,
+            Style::default(),
+        ));
+        assert_eq!(text, vec!["    1  a", "└─", "after"]);
     }
 
     #[test]
@@ -1131,6 +1538,49 @@ mod tests {
         }
         assert!(narrow_text.iter().any(|l| l.contains("Backward")));
         assert!(narrow_text.iter().any(|l| l.contains("propagation")));
+    }
+
+    #[test]
+    fn relative_links_drop_a_url_that_repeats_the_label() {
+        let full = |t: &str| -> String {
+            inline(t, Style::default())
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect()
+        };
+        assert_eq!(
+            full("see [gate.rs:20](app/src/runtime/gate.rs#L20) now"),
+            "see gate.rs:20 now"
+        );
+        assert_eq!(full("[README.md](./README.md)"), "README.md");
+        assert_eq!(full("[`docs/a.md`](docs/a.md)"), "`docs/a.md`");
+        // A label that names something else keeps its target.
+        assert_eq!(
+            full("[the guide](docs/guide.md)"),
+            "the guide (docs/guide.md)"
+        );
+        assert_eq!(
+            full("[gate.rs](https://x.org/gate.rs)"),
+            "gate.rs (https://x.org/gate.rs)"
+        );
+    }
+
+    #[test]
+    fn map_rows_show_status_marks_and_numbers() {
+        let src = "```mermaid\nflowchart TD\n    n_a[\"✓ Candidate checks<br/><small>cand · understood</small>\"]\n    n_b[\"▶ The verdict prompt<br/><small>verdict · open</small>\"]\n    n_c[\"○ Logging<br/><small>log · open</small>\"]\n    n_a --> n_c\n    n_b --> n_c\n```";
+        let lines = render(src, 60, Style::default());
+        assert_eq!(
+            plain(&lines),
+            vec![
+                "✓ 1 Candidate checks · cand · understood",
+                "▶ 2 The verdict prompt · verdict · open",
+                "○ 3 Logging · log · open",
+                "    ← 1, 2",
+            ]
+        );
+        assert_eq!(lines[0].spans[0].style.fg, Some(Color::Green));
+        assert_eq!(lines[1].spans[0].style.fg, Some(Color::Cyan));
+        assert!(!plain(&lines).iter().any(|l| l.starts_with("- ")));
     }
 
     #[test]

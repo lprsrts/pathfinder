@@ -4,63 +4,42 @@ use std::io::{self, BufRead, IsTerminal, Write};
 
 use anyhow::{Context, Result, bail};
 
-use crate::auth::{Credentials, check_key_shape, mask};
-use crate::catalog::{self, ModelCache};
-use crate::config::Route;
+use crate::auth::Credentials;
+use crate::auth::accounts::{self, NAMES, Row, parse_account, process_env};
+use crate::auth::connect::{self, checking_client};
+use crate::auth::flow::{Action, Failure, Flow, KeyTarget, Mode, Secret};
+use crate::catalog;
+use crate::config::{CliAccounts, Config, Route};
 use crate::decide::{self, Provider, Question};
+use crate::prompt;
 
 const AUTH_USAGE: &str = "Usage:
-  pathfinder auth login                              Connect models: pick how
-  pathfinder auth login chatgpt                      Sign in with ChatGPT (uses your plan)
-  pathfinder auth login [anthropic|openai]           Add an API key
-  pathfinder auth login server                       Add an OpenAI-compatible service or your own server
-  pathfinder auth logout chatgpt [--forget]          Sign out; --forget also drops the registration
-  pathfinder auth set [anthropic|openai] [--stdin]   Store an API key in Pathfinder's auth file
-  pathfinder auth set [gemini|typesafe] [--stdin]    Store a decision-model key (Gemini Decision 1, TypeSafe Jev)
-  pathfinder auth set brave [--stdin]                Store a Brave Search key for `/web` (or `auth import brave`)
-  pathfinder auth set openalex [--stdin]             Store an OpenAlex key, past its free daily allowance
-  pathfinder auth remove <provider>                  Remove Pathfinder's stored key
-  pathfinder auth import <provider>                  Copy a <provider>-api-key macOS keychain item
-  pathfinder auth status                             Show which keys are available";
+  pathfinder auth login                         Pick how to connect (arrow keys, Esc goes back)
+  pathfinder auth login chatgpt                 Sign in with your ChatGPT plan in the browser
+  pathfinder auth login anthropic|openai        Add an API key (pay per use); masked, then checked
+  pathfinder auth login endpoint                Add your own OpenAI-compatible server
+  pathfinder auth login typesafe                The gate's key (TypeSafe Jev; in the TUI: Ctrl+P)
+      --with-api-key                            Read the key from stdin instead (also: --stdin)
+  pathfinder auth logout [account] [--forget]   Remove one sign-in or key (pick when not named);
+                                                --forget also drops the ChatGPT registration
+  pathfinder auth status                        Your accounts and what each uses
+  pathfinder auth set <account> [--stdin]       Same as `auth login <account>`; also gemini,
+                                                brave (`/web`) and openalex keys
+  pathfinder auth remove <provider>             Remove Pathfinder's stored key
+  pathfinder auth import <provider>             Copy a <provider>-api-key macOS keychain item";
 
 pub async fn auth(args: &[String]) -> Result<()> {
     let creds = Credentials::system();
     let flag = |f: &str| args.iter().any(|a| a == f);
+    let from_stdin = flag("--stdin") || flag("--with-api-key");
     let positional: Vec<&str> = args
         .iter()
         .map(String::as_str)
         .filter(|a| !a.starts_with("--"))
         .collect();
     match positional.first().copied() {
-        Some("login") => match positional.get(1).copied() {
-            Some("chatgpt") => login_chatgpt(&creds).await,
-            Some("server") => add_server(&creds).await,
-            Some(p) if Route::from_provider_id(p).is_some() => {
-                set(&creds, Some(p), flag("--stdin")).await
-            }
-            Some(other) => bail!("unknown login `{other}`\n\n{AUTH_USAGE}"),
-            None => match choose_login()? {
-                Login::Chatgpt => login_chatgpt(&creds).await,
-                Login::Key(route) => set(&creds, Some(route.provider_id()), false).await,
-                Login::Server => add_server(&creds).await,
-            },
-        },
-        Some("logout") => match positional.get(1).copied() {
-            Some("chatgpt") | None => {
-                let revoked = creds.chatgpt().logout(flag("--forget")).await?;
-                println!(
-                    "Signed out of ChatGPT.{}",
-                    if revoked {
-                        ""
-                    } else {
-                        " The token couldn't be revoked with OpenAI, but it was deleted here."
-                    }
-                );
-                refresh(&creds, Route::Chatgpt).await;
-                Ok(())
-            }
-            Some(other) => bail!("to remove a {other} key use `pathfinder auth remove {other}`"),
-        },
+        Some("login") => login(&creds, positional.get(1).copied(), from_stdin).await,
+        Some("logout") => logout(&creds, positional.get(1).copied(), flag("--forget")).await,
         // An endpoint's key, by the name its config entry gives.
         Some(cmd @ ("set" | "import" | "remove"))
             if endpoint_key(positional.get(1).copied()).is_some() =>
@@ -74,22 +53,17 @@ pub async fn auth(args: &[String]) -> Result<()> {
                 "remove" if creds.remove_named(&name)? => println!("Removed {name}."),
                 "remove" => println!("Pathfinder has no stored {name}."),
                 _ => {
-                    let key = if flag("--stdin") || !io::stdin().is_terminal() {
-                        let mut line = String::new();
-                        io::stdin().lock().read_line(&mut line)?;
-                        line
-                    } else {
-                        rpassword::prompt_password(format!("Paste the key for {name} (hidden): "))?
-                    };
+                    let key =
+                        read_key(&format!("Paste the key for {name} (hidden): "), from_stdin)?;
                     creds.set_named(&name, key.trim())?;
                     println!("Saved {name}.");
                 }
             }
             Ok(())
         }
-        Some("set") => match decision_only(positional.get(1).copied()) {
-            Some(p) => set_decision(&creds, p, flag("--stdin")).await,
-            None => set(&creds, positional.get(1).copied(), flag("--stdin")).await,
+        Some("set") => match positional.get(1).copied() {
+            Some("gemini") => set_decision(&creds, Provider::Gemini, from_stdin).await,
+            name => login(&creds, name, from_stdin).await,
         },
         Some("remove" | "import") if decision_only(positional.get(1).copied()).is_some() => {
             let p = decision_only(positional.get(1).copied()).unwrap();
@@ -116,7 +90,7 @@ pub async fn auth(args: &[String]) -> Result<()> {
             } else {
                 println!("Pathfinder has no stored {} key.", route.provider_name());
             }
-            refresh(&creds, route).await;
+            connect::refresh(&creds, route).await;
             Ok(())
         }
         Some("import") => {
@@ -126,13 +100,17 @@ pub async fn auth(args: &[String]) -> Result<()> {
                     "Copied the {}-api-key keychain item into Pathfinder's auth file.",
                     route.provider_id()
                 );
-                refresh(&creds, route).await;
+                connect::refresh(&creds, route).await;
             } else {
                 println!("No {}-api-key keychain item found.", route.provider_id());
             }
             Ok(())
         }
         Some("status") | None => status(&creds),
+        Some("help") => {
+            println!("{AUTH_USAGE}");
+            Ok(())
+        }
         Some(other) => bail!("unknown auth command `{other}`\n\n{AUTH_USAGE}"),
     }
 }
@@ -142,18 +120,33 @@ pub async fn models(args: &[String]) -> Result<()> {
         let creds = Credentials::system();
         let http = checking_client()?;
         catalog::refresh(&creds, &http, &Route::DISCOVERED).await;
-        catalog::refresh_endpoints(&crate::config::Config::load(), &creds, &http).await;
+        catalog::refresh_endpoints(&Config::load(), &creds, &http).await;
     }
-    let entries = crate::config::Config::load().catalog();
+    let entries = Config::load().catalog();
     if entries.is_empty() {
         println!(
-            "No models discovered yet. Add a key with `pathfinder auth set`, or run `pathfinder models --refresh`."
+            "No models discovered yet. Connect an account with `pathfinder auth login`, or run `pathfinder models --refresh`."
         );
     }
-    for entry in entries {
-        println!("{:<44} {}", entry.id, entry.label);
-    }
+    print!("{}", models_by_account(&entries));
     Ok(())
+}
+
+/// The catalog as `pathfinder models` prints it: a section per account (as
+/// in the TUI's pickers), each model's id and label under it.
+fn models_by_account(entries: &[crate::config::ModelEntry]) -> String {
+    let mut out = String::new();
+    for (i, (account, models)) in crate::config::by_account(entries).into_iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        out.push_str(&account.header());
+        out.push('\n');
+        for m in models {
+            out.push_str(&format!("  {:<44} {}\n", m.id, m.label));
+        }
+    }
+    out
 }
 
 /// The key name of a configured endpoint, when `name` is one.
@@ -166,7 +159,7 @@ fn endpoint_key(name: Option<&str>) -> Option<String> {
     if matches!(name, "openalex" | crate::web::OPENALEX_KEY) {
         return Some(crate::web::OPENALEX_KEY.to_string());
     }
-    crate::config::Config::load()
+    Config::load()
         .endpoints
         .iter()
         .filter_map(|e| e.key.clone())
@@ -179,16 +172,25 @@ fn decision_only(name: Option<&str>) -> Option<Provider> {
         .filter(|p| !matches!(p, Provider::Openai | Provider::Local))
 }
 
-async fn set_decision(creds: &Credentials, p: Provider, from_stdin: bool) -> Result<()> {
-    let key = if from_stdin || !io::stdin().is_terminal() {
+/// A key from stdin (one line) when asked or when there is no terminal;
+/// else a hidden prompt. Never echoed.
+fn read_key(prompt: &str, from_stdin: bool) -> Result<String> {
+    if from_stdin || !io::stdin().is_terminal() {
         let mut line = String::new();
         io::stdin().lock().read_line(&mut line)?;
-        line
+        Ok(line.trim().to_string())
     } else {
-        rpassword::prompt_password(format!("Paste your {} API key (hidden): ", p.label()))?
-    };
-    let key = key.trim();
-    check_key_shape(key).map_err(anyhow::Error::msg)?;
+        Ok(rpassword::prompt_password(prompt)?.trim().to_string())
+    }
+}
+
+/// `auth set gemini`: Gemini Decision 1's key, checked with one request.
+async fn set_decision(creds: &Credentials, p: Provider, from_stdin: bool) -> Result<()> {
+    let key = read_key(
+        &format!("Paste your {} API key (hidden): ", p.label()),
+        from_stdin,
+    )?;
+    crate::auth::check_key_shape(&key).map_err(anyhow::Error::msg)?;
     print!("Checking the key with {}... ", p.label());
     io::stdout().flush()?;
     let probe = [Question {
@@ -196,11 +198,11 @@ async fn set_decision(creds: &Credentials, p: Provider, from_stdin: bool) -> Res
         instructions: "Is this a greeting?".into(),
         options: vec![("yes".into(), String::new()), ("no".into(), String::new())],
     }];
-    match decide::call(&checking_client()?, p, key, "hello", &probe).await {
+    match decide::call(&checking_client()?, p, &key, "hello", &probe).await {
         Ok(_) => println!("ok."),
         Err(e) => bail!("{e:#}. The key was not saved."),
     }
-    creds.set_named(p.key_name(), key)?;
+    creds.set_named(p.key_name(), &key)?;
     println!(
         "Saved to Pathfinder's auth file. Chat messages now go through {} first.",
         p.label()
@@ -216,232 +218,182 @@ fn provider(name: Option<&str>) -> Result<Route> {
         .with_context(|| format!("unknown provider `{name}`; use anthropic or openai"))
 }
 
-enum Login {
-    Chatgpt,
-    Key(Route),
-    Server,
+fn account_rows(creds: &Credentials, cfg: &Config) -> Vec<accounts::RowView> {
+    accounts::with_models(
+        accounts::rows(creds, cfg, CliAccounts::detect(cfg), &process_env),
+        &cfg.catalog(),
+    )
 }
 
-fn ask(prompt: &str) -> Result<String> {
-    print!("{prompt}");
-    io::stdout().flush()?;
-    let mut line = String::new();
-    io::stdin().lock().read_line(&mut line)?;
-    Ok(line.trim().to_string())
+/// The account `name` means; a name that isn't one is never echoed whole
+/// (it may be a key pasted in the wrong place).
+fn named_row(name: &str, cfg: &Config) -> Result<Row> {
+    parse_account(name, cfg).with_context(|| accounts::unknown_account(name))
 }
 
-fn choose_login() -> Result<Login> {
-    if !io::stdin().is_terminal() {
-        bail!("name what to connect\n\n{AUTH_USAGE}");
-    }
-    let mut options = vec![(
-        "Sign in with ChatGPT (uses your plan)".to_string(),
-        Login::Chatgpt,
-    )];
-    for route in Route::API {
-        options.push((
-            format!("{} API key", route.provider_name()),
-            Login::Key(route),
-        ));
-    }
-    options.push((
-        "Another OpenAI-compatible service or your own server (OpenRouter, Ollama, vLLM, ...)"
-            .to_string(),
-        Login::Server,
-    ));
-    println!("Connect models:");
-    for (i, (label, _)) in options.iter().enumerate() {
-        println!("  {}) {label}", i + 1);
-    }
-    let n: usize = ask("Number: ")?.parse().context("enter a number")?;
-    options
-        .into_iter()
-        .nth(n.wrapping_sub(1))
-        .map(|(_, l)| l)
-        .context("no such option")
+/// What happens when there is no terminal to pick in, or the key comes on
+/// stdin: only named accounts, never a prompt that would wait.
+fn no_terminal(what: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "There is no terminal here to pick in. Name the account: pathfinder auth {what} <{NAMES}>"
+    )
 }
 
-/// `pathfinder auth login server`: an OpenAI-compatible endpoint, checked
-/// and added to `config.json`.
-async fn add_server(creds: &Credentials) -> Result<()> {
-    let base_url = ask("Base URL, up to and including /v1 (e.g. http://localhost:11434/v1): ")?;
-    if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
-        bail!("the base URL starts with http:// or https://");
+/// `auth login [account]`: the account list, or straight to one account.
+async fn login(creds: &Credentials, name: Option<&str>, from_stdin: bool) -> Result<()> {
+    let cfg = Config::load();
+    let row = name.map(|n| named_row(n, &cfg)).transpose()?;
+    if from_stdin || !prompt::interactive() {
+        let Some(row) = row else {
+            return Err(no_terminal("login"));
+        };
+        return login_unattended(creds, &row, from_stdin).await;
     }
-    let base_url = base_url.trim_end_matches('/').to_string();
-    let suggested = server_name(&base_url);
-    let id = ask(&format!("Short name [{suggested}]: "))?;
-    let id = if id.is_empty() { suggested } else { id };
-    let key_name = server_key_name(&id)?;
-    let key = rpassword::prompt_password("API key (hidden; Enter if it needs none): ")?;
-    let key = key.trim();
-    let key = (!key.is_empty()).then_some(key);
+    let views = account_rows(creds, &cfg);
+    let (flow, action) = match &row {
+        None => (Flow::login(views), Action::None),
+        Some(r) => Flow::at(Mode::Login, views, r),
+    };
+    drive(creds, flow, action).await
+}
 
-    print!("Checking {base_url}... ");
-    io::stdout().flush()?;
-    let http = checking_client()?;
-    let models = crate::llm::chat::list_models(&http, &base_url, key)
-        .await
-        .map_err(|e| anyhow::anyhow!("{e:#}. Nothing was saved."))?;
-    println!("ok, {} models available.", models.len());
-
-    let key_name = key.map(|_| key_name);
-    if let (Some(name), Some(key)) = (&key_name, key) {
-        creds.set_named(name, key)?;
+/// `auth login <account>` without a terminal, or with `--with-api-key`.
+async fn login_unattended(creds: &Credentials, row: &Row, from_stdin: bool) -> Result<()> {
+    match row {
+        Row::Chatgpt => {
+            if crate::browser_opens() {
+                println!("Opening your browser to sign in with ChatGPT…");
+            }
+            let msg = connect::sign_in_chatgpt(creds, show_url).await?;
+            println!("{msg}");
+        }
+        Row::ClaudeCode | Row::CodexCli => {
+            let installed = CliAccounts::detect(&Config::load());
+            let on = if *row == Row::ClaudeCode {
+                installed.claude
+            } else {
+                installed.codex
+            };
+            println!("{}", row.sign_in_hint(on).unwrap_or_default());
+        }
+        Row::Advanced => bail!(
+            "Adding a server asks a few questions: run `pathfinder auth login endpoint` in a terminal, or add it to config.json's `endpoints`."
+        ),
+        _ => {
+            let target = KeyTarget::of(row).context("this account takes no key")?;
+            // A terminal on stdin but not stdout (`… > log`): ask there,
+            // masked, as the account is named.
+            let key = if !from_stdin && io::stdin().is_terminal() {
+                read_key(&format!("Paste your {} key (hidden): ", row.name()), false)?
+            } else {
+                read_key("", true)?
+            };
+            if key.is_empty() {
+                bail!(
+                    "No key on stdin. Pipe it in: … | pathfinder auth login {} --with-api-key",
+                    row.id()
+                );
+            }
+            crate::auth::check_key_shape(&key).map_err(anyhow::Error::msg)?;
+            eprint!("Checking the key... ");
+            let msg = connect::save_key(creds, &target, &Secret::new(&key)).await?;
+            eprintln!("ok.");
+            println!("{msg}");
+        }
     }
-    crate::config::Config::add_endpoint(&crate::config::Endpoint {
-        id: id.clone(),
-        label: None,
-        base_url,
-        key: key_name,
-        models: Vec::new(),
-        extra: None,
-    })?;
-    catalog::refresh_endpoints(&crate::config::Config::load(), creds, &http).await;
-    println!(
-        "Added `{id}` to {}. Start a new Pathfinder thread to use its models.",
-        crate::config::default_config_path().display()
-    );
     Ok(())
 }
 
-/// Names a server can't take: they belong to Pathfinder's own routes and
-/// keys.
-const RESERVED_SERVERS: &[&str] = &[
-    "anthropic",
-    "openai",
-    "chatgpt",
-    "claude",
-    "codex",
-    "endpoint",
-    "gemini",
-    "google",
-    "typesafe",
-    "brave",
-    "openalex",
-];
-
-/// The auth file entry for a server's key. It has its own prefix, so a
-/// server's key can never replace a provider's (`openai-api-key`) or a search
-/// key.
-fn server_key_name(id: &str) -> Result<String> {
-    if id.is_empty()
-        || !id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
-        bail!("the name is letters, digits, - and _ only");
-    }
-    if RESERVED_SERVERS.contains(&id.to_ascii_lowercase().as_str()) {
-        bail!("`{id}` is one of Pathfinder's own names; pick another for this server");
-    }
-    Ok(format!("endpoint-{id}-api-key"))
-}
-
-/// For checking a server: one that accepts the connection but never answers
-/// fails instead of hanging.
-fn checking_client() -> Result<reqwest::Client> {
-    Ok(reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(30))
-        .build()?)
-}
-
-/// A short name for a server from its URL: `openrouter` for
-/// `https://openrouter.ai/api/v1`, `localhost` for a local one.
-fn server_name(base_url: &str) -> String {
-    let host = base_url
-        .split("://")
-        .nth(1)
-        .unwrap_or("")
-        .split(['/', ':'])
-        .next()
-        .unwrap_or("");
-    if host.is_empty() || host.chars().all(|c| c.is_ascii_digit() || c == '.') {
-        return "server".into();
-    }
-    let parts: Vec<&str> = host.split('.').collect();
-    let name = match parts.as_slice() {
-        [one] => one,
-        [.., name, _tld] if name.len() > 2 => name,
-        [.., name, _, _] => name,
-        _ => host,
-    };
-    name.chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
-        .collect::<String>()
-        .to_lowercase()
-}
-
-fn choose_provider() -> Result<Route> {
-    println!("Which provider's API key do you want to add?");
-    for (i, route) in Route::API.iter().enumerate() {
-        println!("  {}) {}", i + 1, route.provider_name());
-    }
-    print!("Number: ");
-    io::stdout().flush()?;
-    let mut line = String::new();
-    io::stdin().lock().read_line(&mut line)?;
-    let n: usize = line.trim().parse().context("enter a number")?;
-    Route::API
-        .get(n.wrapping_sub(1))
-        .copied()
-        .context("no such provider")
-}
-
-async fn set(creds: &Credentials, name: Option<&str>, from_stdin: bool) -> Result<()> {
-    let route = match name {
-        Some(n) => provider(Some(n))?,
-        None => choose_provider()?,
-    };
-    let key = if from_stdin || !io::stdin().is_terminal() {
-        let mut line = String::new();
-        io::stdin().lock().read_line(&mut line)?;
-        line
+/// The browser sign-in's address, for when the browser doesn't open (or
+/// none is opened here), on a line of its own.
+fn show_url(url: &str) {
+    if crate::browser_opens() {
+        println!("If the browser doesn't open, open this address:\n{url}\n");
     } else {
-        rpassword::prompt_password(format!(
-            "Paste your {} API key (hidden): ",
-            route.provider_name()
-        ))?
-    };
-    let key = key.trim();
-    check_key_shape(key).map_err(anyhow::Error::msg)?;
-
-    print!("Checking the key with {}... ", route.provider_name());
-    io::stdout().flush()?;
-    match catalog::list_models(&checking_client()?, route, key).await {
-        Ok(models) => println!("ok, {} models available.", models.len()),
-        Err(e) => bail!("{e:#}. The key was not saved."),
+        println!(
+            "Open this address in a browser to sign in with ChatGPT. It sends the browser back to 127.0.0.1 on this machine{}:\n{url}\n",
+            if crate::over_ssh() {
+                " (over SSH, forward that port first with ssh -L)"
+            } else {
+                ""
+            }
+        );
     }
-    creds.set_key(route, key)?;
-    println!("Saved to Pathfinder's auth file. Start a new Pathfinder thread to use it.");
-    refresh(creds, route).await;
-    Ok(())
+    println!("Waiting for the browser… (Ctrl+C stops)");
 }
 
-async fn login_chatgpt(creds: &Credentials) -> Result<()> {
-    let session = creds.chatgpt();
-    println!("Opening your browser to sign in with ChatGPT...");
-    let registration = session
-        .login(|url| {
-            println!("If the browser doesn't open, visit:\n{url}\n");
-            open_browser(url);
-        })
-        .await?;
-    println!(
-        "Signed in with ChatGPT{}. Model usage counts against your ChatGPT plan.",
-        registration
-            .email
-            .map(|e| format!(" as {e}"))
-            .unwrap_or_default()
-    );
-    refresh(creds, Route::Chatgpt).await;
-    let count = ModelCache::load()
-        .providers
-        .get("chatgpt")
-        .map_or(0, Vec::len);
-    println!("{count} ChatGPT models available. Start a new Pathfinder thread to use them.");
-    Ok(())
+/// Shows the flow until it closes or a job finishes. A job runs under its
+/// busy step (Esc cancels it); a failed one goes back to the step that
+/// started it, with the reason.
+async fn drive(creds: &Credentials, mut flow: Flow, mut action: Action) -> Result<()> {
+    loop {
+        let job = match action {
+            Action::Run(job) => job,
+            Action::Close | Action::Cancel => {
+                println!("Nothing changed.");
+                return Ok(());
+            }
+            Action::None | Action::Copy(_) => match prompt::drive(&mut flow)? {
+                Some(job) => job,
+                None => {
+                    println!("Nothing changed.");
+                    return Ok(());
+                }
+            },
+        };
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let run = connect::run(creds, job, move |url| {
+            let _ = tx.send(url.to_string());
+        });
+        match prompt::wait(&mut flow, run, rx).await? {
+            prompt::JobEnd::Done(Ok(msg)) => {
+                println!("{msg}");
+                return Ok(());
+            }
+            prompt::JobEnd::Done(Err(e)) => {
+                if !flow.fail(Failure::of(&e)) {
+                    return Err(e);
+                }
+            }
+            prompt::JobEnd::Cancelled => {
+                if flow.is_closed() {
+                    println!("Cancelled. Nothing changed.");
+                    return Ok(());
+                }
+                flow.error = Some("Cancelled.".into());
+            }
+        }
+        action = Action::None;
+    }
+}
+
+/// `auth logout [account]`: removes one sign-in or key; picks when not
+/// named.
+async fn logout(creds: &Credentials, name: Option<&str>, forget: bool) -> Result<()> {
+    let cfg = Config::load();
+    match name {
+        Some(n) => {
+            let row = named_row(n, &cfg)?;
+            let msg = match &row {
+                // A server without a key: removing it is all there is to do.
+                Row::Endpoint(id) if cfg.endpoint(id).is_some_and(|e| e.key.is_none()) => {
+                    connect::remove_server(creds, id).await?
+                }
+                _ => connect::sign_out(creds, &row, forget).await?,
+            };
+            println!("{msg}");
+            Ok(())
+        }
+        None if !prompt::interactive() => Err(no_terminal("logout")),
+        None => {
+            let flow = Flow::logout(account_rows(creds, &cfg));
+            if flow.is_empty() {
+                println!("{}", flow.empty_text());
+                return Ok(());
+            }
+            drive(creds, flow, Action::None).await
+        }
+    }
 }
 
 /// Opens a URL in the default browser, unless PATHFINDER_NO_BROWSER is set
@@ -450,90 +402,30 @@ pub fn open_browser(url: &str) {
     crate::open_browser(url);
 }
 
-/// Refreshes the model list of the one provider a command changed.
-async fn refresh(creds: &Credentials, route: Route) {
-    catalog::refresh(creds, &checking_client().unwrap_or_default(), &[route]).await;
+fn status(creds: &Credentials) -> Result<()> {
+    let cfg = Config::load();
+    let catalog = cfg.catalog();
+    // A status report: nothing is cut; a long line wraps in the terminal.
+    for line in status_text(&account_rows(creds, &cfg), cfg.local_only, catalog.len()) {
+        println!("{line}");
+    }
+    Ok(())
 }
 
-fn status(creds: &Credentials) -> Result<()> {
-    let session = creds.chatgpt();
-    match (session.signed_in(), session.registration()) {
-        (true, Some(reg)) => println!(
-            "{:<10} signed in{}",
-            "ChatGPT",
-            reg.email.map(|e| format!(" as {e}")).unwrap_or_default()
-        ),
-        _ => println!("{:<10} not signed in (`pathfinder auth login`)", "ChatGPT"),
+/// `auth status`: the accounts, then how many models the pickers list (the
+/// same catalog: discovered, CLI and server models).
+fn status_text(views: &[accounts::RowView], local_only: bool, models: usize) -> Vec<String> {
+    let mut out = accounts::status_lines(views);
+    if local_only {
+        out.push("Local only: endpoints only, no cloud models or decision services".into());
     }
-    for route in Route::API {
-        match creds.lookup(route) {
-            Some((key, source)) => {
-                println!(
-                    "{:<10} {} from {}",
-                    route.provider_name(),
-                    mask(&key),
-                    source.describe()
-                );
-            }
-            None => println!(
-                "{:<10} no key (`pathfinder auth set {}`)",
-                route.provider_name(),
-                route.provider_id()
-            ),
-        }
-    }
-    let cfg = crate::config::Config::load();
-    for ep in &cfg.endpoints {
-        let key = match &ep.key {
-            None => "no key".to_string(),
-            Some(name) => match creds.stored(name) {
-                Some(k) => format!("key {}", mask(&k)),
-                None => format!("missing key `{name}` (`pathfinder auth import {name}`)"),
-            },
-        };
-        println!("{:<10} {} ({key})", ep.id, ep.base_url);
-    }
-    if cfg.local_only {
-        println!(
-            "{:<10} only endpoints: no cloud models or decision services",
-            "Local only"
-        );
-    }
-    let decision = Provider::ALL.into_iter().find_map(|p| {
-        if p == Provider::Local {
-            return None;
-        }
-        creds
-            .named_key(p.key_name(), p.key_env())
-            .map(|(_, s)| (p, s))
+    out.push(String::new());
+    out.push(match models {
+        0 => "No models listed yet. `pathfinder auth login` connects an account.".into(),
+        1 => "1 model listed; `pathfinder models` shows it.".into(),
+        n => format!("{n} models listed; `pathfinder models` shows them."),
     });
-    // The gate: the check that keeps a candidate's answer back while you
-    // judge it. It needs a decision model: your own, or the shared one.
-    let label = "Gate";
-    let joined = crate::telemetry::Consent::load().enrolled;
-    match (&cfg.decisions, decision) {
-        (Some(d), _) => println!(
-            "{label:<10} your endpoint model {} on `{}`",
-            d.model, d.endpoint
-        ),
-        (None, _) if cfg.local_only => {
-            println!("{label:<10} off: on-premises mode needs `decisions` set to an endpoint model")
-        }
-        (None, Some((p, source))) => println!(
-            "{label:<10} your own key: {} (from {})",
-            p.label(),
-            source.describe()
-        ),
-        (None, None) if joined => {
-            println!("{label:<10} the shared gate (you've joined the beta; no key needed)")
-        }
-        (None, None) => println!(
-            "{label:<10} off: join the beta (`pathfinder data join`) or add a key (`pathfinder auth set typesafe`)"
-        ),
-    }
-    let cache = ModelCache::load();
-    println!("\n{} models discovered.", cache.entries().len());
-    Ok(())
+    out
 }
 
 /// `pathfinder coverage [--export] [path]`: understanding coverage of the
@@ -726,32 +618,107 @@ pub async fn data(args: &[String]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{server_key_name, server_name};
+    use super::models_by_account;
 
     #[test]
-    fn a_server_key_never_takes_a_providers_name() {
-        assert_eq!(server_key_name("lab").unwrap(), "endpoint-lab-api-key");
-        for taken in [
-            "openai",
-            "Anthropic",
-            "brave",
-            "openalex",
-            "typesafe",
-            "gemini",
-        ] {
-            assert!(server_key_name(taken).is_err(), "{taken}");
-        }
-        assert!(server_key_name("my lab").is_err());
-        assert!(server_key_name("").is_err());
+    fn models_print_in_sections_by_account() {
+        use crate::config::{ModelEntry, Route};
+        let m = |id: &str, label: &str, route| ModelEntry {
+            id: id.into(),
+            label: label.into(),
+            route,
+            model: id.into(),
+            effort: None,
+            endpoint: None,
+        };
+        let out = models_by_account(&[
+            m("anthropic:claude-opus", "Claude Opus", Route::Anthropic),
+            m("claude-haiku", "Haiku", Route::Claude),
+        ]);
+        let lines: Vec<&str> = out.lines().map(str::trim_end).collect();
+        assert_eq!(lines[0], "Claude Code · Claude subscription");
+        assert!(lines[1].starts_with("  claude-haiku") && lines[1].ends_with("Haiku"));
+        assert_eq!(lines[2], "");
+        assert_eq!(lines[3], "Anthropic API · pay per use");
+        assert!(lines[4].ends_with("Claude Opus"));
     }
 
     #[test]
-    fn a_server_is_named_after_its_host() {
-        assert_eq!(server_name("https://openrouter.ai/api/v1"), "openrouter");
-        assert_eq!(server_name("https://api.together.xyz/v1"), "together");
-        assert_eq!(server_name("http://localhost:11434/v1"), "localhost");
-        assert_eq!(server_name("http://gpu-box:8000/v1"), "gpu-box");
-        assert_eq!(server_name("https://llm.lab.example.co.uk/v1"), "example");
-        assert_eq!(server_name("http://192.168.1.5:8000/v1"), "server");
+    fn status_counts_the_models_the_pickers_list() {
+        use crate::auth::accounts::{Row, RowView, State, with_models};
+        use crate::catalog::{CachedModel, ModelCache};
+        use crate::config::{CliAccounts, Config, Endpoint};
+        let mut cache = ModelCache::default();
+        cache.providers.insert(
+            "endpoint:local".into(),
+            ["llama3", "qwen2.5"]
+                .iter()
+                .map(|m| CachedModel {
+                    id: m.to_string(),
+                    label: m.to_string(),
+                })
+                .collect(),
+        );
+        let cfg = Config {
+            endpoints: vec![Endpoint {
+                id: "local".into(),
+                label: None,
+                base_url: "http://127.0.0.1:8080/v1".into(),
+                key: None,
+                models: Vec::new(),
+                extra: None,
+            }],
+            ..Config::default()
+        };
+        let catalog = cfg.catalog_from(&cache, CliAccounts::default());
+        let views = with_models(
+            vec![RowView::new(
+                Row::Endpoint("local".into()),
+                State::NoKeyNeeded,
+            )],
+            &catalog,
+        );
+        let text = super::status_text(&views, false, catalog.len()).join("\n");
+        assert!(text.starts_with("Your servers\n"), "{text}");
+        assert!(
+            text.contains("  local  ✓ no key needed · 2 models"),
+            "{text}"
+        );
+        assert!(
+            text.ends_with("2 models listed; `pathfinder models` shows them."),
+            "{text}"
+        );
+        assert!(!text.contains("connects"), "{text}");
+        let none = super::status_text(&[], false, 0);
+        assert!(none.last().unwrap().starts_with("No models listed yet"));
+    }
+
+    #[tokio::test]
+    async fn without_a_terminal_a_picker_is_never_waited_for() {
+        if crate::prompt::interactive() {
+            return;
+        }
+        let creds = crate::auth::Credentials::system();
+        let err = super::login(&creds, None, false).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("pathfinder auth login <chatgpt|anthropic|openai|endpoint|typesafe>"),
+            "{err}"
+        );
+        let err = super::logout(&creds, None, false).await.unwrap_err();
+        assert!(err.to_string().contains("no terminal"), "{err}");
+        let err = super::login(&creds, Some("nope"), false).await.unwrap_err();
+        assert!(err.to_string().contains("No account `nope`"), "{err}");
+        // A key where the account goes is never echoed.
+        let err = super::login(&creds, Some("sk-proj-PASTEDKEY-0123456789abcd"), false)
+            .await
+            .unwrap_err();
+        assert!(!err.to_string().contains("PASTEDKEY"), "{err}");
+        assert!(err.to_string().contains("looks like a key"), "{err}");
+        // A server asks questions: it says so instead of waiting.
+        let err = super::login(&creds, Some("endpoint"), true)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("in a terminal"), "{err}");
     }
 }

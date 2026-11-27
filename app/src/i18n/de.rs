@@ -73,6 +73,67 @@ fn line(l: Line) -> &'static str {
         FindHits => "**{n}** für {terms}:",
         FindNone => "Keine Zeile in diesem Ordner enthält {terms}.",
         WebNone => "Online passte nichts zu {terms}.",
+        ShowKnown => {
+            "Vermerkt: Du kennst **{title}** schon. Eine Behauptung, kein Nachweis. `/undo` (Esc) nimmt es zurück."
+        }
+        ShowTell => {
+            "Ich sag's dir, wie gewünscht. Vermerkt als gesagt, nie als verstanden. Esc, bevor es da ist, bricht ab."
+        }
+        ShowHandoff => {
+            "**{title}** an den Agenten geben? Er arbeitet in einer Staging-Kopie, und du prüfst das Ergebnis. Enter startet · Esc bricht ab."
+        }
+        ShowHandoffInPlace => {
+            "**{title}** an den Agenten geben? Das ist kein Git-Repository: Er ändert deine Dateien direkt, ohne Staging und ohne geprüftes Review. Enter startet · Esc bricht ab."
+        }
+        ShowDelegate => {
+            "**{title}** abgeben, ohne es zu verstehen? Es wird als abgegeben vermerkt: Für das Ergebnis bürgst du nicht. Enter startet · Esc bricht ab."
+        }
+        ShowVerdict => {
+            "Das als dein Urteil über den Kandidaten werten? „{words}“ Enter wertet · Esc behält es als Notiz."
+        }
+        NotRunVerdict => "Nicht als Urteil gewertet: als Notiz behalten.",
+        NotRunHandoff => "Nicht ausgeführt: **{title}** ging nicht an den Agenten.",
+        NotRunDelegate => "Nicht ausgeführt: **{title}** wurde nicht abgegeben.",
+        NotRunStale => "Nicht ausgeführt: Was auf dein OK wartete, gilt nicht mehr.",
+        AskWhich => {
+            "Meintest du {choices}? Nichts wird vermerkt, bis du es sagst. Sonst mach einfach weiter."
+        }
+        AskKnown => "dass du **{title}** schon kennst (`/known`)",
+        AskTell => "dass ich es dir sage (`/tell <question>`)",
+        AskAgent => "dass der Agent den Teil übernimmt (`/handoff` oder `/delegate`)",
+        Or => " oder ",
+        Undone => {
+            "Rückgängig: Deine Behauptung zu **{title}** ist zurückgezogen. Der Verlauf hält sie als zurückgezogen fest."
+        }
+        NothingToUndo => {
+            "Nichts rückgängig zu machen. Nur eine Behauptung aus deinem letzten Schritt lässt sich zurücknehmen. Ein gewertetes Urteil, ein Review, eine Übergabe, eine Abgabe und eine Antwort, die du dir sagen ließt, bleiben."
+        }
+        NothingWaiting => "Nichts wartet auf dein OK.",
+        NextStep => "Als Nächstes: {at} · {question}",
+        NextStepNoPlace => {
+            "Als Nächstes: Noch keine Stelle in deinen Quellen nennt **{concept}**; `/find <terms>` durchsucht sie. · {question}"
+        }
+        StepWideExample => "Finde eine Stelle, an der {concept} vorkommt. Was bewirkt es dort?",
+        StepWidePurpose => "Wozu dient {concept} in diesem Teil, in deinen Worten?",
+        StepWideMechanism => "Wie funktioniert {concept}, Schritt für Schritt?",
+        StepNarrowExample => {
+            "Nimm eine Zeile, in der {concept} zählt. Was änderte sich, wäre es anders?"
+        }
+        StepNarrowPurpose => "Warum braucht es {concept} genau dort, und was bricht ohne?",
+        StepNarrowMechanism => {
+            "Verfolge {concept} Schritt für Schritt: Was passiert zuerst, was danach?"
+        }
+        Horizon => "Horizont: {what}.",
+        HorizonNeeds => "braucht {parts}",
+        HorizonLeads => "führt zu {parts}",
+        EvidenceRatio => "Bestanden: {passes} · Behauptungen: {claims}.",
+        ClaimWithdrawn => "Behauptung zu **{concept}** zurückgezogen ({date}).",
+        StepHistory => "Wie du hierher kamst: {kinds}.",
+        StepKindRate => "{kind} {passes} von {judged} führten zum Bestehen",
+        SteeredTimes => "{n}-mal von dir gelenkt",
+        StepHistoryNote => {
+            "Mehr hält Pathfinder nicht darüber fest, wie du lernst; es bleibt im lokalen Verlauf dieses Ordners."
+        }
     }
 }
 

@@ -134,6 +134,76 @@ pub enum Line {
     FindNone,
     /// `/web` found nothing: "{terms}".
     WebNone,
+    /// A claim read from plain words, shown back as it is recorded: "{title}".
+    ShowKnown,
+    /// Before an answer asked for in plain words.
+    ShowTell,
+    /// A plain handoff waiting for Enter: "{title}".
+    ShowHandoff,
+    /// The same outside a git repository: "{title}".
+    ShowHandoffInPlace,
+    /// A plain delegation waiting for Enter: "{title}".
+    ShowDelegate,
+    /// A verdict read from plain words, waiting for Enter: "{words}".
+    ShowVerdict,
+    /// A verdict you didn't confirm.
+    NotRunVerdict,
+    /// A handoff you didn't confirm: "{title}".
+    NotRunHandoff,
+    /// A delegation you didn't confirm: "{title}".
+    NotRunDelegate,
+    /// What waited no longer applies.
+    NotRunStale,
+    /// An unsure commitment: "{choices}".
+    AskWhich,
+    /// One choice of `AskWhich`: "{title}".
+    AskKnown,
+    /// One choice of `AskWhich`.
+    AskTell,
+    /// One choice of `AskWhich`.
+    AskAgent,
+    /// Between the choices of `AskWhich`.
+    Or,
+    /// A claim taken back: "{title}".
+    Undone,
+    /// `/undo` with nothing undoable.
+    NothingToUndo,
+    /// `/confirm` or `/cancel` with nothing waiting.
+    NothingWaiting,
+    /// The next step (§16): "{at}", "{question}".
+    NextStep,
+    /// The next step with no place found: "{concept}", "{question}".
+    NextStepNoPlace,
+    /// An orienting step, example first: "{concept}".
+    StepWideExample,
+    /// An orienting step, purpose first: "{concept}".
+    StepWidePurpose,
+    /// An orienting step, mechanism first: "{concept}".
+    StepWideMechanism,
+    /// A narrow step, example first: "{concept}".
+    StepNarrowExample,
+    /// A narrow step, purpose first: "{concept}".
+    StepNarrowPurpose,
+    /// A narrow step, mechanism first: "{concept}".
+    StepNarrowMechanism,
+    /// The horizon (§16): "{what}".
+    Horizon,
+    /// Parts a part needs: "{parts}".
+    HorizonNeeds,
+    /// Parts that need it: "{parts}".
+    HorizonLeads,
+    /// Passes against claims (A10): "{passes}", "{claims}".
+    EvidenceRatio,
+    /// A claim `/undo` took back: "{concept}", "{date}".
+    ClaimWithdrawn,
+    /// Which steps led to passes: "{kinds}".
+    StepHistory,
+    /// One kind of step: "{kind}", "{passes}", "{judged}".
+    StepKindRate,
+    /// Steps you steered: "{n}".
+    SteeredTimes,
+    /// Under the step history.
+    StepHistoryNote,
 }
 
 /// One language's lines and names.
@@ -286,6 +356,41 @@ mod tests {
         Line::FindHits,
         Line::FindNone,
         Line::WebNone,
+        Line::ShowKnown,
+        Line::ShowTell,
+        Line::ShowHandoff,
+        Line::ShowHandoffInPlace,
+        Line::ShowDelegate,
+        Line::ShowVerdict,
+        Line::NotRunVerdict,
+        Line::NotRunHandoff,
+        Line::NotRunDelegate,
+        Line::NotRunStale,
+        Line::AskWhich,
+        Line::AskKnown,
+        Line::AskTell,
+        Line::AskAgent,
+        Line::Or,
+        Line::Undone,
+        Line::NothingToUndo,
+        Line::NothingWaiting,
+        Line::NextStep,
+        Line::NextStepNoPlace,
+        Line::StepWideExample,
+        Line::StepWidePurpose,
+        Line::StepWideMechanism,
+        Line::StepNarrowExample,
+        Line::StepNarrowPurpose,
+        Line::StepNarrowMechanism,
+        Line::Horizon,
+        Line::HorizonNeeds,
+        Line::HorizonLeads,
+        Line::EvidenceRatio,
+        Line::ClaimWithdrawn,
+        Line::StepHistory,
+        Line::StepKindRate,
+        Line::SteeredTimes,
+        Line::StepHistoryNote,
     ];
 
     fn placeholders(s: &str) -> Vec<&str> {

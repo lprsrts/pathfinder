@@ -24,6 +24,8 @@ pub enum Local {
     Attach,
     Share,
     Bug,
+    Login,
+    Logout,
 }
 
 /// Which subsystem owns a command.
@@ -50,6 +52,134 @@ pub struct CommandInfo {
     pub args: &'static str,
     pub description: &'static str,
     pub category: CommandCategory,
+    /// The palette section it is listed under.
+    pub group: Group,
+    /// Whether running it calls a model (the palette marks it with `◆`).
+    pub model: bool,
+}
+
+/// The palette's sections, in the order it lists them: the loop first
+/// (read, ask, plan), then the agent, threads and settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Group {
+    /// What the current state asks for (contextual actions); never a
+    /// command's own group.
+    Next,
+    Read,
+    Ask,
+    Plan,
+    Agent,
+    Threads,
+    Settings,
+}
+
+impl Group {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Next => "Next",
+            Self::Read => "Read & search",
+            Self::Ask => "Ask",
+            Self::Plan => "Plan & progress",
+            Self::Agent => "Agent",
+            Self::Threads => "Threads",
+            Self::Settings => "Settings & help",
+        }
+    }
+
+    fn of(name: &str) -> Self {
+        match name {
+            "/open" | "/find" | "/web" | "/attach" => Self::Read,
+            "/tell" | "/check" | "/summary" | "/why" => Self::Ask,
+            "/plan" | "/map" | "/next" | "/focus" | "/known" | "/replan" | "/accept"
+            | "/reject" | "/confirm" | "/cancel" | "/undo" => Self::Plan,
+            "/handoff" | "/delegate" | "/approve" | "/object" | "/coverage" => Self::Agent,
+            "/new" | "/resume" | "/copy" | "/share" => Self::Threads,
+            _ => Self::Settings,
+        }
+    }
+}
+
+/// Every command in the palette's order: by section, the loop's steps
+/// first within each.
+const ORDER: [&str; 40] = [
+    "/open",
+    "/find",
+    "/web",
+    "/attach",
+    "/tell",
+    "/check",
+    "/summary",
+    "/why",
+    "/plan",
+    "/map",
+    "/next",
+    "/focus",
+    "/known",
+    "/replan",
+    "/accept",
+    "/reject",
+    "/confirm",
+    "/cancel",
+    "/undo",
+    "/handoff",
+    "/delegate",
+    "/approve",
+    "/object",
+    "/coverage",
+    "/new",
+    "/resume",
+    "/copy",
+    "/share",
+    "/help",
+    "/model",
+    "/status",
+    "/login",
+    "/logout",
+    "/thinking",
+    "/tools",
+    "/update",
+    "/data",
+    "/join",
+    "/bug",
+    "/quit",
+];
+
+/// Where a command sits in the palette's order.
+pub fn order_of(name: &str) -> usize {
+    ORDER.iter().position(|n| *n == name).unwrap_or(ORDER.len())
+}
+
+/// The commands that call a model when run (a reply, a plan, a check, an
+/// agent's turn or a web search's reading).
+const MODEL: [&str; 10] = [
+    "/web",
+    "/confirm",
+    "/tell",
+    "/check",
+    "/summary",
+    "/plan",
+    "/replan",
+    "/handoff",
+    "/delegate",
+    "/object",
+];
+
+/// Commands hidden from the bare `/` list while they can't run; typing
+/// them still finds them.
+fn runs_now(name: &str, session: &Session) -> bool {
+    let review = session
+        .map
+        .parts
+        .iter()
+        .any(|p| p.status == PartStatus::InReview);
+    match name {
+        "/approve" | "/object" => review,
+        "/accept" | "/reject" => session.pending_change.is_some(),
+        "/confirm" | "/cancel" => session.pending_commitment.is_some(),
+        "/undo" => session.undoable(),
+        "/next" | "/focus" | "/summary" => !session.map.parts.is_empty(),
+        _ => true,
+    }
 }
 
 impl CommandInfo {
@@ -87,7 +217,7 @@ pub struct AttachCandidate {
 }
 
 /// (name, other names, what it does), in the order help shows them.
-pub const LOCAL: [(Local, &str, &[&str], &str); 15] = [
+pub const LOCAL: [(Local, &str, &[&str], &str); 17] = [
     (Local::Help, "/help", &["/?"], "these commands and the keys"),
     (
         Local::Quit,
@@ -113,6 +243,18 @@ pub const LOCAL: [(Local, &str, &[&str], &str); 15] = [
         "/status",
         &["/version"],
         "version, models, sign-in, gate, sharing",
+    ),
+    (
+        Local::Login,
+        "/login",
+        &["/auth"],
+        "connect a model account or key",
+    ),
+    (
+        Local::Logout,
+        "/logout",
+        &[],
+        "sign out of an account or remove a key",
     ),
     (Local::Copy, "/copy", &[], "copy the last reply"),
     (Local::Thinking, "/thinking", &[], "show or hide thinking"),
@@ -151,7 +293,7 @@ pub const LOCAL: [(Local, &str, &[&str], &str); 15] = [
 ];
 
 /// The task commands, run by the runtime: (name, what it does).
-pub const TASK: [(&str, &str); 20] = [
+pub const TASK: [(&str, &str); 23] = [
     ("/find", "search files: /find <terms>"),
     ("/open", "show a file: /open <file> [page or line]"),
     ("/web", "search online: /web <terms>"),
@@ -175,9 +317,18 @@ pub const TASK: [(&str, &str); 20] = [
         "/coverage",
         "how much of the agent's work you can vouch for",
     ),
+    ("/confirm", "run what waits for your OK (Enter)"),
+    ("/cancel", "drop what waits for your OK (Esc)"),
+    ("/undo", "take back the claim you just made (Esc)"),
 ];
 
-const LOCAL_ARGS: [(&str, &str, &str); 3] = [
+const LOCAL_ARGS: [(&str, &str, &str); 5] = [
+    ("/login", "[account]", "connect a model account or key"),
+    (
+        "/logout",
+        "[account]",
+        "sign out of an account or remove a key",
+    ),
     (
         "/attach",
         "<file|clear>",
@@ -191,7 +342,7 @@ const LOCAL_ARGS: [(&str, &str, &str); 3] = [
     ),
 ];
 
-const TASK_META: [(&str, &str, &str); 20] = [
+const TASK_META: [(&str, &str, &str); 23] = [
     ("/find", "<terms>", "search files"),
     ("/open", "<file> [page or line]", "show a file"),
     ("/web", "<terms>", "search online"),
@@ -228,6 +379,9 @@ const TASK_META: [(&str, &str, &str); 20] = [
         "",
         "how much of the agent's work you can vouch for",
     ),
+    ("/confirm", "", "run what waits for your OK (Enter)"),
+    ("/cancel", "", "drop what waits for your OK (Esc)"),
+    ("/undo", "", "take back the claim you just made (Esc)"),
 ];
 
 /// Metadata for every known slash command, local first then task.
@@ -244,6 +398,8 @@ pub fn all() -> Vec<CommandInfo> {
             args,
             description,
             category: CommandCategory::Local,
+            group: Group::of(name),
+            model: MODEL.contains(&name),
         });
     }
     for (name, args, description) in TASK_META {
@@ -253,6 +409,8 @@ pub fn all() -> Vec<CommandInfo> {
             args,
             description,
             category: CommandCategory::Task,
+            group: Group::of(name),
+            model: MODEL.contains(&name),
         });
     }
     out
@@ -309,9 +467,25 @@ pub fn search(input: &str) -> Vec<CommandInfo> {
     search_for(input, None)
 }
 
-/// Searches commands while typing the first word, ordering contextual matches
-/// for `session` first within each match tier.
+/// Searches commands while typing the first word. Bare `/` lists them by
+/// section ([`palette`] has the headers), what the state asks for first,
+/// without the ones that can't run now. Typed, they rank as every filtered
+/// list does ([`crate::picker::rank`]): an exact name, then a name or
+/// other name it starts, and from three letters a word of the name, then
+/// the name's letters in order; a word of the description only when no
+/// name matches at all. Ties keep what the state asks for first.
 pub fn search_for(input: &str, session: Option<&Session>) -> Vec<CommandInfo> {
+    palette(input, session)
+        .into_iter()
+        .map(|(_, c)| c)
+        .collect()
+}
+
+/// [`search_for`] with the section each command is listed under: on bare
+/// `/` its [`Group`] (or [`Group::Next`] for what the state asks for);
+/// None while typing, when the list is ranked instead.
+pub fn palette(input: &str, session: Option<&Session>) -> Vec<(Option<Group>, CommandInfo)> {
+    use crate::picker::rank;
     if !input.starts_with('/') || input.contains(char::is_whitespace) {
         return Vec::new();
     }
@@ -328,29 +502,137 @@ pub fn search_for(input: &str, session: Option<&Session>) -> Vec<CommandInfo> {
                 .collect()
         })
         .unwrap_or_default();
+    let ctx = |name: &str| context_rank.get(name).copied().unwrap_or(usize::MAX);
 
+    if needle.is_empty() {
+        let mut listed: Vec<(Group, usize, usize, CommandInfo)> = all()
+            .into_iter()
+            .filter(|c| session.is_none_or(|s| runs_now(c.name, s)))
+            .map(|c| {
+                let order = order_of(c.name);
+                let next = ctx(c.name);
+                let group = if next == usize::MAX {
+                    c.group
+                } else {
+                    Group::Next
+                };
+                (group, next, order, c)
+            })
+            .collect();
+        listed.sort_by_key(|&(g, next, order, _)| (g, next, order));
+        return listed
+            .into_iter()
+            .map(|(g, _, _, c)| (Some(g), c))
+            .collect();
+    }
+
+    let short = needle.chars().count() < 3;
+    // What the commands say they do counts only when no name matches.
+    let by_name = |info: &CommandInfo| {
+        std::iter::once(info.name)
+            .chain(info.aliases.iter().copied())
+            .any(|n| rank(n.trim_start_matches('/'), needle).is_some())
+    };
+    let any_name = !short && all().iter().any(by_name);
     let mut scored: Vec<((u8, usize, usize), CommandInfo)> = Vec::new();
-    for (order, info) in all().into_iter().enumerate() {
-        let match_tier = if info.name == typed {
+    for info in all() {
+        let order = order_of(info.name);
+        let bare = |n: &'static str| n.trim_start_matches('/');
+        let names = std::iter::once(info.name).chain(info.aliases.iter().copied());
+        let tier = if names.clone().any(|n| bare(n) == needle) {
             Some(0)
-        } else if info.name.starts_with(&typed) {
+        } else if bare(info.name).starts_with(needle) {
             Some(1)
-        } else if info.aliases.iter().any(|a| a.starts_with(&typed)) {
+        } else if info.aliases.iter().any(|a| bare(a).starts_with(needle)) {
             Some(2)
-        } else if !needle.is_empty() && info.name[1..].contains(needle) {
-            Some(3)
-        } else if !needle.is_empty() && info.aliases.iter().any(|a| a[1..].contains(needle)) {
-            Some(4)
-        } else {
+        } else if short {
             None
+        } else {
+            let name_rank = names.filter_map(|n| rank(bare(n), needle)).min();
+            match name_rank {
+                Some(1 | 2) => Some(3),
+                _ if !any_name && rank(info.description, needle).is_some_and(|r| r <= 1) => Some(4),
+                Some(_) => Some(5),
+                None => None,
+            }
         };
-        if let Some(tier) = match_tier {
-            let ctx = context_rank.get(info.name).copied().unwrap_or(usize::MAX);
-            scored.push(((tier, ctx, order), info));
+        if let Some(tier) = tier {
+            scored.push(((tier, ctx(info.name), order), info));
         }
     }
     scored.sort_by_key(|(key, _)| *key);
-    scored.into_iter().map(|(_, info)| info).collect()
+    scored.into_iter().map(|(_, info)| (None, info)).collect()
+}
+
+/// Whether `typed` (`/wo…`, lower case) is the start of the command's name
+/// or of one of its aliases: a match Enter may run as it is. A bare `/`
+/// starts nothing.
+pub fn starts(cmd: &CommandInfo, typed: &str) -> bool {
+    let needle = typed.trim().trim_start_matches('/');
+    !needle.is_empty()
+        && std::iter::once(cmd.name)
+            .chain(cmd.aliases.iter().copied())
+            .any(|n| n.trim_start_matches('/').starts_with(needle))
+}
+
+/// The command an unknown `/word` most likely meant: one it starts or is
+/// the start of, else the nearest by edits (a swap counts as one), within
+/// a third of its length. None for a path such as `/Users/me/x.pdf`.
+pub fn closest(word: &str) -> Option<&'static str> {
+    let typed = word.trim().to_ascii_lowercase();
+    let bare = typed.strip_prefix('/')?;
+    if bare.is_empty() || bare.contains(['/', '\\']) {
+        return None;
+    }
+    let mut named: Vec<(&'static str, &'static str)> = Vec::new();
+    for info in all() {
+        named.push((info.name, info.name));
+        named.extend(info.aliases.iter().map(|a| (*a, info.name)));
+    }
+    if let Some((_, name)) = named.iter().find(|(n, _)| n.starts_with(&typed)) {
+        return Some(name);
+    }
+    if let Some((_, name)) = named
+        .iter()
+        .filter(|(n, _)| n.len() > 2 && typed.starts_with(n))
+        .max_by_key(|(n, _)| n.len())
+    {
+        return Some(name);
+    }
+    let limit = (bare.chars().count() / 3).max(1);
+    named
+        .iter()
+        .map(|(n, name)| (edit_distance(&typed, n), *name))
+        .filter(|(d, _)| *d <= limit)
+        .min_by_key(|(d, _)| *d)
+        .map(|(_, name)| name)
+}
+
+/// Edits from `a` to `b`: insertions, deletions, substitutions and swaps of
+/// neighbours.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut d = vec![vec![0usize; b.len() + 1]; a.len() + 1];
+    for (i, row) in d.iter_mut().enumerate() {
+        row[0] = i;
+    }
+    for (j, cell) in d[0].iter_mut().enumerate() {
+        *cell = j;
+    }
+    for i in 1..=a.len() {
+        for j in 1..=b.len() {
+            let cost = usize::from(a[i - 1] != b[j - 1]);
+            let mut best = (d[i - 1][j] + 1)
+                .min(d[i][j - 1] + 1)
+                .min(d[i - 1][j - 1] + cost);
+            if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
+                best = best.min(d[i - 2][j - 2] + 1);
+            }
+            d[i][j] = best;
+        }
+    }
+    d[a.len()][b.len()]
 }
 
 /// What Tab completes the input to: the one match, or the prefix matches'
@@ -366,10 +648,13 @@ pub fn complete(input: &str) -> Option<String> {
     }
     if prefix.is_empty() {
         let found = search(input);
-        if found.len() == 1 {
-            return Some(format!("{} ", found[0].name));
-        }
-        return None;
+        let typed = input.to_ascii_lowercase();
+        return match found.first() {
+            Some(c) if found.len() == 1 || c.aliases.contains(&typed.as_str()) => {
+                Some(format!("{} ", c.name))
+            }
+            _ => None,
+        };
     }
     let first = prefix[0];
     let common: String = first
@@ -399,6 +684,29 @@ pub fn step_selection(current: usize, len: usize, delta: isize) -> usize {
 /// Contextual next-step actions for the current `Session` state.
 pub fn contextual_actions(session: &Session) -> Vec<QuickAction> {
     let mut actions = Vec::new();
+    // A commitment shown back and waiting for your OK comes first (§15).
+    if session.pending_commitment.is_some() {
+        actions.push(QuickAction {
+            command: "/confirm",
+            label: "/confirm",
+            description: "run what waits for your OK (Enter)",
+            needs_arg: false,
+        });
+        actions.push(QuickAction {
+            command: "/cancel",
+            label: "/cancel",
+            description: "drop what waits for your OK (Esc)",
+            needs_arg: false,
+        });
+    }
+    if session.undoable() {
+        actions.push(QuickAction {
+            command: "/undo",
+            label: "/undo",
+            description: "take back the claim you just made (Esc)",
+            needs_arg: false,
+        });
+    }
     if session.pending_change.is_some() {
         actions.push(QuickAction {
             command: "/accept",
@@ -526,6 +834,20 @@ fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
+}
+
+/// A path for display: the home folder as `~`.
+pub fn tilde_path(path: &Path) -> String {
+    if let Some(home) = home_dir()
+        && let Ok(rest) = path.strip_prefix(&home)
+    {
+        return if rest.as_os_str().is_empty() {
+            "~".to_string()
+        } else {
+            format!("~/{}", rest.to_string_lossy())
+        };
+    }
+    path.display().to_string()
 }
 
 pub(crate) fn expand_tilde(path: &str) -> String {
@@ -875,6 +1197,20 @@ mod tests {
     }
 
     #[test]
+    fn closest_names_the_command_a_typo_meant() {
+        assert_eq!(closest("/opne"), Some("/open"));
+        assert_eq!(closest("/Opne"), Some("/open"));
+        assert_eq!(closest("/fnid"), Some("/find"));
+        assert_eq!(closest("/stat"), Some("/status"));
+        assert_eq!(closest("/openx"), Some("/open"));
+        assert_eq!(closest("/exti"), Some("/quit"));
+        assert_eq!(closest("/hlep"), Some("/help"));
+        assert_eq!(closest("/frobnicate"), None);
+        assert_eq!(closest("/"), None);
+        assert_eq!(closest("/Users/me/notes.pdf"), None);
+    }
+
+    #[test]
     fn every_name_is_unique() {
         let mut all: Vec<&str> = names().collect();
         all.extend(
@@ -934,6 +1270,69 @@ mod tests {
     }
 
     #[test]
+    fn bare_slash_lists_by_section_next_first_without_what_cannot_run() {
+        let mut order: Vec<&str> = ORDER.to_vec();
+        order.sort();
+        let mut names: Vec<&str> = all().iter().map(|c| c.name).collect();
+        names.sort();
+        assert_eq!(order, names, "ORDER lists every command once");
+
+        let s = Session::new("s".into(), PathBuf::from("."));
+        let listed = palette("/", Some(&s));
+        let groups: Vec<Group> = listed.iter().map(|(g, _)| g.unwrap()).collect();
+        assert!(groups.windows(2).all(|w| w[0] <= w[1]), "{groups:?}");
+        // A fresh thread: what it asks for (search, plan) leads.
+        assert_eq!(groups[0], Group::Next);
+        let next: Vec<&str> = listed
+            .iter()
+            .filter(|(g, _)| *g == Some(Group::Next))
+            .map(|(_, c)| c.name)
+            .collect();
+        assert_eq!(next, ["/find", "/plan"]);
+        let names: Vec<&str> = listed.iter().map(|(_, c)| c.name).collect();
+        assert_eq!(names[2..5], ["/open", "/web", "/attach"]);
+        for hidden in [
+            "/approve", "/object", "/accept", "/reject", "/next", "/focus", "/summary",
+        ] {
+            assert!(!names.contains(&hidden), "{hidden}");
+        }
+        // Typed, they are found all the same.
+        assert_eq!(search_for("/appr", Some(&s))[0].name, "/approve");
+        // Without a session nothing is hidden.
+        assert_eq!(search("/").len(), all().len());
+
+        // A proposed change: /accept and /reject can run, and lead.
+        let mut s = s;
+        s.pending_change = Some(MapChange::default());
+        let listed = palette("/", Some(&s));
+        assert_eq!(listed[0].1.name, "/accept");
+        assert_eq!(listed[1].1.name, "/reject");
+    }
+
+    #[test]
+    fn typed_commands_rank_prefix_then_word_then_letters() {
+        let names = |q: &str| search(q).iter().map(|c| c.name).collect::<Vec<_>>();
+        // Under three letters: prefixes only, names before other names.
+        assert_eq!(names("/o"), ["/open", "/object"]);
+        assert_eq!(names("/he"), ["/help"]);
+        assert_eq!(names("/ve"), ["/status"]);
+        // From three: a word of the name, then its letters in order.
+        assert_eq!(names("/opn"), ["/open"]);
+        assert_eq!(names("/sta"), ["/status"]);
+        // A description counts only when no name matches.
+        assert_eq!(names("/sear"), ["/find", "/web"]);
+        assert!(names("/zzz").is_empty());
+        // What calls a model is marked.
+        let model: Vec<&str> = all().iter().filter(|c| c.model).map(|c| c.name).collect();
+        for m in ["/plan", "/tell", "/check", "/web", "/handoff", "/delegate"] {
+            assert!(model.contains(&m), "{m}");
+        }
+        for local in ["/open", "/find", "/status", "/map", "/help"] {
+            assert!(!model.contains(&local), "{local}");
+        }
+    }
+
+    #[test]
     fn contextual_actions_reflect_session_state() {
         let mut s = Session::new("s".into(), PathBuf::from("."));
         assert!(contextual_actions(&s).iter().any(|a| a.command == "/plan"));
@@ -987,6 +1386,41 @@ mod tests {
             .map(|a| a.command)
             .collect();
         assert_eq!(first_two, vec!["/accept", "/reject"]);
+
+        // §15: what waits for your OK leads; an undoable claim offers /undo.
+        assert!(!contextual_actions(&s).iter().any(|a| a.command == "/undo"));
+        s.pending_commitment = Some(crate::domain::PendingCommitment {
+            kind: crate::domain::CommitKind::Handoff,
+            part: "p1".into(),
+            text: String::new(),
+            files: vec![],
+            candidate: None,
+        });
+        let first_two: Vec<&str> = contextual_actions(&s)
+            .into_iter()
+            .take(2)
+            .map(|a| a.command)
+            .collect();
+        assert_eq!(first_two, vec!["/confirm", "/cancel"]);
+        assert!(runs_now("/confirm", &s) && !runs_now("/undo", &s));
+        s.pending_commitment = None;
+        s.turn = 4;
+        s.last_commitment = Some(crate::domain::Undoable {
+            part: "p1".into(),
+            events: vec![],
+            turn: 3,
+            prev_active: None,
+            prev_mode: SessionMode::Working,
+            prev_change: None,
+            prev_gaps: vec![],
+        });
+        assert_eq!(contextual_actions(&s)[0].command, "/undo");
+        assert!(runs_now("/undo", &s) && !runs_now("/cancel", &s));
+        // Only right after the claim.
+        s.turn = 5;
+        assert!(!contextual_actions(&s).iter().any(|a| a.command == "/undo"));
+        assert_eq!(parse("/undo"), Parsed::Task);
+        assert_eq!(parse("/confirm"), Parsed::Task);
     }
 
     #[test]
