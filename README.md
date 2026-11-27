@@ -22,7 +22,7 @@ Pathfinder has its own agent, which edits your files, but only the parts you han
 > This is *NOT* an autonomous coding agent. It asks more of you by design. The workflow is slow and requires patience, which is absent in today's most used agent harnesses.
 
 ### Demo
-<img src="collector/public/pathfinder-demo.gif" alt="A session over lecture notes">
+<img src="collector/public/pathfinder-demo.gif" alt="A real session: someone works out why their electricity bill went up from quoted lines in the bill, judges an explanation, then has the agent draft a letter asking for a real meter reading">
 
 ## Install
 

@@ -1,0 +1,14 @@
+# Captions for demo/cut.py: `STEP text` from when step STEP starts (the
+# STEPth say.sh action), `STEP+ text` from when its reply has arrived.
+# These fit the current recording's steps (see README.md).
+0 Pathfinder: understand it yourself before an AI does it for you
+1 Their electricity bill went up a lot, and they want to know why
+2+ It doesn't just answer. It points to the lines in the bill that matter
+3 They read those lines and say what they think, in their own words
+3+ Pathfinder writes an explanation that may be wrong on purpose. They must judge it
+4+ They judged it right and said why. That counts as understanding
+5+ They ask for a letter. First, Pathfinder maps what the letter depends on
+6+ "I already know this" is recorded as a claim, not as proof
+7+ This part wasn't checked, so Pathfinder asks before the agent does it on trust
+8+ The agent writes the letter and saves it in their folder
+9+ Their record: what they showed they understand, and what they only said
