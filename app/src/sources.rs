@@ -1843,10 +1843,17 @@ mod tests {
                 line: None,
             }
         );
+        // Backslash escapes are a Unix shell's; on Windows `\` separates folders.
+        let escaped = parse_open_spec(r#"my\ notes.md 12"#);
+        let expected_file = if cfg!(windows) {
+            r"my\ notes.md"
+        } else {
+            "my notes.md"
+        };
         assert_eq!(
-            parse_open_spec(r#"my\ notes.md 12"#),
+            escaped,
             OpenSpec {
-                file: "my notes.md".into(),
+                file: expected_file.into(),
                 at: Some(12),
                 end: None,
                 line: None,
