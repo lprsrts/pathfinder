@@ -12,7 +12,9 @@ fn line(l: Line) -> &'static str {
         CandidateFor => "Đề xuất giải thích cho **{title}**:",
         IsItRight => "Có đúng không? Hãy nói vì sao.",
         PassedOneMore => "Đạt. Thêm một câu nữa:",
-        PartHint => "Hãy viết ra suy nghĩ của bạn ở đây. `/summary` · `/known` · `/delegate`",
+        PartHint => {
+            "Hãy viết ra suy nghĩ của bạn ở đây: lập luận trong lúc làm, rồi giải thích phần này bằng lời của bạn khi sẵn sàng. Nếu bạn đã biết rồi hoặc muốn tác tử làm, cứ nói."
+        }
         RestsOn => "Dựa trên",
         ToldNotShown => "Đã ghi là được cho biết: {labels}.",
         GapNeeds => "Cần **{concept}** trước: {why}.",
@@ -24,7 +26,7 @@ fn line(l: Line) -> &'static str {
         AddGapParts => "Thêm một phần cho {names}?",
         And => " và ",
         ProposedChange => "Đề xuất thay đổi bản đồ:",
-        AcceptReject => "`/accept` hoặc `/reject`.",
+        AcceptReject => "Nói có để thêm vào, hoặc không.",
         Needs => "cần {deps}",
         FixedReply => "Đó là điều bạn đang đánh giá. Hãy đưa ra kết luận trước.",
         GateCapped => {
@@ -33,7 +35,7 @@ fn line(l: Line) -> &'static str {
         GateUnavailable => {
             "(Không kết nối được dịch vụ kiểm tra, câu trả lời bị giữ lại. Hãy thử lại sau giây lát.)"
         }
-        Understood => "**{title}**: đã hiểu. `/next` · `/handoff`",
+        Understood => "**{title}**: đã hiểu. Hãy nói khi bạn muốn đi tiếp hoặc giao nó cho tác tử.",
         KeepWorking => "Tiếp tục làm, rồi giải thích lại.",
         AllResolved => "Mọi phần đã được giải quyết.",
         NoOtherPart => "Không còn phần nào chưa giải quyết.",
@@ -74,7 +76,7 @@ fn line(l: Line) -> &'static str {
         FindNone => "Không có dòng nào trong thư mục này chứa {terms}.",
         WebNone => "Không có kết quả trực tuyến nào khớp với {terms}.",
         ShowKnown => {
-            "Đã ghi: bạn đã biết **{title}**. Một lời tự nhận, không phải bằng chứng. `/undo` (Esc) rút lại."
+            "Đã ghi: bạn đã biết **{title}**. Một lời tự nhận, không phải bằng chứng. Nói \"hoàn tác\" hoặc nhấn Esc để rút lại."
         }
         ShowTell => {
             "Sẽ nói cho bạn, như bạn yêu cầu. Ghi là đã được nói, không bao giờ là đã hiểu. Esc trước khi câu trả lời đến sẽ hủy."
@@ -96,11 +98,14 @@ fn line(l: Line) -> &'static str {
         NotRunDelegate => "Chưa chạy: **{title}** chưa được giao đi.",
         NotRunStale => "Chưa chạy: điều đang chờ bạn đồng ý không còn áp dụng.",
         AskWhich => {
-            "Ý bạn là {choices}? Chưa ghi gì cho đến khi bạn nói. Nếu không thì cứ tiếp tục."
+            "Ý bạn là gì: {choices}? Chưa ghi gì cho đến khi bạn nói; một con số hoặc vài từ là đủ."
         }
-        AskKnown => "rằng bạn đã biết **{title}** (`/known`)",
-        AskTell => "được nói cho biết (`/tell <question>`)",
-        AskAgent => "giao phần này cho tác tử (`/handoff` hoặc `/delegate`)",
+        AskKnown => "ghi nhận rằng tôi đã biết **{title}** (không kiểm tra)",
+        AskTell => "cứ nói cho tôi biết",
+        AskAgent => "để tác tử làm phần này",
+        AskCheck => "kiểm tra tôi về **{title}**",
+        AskNote => "chỉ là ghi chú",
+        AskWhichPart => "Bạn muốn nói phần nào: {choices}? Chưa ghi gì cho đến khi bạn nói.",
         Or => " hay ",
         Undone => "Đã hoàn tác: lời tự nhận về **{title}** đã rút lại. Hồ sơ giữ nó ở dạng đã rút.",
         NothingToUndo => {
@@ -109,8 +114,9 @@ fn line(l: Line) -> &'static str {
         NothingWaiting => "Không có gì đang chờ bạn đồng ý.",
         NextStep => "Tiếp theo: {at} · {question}",
         NextStepNoPlace => {
-            "Tiếp theo: chưa chỗ nào trong nguồn của bạn nhắc **{concept}**; `/find <terms>` tìm trong đó. · {question}"
+            "Tiếp theo: chưa có gì trong nguồn của bạn nhắc **{concept}**; hãy hỏi tôi nên tìm ở đâu. · {question}"
         }
+        StepPart => "Phần này dùng để làm gì, theo lời bạn?",
         StepWideExample => "Tìm một chỗ dùng {concept}. Nó làm gì ở đó?",
         StepWidePurpose => "{concept} dùng để làm gì trong phần này, theo lời bạn?",
         StepWideMechanism => "{concept} hoạt động thế nào, từng bước?",

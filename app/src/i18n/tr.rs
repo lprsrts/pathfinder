@@ -12,7 +12,9 @@ fn line(l: Line) -> &'static str {
         CandidateFor => "**{title}** için aday:",
         IsItRight => "Doğru mu? Nedenini söyle.",
         PassedOneMore => "Geçti. Bir tane daha:",
-        PartHint => "Burada sesli düşün. `/summary` · `/known` · `/delegate`",
+        PartHint => {
+            "Burada sesli düşün: çalışırken akıl yürütmeni, hazır olduğunda da bu bölümü kendi sözlerinle yaz. Zaten biliyorsan ya da ajanın yapmasını istiyorsan, söylemen yeterli."
+        }
         RestsOn => "Dayandıkları",
         ToldNotShown => "Söylendi olarak kaydedildi: {labels}.",
         GapNeeds => "Önce **{concept}** gerekiyor: {why}.",
@@ -24,14 +26,14 @@ fn line(l: Line) -> &'static str {
         AddGapParts => "{names} için bir parça eklensin mi?",
         And => " ve ",
         ProposedChange => "Önerilen harita değişikliği:",
-        AcceptReject => "`/accept` ya da `/reject`.",
+        AcceptReject => "Eklemek için evet de, ya da hayır.",
         Needs => "gerektirir: {deps}",
         FixedReply => "Şu an bunu değerlendiriyorsun. Önce kararın.",
         GateCapped => {
             "(Bugünkü ortak kontroller bitti; adayla ilgili yanıtlar kararını bekliyor. Kendi anahtarın: `pathfinder auth set typesafe`.)"
         }
         GateUnavailable => "(Kontrole ulaşılamadı, yanıt bekletildi. Birazdan tekrar dene.)",
-        Understood => "**{title}** anlaşıldı. `/next` · `/handoff`",
+        Understood => "**{title}** anlaşıldı. Devam etmek ya da ajana vermek istediğinde söyle.",
         KeepWorking => "Çalışmaya devam et, sonra yeniden açıkla.",
         AllResolved => "Tüm parçalar çözüldü.",
         NoOtherPart => "Çözülmemiş başka parça yok.",
@@ -72,7 +74,7 @@ fn line(l: Line) -> &'static str {
         FindNone => "Bu klasörde {terms} içeren satır yok.",
         WebNone => "Çevrimiçi hiçbir şey {terms} ile eşleşmedi.",
         ShowKnown => {
-            "Kaydedildi: **{title}** konusunu zaten biliyorsun. Bir iddia, kanıt değil. `/undo` (Esc) geri alır."
+            "Kaydedildi: **{title}** konusunu zaten biliyorsun. Bir iddia, kanıt değil. Geri almak için \"geri al\" de ya da Esc'ye bas."
         }
         ShowTell => {
             "İstediğin gibi söylüyorum. Söylendi olarak kaydedilir, asla anlaşıldı olarak değil. Gelmeden önce Esc iptal eder."
@@ -94,11 +96,16 @@ fn line(l: Line) -> &'static str {
         NotRunDelegate => "Çalıştırılmadı: **{title}** devredilmedi.",
         NotRunStale => "Çalıştırılmadı: onayını bekleyen şey artık geçerli değil.",
         AskWhich => {
-            "Şunu mu demek istedin: {choices}? Sen söyleyene kadar hiçbir şey kaydedilmez. Yoksa devam et."
+            "Hangisini demek istedin: {choices}? Sen söyleyene kadar hiçbir şey kaydedilmez; bir numara ya da birkaç kelime yeter."
         }
-        AskKnown => "**{title}** konusunu zaten bildiğin (`/known`)",
-        AskTell => "sana söylenmesi (`/tell <question>`)",
-        AskAgent => "bölümün ajana verilmesi (`/handoff` veya `/delegate`)",
+        AskKnown => "**{title}** konusunu zaten bildiğimi kaydet (kontrolsüz)",
+        AskTell => "bana söyleyiver",
+        AskAgent => "bu bölümü ajan yapsın",
+        AskCheck => "beni **{title}** üzerinde sına",
+        AskNote => "sadece bir not",
+        AskWhichPart => {
+            "Hangi bölümü kastediyorsun: {choices}? Sen söyleyene kadar hiçbir şey kaydedilmez."
+        }
         Or => " ya da ",
         Undone => {
             "Geri alındı: **{title}** hakkındaki iddian çekildi. Kayıt onu çekilmiş olarak tutar."
@@ -109,8 +116,9 @@ fn line(l: Line) -> &'static str {
         NothingWaiting => "Onayını bekleyen bir şey yok.",
         NextStep => "Sıradaki: {at} · {question}",
         NextStepNoPlace => {
-            "Sıradaki: kaynaklarında henüz **{concept}** geçen bir yer yok; `/find <terms>` onlarda arar. · {question}"
+            "Sıradaki: kaynaklarında henüz **{concept}** geçen bir şey yok; nereye bakacağını bana sor. · {question}"
         }
+        StepPart => "Bu bölüm ne işe yarıyor, kendi sözlerinle?",
         StepWideExample => "{concept} kavramının kullanıldığı bir yer bul. Orada ne yapıyor?",
         StepWidePurpose => "{concept} bu bölümde ne işe yarıyor, kendi sözlerinle?",
         StepWideMechanism => "{concept} adım adım nasıl çalışıyor?",

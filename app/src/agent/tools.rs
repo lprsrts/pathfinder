@@ -629,41 +629,93 @@ pub fn view(
 /// by path and modification time, since grep and read come back to the
 /// same slides often.
 pub(crate) fn pdf_pages(file: &Path, path: &str) -> Result<std::sync::Arc<Vec<String>>, String> {
+    pdf_text(file, path).map(|t| t.pages.clone())
+}
+
+/// A PDF's text by page, with the pages whose math didn't extract cleanly
+/// (see [`crate::pdftext`]).
+pub(crate) struct PdfText {
+    pub pages: std::sync::Arc<Vec<String>>,
+    /// One per page: how far its text can be trusted.
+    pub unclean: Vec<crate::pdftext::PageTrust>,
+}
+
+/// [`pdf_pages`], with each page's reliability.
+pub(crate) fn pdf_text(file: &Path, path: &str) -> Result<std::sync::Arc<PdfText>, String> {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex, OnceLock};
-    type Cache = Mutex<HashMap<PathBuf, (std::time::SystemTime, Arc<Vec<String>>)>>;
+    type Cache = Mutex<HashMap<PathBuf, (std::time::SystemTime, Arc<PdfText>)>>;
     static CACHE: OnceLock<Cache> = OnceLock::new();
     let cache = CACHE.get_or_init(Default::default);
     let mtime = fs::metadata(file)
         .and_then(|m| m.modified())
         .map_err(|e| format!("cannot read `{path}`: {e}"))?;
-    if let Some((t, pages)) = cache.lock().unwrap().get(file)
+    if let Some((t, text)) = cache.lock().unwrap().get(file)
         && *t == mtime
     {
-        return Ok(pages.clone());
+        return Ok(text.clone());
     }
     // A size limit and a time limit: one odd PDF can't stall a turn.
     if fs::metadata(file).map(|m| m.len()).unwrap_or(0) > PDF_MAX_BYTES {
         return Err(format!("the PDF `{path}` is too large to read here"));
     }
-    let out = run_pdftotext(file, path)?;
+    let out = run_poppler(
+        "pdftotext",
+        &["-layout", "-enc", "UTF-8"],
+        file,
+        &["-"],
+        path,
+    )?;
     let text = String::from_utf8_lossy(&out.stdout);
     let mut pages: Vec<String> = text.split('\u{c}').map(str::to_string).collect();
     if pages.last().is_some_and(|p| p.trim().is_empty()) {
         pages.pop();
     }
-    let pages = Arc::new(pages);
+    let unclean = repair_math(file, path, &mut pages);
+    let text = Arc::new(PdfText {
+        pages: Arc::new(pages),
+        unclean,
+    });
     let mut cache = cache.lock().unwrap();
     // Bounded: past the limit, start over rather than grow.
     let held: usize = cache
         .values()
-        .map(|(_, p)| p.iter().map(String::len).sum::<usize>())
+        .map(|(_, t)| t.pages.iter().map(String::len).sum::<usize>())
         .sum();
     if cache.len() >= PDF_CACHE_FILES || held > PDF_CACHE_BYTES {
         cache.clear();
     }
-    cache.insert(file.to_path_buf(), (mtime, pages.clone()));
-    Ok(pages)
+    cache.insert(file.to_path_buf(), (mtime, text.clone()));
+    Ok(text)
+}
+
+/// Symbol and math fonts: when the text has private-use symbol codes, or
+/// `pdffonts` lists such a font, asks `pdftohtml -xml` which font drew what,
+/// maps the codes back (see [`crate::pdftext`]) and says which pages are
+/// still unreliable. Without poppler's help nothing is mapped, and pages
+/// with leftover codes are marked.
+fn repair_math(file: &Path, path: &str, pages: &mut [String]) -> Vec<crate::pdftext::PageTrust> {
+    use crate::pdftext;
+    let wanted = pdftext::has_private(pages)
+        || run_poppler("pdffonts", &[], file, &[], path)
+            .ok()
+            .filter(|o| o.status.success())
+            .is_some_and(|o| pdftext::lists_math_fonts(&String::from_utf8_lossy(&o.stdout)));
+    let fonts = if wanted {
+        run_poppler(
+            "pdftohtml",
+            &["-xml", "-i", "-q", "-stdout"],
+            file,
+            &[],
+            path,
+        )
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| pdftext::parse_xml(&String::from_utf8_lossy(&o.stdout)))
+    } else {
+        None
+    };
+    pdftext::repair(pages, fonts.as_ref())
 }
 
 /// Largest PDF read, how long `pdftotext` may take, and how much text the
@@ -673,21 +725,28 @@ const PDF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 const PDF_CACHE_FILES: usize = 64;
 const PDF_CACHE_BYTES: usize = 128 * 1024 * 1024;
 
-/// `pdftotext -layout` on `file`, stopped after [`PDF_TIMEOUT`].
-fn run_pdftotext(file: &Path, path: &str) -> Result<std::process::Output, String> {
+/// A poppler tool (`pdftotext`, `pdffonts`, `pdftohtml`) on `file`, its
+/// options before the file and `after` it, stopped after [`PDF_TIMEOUT`].
+fn run_poppler(
+    tool: &str,
+    options: &[&str],
+    file: &Path,
+    after: &[&str],
+    path: &str,
+) -> Result<std::process::Output, String> {
     use std::io::Read;
     use std::process::{Command, Stdio};
-    let mut child = Command::new("pdftotext")
-        .args(["-layout", "-enc", "UTF-8"])
+    let mut child = Command::new(tool)
+        .args(options)
         .arg(file)
-        .arg("-")
+        .args(after)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|_| {
             format!(
-                "can't read the PDF `{path}`: `pdftotext` isn't installed ({POPPLER_HINT}). Ask the user to attach it instead."
+                "can't read the PDF `{path}`: `{tool}` isn't installed ({POPPLER_HINT}). Ask the user to attach it instead."
             )
         })?;
     let mut stdout = child.stdout.take().expect("piped");
@@ -730,7 +789,8 @@ const PDF_DEFAULT_PAGES: usize = 20;
 /// A PDF's text by page, through `pdftotext` (poppler). Slides and scripts
 /// are long, so the reader asks for pages.
 fn read_pdf(file: &Path, path: &str, pages: Option<&str>) -> Result<String, String> {
-    let all = pdf_pages(file, path)?;
+    let text = pdf_text(file, path)?;
+    let all = &text.pages;
     let total = all.len();
     let (first, last) = match pages {
         Some(spec) => {
@@ -752,7 +812,13 @@ fn read_pdf(file: &Path, path: &str, pages: Option<&str>) -> Result<String, Stri
     }
     let mut s = format!("`{path}`: {total} pages, showing {first}–{last}.\n");
     for (i, page) in all.iter().enumerate().take(last).skip(first - 1) {
-        let block = format!("\n--- page {} ---\n{}\n", i + 1, page.trim_end());
+        // The model can look at the page itself when its math is garbled.
+        let note = if text.unclean.get(i).is_some_and(|t| t.marked()) {
+            " (math didn't extract cleanly: see it with `view`)"
+        } else {
+            ""
+        };
+        let block = format!("\n--- page {}{note} ---\n{}\n", i + 1, page.trim_end());
         if s.len() + block.len() > MAX_READ_BYTES {
             let _ = writeln!(
                 s,

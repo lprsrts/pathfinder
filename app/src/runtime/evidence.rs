@@ -18,6 +18,14 @@ pub(super) enum Routed {
     Unsure { top: Vec<&'static str> },
 }
 
+/// The Tutor's acknowledgement of a log entry, at most this many
+/// characters.
+const ACK_MAX: usize = 200;
+
+/// The Tutor's open question for the next step, at most this many
+/// characters.
+const QUESTION_MAX: usize = 240;
+
 impl Runtime {
     /// `decided_by`: the decision model that already classified the message
     /// as a log entry; the LLM then only replies.
@@ -98,8 +106,9 @@ impl Runtime {
         };
         let current = session.map.clone();
         let change_waiting = session.pending_change.is_some();
-        // The model's own reply is never shown: a question gets sources, a
-        // log entry gets none.
+        // The model's free `reply` is never shown: a question gets sources,
+        // a log entry the Tutor's `ack`, and only once code has checked
+        // that it adds nothing to your words (`plain_ack`).
         if matches!(gate, gate::GateMode::Checked(_)) {
             sink(StreamEvent::Thought(
                 "Checking the reply against what you're judging before showing it.\n".into(),
@@ -136,8 +145,13 @@ impl Runtime {
                 .await;
         }
         let _ = shown;
+        // A question gets its sources; a log entry a short acknowledgement
+        // of what you did, adding nothing (§11), and both end with the
+        // next step (§16).
         decision.reply = if crate::sources::is_question(text) {
             self.cite_reply(session, text, files, &sink).await?
+        } else if let Some(ack) = plain_ack(&decision.ack, text, &part.title) {
+            ack
         } else {
             i18n::line(session.language.as_deref(), i18n::Line::Logged).to_string()
         };
@@ -159,9 +173,10 @@ impl Runtime {
         }
         let mut visible = String::new();
         let mut full = decision.reply;
-        // §16: the next step, when it changed since the last one shown, or
-        // always when you steered it.
-        if let Some(next) = self.next_step(session, steer, steer.is_none()) {
+        // §16: one exact next step, with the Tutor's open question when it
+        // wrote one.
+        let question = one_question(&decision.question);
+        if let Some(next) = self.next_step(session, steer, question.as_deref(), steer.is_some()) {
             let next = format!("\n\n{next}");
             sink(StreamEvent::TextDelta(next.clone()));
             full.push_str(&next);
@@ -194,6 +209,7 @@ impl Runtime {
             return self.handle_log(session, text, files, sink, None).await;
         }
         let routed = self.decide_step(session, text, &sink).await;
+        let routed = second_look(session, text, routed);
         // Something waits for your OK: only a clear yes runs it; any other
         // message drops it, and nothing ever runs on its own.
         let mut dropped = None;
@@ -238,10 +254,10 @@ impl Runtime {
     ) -> Result<TurnOutput> {
         let checking = (session.quick_check || session.exam) && session.pending_candidate.is_some();
         match routed {
-            Some(Routed::Unsure { top }) => {
-                session.push_turn("user", text);
-                Ok(self.ask_which(session, &top))
-            }
+            Some(Routed::Unsure { top }) => match self.ask_which(session, text, files, &top) {
+                Some(out) => Ok(out),
+                None => self.handle_log(session, text, files, sink, None).await,
+            },
             // A quick check or an exam question you chose to be asked: the
             // judge decides whether it is an answer, and drops the check if
             // not (the one place a verdict isn't shown back first).
@@ -270,6 +286,13 @@ impl Runtime {
                 self.undo(session)
             }
             Some(Routed::Step { step, part, .. }) => {
+                // A claim on the part your words name ("I know the part on
+                // page 19"), never silently on another one.
+                if step == "known"
+                    && let Some(out) = self.claim_target(session, text, files, part.as_deref())?
+                {
+                    return Ok(out);
+                }
                 let intent = match step.as_str() {
                     "summary" => Intent::Summary,
                     "known" => Intent::Known,
@@ -458,7 +481,18 @@ impl Runtime {
             // record: ask which you meant, never guess (§15). While a
             // candidate waits, the verdict's show-back is that question.
             let mass: f64 = offered.iter().map(|c| step.p(c, n_steps)).sum();
-            if session.pending_candidate.is_none() && mass >= UNSURE_COMMITMENT {
+            // Any one commitment the model actually weighs (not an even
+            // split of what's left) counts as meaningful.
+            let weighed = offered
+                .iter()
+                .filter_map(|c| {
+                    step.all
+                        .get(*c)
+                        .copied()
+                        .or((step.choice == *c).then_some(step.probability))
+                })
+                .any(|p| p >= UNSURE_ONE);
+            if session.pending_candidate.is_none() && (mass >= UNSURE_COMMITMENT || weighed) {
                 let mut top = offered.clone();
                 top.sort_by(|a, b| step.p(b, n_steps).total_cmp(&step.p(a, n_steps)));
                 top.truncate(2);
@@ -526,7 +560,7 @@ impl Runtime {
                 session.push_turn("assistant", reply);
                 Ok(TurnOutput::text(reply))
             }
-            Intent::Known => self.claim_shown_back(session, part),
+            Intent::Known => self.claim_shown_back(session, part, None),
             Intent::Agent => Ok(self.propose_agent(session, text, files)),
             Intent::Tell => self.tell(session, text, files, sink, true).await,
             Intent::Move => Ok(match part.filter(|p| !p.is_empty() && *p != "next") {
@@ -928,3 +962,140 @@ impl Runtime {
         Ok(TurnOutput::text(next))
     }
 }
+
+/// A second look by code at what the Router read (§15, A3): words that
+/// plausibly make a commitment ("I understand this part", "just tell me")
+/// are asked about, never logged silently, even when the Router read
+/// them as a log entry or wasn't sure. A clear commitment, anything while
+/// a candidate waits (its show-back is that question) and a yes to what
+/// waits for your OK are left as read.
+fn second_look(session: &Session, text: &str, routed: Option<Routed>) -> Option<Routed> {
+    if session.pending_candidate.is_some() || session.quick_check || session.exam {
+        return routed;
+    }
+    let read_as_log = matches!(&routed, Some(Routed::Step { step, .. }) if step == "log");
+    match super::refer::plain_commitment(text) {
+        // A claim the Router read as a log entry or wasn't sure about: the
+        // Tutor would log it silently. Asking to be told or for the agent,
+        // when unsure, the Tutor still reads and shows back itself.
+        Some(c) if read_as_log || (routed.is_none() && c == "known") => {
+            Some(Routed::Unsure { top: vec![c] })
+        }
+        _ => routed,
+    }
+}
+
+/// Words an acknowledgement may use beyond yours: who did it and what kind
+/// of thing they did, never what it is about.
+const ACK_WORDS: &[&str] = &[
+    "you",
+    "your",
+    "yours",
+    "yourself",
+    "linked",
+    "link",
+    "connected",
+    "connect",
+    "traced",
+    "trace",
+    "tied",
+    "related",
+    "relate",
+    "described",
+    "describe",
+    "explained",
+    "explain",
+    "wrote",
+    "said",
+    "noted",
+    "put",
+    "own",
+    "words",
+    "between",
+    "together",
+    "these",
+    "those",
+    "them",
+    "its",
+    "through",
+    "way",
+    "back",
+    "step",
+    "steps",
+    "part",
+    "think",
+    "thinking",
+    "thought",
+    "idea",
+    "ideas",
+    "reasoning",
+    "here",
+    "just",
+    "also",
+    "all",
+    "out",
+    "walked",
+    "summed",
+    "summarized",
+    "went",
+    "how",
+    "what",
+    "why",
+    "who",
+    "both",
+    "each",
+    "one",
+    "two",
+    "first",
+    "then",
+    "now",
+    "got",
+    "gave",
+    "set",
+    "laid",
+    "spelled",
+    "stated",
+    "named",
+];
+
+/// The Tutor's acknowledgement of a log entry, if code can tell it adds
+/// nothing (§11): one sentence of at most `ACK_WORDS_MAX` words, not a
+/// question, whose content words all come from your message or the
+/// part's title. Else None, and the fixed "Logged." is shown.
+fn plain_ack(ack: &str, text: &str, title: &str) -> Option<String> {
+    let ack = ack.trim();
+    if ack.is_empty()
+        || ack.contains('\n')
+        || ack.ends_with('?')
+        || ack.split_whitespace().count() > ACK_WORDS_MAX
+        || ack.chars().count() > ACK_MAX
+        || more_than_one_sentence(ack)
+    {
+        return None;
+    }
+    let yours: Vec<String> = crate::sources::keywords(&format!("{text} {title}"));
+    let adds = crate::sources::keywords(ack).into_iter().any(|w| {
+        !ACK_WORDS.contains(&w.as_str()) && !yours.iter().any(|y| super::refer::alike(&w, y))
+    });
+    (!adds).then(|| ack.to_string())
+}
+
+/// The Tutor's open question, if it is one: a single sentence ending in
+/// "?". Else None, and the fixed question for the step is asked.
+fn one_question(q: &str) -> Option<String> {
+    let q = q.trim();
+    (q.ends_with('?')
+        && !q.contains('\n')
+        && q.chars().count() <= QUESTION_MAX
+        && !more_than_one_sentence(q))
+    .then(|| q.to_string())
+}
+
+/// Whether `s` has a sentence end before its last character.
+fn more_than_one_sentence(s: &str) -> bool {
+    let body = s.trim_end_matches(['.', '!', '?', ' ']);
+    body.contains(". ") || body.contains("? ") || body.contains("! ") || body.contains("; ")
+}
+
+/// Words an acknowledgement may have, at most.
+const ACK_WORDS_MAX: usize = 20;

@@ -35,6 +35,7 @@ mod onboarding;
 mod path;
 mod provenance;
 mod record;
+mod refer;
 mod review;
 mod skips;
 
@@ -560,6 +561,18 @@ impl Runtime {
         files: &[PathBuf],
         sink: StreamSink,
     ) -> Result<TurnOutput> {
+        // A question back to you lasts one message: this one may answer
+        // it; otherwise it is dropped and nothing was recorded (§15).
+        let ask = session.pending_ask.take();
+        if let Some(ask) = ask
+            && !text.starts_with('/')
+            && session.mode == SessionMode::Working
+            && let Some(out) = self
+                .answer_ask(session, ask, text, files, sink.clone())
+                .await?
+        {
+            return Ok(out);
+        }
         let output = if text.starts_with('/') {
             self.handle_command(session, text, files, sink).await?
         } else {
@@ -725,6 +738,10 @@ const COMMITMENTS: [&str; 4] = [VERDICT, "known", AGENT, TELL];
 /// on commitments (§15).
 const UNSURE_COMMITMENT: f64 = 0.4;
 
+/// An unsure Router also asks when it weighs any one commitment this much
+/// (§15, A3: a commitment with meaningful probability).
+const UNSURE_ONE: f64 = 0.25;
+
 /// While a candidate waits, a log, move or skip needs this much to skip
 /// the judge.
 const CONFIDENT_STEP: f64 = 0.9;
@@ -760,11 +777,19 @@ fn flush(sink: &StreamSink, full: &str, shown: &str) {
     }
 }
 
-/// A part as you start on it. The command hint shows only with the first part.
-/// The note is shown only as a pointer into the workspace ("where to read").
-fn render_part(part: &Part, hint: bool, lang: Option<&str>, cwd: &std::path::Path) -> String {
+/// A part as you start on it. The plain-words hint shows only with the
+/// first part. The note is shown only as a pointer into the workspace
+/// ("where to read"), and only when no next step points somewhere (§16:
+/// one pointer, never two).
+fn render_part(
+    part: &Part,
+    hint: bool,
+    read_at: bool,
+    lang: Option<&str>,
+    cwd: &std::path::Path,
+) -> String {
     let mut out = format!("**{}** (`{}`)", part.title, part.id);
-    if let Some(at) = crate::sources::pointer_note(cwd, &part.note) {
+    if read_at && let Some(at) = crate::sources::pointer_note(cwd, &part.note) {
         out.push_str(&format!("\n{} {at}", i18n::line(lang, i18n::Line::ReadAt)));
     }
     if part.status != PartStatus::Open {
@@ -920,7 +945,9 @@ First decide what the latest message is (`intent`):
 - `tell`: they ask to be told the answer or an explanation outright, rather than pointed to sources.
 For anything but `log`, set `reply` to "" and `map_change` to null: Pathfinder takes the step.
 
-For `log`, set `reply` to "ok". Pathfinder never answers in its own words: a question gets pointers into the sources, found separately, and a log entry gets no comment.
+For `log`, set `reply` to "ok". Pathfinder never answers in its own words: a question gets pointers into the sources, found separately. For `log`, also write, in the user's language:
+- `ack`: for a log entry (not a question), one short sentence, at most 20 words, saying "you", that names what they just did in their own terms ("You linked Maxwell's equations to the Helmholtz equation."). It adds nothing: no fact, no explanation, no correction, no praise, no judgment of whether they are right, no hint. "" for a question.
+- `question`: one open question for their next step, at most 25 words, written from this part and the place in its sources they should look next (the part's note, the file and page you read). It makes them think further about what they wrote, never contains or hints at the answer, and reads as a natural, grammatical sentence (don't paste a long name into a template). "" if you can't write one.
 
 If a `log` message reveals the map is wrong (a missing dependency, a part that doesn't belong, a wrong edge, or a new constraint that changes the task's scope), propose a change in `map_change`; the user accepts or rejects it. Otherwise set it to null. A change has `brief` (one sentence to the user, saying "you"), `goal` (only when the message changes what the task is, e.g. a new purpose or scope: the new goal as one sentence starting with a verb, not in first person; otherwise null), `parts` (to add, or update by id: id, title, note, depends_on; new ids are short hyphenated slugs of at most 12 characters) and `remove` (ids of parts with no work yet).
 
@@ -934,9 +961,9 @@ For `log`, also record what the message is about, without judging it:
 Call `read` before writing your JSON if a file matters: `reply` ends your turn. If they ask about a figure, diagram, slide or page, open the file and look at that page first (with `view`, or your file tool for PDFs and images); never say you can't see a file that is attached or in the workspace.
 
 Return ONLY a JSON object:
-{"intent": "log", "part": null, "reply": "...", "map_change": null, "concepts": [], "misconception": null}
+{"intent": "log", "part": null, "reply": "ok", "ack": "...", "question": "...", "map_change": null, "concepts": [], "misconception": null}
 or, with a change:
-{"intent": "log", "part": null, "reply": "...", "map_change": {"brief": "...", "goal": null, "parts": [], "remove": []}, "concepts": [], "misconception": null}"#;
+{"intent": "log", "part": null, "reply": "ok", "ack": "...", "question": "...", "map_change": {"brief": "...", "goal": null, "parts": [], "remove": []}, "concepts": [], "misconception": null}"#;
 
 const CANDIDATE_SYSTEM: &str = r#"You make a candidate for the user to judge. Their judgment decides whether they understand the part well enough to direct an agent and tell whether its result is right.
 

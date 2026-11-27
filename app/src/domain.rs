@@ -571,6 +571,12 @@ pub struct Session {
     /// The last next step shown (§16), so it isn't repeated every message.
     #[serde(default)]
     pub last_step: Option<StepShown>,
+    /// A question back to you (§15, A3): the Router was unsure whether your
+    /// last message was a commitment, or which part it meant. Your next
+    /// message may answer it; any other message drops it. Nothing is
+    /// recorded while it waits.
+    #[serde(default)]
+    pub pending_ask: Option<PendingAsk>,
     /// What a confirmation ran in this turn, for the usage count: a
     /// `/confirm` that ran nothing is not a verdict. Never saved.
     #[serde(skip)]
@@ -603,6 +609,41 @@ pub struct PendingCommitment {
     /// Confirming judges it only against that same candidate.
     #[serde(default)]
     pub candidate: Option<String>,
+}
+
+/// One answer to a question back to you (§15).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "part")]
+pub enum AskChoice {
+    /// Record that you already know the part: a claim, no check.
+    Known,
+    /// Check you on the part with a candidate (§5.3).
+    Check,
+    /// Just keep the message as a note in your log.
+    Note,
+    /// Tell you outright (§11).
+    Tell,
+    /// Give the part to the agent.
+    Agent,
+    /// The message meant this part.
+    Part(String),
+}
+
+/// A question back to you, waiting for your answer (§15).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingAsk {
+    /// Your message that raised it.
+    pub text: String,
+    #[serde(default)]
+    pub files: Vec<PathBuf>,
+    /// The part it is about: the one your message named, or the active one.
+    pub part: String,
+    /// The answers offered, in the order shown (numbered from 1).
+    pub choices: Vec<AskChoice>,
+    /// When the choices are parts: what to ask (or, if it's one thing, do)
+    /// once you pick one.
+    #[serde(default)]
+    pub then: Vec<AskChoice>,
 }
 
 /// A claim from plain words and what it changed, so `/undo` can take it
@@ -655,6 +696,7 @@ impl Session {
             pending_commitment: None,
             last_commitment: None,
             last_step: None,
+            pending_ask: None,
             ran_commitment: None,
         }
     }
@@ -842,6 +884,14 @@ pub struct LogReply {
     pub part: Option<String>,
     #[serde(default)]
     pub reply: String,
+    /// For `log`: one short sentence acknowledging what you did, in your
+    /// terms, adding nothing (§11). Empty for a question.
+    #[serde(default)]
+    pub ack: String,
+    /// For `log`: one open question to take to the next place in your
+    /// sources, written from the part and its source (§16).
+    #[serde(default)]
+    pub question: String,
     #[serde(default)]
     pub map_change: Option<MapChange>,
     /// Concepts the message touched: ids from the part's list, or short

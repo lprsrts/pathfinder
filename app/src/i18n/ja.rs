@@ -12,7 +12,9 @@ fn line(l: Line) -> &'static str {
         CandidateFor => "**{title}** の説明候補：",
         IsItRight => "正しいですか？理由も答えてください。",
         PassedOneMore => "合格です。もう一問：",
-        PartHint => "ここで考えを書き出してください。`/summary` · `/known` · `/delegate`",
+        PartHint => {
+            "ここで考えを書き出してください。作業しながらの考えと、準備ができたらこのパートを自分の言葉で。もう知っている、またはエージェントに任せたいなら、そう言ってください。"
+        }
         RestsOn => "前提",
         ToldNotShown => "「教わった」として記録しました：{labels}。",
         GapNeeds => "先に **{concept}** が必要です：{why}。",
@@ -24,7 +26,7 @@ fn line(l: Line) -> &'static str {
         AddGapParts => "{names} のパートを追加しますか？",
         And => "と",
         ProposedChange => "マップの変更案：",
-        AcceptReject => "`/accept` または `/reject`。",
+        AcceptReject => "追加するなら「はい」、しないなら「いいえ」と言ってください。",
         Needs => "{deps} が必要",
         FixedReply => "それは今あなたが判定している内容です。まず判定をどうぞ。",
         GateCapped => {
@@ -33,7 +35,9 @@ fn line(l: Line) -> &'static str {
         GateUnavailable => {
             "（チェックに接続できないため返答を保留しました。少し待ってから再度お試しください。）"
         }
-        Understood => "**{title}** を理解しました。`/next` · `/handoff`",
+        Understood => {
+            "**{title}** を理解しました。先に進むときやエージェントに任せるときは言ってください。"
+        }
         KeepWorking => "作業を続けて、もう一度説明してください。",
         AllResolved => "すべてのパートが解決しました。",
         NoOtherPart => "未解決のパートはほかにありません。",
@@ -74,7 +78,7 @@ fn line(l: Line) -> &'static str {
         FindNone => "このフォルダーに {terms} を含む行はありません。",
         WebNone => "オンラインで {terms} に一致するものはありませんでした。",
         ShowKnown => {
-            "記録しました: **{title}** はもう知っている、と。根拠ではなく申告です。`/undo` (Esc) で取り消せます。"
+            "記録しました: **{title}** はもう知っている、と。根拠ではなく申告です。「取り消して」と言うか Esc で取り消せます。"
         }
         ShowTell => {
             "ご要望どおりお答えします。理解ではなく「教わった」と記録されます。届く前に Esc で取り消せます。"
@@ -96,11 +100,14 @@ fn line(l: Line) -> &'static str {
         NotRunDelegate => "未実行: **{title}** は委任していません。",
         NotRunStale => "未実行: 承認を待っていた内容はもう当てはまりません。",
         AskWhich => {
-            "{choices}という意味ですか？ はっきりするまで何も記録しません。違えばそのまま続けてください。"
+            "どれのことですか：{choices}？ はっきりするまで何も記録しません。番号か一言で答えてください。"
         }
-        AskKnown => "**{title}** をもう知っている (`/known`)",
-        AskTell => "答えを教えてほしい (`/tell <question>`)",
-        AskAgent => "このパートをエージェントに任せる (`/handoff` または `/delegate`)",
+        AskKnown => "**{title}** はもう知っていると記録する（確認なし）",
+        AskTell => "答えを教えてほしい",
+        AskAgent => "このパートをエージェントに任せる",
+        AskCheck => "**{title}** について確認してほしい",
+        AskNote => "ただのメモ",
+        AskWhichPart => "どのパートのことですか：{choices}？ はっきりするまで何も記録しません。",
         Or => "、または",
         Undone => {
             "取り消しました: **{title}** についての申告は撤回されました。記録には撤回として残ります。"
@@ -111,8 +118,9 @@ fn line(l: Line) -> &'static str {
         NothingWaiting => "承認を待っているものはありません。",
         NextStep => "次: {at} · {question}",
         NextStepNoPlace => {
-            "次: 手元の資料にはまだ **{concept}** が出てくる箇所がありません。`/find <terms>` で検索できます。 · {question}"
+            "次: 手元の資料にはまだ **{concept}** が出てくる箇所がありません。どこを見ればいいか聞いてください。 · {question}"
         }
+        StepPart => "このパートは何のためにありますか？自分の言葉で。",
         StepWideExample => {
             "{concept} が使われている箇所を一つ探してください。そこで何をしていますか？"
         }

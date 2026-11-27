@@ -6,11 +6,31 @@ use std::path::{Component, Path, PathBuf};
 /// Symlinks and `..` are resolved through the longest existing ancestor, so a
 /// link pointing outside the workspace is caught. Paths in `extra_readable`
 /// (files the user attached) are allowed for reading.
+/// Pathfinder's private files ([`crate::paths::Private`]) are refused too,
+/// even inside the workspace (a database set there with
+/// `PATHFINDER_DB_PATH`), unless the workspace itself lies inside one (a
+/// staging copy).
 pub fn confine(
     root: &Path,
     requested: &str,
     write: bool,
     extra_readable: &[PathBuf],
+) -> Result<PathBuf, String> {
+    confine_with(
+        root,
+        requested,
+        write,
+        extra_readable,
+        &crate::paths::private_paths(),
+    )
+}
+
+fn confine_with(
+    root: &Path,
+    requested: &str,
+    write: bool,
+    extra_readable: &[PathBuf],
+    private: &crate::paths::Private,
 ) -> Result<PathBuf, String> {
     // Every comparison below is between paths from std's canonicalize, so
     // both sides share one form (on Windows the verbatim `\\?\C:\...`). Only
@@ -38,6 +58,15 @@ pub fn confine(
         return Err(format!(
             "`{requested}` is outside the workspace; only paths under {} are allowed",
             dunce::simplified(&root).display()
+        ));
+    }
+    let hidden = private
+        .all()
+        .filter_map(|p| resolve(p).ok())
+        .any(|p| !root.starts_with(&p) && resolved.starts_with(&p));
+    if hidden {
+        return Err(format!(
+            "`{requested}` is one of Pathfinder's own files (its record, settings or another review's copy), which the agent's tools can't open"
         ));
     }
     if write {
@@ -147,6 +176,29 @@ mod tests {
         assert!(confine(&ws, ".Pathfinder/x.json", true, &[]).is_err());
         assert!(confine(&ws, "src/../.pathfinder/x.json", true, &[]).is_err());
         assert!(confine(&ws, ".gitignore", true, &[]).is_ok());
+        fs::remove_dir_all(ws).unwrap();
+    }
+
+    #[test]
+    fn refuses_pathfinders_files_inside_the_workspace() {
+        let ws = workspace();
+        let db = ws.join("data").join("harness.sqlite");
+        fs::create_dir_all(db.parent().unwrap()).unwrap();
+        fs::write(&db, "db").unwrap();
+        fs::write(ws.join("data").join("notes.txt"), "mine").unwrap();
+        let private = crate::paths::private_paths_for(&db);
+        let open = |p: &str, write| confine_with(&ws, p, write, &[], &private);
+        assert!(open("data/harness.sqlite", false).is_err());
+        assert!(open("data/harness.sqlite-wal", true).is_err());
+        assert!(open("data/tui.log", false).is_err());
+        assert!(open("data/staging/s/p1/answer.rs", false).is_err());
+        assert!(open("data/notes.txt", false).is_ok());
+        // A workspace inside a private folder (a staging copy) still works.
+        let copy = ws.join("data").join("staging").join("s").join("p1");
+        fs::create_dir_all(&copy).unwrap();
+        let copy = dunce::canonicalize(copy).unwrap();
+        assert!(confine_with(&copy, "a.rs", true, &[], &private).is_ok());
+        assert!(confine_with(&copy, "../../../harness.sqlite", false, &[], &private).is_err());
         fs::remove_dir_all(ws).unwrap();
     }
 

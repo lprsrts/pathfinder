@@ -121,6 +121,7 @@ Handoff runs in an isolated staging copy, and live diffs and prose summaries of 
 - **Tying work to concepts can be wrong.** You can see and correct it, and when it is unsure, or when later formatting breaks a hash, coverage is counted as lower, never higher.
 - **Local integrity is not cryptographic proof.** The hash chain and tool boundaries keep the agent from altering the record (as far as command permissions and routes enforce them). Proving the record to an untrusting third party requires external signing.
 - **Separation has a boundary.** Without the reply check (or on external CLI routes that keep their own transcripts), Pathfinder can mask history, but cannot stop a quoted line or a told answer from settling a candidate you paraphrase back to it.
+- **The sandbox is Pathfinder's own.** It hides Pathfinder's files from its own agent's commands (A2). Claude Code and Codex on the CLI routes run in their own sandboxes, which can read them.
 - **Checks have a cost.** How often reviews are checked (section 13) is a visible setting of the session. A check you can't see is not allowed.
 
 ## 15. You work in plain language
@@ -227,7 +228,7 @@ flowchart TB
 | Tagger | decision | none | part only | | | | | concepts, p |
 | Planter | language | none | one hunk | | | | writes it | flawed hunk |
 
-The Agent never sees concept states or the ledger, so it can't shape its work to look reviewable (§12). Judge runs with no workspace tools, so untrusted files can't inject into a secret-bearing prompt, and buffers its reply until it confirms the message is a verdict. Thinking from Examiner, Judge and Planter is dropped at the sink by role (§11). Strict secret isolation holds on API routes; external CLI routes keep their own transcripts and sandboxes (§14).
+The Agent never sees concept states or the ledger, so it can't shape its work to look reviewable (§12). On the own-agent routes this holds on disk too: its file tools refuse, and its sandboxed commands can neither read, write nor move out of hiding, anything private to Pathfinder (the database with the ledger and secrets, its logs and caches, the config with credentials, other reviews' staging copies), apart from its own staging copy, and on Linux they can't see or signal Pathfinder's process. Where that sandbox can't be applied in full, there is none and every command is asked first. Judge runs with no workspace tools, so untrusted files can't inject into a secret-bearing prompt, and buffers its reply until it confirms the message is a verdict. Thinking from Examiner, Judge and Planter is dropped at the sink by role (§11). Strict secret isolation holds on API routes; external CLI routes keep their own transcripts and sandboxes (§14).
 
 ## A3. A turn
 

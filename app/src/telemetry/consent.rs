@@ -54,7 +54,7 @@ pub fn path() -> PathBuf {
 }
 
 fn secrets() -> FileStore {
-    FileStore::new(crate::auth::chatgpt::config_dir().join("auth.json"))
+    FileStore::new(crate::paths::auth_file())
 }
 
 impl Consent {

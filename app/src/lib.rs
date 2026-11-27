@@ -18,6 +18,7 @@ pub mod llm;
 pub mod operator;
 pub mod options;
 pub mod paths;
+pub mod pdftext;
 pub mod picker;
 pub mod providers;
 pub mod runtime;

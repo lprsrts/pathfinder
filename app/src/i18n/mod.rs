@@ -162,6 +162,12 @@ pub enum Line {
     AskTell,
     /// One choice of `AskWhich`.
     AskAgent,
+    /// A choice offered by the unsure Router: be checked on "{title}".
+    AskCheck,
+    /// A choice offered by the unsure Router: keep the message as a note.
+    AskNote,
+    /// Which part a message meant: "{choices}".
+    AskWhichPart,
     /// Between the choices of `AskWhich`.
     Or,
     /// A claim taken back: "{title}".
@@ -174,6 +180,8 @@ pub enum Line {
     NextStep,
     /// The next step with no place found: "{concept}", "{question}".
     NextStepNoPlace,
+    /// The open question for a part with no concept to aim at yet.
+    StepPart,
     /// An orienting step, example first: "{concept}".
     StepWideExample,
     /// An orienting step, purpose first: "{concept}".
@@ -370,12 +378,16 @@ mod tests {
         Line::AskKnown,
         Line::AskTell,
         Line::AskAgent,
+        Line::AskCheck,
+        Line::AskNote,
+        Line::AskWhichPart,
         Line::Or,
         Line::Undone,
         Line::NothingToUndo,
         Line::NothingWaiting,
         Line::NextStep,
         Line::NextStepNoPlace,
+        Line::StepPart,
         Line::StepWideExample,
         Line::StepWidePurpose,
         Line::StepWideMechanism,

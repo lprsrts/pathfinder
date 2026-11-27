@@ -625,10 +625,12 @@ async fn run_command(
     // In the sandbox unless the model asked to leave it; no sandbox on this
     // machine means every command asks.
     let jail = if outside { None } else { sandbox::available() };
-    let policy = sandbox::Policy {
-        workspace: req.cwd.clone(),
-        network,
-    };
+    #[allow(unused_mut)]
+    let mut policy = sandbox::Policy::new(req.cwd.clone(), network);
+    // Unit tests run commands too: they mustn't make the folders of
+    // whoever runs them.
+    #[cfg(test)]
+    policy.private.made.clear();
     let ask = jail.is_none() || network || crate::config::Config::load().ask_every_command;
     if ask {
         // Fail closed: a command that needs approval never runs unasked.
@@ -644,7 +646,9 @@ async fn run_command(
     // Output and errors share one pipe (see `run_local`), so no shell-level
     // `2>&1` is needed and any shell's syntax works.
     let local_argv = match &jail {
-        Some(kind) => sandbox::wrap(kind, &policy, command),
+        Some(kind) => sandbox::wrap(kind, &policy, command).map_err(|e| {
+            format!("The sandbox couldn't be set up, so the command didn't run: {e}")
+        })?,
         None => shell::current().argv(command),
     };
     let output = run_local(id, command, local_argv, &req.cwd, timeout, cancel, sink).await?;

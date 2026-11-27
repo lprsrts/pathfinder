@@ -12,7 +12,9 @@ fn line(l: Line) -> &'static str {
         CandidateFor => "شرح مرشّح لـ **{title}**:",
         IsItRight => "هل هذا صحيح؟ قل لماذا.",
         PassedOneMore => "نجحت. واحد آخر:",
-        PartHint => "فكّر بصوت عالٍ هنا. `/summary` · `/known` · `/delegate`",
+        PartHint => {
+            "فكّر بصوت عالٍ هنا: اكتب تفكيرك أثناء العمل، ثم اشرح الجزء بكلماتك عندما تكون جاهزًا. إن كنت تعرفه مسبقًا أو تريد أن يتولاه الوكيل، فقل ذلك فحسب."
+        }
         RestsOn => "يعتمد على",
         ToldNotShown => "سُجّل على أنه قيل لك: {labels}.",
         GapNeeds => "يحتاج أولًا إلى **{concept}**: {why}.",
@@ -24,14 +26,14 @@ fn line(l: Line) -> &'static str {
         AddGapParts => "إضافة جزء لـ {names}؟",
         And => " و",
         ProposedChange => "تغيير مقترح على الخريطة:",
-        AcceptReject => "`/accept` أو `/reject`.",
+        AcceptReject => "قل نعم لإضافته، أو لا.",
         Needs => "يحتاج إلى {deps}",
         FixedReply => "هذا ما تحكم عليه الآن. حكمك أولًا.",
         GateCapped => {
             "(نفدت عمليات التحقق المشتركة لهذا اليوم؛ الردود المتعلقة بالمرشّح تنتظر حكمك. مفتاحك الخاص: `pathfinder auth set typesafe`.)"
         }
         GateUnavailable => "(تعذّر الوصول إلى التحقق، حُجب الرد. حاول مجددًا بعد قليل.)",
-        Understood => "**{title}**: تم الفهم. `/next` · `/handoff`",
+        Understood => "**{title}**: تم الفهم. أخبرني عندما تريد المتابعة أو تسليمه إلى الوكيل.",
         KeepWorking => "واصل العمل، ثم اشرحه مرة أخرى.",
         AllResolved => "حُلّت جميع الأجزاء.",
         NoOtherPart => "لا يوجد جزء آخر لم يُحل.",
@@ -71,7 +73,9 @@ fn line(l: Line) -> &'static str {
         FindHits => "**{n}** نتيجة لـ {terms}:",
         FindNone => "لا يحتوي أي سطر في هذا المجلد على {terms}.",
         WebNone => "لا شيء على الإنترنت يطابق {terms}.",
-        ShowKnown => "سُجّل: أنت تعرف **{title}** مسبقًا. ادعاء، لا دليل. `/undo` (Esc) يتراجع عنه.",
+        ShowKnown => {
+            "سُجّل: أنت تعرف **{title}** مسبقًا. ادعاء، لا دليل. قل «تراجع» أو اضغط Esc لسحبه."
+        }
         ShowTell => {
             "سأخبرك كما طلبت. يُسجّل على أنه أُخبرت به، لا على أنك فهمته أبدًا. Esc قبل وصول الإجابة يلغيها."
         }
@@ -89,10 +93,13 @@ fn line(l: Line) -> &'static str {
         NotRunHandoff => "لم يُنفّذ: لم يُسلَّم **{title}** للوكيل.",
         NotRunDelegate => "لم يُنفّذ: لم يُسلَّم **{title}**.",
         NotRunStale => "لم يُنفّذ: ما كان ينتظر موافقتك لم يعد قائمًا.",
-        AskWhich => "هل قصدت {choices}؟ لا يُسجّل شيء حتى تقول. وإلا فتابع.",
-        AskKnown => "أنك تعرف **{title}** مسبقًا (`/known`)",
-        AskTell => "أن تُخبَر بالإجابة (`/tell <question>`)",
-        AskAgent => "أن يتولى الوكيل هذا الجزء (`/handoff` أو `/delegate`)",
+        AskWhich => "ماذا قصدت: {choices}؟ لا يُسجّل شيء حتى تقول؛ يكفي رقم أو بضع كلمات.",
+        AskKnown => "سجّل أنني أعرف **{title}** مسبقًا (دون تحقق)",
+        AskTell => "أخبرني فحسب",
+        AskAgent => "دع الوكيل يتولى هذا الجزء",
+        AskCheck => "اختبرني في **{title}**",
+        AskNote => "مجرد ملاحظة",
+        AskWhichPart => "أي جزء تقصد: {choices}؟ لا يُسجّل شيء حتى تقول.",
         Or => " أم ",
         Undone => "تم التراجع: سُحب ادعاؤك بشأن **{title}**. يحتفظ السجل به على أنه مسحوب.",
         NothingToUndo => {
@@ -101,8 +108,9 @@ fn line(l: Line) -> &'static str {
         NothingWaiting => "لا شيء ينتظر موافقتك.",
         NextStep => "التالي: {at} · {question}",
         NextStepNoPlace => {
-            "التالي: لا موضع في مصادرك يذكر **{concept}** بعد؛ `/find <terms>` يبحث فيها. · {question}"
+            "التالي: لا شيء في مصادرك يذكر **{concept}** بعد؛ اسألني أين تبحث. · {question}"
         }
+        StepPart => "ما الغرض من هذا الجزء، بكلماتك؟",
         StepWideExample => "اعثر على موضع يُستخدم فيه {concept}. ماذا يفعل هناك؟",
         StepWidePurpose => "ما الغرض من {concept} في هذا الجزء، بكلماتك؟",
         StepWideMechanism => "كيف يعمل {concept}، خطوة بخطوة؟",

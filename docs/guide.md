@@ -36,6 +36,8 @@ Searches don't mind spelling: "k-means", "K means" and "kmeans" find each other,
 
 What you open and search is on your record as *read*; it grows the graph but never counts as understanding.
 
+Math on PDF slides (Greek letters and symbols from the Symbol font, Word's equations) is turned back into the right characters where Pathfinder can tell which font drew it. A page where it still can't gets a line above it in `/open` saying its math didn't extract cleanly and to check it in your PDF viewer, and its garbled lines are never quoted as the source's words.
+
 To check your own work, `/check <your work>`, `/check derivation.md` or `/check photo.jpg` quotes the first step that doesn't hold. It doesn't say why or how to fix it. A photo of handwritten work is copied into text first and the copy is shown, so you can see it read your steps right.
 
 When you do want an answer, `/tell <question>` gives one. It's marked **Told** and recorded as told, not as understood.
@@ -55,16 +57,16 @@ Passing a candidate or a test question is what puts an idea on your record as sh
 
 Everything above works without a command. "I already know this part", "just tell me", "let the agent do this one" and "it's right, because …" are read like the commands they stand for. When one of them would change your record, Pathfinder shows it back in one line before anything rests on it:
 
-- **"I already know this"** is recorded at once as your claim and shown back. Esc (or `/undo`, or "no, take that back") withdraws it, but only right away, before your next message. The record keeps it as withdrawn.
+- **"I already know this"** is recorded at once as your claim and shown back. Esc (or saying "undo", or "no, take that back") withdraws it, but only right away, before your next message. The record keeps it as withdrawn.
 - **"Just tell me"** is shown back first, then answered and recorded as told. Esc while the answer is still coming cancels it and records nothing; once you've seen the answer, it stays on your record.
 - **"Let the agent do it"** waits for your OK: Enter hands the part off (or delegates it, if you haven't understood it yet), Esc cancels. Nothing runs before you press Enter.
 - **A verdict on a candidate** in your own words waits for Enter too, since a judged verdict is final. Esc keeps your message as a note, so a question about the candidate still gets its answer.
 
-A verdict, a review, a handoff, a delegation and an answer you were told can never be undone: taking them back would make your record look better than it is. When Pathfinder can't tell whether you meant one of these, it asks which, with the command for each, and records nothing until you say. Typed commands (`/known`, `/tell`, `/handoff`, `/delegate`) are already explicit and run as they are. A typed command that changes things (such as `/summary` or `/plan`) drops what waited for your OK, and says so.
+A verdict, a review, a handoff, a delegation and an answer you were told can never be undone: taking them back would make your record look better than it is. When Pathfinder can't tell whether you meant one of these, or you say something as short as "I get it" or "I understand the part on page 19", it asks which you meant in plain words, with numbered choices such as "record that I already know it (no check)", "check me on it" and "just a note", and records nothing until you say. Answer with the number or in a few words; "I don't know" or "don't record it" records nothing and goes on as an ordinary message. A claim goes on the part your words name (by title, idea, file or page), and taking it back returns you to where you were. Typed commands (`/known`, `/tell`, `/handoff`, `/delegate`) are already explicit and run as they are. A typed command that changes things (such as `/summary` or `/plan`) drops what waited for your OK, and says so.
 
 ## The next step
 
-In a task, each part ends with where to go next: the exact place (`Next: src/gate.rs:30-50`) and one open question to take there, and the part's horizon: what it needs and what it leads to, never the order to get there. A concept you haven't touched gets a wide step; a shaky one gets a narrow one. Say "give me an example first" or "start from what it's for" and the next step changes. While a candidate or a review waits, no next step is shown.
+In a task, each part ends with where to go next: the exact place (`Next: src/gate.rs:30-50`) and one open question to take there, and the part's horizon: what it needs and what it leads to, never the order to get there. A concept you haven't touched gets a wide step; a shaky one gets a narrow one. Say "give me an example first" or "start from what it's for" and the next step changes. The place is always inside the part's own source (its file, and its own pages of a slide deck), never another part's. When you write out your thinking, the reply names what you did in your own words, adding nothing, and ends with that one next step; if the acknowledgement would add anything of its own, you get "Logged." instead. While a candidate or a review waits, no next step is shown.
 
 Over time Pathfinder leans on the kinds of step that led you to a pass. That is the only thing it keeps about how you learn: `/why` shows it in full ("How you got here: wide·example 3 of 4 led to a pass …"), and it lives in the same local database as the rest of your record.
 

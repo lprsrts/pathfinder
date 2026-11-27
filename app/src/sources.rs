@@ -464,6 +464,30 @@ pub fn pages(full: &Path, rel: &str) -> Result<Vec<String>, String> {
     Ok(vec![String::from_utf8_lossy(&bytes).into_owned()])
 }
 
+/// How far each page of [`pages`] can be trusted: a PDF page's math may
+/// not have extracted cleanly (see [`crate::pdftext`]). Other sources are
+/// all clean.
+pub fn unclean_pages(full: &Path, rel: &str) -> Vec<crate::pdftext::PageTrust> {
+    if !is_pdf(full) {
+        return Vec::new();
+    }
+    crate::agent::tools::pdf_text(full, rel)
+        .map(|t| t.unclean.clone())
+        .unwrap_or_default()
+}
+
+/// Whether a line of page `i` (0-based) can stand as the source's own words:
+/// on a page whose math didn't extract cleanly, only plain prose can, and on
+/// one whose math font came out as ordinary letters (`m` for μ), none can.
+fn quotable(unclean: &[crate::pdftext::PageTrust], i: usize, line: &str) -> bool {
+    use crate::pdftext::PageTrust;
+    match unclean.get(i).copied().unwrap_or_default() {
+        PageTrust::Clean => true,
+        PageTrust::Shaky => crate::pdftext::plain_prose(line),
+        PageTrust::Unquotable => false,
+    }
+}
+
 // ------------------------------------------------------------ verification
 
 /// A hit as the model proposes it. Only `file`, `page` and `quote` are
@@ -527,6 +551,7 @@ pub fn verify_local(cwd: &Path, p: &ProposedHit) -> Result<Hit, Rejected> {
         .unwrap_or_else(|_| raw.to_string());
     let pages = pages(&full, &file).map_err(Rejected::Unreadable)?;
     let pdf = is_pdf(&full);
+    let unclean = unclean_pages(&full, &file);
     // The cited page first, then the rest: a wrong page number is corrected,
     // a quote that isn't in the file at all is dropped.
     let order: Vec<usize> = p
@@ -539,6 +564,10 @@ pub fn verify_local(cwd: &Path, p: &ProposedHit) -> Result<Hit, Rejected> {
     for i in order {
         let lines: Vec<&str> = pages[i].lines().collect();
         if let Some((line, own)) = locate(&lines, &p.quote) {
+            // Garbled math is never shown as what the source says.
+            if !quotable(&unclean, i, &own) {
+                continue;
+            }
             return Ok(Hit {
                 at: Locator::Local {
                     file,
@@ -693,11 +722,12 @@ pub fn find_counted(cwd: &Path, terms: &[String], limit: usize) -> (Vec<Hit>, us
             continue;
         };
         let pdf = is_pdf(&full);
+        let unclean = unclean_pages(&full, &rel);
         for (pi, page) in pages.iter().enumerate() {
             for (li, line) in page.lines().enumerate() {
                 let low = loose(line).0;
                 let n = terms.iter().filter(|t| low.contains(t.as_str())).count();
-                if n == 0 {
+                if n == 0 || !quotable(&unclean, pi, line) {
                     continue;
                 }
                 total += 1;
@@ -1179,8 +1209,17 @@ pub fn open_spec(cwd: &Path, spec: &OpenSpec) -> Result<OpenedSource, String> {
             body.push_str(&format!("{:>4}  {}\n", i + 1, l.trim_end()));
         }
         let fence = safe_fence(&body);
+        // A page whose math came out garbled says so, above its text.
+        let note = if unclean_pages(&resolved, &rel_display)
+            .get(n - 1)
+            .is_some_and(|t| t.marked())
+        {
+            format!("{}\n\n", crate::pdftext::unclean_note(n))
+        } else {
+            String::new()
+        };
         let mut out = format!(
-            "`{rel_display}` page {n} of {}\n\n{fence}text numbered\n{body}{fence}",
+            "`{rel_display}` page {n} of {}\n\n{note}{fence}text numbered\n{body}{fence}",
             pages.len()
         );
         if n < pages.len() {
@@ -1614,6 +1653,160 @@ mod tests {
                 let _ = std::fs::remove_dir_all(&self.0);
             }
         }
+    }
+
+    fn have_poppler() -> bool {
+        ["pdftotext", "pdftohtml"]
+            .iter()
+            .all(|t| std::process::Command::new(t).arg("-v").output().is_ok())
+    }
+
+    fn pdf_ws(pdf: &[u8]) -> tempdir::Dir {
+        let d = tempdir::Dir::new();
+        std::fs::write(d.path().join("slides.pdf"), pdf).unwrap();
+        d
+    }
+
+    #[test]
+    fn symbol_math_in_private_use_codes_reads_as_greek_and_math() {
+        if !have_poppler() {
+            return;
+        }
+        use crate::pdftext::fixture;
+        // Symbol drawn through a ToUnicode that maps to U+F0xx, as
+        // PowerPoint's SymbolMT does.
+        let pdf = fixture::pdf(
+            "<< /Type /Font /Subtype /TrueType /BaseFont /SymbolMT >>",
+            Some(&[(0x72, 0xF072), (0xB6, 0xF0B6)]),
+            fixture::MAXWELL,
+        );
+        let d = pdf_ws(&pdf);
+        let opened = open_spec(d.path(), &parse_open_spec("slides.pdf 1")).unwrap();
+        let md = &opened.markdown;
+        assert!(md.contains("div D = ρ"), "{md}");
+        assert!(md.contains("∂B"), "{md}");
+        assert!(md.contains("FuB 1.19"), "{md}");
+        assert!(
+            !md.chars().any(|c| ('\u{E000}'..='\u{F8FF}').contains(&c)),
+            "{md}"
+        );
+        assert!(!md.contains("didn't extract cleanly"), "{md}");
+        let h = verify_local(d.path(), &hit("slides.pdf", Some(1), "div D = ρ")).unwrap();
+        assert_eq!(h.quote, "div D = ρ");
+    }
+
+    #[test]
+    fn wrongly_mapped_symbol_math_is_flagged_and_never_quoted() {
+        if !have_poppler() {
+            return;
+        }
+        use crate::pdftext::fixture;
+        // A Symbol font whose ToUnicode says `r` and `¶` for ρ and ∂.
+        let pdf = fixture::pdf(
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Symbol >>",
+            Some(&[(0x72, 0x72), (0xB6, 0xB6)]),
+            fixture::MAXWELL,
+        );
+        let d = pdf_ws(&pdf);
+        let opened = open_spec(d.path(), &parse_open_spec("slides.pdf 1")).unwrap();
+        let (_, _, body) = split_source(&opened.markdown).unwrap();
+        assert!(
+            body.starts_with(&format!(
+                "{}\n\n```text numbered",
+                crate::pdftext::unclean_note(1)
+            )),
+            "{body}"
+        );
+        // Garbled math isn't the source's words, and since a wrong letter
+        // reads like any other, no line on the page is.
+        assert!(matches!(
+            verify_local(d.path(), &hit("slides.pdf", Some(1), "div D = r")),
+            Err(Rejected::NotInSource { .. })
+        ));
+        assert!(matches!(
+            verify_local(
+                d.path(),
+                &hit("slides.pdf", Some(1), "Maxwell equations describe")
+            ),
+            Err(Rejected::NotInSource { .. })
+        ));
+        assert!(find(d.path(), &["div".to_string()], 5).is_empty());
+        assert!(find(d.path(), &["Maxwell".to_string()], 5).is_empty());
+    }
+
+    #[test]
+    fn a_symbol_mu_read_as_m_never_verifies_as_millimetres() {
+        if !have_poppler() {
+            return;
+        }
+        use crate::pdftext::fixture;
+        // "25 μm", with μ from a Symbol font whose ToUnicode says `m`.
+        let pdf = fixture::pdf(
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Symbol >>",
+            Some(&[(0x6D, 0x6D)]),
+            "BT /F2 20 Tf 50 300 Td (Metallschicht 25 ) Tj /F1 20 Tf (m) Tj /F2 20 Tf (m) Tj ET",
+        );
+        let d = pdf_ws(&pdf);
+        let opened = open_spec(d.path(), &parse_open_spec("slides.pdf 1")).unwrap();
+        assert!(opened.markdown.contains("25 mm"), "{}", opened.markdown);
+        assert!(
+            opened.markdown.contains(&crate::pdftext::unclean_note(1)),
+            "{}",
+            opened.markdown
+        );
+        assert!(matches!(
+            verify_local(d.path(), &hit("slides.pdf", Some(1), "Metallschicht 25 mm")),
+            Err(Rejected::NotInSource { .. })
+        ));
+    }
+
+    #[test]
+    fn a_symbol_font_without_to_unicode_stays_clean() {
+        if !have_poppler() {
+            return;
+        }
+        use crate::pdftext::fixture;
+        let pdf = fixture::pdf(
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Symbol >>",
+            None,
+            fixture::MAXWELL,
+        );
+        let d = pdf_ws(&pdf);
+        let opened = open_spec(d.path(), &parse_open_spec("slides.pdf 1")).unwrap();
+        assert!(opened.markdown.contains("div D = ρ"), "{}", opened.markdown);
+        assert!(!opened.markdown.contains("didn't extract cleanly"));
+    }
+
+    /// The FUB lecture's Maxwell slide, from a real PDF outside the repo:
+    /// `PATHFINDER_FUB_PDF=/path/to/FUB_Folien1.pdf cargo test -- --ignored fub_slide`.
+    #[test]
+    #[ignore]
+    fn fub_slide_19_reads_its_maxwell_equations() {
+        let Some(path) = std::env::var_os("PATHFINDER_FUB_PDF") else {
+            return;
+        };
+        let path = std::path::PathBuf::from(path);
+        let dir = path.parent().unwrap();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let opened = open_spec(dir, &parse_open_spec(&format!("{name} 19"))).unwrap();
+        println!("{}", opened.markdown);
+        let md = &opened.markdown;
+        assert!(md.contains("div D = ρ"), "{md}");
+        assert!(
+            md.contains("∂B") && md.contains("∂t") && md.contains("∂D"),
+            "{md}"
+        );
+        assert!(md.contains("FuB 1.19"), "{md}");
+        assert!(
+            !md.chars().any(|c| ('\u{E000}'..='\u{F8FF}').contains(&c)),
+            "{md}"
+        );
+        let unclean = unclean_pages(&path, &name);
+        assert!(!unclean[18].marked(), "page 19 is marked unclean");
+        let marked: Vec<usize> = (1..=unclean.len())
+            .filter(|p| unclean[p - 1].marked())
+            .collect();
+        println!("pages marked unclean: {marked:?}");
     }
 
     const NOTES: &str = "# Notes\n\nThe Laplace transform turns\ndifferential equations into algebraic ones.\nIt is linear.\n";

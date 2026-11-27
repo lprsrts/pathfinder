@@ -54,7 +54,7 @@ impl Runtime {
         }
     }
 
-    fn labels(&self, session: &Session) -> HashMap<String, String> {
+    pub(super) fn labels(&self, session: &Session) -> HashMap<String, String> {
         self.store
             .concepts(&Self::workspace(session))
             .unwrap_or_default()
@@ -509,17 +509,20 @@ impl Runtime {
 
     /// The active part as you enter it: its card, what it rests on, any
     /// gaps underneath it (A5), then the horizon and the next step (§16).
+    /// One pointer only: the next step's place, or the card's "Read:" when
+    /// there's no next step.
     pub(super) fn enter_part(&self, session: &mut Session, hint: bool) -> String {
-        let mut out = self.part_card(session, hint);
         if session.quick_check || session.exam {
-            return out;
+            return self.part_card(session, hint, true);
         }
+        let next = self.next_step(session, None, None, true);
+        let mut out = self.part_card(session, hint, next.is_none());
         if let Some(part) = session.active_part().cloned()
             && let Some(h) = super::path::horizon(session, &part)
         {
             out.push_str(&format!("\n\n{h}"));
         }
-        if let Some(next) = self.next_step(session, None, false) {
+        if let Some(next) = next {
             out.push_str(&format!("\n\n{next}"));
         }
         out
@@ -527,13 +530,13 @@ impl Runtime {
 
     /// The part's card, what it rests on, and any gaps underneath it (A5),
     /// each raised once, proposed as small parts.
-    fn part_card(&self, session: &mut Session, hint: bool) -> String {
+    fn part_card(&self, session: &mut Session, hint: bool, read_at: bool) -> String {
         let Some(part) = session.active_part().cloned() else {
             return String::new();
         };
         let lang = session.language.clone();
         let lang = lang.as_deref();
-        let mut out = render_part(&part, hint, lang, &session.cwd);
+        let mut out = render_part(&part, hint, read_at, lang, &session.cwd);
         if part.concepts.is_empty() {
             return out;
         }
