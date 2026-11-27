@@ -1057,11 +1057,6 @@ async fn chat_drives_the_loop() {
                 S1,
                 r#"{"intent":"move","part":null,"reply":"","map_change":null}"#,
             ),
-            (
-                ReadOnly,
-                S1,
-                r#"{"intent":"known","reply":"","map_change":null}"#,
-            ),
         ]),
         false,
     );
@@ -1099,7 +1094,17 @@ async fn chat_drives_the_loop() {
     let next = s.active.clone().unwrap();
     assert_ne!(next, "route");
 
-    turn(&rt, "I already know this one").await;
+    // A bare claim the Tutor would read as a log entry is asked about
+    // first (§15), then recorded as you pick it.
+    let ask = turn(&rt, "I already know this one").await;
+    assert!(
+        ask.reply.starts_with("Which did you mean:"),
+        "{}",
+        ask.reply
+    );
+    let s = rt.load_session("s").unwrap().unwrap();
+    assert_eq!(s.map.get(&next).unwrap().status, PartStatus::Open);
+    turn(&rt, "1").await;
     let s = rt.load_session("s").unwrap().unwrap();
     assert_eq!(s.map.get(&next).unwrap().status, PartStatus::Known);
 }
@@ -1529,7 +1534,7 @@ async fn map_change_waits_for_your_ok() {
     );
     turn(&rt, "goal").await;
     let out = turn(&rt, "status should show saved sessions").await;
-    assert!(out.reply.contains("/accept"));
+    assert!(out.reply.contains("Say yes to add it, or no."));
     assert!(
         rt.load_session("s")
             .unwrap()
@@ -1857,7 +1862,7 @@ async fn a_plain_claim_is_shown_back_and_undone() {
     let out = turn(&rt, "I already know routing").await;
     assert!(
         out.reply.starts_with(
-            "Recorded: you already know **Command routing**. A claim, not evidence. `/undo` (Esc) takes it back."
+            "Recorded: you already know **Command routing**. A claim, not evidence. Say undo, or press Esc, to take it back."
         ),
         "{}",
         out.reply
@@ -2417,7 +2422,7 @@ async fn an_unsure_commitment_asks() {
     let out = turn(&rt, "routing, I sort of know that, or do I").await;
     assert_eq!(
         out.reply,
-        "Did you mean to claim you already know **Command routing** (`/known`) or to be told (`/tell <question>`)? Nothing is recorded until you say. Otherwise just go on."
+        "Which did you mean: (1) record that I already know **Command routing** (no check), (2) check me on **Command routing**, (3) just tell me or (4) just a note? Nothing is recorded until you say; a number or a few words is enough."
     );
     assert_eq!(out.shown, Shown::Notice);
     let s = session(&rt);
@@ -2459,7 +2464,7 @@ async fn an_unsure_non_commitment_falls_back_to_the_llm() {
     );
     turn(&rt, "goal").await;
     let out = turn(&rt, "the router keeps a table").await;
-    assert!(!out.reply.contains("Did you mean"));
+    assert!(!out.reply.contains("did you mean"));
     assert!(engine.replies.lock().unwrap().is_empty());
     assert_eq!(
         session(&rt).map.get("route").unwrap().log,
@@ -2534,7 +2539,7 @@ async fn fixed_lines_never_carry_the_key() {
     ];
     let mut s = session(&rt);
     assert!(
-        rt.next_step(&mut s, None, false).is_none(),
+        rt.next_step(&mut s, None, None, false).is_none(),
         "no next step while a secret is active"
     );
     assert!(
@@ -2658,7 +2663,7 @@ async fn entering_a_part_shows_the_next_step_and_horizon() {
     let out = turn(&rt, "goal").await;
     assert!(
         out.reply.contains(
-            "Next: `notes.md:20-35` · What is Dispatch by name for in this part, in your own words?"
+            "Next: `notes.md:20-35` · What role does “Dispatch by name” play in this part? Put it in your own words."
         ),
         "{}",
         out.reply
@@ -2715,7 +2720,7 @@ async fn a_steer_changes_the_next_step_and_keeps_the_message() {
     let reply = &s.history.last().unwrap().content;
     assert!(
         reply.ends_with(
-            "Next: no place in your sources names **Dispatch by name** yet; `/find <terms>` searches them. · Find one place where Dispatch by name is used. What does it do there?"
+            "Next: nothing in your sources names **Dispatch by name** yet; ask me where to look. · Find one place where “Dispatch by name” comes up. What happens there?"
         ),
         "{reply}"
     );
@@ -2918,4 +2923,404 @@ async fn confirm_turns_are_counted_by_what_ran() {
         pathfinder_schema::Step::Handoff,
         "a handoff confirmed in plain words is counted as a log turn"
     );
+}
+
+// A real session's deviations (§11, §15, §16, A3): a bare claim below the
+// Router's threshold, a part named by its source, an explanation logged
+// with no Tutor reply, commands taught in replies, and two pointers.
+
+/// Two parts whose notes point into the workspace (`b.md`, `a.md`).
+const MAP_NOTES: &str = r#"{"brief":"Two parts.","concepts":[
+    {"id":"dispatch","label":"Dispatch by name","needs":[]},
+    {"id":"status-fields","label":"Status fields","needs":[]}],
+    "parts":[
+    {"id":"route","title":"Command routing","note":"See b.md:38","depends_on":[],"concepts":["dispatch"]},
+    {"id":"report","title":"What status reports","note":"a.md:1","depends_on":["route"],"concepts":["status-fields"]}]}"#;
+
+/// `a.md` names the concept first; `b.md`, where the routing part points,
+/// names it near line 38.
+fn write_notes(rt: &Runtime) {
+    let cwd = session(rt).cwd;
+    std::fs::write(cwd.join("a.md"), "Dispatch by name, in passing.\nmore\n").unwrap();
+    let mut b: Vec<String> = (1..=60).map(|i| format!("filler {i}")).collect();
+    b[39] = "Dispatch by name: the router looks the name up.".into();
+    std::fs::write(cwd.join("b.md"), b.join("\n")).unwrap();
+}
+
+#[tokio::test]
+async fn a_bare_claim_below_the_threshold_is_asked_about_for_the_part_it_names() {
+    let (rt, engine) = runtime(
+        FakeEngine::new(vec![(ReadOnly, S1, ONBOARD_READY), (ReadOnly, S2, MAP)]),
+        false,
+    );
+    // The decision service read "log (47%)": below 0.6, no commitment weighed.
+    let (rt, _) = with_script(rt, vec![says("log", 0.47)]);
+    turn(&rt, "goal").await;
+    let out = turn(&rt, "I understand the part on status reports").await;
+    assert_eq!(out.shown, Shown::Notice);
+    assert!(
+        out.reply.starts_with(
+            "Which did you mean: (1) record that I already know **What status reports** (no check), (2) check me on **What status reports** or (3) just a note?"
+        ),
+        "{}",
+        out.reply
+    );
+    // No command taught, nothing recorded, no model called.
+    assert!(!out.reply.contains("`/"), "{}", out.reply);
+    let s = session(&rt);
+    assert!(s.map.parts.iter().all(|p| p.status == PartStatus::Open));
+    assert!(s.map.parts.iter().all(|p| p.log.is_empty()));
+    assert!(s.last_commitment.is_none());
+    assert!(engine.replies.lock().unwrap().is_empty());
+
+    // "No check" picks the claim on the part the words named.
+    let out = turn(&rt, "record it, no check").await;
+    assert!(
+        out.reply
+            .starts_with("Recorded: you already know **What status reports**."),
+        "{}",
+        out.reply
+    );
+    assert_eq!(status(&rt, "report"), PartStatus::Known);
+    assert_eq!(status(&rt, "route"), PartStatus::Open);
+    assert!(session(&rt).pending_ask.is_none());
+    // No reply in the whole flow teaches a command (§15).
+    for t in session(&rt)
+        .history
+        .iter()
+        .filter(|t| t.role == "assistant")
+    {
+        assert!(!t.content.contains("`/"), "{}", t.content);
+    }
+}
+
+#[tokio::test]
+async fn undoing_a_claim_on_a_named_part_takes_you_back() {
+    let (rt, _) = runtime(
+        FakeEngine::new(vec![(ReadOnly, S1, ONBOARD_READY), (ReadOnly, S2, MAP)]),
+        false,
+    );
+    let (rt, _) = with_script(rt, vec![says("log", 0.47), says("undo", 0.95)]);
+    turn(&rt, "goal").await;
+    assert_eq!(session(&rt).active.as_deref(), Some("route"));
+    turn(&rt, "I understand the part on status reports").await;
+    turn(&rt, "1").await;
+    assert_eq!(status(&rt, "report"), PartStatus::Known);
+    let out = turn(&rt, "undo that").await;
+    assert!(out.reply.contains("What status reports"), "{}", out.reply);
+    let s = session(&rt);
+    assert_eq!(s.map.get("report").unwrap().status, PartStatus::Open);
+    // Back on the part you were working on, not the one you named.
+    assert_eq!(s.active.as_deref(), Some("route"));
+}
+
+#[tokio::test]
+async fn i_get_it_is_asked_about_even_when_the_router_says_log() {
+    let (rt, engine) = runtime(
+        FakeEngine::new(vec![
+            (ReadOnly, S1, ONBOARD_READY),
+            (ReadOnly, S2, MAP),
+            (
+                ReadOnly,
+                S2,
+                r#"{"candidate":"It routes by a table of names.","key_reason":"r"}"#,
+            ),
+        ]),
+        false,
+    );
+    let (rt, _) = with_script(rt, vec![says("log", 0.9)]);
+    turn(&rt, "goal").await;
+    let out = turn(&rt, "ok I get it").await;
+    assert!(
+        out.reply.starts_with("Which did you mean:"),
+        "{}",
+        out.reply
+    );
+    assert!(out.reply.contains("check me on **Command routing**"));
+    // "Check me on it": your words start the log, and a candidate is written.
+    turn(&rt, "check me").await;
+    let s = session(&rt);
+    assert!(s.pending_candidate.is_some());
+    assert_eq!(
+        s.map.get("route").unwrap().log,
+        vec!["ok I get it".to_string()]
+    );
+    assert_eq!(s.map.get("route").unwrap().status, PartStatus::Open);
+    assert!(engine.replies.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn just_a_note_logs_the_message_once() {
+    let (rt, engine) = runtime(
+        FakeEngine::new(vec![
+            (ReadOnly, S1, ONBOARD_READY),
+            (ReadOnly, S2, MAP),
+            (
+                ReadOnly,
+                S1,
+                r#"{"intent":"log","reply":"ok","ack":"You say you understand routing.","question":"","map_change":null}"#,
+            ),
+        ]),
+        false,
+    );
+    rt.set_option("s", "decisions", OptionValue::Bool(false))
+        .unwrap();
+    turn(&rt, "goal").await;
+    let out = turn(&rt, "I understand this part").await;
+    assert!(
+        out.reply.starts_with("Which did you mean:"),
+        "{}",
+        out.reply
+    );
+    turn(&rt, "3").await;
+    let s = session(&rt);
+    let route = s.map.get("route").unwrap();
+    assert_eq!(route.log, vec!["I understand this part".to_string()]);
+    assert_eq!(route.status, PartStatus::Open);
+    let users: Vec<&str> = s
+        .history
+        .iter()
+        .filter(|t| t.role == "user")
+        .map(|t| t.content.as_str())
+        .collect();
+    assert_eq!(
+        users
+            .iter()
+            .filter(|u| **u == "I understand this part")
+            .count(),
+        1,
+        "{users:?}"
+    );
+    assert!(
+        s.history
+            .last()
+            .unwrap()
+            .content
+            .starts_with("You say you understand routing."),
+        "{}",
+        s.history.last().unwrap().content
+    );
+    assert!(engine.replies.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn any_other_message_drops_the_question() {
+    let (rt, _) = runtime(
+        FakeEngine::new(vec![
+            (ReadOnly, S1, ONBOARD_READY),
+            (ReadOnly, S2, MAP),
+            (ReadOnly, S1, &log_reply("ok")),
+        ]),
+        false,
+    );
+    let (rt, _) = with_script(rt, vec![says("log", 0.47), says("log", 0.9)]);
+    turn(&rt, "goal").await;
+    turn(&rt, "I know this").await;
+    assert!(session(&rt).pending_ask.is_some());
+    turn(&rt, "the router keeps a table of handlers").await;
+    let s = session(&rt);
+    assert!(s.pending_ask.is_none());
+    assert_eq!(
+        s.map.get("route").unwrap().log,
+        vec!["the router keeps a table of handlers".to_string()]
+    );
+    assert_eq!(s.map.get("route").unwrap().status, PartStatus::Open);
+}
+
+#[tokio::test]
+async fn a_doubt_or_a_no_never_records_a_claim() {
+    for answer in [
+        "I don't know",
+        "don't record anything",
+        "not sure, I don't know which",
+        "weiß nicht",
+        "skip",
+    ] {
+        let (rt, _) = runtime(
+            FakeEngine::new(vec![
+                (ReadOnly, S1, ONBOARD_READY),
+                (ReadOnly, S2, MAP),
+                (ReadOnly, S1, &log_reply("ok")),
+            ]),
+            false,
+        );
+        let (rt, _) = with_script(rt, vec![says("log", 0.47), says("log", 0.9)]);
+        turn(&rt, "goal").await;
+        let out = turn(&rt, "I understand this part").await;
+        assert!(
+            out.reply.starts_with("Which did you mean:"),
+            "{}",
+            out.reply
+        );
+        let out = turn(&rt, answer).await;
+        assert!(!out.reply.contains("Recorded"), "{answer}: {}", out.reply);
+        let s = session(&rt);
+        assert!(s.pending_ask.is_none(), "{answer}");
+        assert!(s.last_commitment.is_none(), "{answer}");
+        assert!(
+            s.map.parts.iter().all(|p| p.status == PartStatus::Open),
+            "{answer}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_ack_that_adds_to_your_words_is_not_shown() {
+    let (rt, _) = runtime(
+        FakeEngine::new(vec![
+            (ReadOnly, S1, ONBOARD_READY),
+            (ReadOnly, S2, MAP_NOTES),
+            (
+                ReadOnly,
+                S1,
+                r#"{"intent":"log","reply":"ok","ack":"You're right, and an unknown name falls through to the default handler.","question":"Good. Now where does it fail?","map_change":null}"#,
+            ),
+        ]),
+        false,
+    );
+    write_notes(&rt);
+    let (rt, _) = with_script(rt, vec![says("log", 0.9)]);
+    turn(&rt, "goal").await;
+    turn(&rt, "Explain how the router picks the handler").await;
+    let reply = session(&rt).history.last().unwrap().content.clone();
+    // New facts in the ack: the fixed line instead (§11). Two sentences in
+    // the question: the fixed question instead.
+    assert!(reply.starts_with("Logged.\n\nNext: `b.md:"), "{reply}");
+    assert!(!reply.contains("default handler"), "{reply}");
+    assert!(!reply.contains("Good. Now"), "{reply}");
+    assert!(reply.ends_with("Put it in your own words."), "{reply}");
+}
+
+#[tokio::test]
+async fn a_claim_on_a_source_with_two_parts_asks_which_part() {
+    const MAP_ONE_FILE: &str = r#"{"brief":"Two parts.","parts":[
+        {"id":"route","title":"Command routing","note":"notes.md:1","depends_on":[]},
+        {"id":"report","title":"What status reports","note":"notes.md:3","depends_on":["route"]}]}"#;
+    let (rt, _) = runtime(
+        FakeEngine::new(vec![
+            (ReadOnly, S1, ONBOARD_READY),
+            (ReadOnly, S2, MAP_ONE_FILE),
+        ]),
+        false,
+    );
+    std::fs::write(session(&rt).cwd.join("notes.md"), "a\nb\nc\nd\n").unwrap();
+    let rt = with_decisions(rt, vec![("known", 0.9, None)]);
+    turn(&rt, "goal").await;
+    let out = turn(&rt, "I know what's in notes.md").await;
+    assert_eq!(
+        out.reply,
+        "Which part do you mean: (1) **Command routing** or (2) **What status reports**? Nothing is recorded until you say."
+    );
+    assert!(
+        session(&rt)
+            .map
+            .parts
+            .iter()
+            .all(|p| p.status == PartStatus::Open)
+    );
+    // One thing to do on the part you pick: it is done, and shown back.
+    let out = turn(&rt, "2").await;
+    assert!(
+        out.reply
+            .starts_with("Recorded: you already know **What status reports**."),
+        "{}",
+        out.reply
+    );
+    assert_eq!(status(&rt, "report"), PartStatus::Known);
+    assert_eq!(status(&rt, "route"), PartStatus::Open);
+}
+
+#[tokio::test]
+async fn an_explanation_gets_a_tutor_reply_and_one_next_step() {
+    let (rt, engine) = runtime(
+        FakeEngine::new(vec![
+            (ReadOnly, S1, ONBOARD_READY),
+            (ReadOnly, S2, MAP_NOTES),
+            (
+                ReadOnly,
+                S1,
+                r#"{"intent":"log","reply":"ok","ack":"You traced how the router finds the handler for a name.","question":"Where in b.md does the lookup fail for an unknown name, and what happens then?","map_change":null,"concepts":["dispatch"],"misconception":null}"#,
+            ),
+        ]),
+        false,
+    );
+    write_notes(&rt);
+    let (rt, _) = with_script(rt, vec![says("log", 0.7)]);
+    let entered = turn(&rt, "goal").await;
+    // One pointer: the concept's lines in the part's own file, not the
+    // first file that names it, and no separate "Read:".
+    assert!(!entered.reply.contains("Read:"), "{}", entered.reply);
+    assert_eq!(
+        entered.reply.matches("Next:").count(),
+        1,
+        "{}",
+        entered.reply
+    );
+    assert!(
+        entered.reply.contains("Next: `b.md:30-50` · "),
+        "{}",
+        entered.reply
+    );
+    assert!(!entered.reply.contains("a.md"), "{}", entered.reply);
+    // Plain words, no commands taught (§15).
+    assert!(!entered.reply.contains("`/"), "{}", entered.reply);
+    assert!(entered.reply.contains("just say so"), "{}", entered.reply);
+
+    let text = "The router reads the command name, looks it up in a table and calls the handler it finds there.";
+    turn(&rt, text).await;
+    let s = session(&rt);
+    assert_eq!(s.map.get("route").unwrap().log, vec![text.to_string()]);
+    let reply = &s.history.last().unwrap().content;
+    assert!(!reply.contains("Logged."), "{reply}");
+    assert!(
+        reply
+            .starts_with("You traced how the router finds the handler for a name.\n\nNext: `b.md:"),
+        "{reply}"
+    );
+    assert!(
+        reply.ends_with(
+            " · Where in b.md does the lookup fail for an unknown name, and what happens then?"
+        ),
+        "{reply}"
+    );
+    assert_eq!(reply.matches("Next:").count(), 1, "{reply}");
+    // The Extractor still ran on the log entry.
+    assert!(
+        events_of(&rt, "dispatch")
+            .iter()
+            .any(|e| e.kind == EventKind::Touched)
+    );
+    assert!(engine.replies.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_log_entry_without_model_text_falls_back_to_fixed_lines() {
+    let (rt, _) = runtime(
+        FakeEngine::new(vec![
+            (ReadOnly, S1, ONBOARD_READY),
+            (ReadOnly, S2, MAP_NOTES),
+            (ReadOnly, S1, &log_reply("ok")),
+        ]),
+        false,
+    );
+    write_notes(&rt);
+    let (rt, _) = with_script(rt, vec![says("log", 0.9)]);
+    turn(&rt, "goal").await;
+    turn(&rt, "the router keeps a table").await;
+    let reply = session(&rt).history.last().unwrap().content.clone();
+    // Every reply still ends with one exact next step, even one shown
+    // before, with a grammatical question around the concept's name.
+    assert!(reply.starts_with("Logged.\n\nNext: `b.md:"), "{reply}");
+    assert!(
+        reply.ends_with(
+            "· What role does “Dispatch by name” play in this part? Put it in your own words."
+        ),
+        "{reply}"
+    );
+    // Shown again, recorded once.
+    let steps = events_of(&rt, "dispatch")
+        .into_iter()
+        .filter(|e| e.kind == EventKind::Step)
+        .count();
+    assert_eq!(steps, 1);
 }

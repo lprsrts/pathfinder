@@ -12,7 +12,9 @@ fn line(l: Line) -> &'static str {
         CandidateFor => "Candidate for **{title}**:",
         IsItRight => "Is it right? Say why.",
         PassedOneMore => "Passed. One more:",
-        PartHint => "Think out loud here. `/summary` · `/known` · `/delegate`",
+        PartHint => {
+            "Think out loud here: your reasoning as you go, then the part in your own words when you're ready. If you already know it, or want the agent to do it, just say so."
+        }
         RestsOn => "Rests on",
         ToldNotShown => "Recorded as told: {labels}.",
         GapNeeds => "It needs **{concept}** first: {why}.",
@@ -24,14 +26,16 @@ fn line(l: Line) -> &'static str {
         AddGapParts => "Add a part for {names}?",
         And => " and ",
         ProposedChange => "Proposed map change:",
-        AcceptReject => "`/accept` or `/reject`.",
+        AcceptReject => "Say yes to add it, or no.",
         Needs => "needs {deps}",
         FixedReply => crate::secrets::FIXED_REPLY,
         GateCapped => {
             "(Shared checks used up for today; replies about the candidate wait for your verdict. Own key: `pathfinder auth set typesafe`.)"
         }
         GateUnavailable => "(Check unreachable, reply held back. Try again in a moment.)",
-        Understood => "**{title}** understood. `/next` · `/handoff`",
+        Understood => {
+            "**{title}** understood. Say when you want to go on, or to hand it to the agent."
+        }
         KeepWorking => "Keep working, then explain it again.",
         AllResolved => "Every part is resolved.",
         NoOtherPart => "No other unresolved part.",
@@ -72,7 +76,7 @@ fn line(l: Line) -> &'static str {
         FindNone => "No line in this workspace contains {terms}.",
         WebNone => "Nothing online matched {terms}.",
         ShowKnown => {
-            "Recorded: you already know **{title}**. A claim, not evidence. `/undo` (Esc) takes it back."
+            "Recorded: you already know **{title}**. A claim, not evidence. Say undo, or press Esc, to take it back."
         }
         ShowTell => {
             "Telling you, as you asked. Recorded as told, never as understood. Esc before it arrives cancels it."
@@ -94,11 +98,14 @@ fn line(l: Line) -> &'static str {
         NotRunDelegate => "Not run: **{title}** wasn't delegated.",
         NotRunStale => "Not run: what waited for your OK no longer applies.",
         AskWhich => {
-            "Did you mean {choices}? Nothing is recorded until you say. Otherwise just go on."
+            "Which did you mean: {choices}? Nothing is recorded until you say; a number or a few words is enough."
         }
-        AskKnown => "to claim you already know **{title}** (`/known`)",
-        AskTell => "to be told (`/tell <question>`)",
-        AskAgent => "to give the part to the agent (`/handoff` or `/delegate`)",
+        AskKnown => "record that I already know **{title}** (no check)",
+        AskTell => "just tell me",
+        AskAgent => "let the agent do this part",
+        AskCheck => "check me on **{title}**",
+        AskNote => "just a note",
+        AskWhichPart => "Which part do you mean: {choices}? Nothing is recorded until you say.",
         Or => " or ",
         Undone => {
             "Undone: your claim on **{title}** is withdrawn. The record keeps it as withdrawn."
@@ -109,16 +116,19 @@ fn line(l: Line) -> &'static str {
         NothingWaiting => "Nothing is waiting for your OK.",
         NextStep => "Next: {at} · {question}",
         NextStepNoPlace => {
-            "Next: no place in your sources names **{concept}** yet; `/find <terms>` searches them. · {question}"
+            "Next: nothing in your sources names **{concept}** yet; ask me where to look. · {question}"
         }
-        StepWideExample => "Find one place where {concept} is used. What does it do there?",
-        StepWidePurpose => "What is {concept} for in this part, in your own words?",
-        StepWideMechanism => "How does {concept} work, step by step?",
+        StepPart => "What is this part for, in your own words?",
+        StepWideExample => "Find one place where “{concept}” comes up. What happens there?",
+        StepWidePurpose => {
+            "What role does “{concept}” play in this part? Put it in your own words."
+        }
+        StepWideMechanism => "How does “{concept}” work here, step by step?",
         StepNarrowExample => {
-            "Pick one line where {concept} matters. What would change if it were different?"
+            "Pick one line where “{concept}” matters. What would change if it were different?"
         }
-        StepNarrowPurpose => "Why is {concept} needed exactly there, and what breaks without it?",
-        StepNarrowMechanism => "Trace {concept} step by step: what happens first, and what next?",
+        StepNarrowPurpose => "What would break exactly there without “{concept}”?",
+        StepNarrowMechanism => "Trace “{concept}” step by step: what happens first, and what next?",
         Horizon => "Horizon: {what}.",
         HorizonNeeds => "needs {parts}",
         HorizonLeads => "leads to {parts}",

@@ -11,7 +11,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -153,8 +153,11 @@ fn review_text(hunks: &[RecordedHunk], planted: Option<(usize, &[String])>) -> S
     out
 }
 
-/// Checks the planted file still parses, where a checker is at hand.
-fn still_parses(path: &str, content: &str) -> bool {
+/// Checks the planted file still parses, where a checker is at hand. The
+/// file to check is written under `private` (the staging root, hidden from
+/// sandboxed commands and this user's only), never the shared temp folder:
+/// the planted flaw is what the agent must not see.
+fn still_parses(private: &Path, path: &str, content: &str) -> bool {
     let ext = Path::new(path)
         .extension()
         .and_then(|e| e.to_str())
@@ -174,8 +177,10 @@ fn still_parses(path: &str, content: &str) -> bool {
         "js" | "mjs" | "cjs" => &[&["node", "--check"]],
         _ => return true,
     };
-    let dir = std::env::temp_dir().join(format!("harness-plant-{}", uuid::Uuid::new_v4().simple()));
-    if std::fs::create_dir_all(&dir).is_err() {
+    let dir = private.join(format!("check-{}", uuid::Uuid::new_v4().simple()));
+    if crate::paths::ensure_private_dir(private).is_err()
+        || crate::paths::ensure_private_dir(&dir).is_err()
+    {
         return true;
     }
     let file = dir.join(format!("check.{ext}"));
@@ -222,13 +227,8 @@ fn splice(content: &str, start: usize, len: usize, added: &[String]) -> String {
 
 impl Runtime {
     fn staging_dir(&self, session: &Session, part_id: &str) -> PathBuf {
-        let base = (self.config)()
-            .db_path
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(std::env::temp_dir);
         let run = uuid::Uuid::new_v4().simple().to_string();
-        base.join("staging")
+        crate::paths::staging_root(&(self.config)().db_path)
             .join(&session.id)
             .join(format!("{part_id}-{}", &run[..8]))
     }
@@ -245,6 +245,11 @@ impl Runtime {
         sink: StreamSink,
     ) -> Result<TurnOutput> {
         let base = ledger::snapshot(root)?;
+        // A real folder, this user's only: a link planted where the staging
+        // root goes would put the copies (and their planted flaws) in sight.
+        let staging_root = crate::paths::staging_root(&(self.config)().db_path);
+        crate::paths::ensure_private_dir(&staging_root)
+            .with_context(|| format!("making {}", staging_root.display()))?;
         let dir = self.staging_dir(session, &part.id);
         if dir.exists() {
             std::fs::remove_dir_all(&dir).ok();
@@ -470,7 +475,11 @@ impl Runtime {
             };
             let added: Vec<String> = planted.added.lines().map(str::to_string).collect();
             let content = splice(&file, target.hunk.new_start, target.hunk.new_len, &added);
-            let parses = still_parses(&target.path, &content);
+            let parses = still_parses(
+                &crate::paths::staging_root(&(self.config)().db_path),
+                &target.path,
+                &content,
+            );
             outcome.attempts.push(Attempt {
                 parses,
                 changes_behaviour: None,
@@ -837,8 +846,9 @@ mod tests {
             splice("a\nb\nc\n", 2, 1, &["x".into(), "y".into()]),
             "a\nx\ny\nc\n"
         );
-        assert!(still_parses("x.json", "{}"));
-        assert!(!still_parses("x.json", "{"));
+        let tmp = std::env::temp_dir();
+        assert!(still_parses(&tmp, "x.json", "{}"));
+        assert!(!still_parses(&tmp, "x.json", "{"));
     }
 
     use std::collections::{HashMap, VecDeque};

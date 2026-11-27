@@ -12,7 +12,9 @@ fn line(l: Line) -> &'static str {
         CandidateFor => "**{title}** 설명 후보:",
         IsItRight => "맞나요? 이유도 말해 주세요.",
         PassedOneMore => "통과했어요. 하나 더:",
-        PartHint => "여기서 생각을 적어 가며 풀어 보세요. `/summary` · `/known` · `/delegate`",
+        PartHint => {
+            "여기서 생각을 적어 가며 풀어 보세요. 작업하면서 떠오른 이유를 적고, 준비되면 이 파트를 자기 말로 설명해 보세요. 이미 알거나 에이전트에게 맡기고 싶다면 그냥 말해 주세요."
+        }
         RestsOn => "기반",
         ToldNotShown => "들은 것으로 기록했어요: {labels}.",
         GapNeeds => "먼저 **{concept}**이(가) 필요해요: {why}.",
@@ -24,7 +26,7 @@ fn line(l: Line) -> &'static str {
         AddGapParts => "{names} 파트를 추가할까요?",
         And => ", ",
         ProposedChange => "지도 변경 제안:",
-        AcceptReject => "`/accept` 또는 `/reject`.",
+        AcceptReject => "추가하려면 네, 아니면 아니요라고 해 주세요.",
         Needs => "필요: {deps}",
         FixedReply => "그건 지금 판정하고 있는 내용이에요. 판정부터 해 주세요.",
         GateCapped => {
@@ -33,7 +35,9 @@ fn line(l: Line) -> &'static str {
         GateUnavailable => {
             "(확인 서비스에 연결할 수 없어 답변을 보류했어요. 잠시 후 다시 시도해 주세요.)"
         }
-        Understood => "**{title}** 이해 완료. `/next` · `/handoff`",
+        Understood => {
+            "**{title}** 이해 완료. 다음으로 넘어가거나 에이전트에게 맡기고 싶을 때 말해 주세요."
+        }
         KeepWorking => "계속 작업한 뒤 다시 설명해 보세요.",
         AllResolved => "모든 파트가 해결됐어요.",
         NoOtherPart => "해결되지 않은 다른 파트가 없어요.",
@@ -74,7 +78,7 @@ fn line(l: Line) -> &'static str {
         FindNone => "이 폴더에는 {terms}이(가) 들어 있는 줄이 없어요.",
         WebNone => "온라인에서 {terms}와(과) 일치하는 결과가 없어요.",
         ShowKnown => {
-            "기록했어요: **{title}**을(를) 이미 안다고요. 근거가 아니라 주장이에요. `/undo` (Esc)로 되돌릴 수 있어요."
+            "기록했어요: **{title}**을(를) 이미 안다고요. 근거가 아니라 주장이에요. \"되돌려\"라고 하거나 Esc를 누르면 되돌릴 수 있어요."
         }
         ShowTell => {
             "요청대로 알려 드릴게요. 이해가 아니라 '들음'으로 기록돼요. 답이 오기 전에 Esc를 누르면 취소돼요."
@@ -96,11 +100,16 @@ fn line(l: Line) -> &'static str {
         NotRunDelegate => "실행 안 됨: **{title}**을(를) 넘기지 않았어요.",
         NotRunStale => "실행 안 됨: 승인을 기다리던 일이 더 이상 해당되지 않아요.",
         AskWhich => {
-            "{choices} 뜻이었나요? 말해 주기 전까지는 아무것도 기록하지 않아요. 아니면 그냥 계속하세요."
+            "어느 쪽이었나요: {choices}? 말해 주기 전까지는 아무것도 기록하지 않아요. 번호나 몇 마디면 돼요."
         }
-        AskKnown => "**{title}**을(를) 이미 안다는 (`/known`)",
-        AskTell => "답을 알려 달라는 (`/tell <question>`)",
-        AskAgent => "이 부분을 에이전트에게 맡기라는 (`/handoff` 또는 `/delegate`)",
+        AskKnown => "**{title}**을(를) 이미 안다고 기록 (확인 없음)",
+        AskTell => "그냥 알려 줘",
+        AskAgent => "이 파트는 에이전트가 하게 해 줘",
+        AskCheck => "**{title}**에 대해 확인해 줘",
+        AskNote => "그냥 메모",
+        AskWhichPart => {
+            "어느 파트를 말하는 건가요: {choices}? 말해 주기 전까지는 아무것도 기록하지 않아요."
+        }
         Or => " 또는 ",
         Undone => "되돌렸어요: **{title}**에 대한 주장을 철회했어요. 기록에는 철회로 남아요.",
         NothingToUndo => {
@@ -109,8 +118,9 @@ fn line(l: Line) -> &'static str {
         NothingWaiting => "승인을 기다리는 것이 없어요.",
         NextStep => "다음: {at} · {question}",
         NextStepNoPlace => {
-            "다음: 자료에 아직 **{concept}**이(가) 나오는 곳이 없어요. `/find <terms>`로 찾아볼 수 있어요. · {question}"
+            "다음: 자료에 아직 **{concept}**이(가) 나오는 곳이 없어요. 어디를 보면 될지 물어보세요. · {question}"
         }
+        StepPart => "이 부분은 무엇을 위한 건가요? 자기 말로요.",
         StepWideExample => "{concept}이(가) 쓰이는 곳을 하나 찾아보세요. 거기서 무엇을 하나요?",
         StepWidePurpose => "이 부분에서 {concept}은(는) 무엇을 위한 건가요? 자기 말로요.",
         StepWideMechanism => "{concept}은(는) 어떻게 작동하나요? 한 단계씩요.",

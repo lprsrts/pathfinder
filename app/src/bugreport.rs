@@ -13,9 +13,7 @@ const LOG_LINES: usize = 60;
 
 /// Where the TUI writes its log.
 pub fn tui_log() -> PathBuf {
-    crate::config::Config::load()
-        .db_path
-        .with_file_name("tui.log")
+    crate::paths::tui_log(&crate::config::Config::load().db_path)
 }
 
 pub fn build(note: &str, cwd: &Path) -> BugReport {

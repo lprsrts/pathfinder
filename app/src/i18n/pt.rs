@@ -12,7 +12,9 @@ fn line(l: Line) -> &'static str {
         CandidateFor => "Candidato para **{title}**:",
         IsItRight => "Está certo? Diga por quê.",
         PassedOneMore => "Aprovado. Mais um:",
-        PartHint => "Pense em voz alta aqui. `/summary` · `/known` · `/delegate`",
+        PartHint => {
+            "Pense em voz alta aqui: seu raciocínio enquanto trabalha e, quando estiver pronto, a parte com suas próprias palavras. Se já a conhece ou quer que o agente a faça, é só dizer."
+        }
         RestsOn => "Depende de",
         ToldNotShown => "Registrado como dito: {labels}.",
         GapNeeds => "Primeiro precisa de **{concept}**: {why}.",
@@ -24,7 +26,7 @@ fn line(l: Line) -> &'static str {
         AddGapParts => "Adicionar uma parte para {names}?",
         And => " e ",
         ProposedChange => "Mudança proposta no mapa:",
-        AcceptReject => "`/accept` ou `/reject`.",
+        AcceptReject => "Diga sim para adicionar, ou não.",
         Needs => "precisa de {deps}",
         FixedReply => "É isso que você está julgando. Primeiro o seu veredito.",
         GateCapped => {
@@ -33,7 +35,9 @@ fn line(l: Line) -> &'static str {
         GateUnavailable => {
             "(Verificação indisponível, resposta retida. Tente de novo em instantes.)"
         }
-        Understood => "**{title}** entendido. `/next` · `/handoff`",
+        Understood => {
+            "**{title}** entendido. Diga quando quiser seguir em frente ou passá-lo ao agente."
+        }
         KeepWorking => "Continue trabalhando e depois explique de novo.",
         AllResolved => "Todas as partes estão resolvidas.",
         NoOtherPart => "Nenhuma outra parte pendente.",
@@ -74,7 +78,7 @@ fn line(l: Line) -> &'static str {
         FindNone => "Nenhuma linha desta pasta contém {terms}.",
         WebNone => "Nada online corresponde a {terms}.",
         ShowKnown => {
-            "Registrado: você já conhece **{title}**. Uma afirmação, não uma evidência. `/undo` (Esc) desfaz."
+            "Registrado: você já conhece **{title}**. Uma afirmação, não uma evidência. Diga \"desfazer\" ou aperte Esc para retirar."
         }
         ShowTell => {
             "Vou te dizer, como pediu. Registrado como dito, nunca como entendido. Esc antes de chegar cancela."
@@ -96,11 +100,14 @@ fn line(l: Line) -> &'static str {
         NotRunDelegate => "Não executado: **{title}** não foi delegado.",
         NotRunStale => "Não executado: o que esperava seu OK não se aplica mais.",
         AskWhich => {
-            "Você quis dizer {choices}? Nada é registrado até você dizer. Senão, siga em frente."
+            "O que você quis dizer: {choices}? Nada é registrado até você dizer; um número ou algumas palavras bastam."
         }
-        AskKnown => "que já conhece **{title}** (`/known`)",
-        AskTell => "que eu te diga (`/tell <question>`)",
-        AskAgent => "passar a parte ao agente (`/handoff` ou `/delegate`)",
+        AskKnown => "registrar que já conheço **{title}** (sem verificação)",
+        AskTell => "só me diga",
+        AskAgent => "deixe o agente fazer esta parte",
+        AskCheck => "me teste em **{title}**",
+        AskNote => "só uma nota",
+        AskWhichPart => "Qual parte você quer dizer: {choices}? Nada é registrado até você dizer.",
         Or => " ou ",
         Undone => {
             "Desfeito: sua afirmação sobre **{title}** foi retirada. O registro a mantém como retirada."
@@ -111,8 +118,9 @@ fn line(l: Line) -> &'static str {
         NothingWaiting => "Nada espera seu OK.",
         NextStep => "Próximo: {at} · {question}",
         NextStepNoPlace => {
-            "Próximo: nenhum lugar nas suas fontes cita **{concept}** ainda; `/find <terms>` busca nelas. · {question}"
+            "Próximo: nada nas suas fontes cita **{concept}** ainda; pergunte-me onde procurar. · {question}"
         }
+        StepPart => "Para que serve esta parte, com suas palavras?",
         StepWideExample => "Ache um lugar onde {concept} é usado. O que ele faz ali?",
         StepWidePurpose => "Para que serve {concept} nesta parte, com suas palavras?",
         StepWideMechanism => "Como {concept} funciona, passo a passo?",

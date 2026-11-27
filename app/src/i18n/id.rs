@@ -12,7 +12,9 @@ fn line(l: Line) -> &'static str {
         CandidateFor => "Kandidat untuk **{title}**:",
         IsItRight => "Benar? Jelaskan alasannya.",
         PassedOneMore => "Lulus. Satu lagi:",
-        PartHint => "Tulis jalan pikiranmu di sini. `/summary` · `/known` · `/delegate`",
+        PartHint => {
+            "Tulis jalan pikiranmu di sini: alasanmu sambil bekerja, lalu bagian ini dengan kata-katamu sendiri saat kamu siap. Kalau sudah tahu atau ingin agen yang mengerjakannya, bilang saja."
+        }
         RestsOn => "Bergantung pada",
         ToldNotShown => "Dicatat sebagai diberi tahu: {labels}.",
         GapNeeds => "Perlu **{concept}** dulu: {why}.",
@@ -24,7 +26,7 @@ fn line(l: Line) -> &'static str {
         AddGapParts => "Tambahkan bagian untuk {names}?",
         And => " dan ",
         ProposedChange => "Usulan perubahan peta:",
-        AcceptReject => "`/accept` atau `/reject`.",
+        AcceptReject => "Bilang ya untuk menambahkannya, atau tidak.",
         Needs => "butuh {deps}",
         FixedReply => "Itu yang sedang kamu nilai. Putusanmu dulu.",
         GateCapped => {
@@ -33,7 +35,9 @@ fn line(l: Line) -> &'static str {
         GateUnavailable => {
             "(Pemeriksaan tidak terjangkau, balasan ditahan. Coba lagi sebentar lagi.)"
         }
-        Understood => "**{title}** dipahami. `/next` · `/handoff`",
+        Understood => {
+            "**{title}** dipahami. Bilang kalau kamu mau lanjut atau menyerahkannya ke agen."
+        }
         KeepWorking => "Lanjutkan, lalu jelaskan lagi.",
         AllResolved => "Semua bagian sudah selesai.",
         NoOtherPart => "Tidak ada bagian lain yang belum selesai.",
@@ -74,7 +78,7 @@ fn line(l: Line) -> &'static str {
         FindNone => "Tidak ada baris di folder ini yang memuat {terms}.",
         WebNone => "Tidak ada hasil daring untuk {terms}.",
         ShowKnown => {
-            "Dicatat: kamu sudah tahu **{title}**. Sebuah klaim, bukan bukti. `/undo` (Esc) membatalkannya."
+            "Dicatat: kamu sudah tahu **{title}**. Sebuah klaim, bukan bukti. Bilang \"batalkan\" atau tekan Esc untuk menariknya kembali."
         }
         ShowTell => {
             "Aku beri tahu, seperti yang kamu minta. Dicatat sebagai diberi tahu, tidak pernah sebagai dipahami. Esc sebelum jawabannya tiba membatalkannya."
@@ -96,11 +100,16 @@ fn line(l: Line) -> &'static str {
         NotRunDelegate => "Tidak dijalankan: **{title}** tidak diserahkan.",
         NotRunStale => "Tidak dijalankan: yang menunggu OK-mu sudah tidak berlaku.",
         AskWhich => {
-            "Maksudmu {choices}? Tidak ada yang dicatat sampai kamu bilang. Kalau tidak, lanjut saja."
+            "Maksudmu yang mana: {choices}? Tidak ada yang dicatat sampai kamu bilang; cukup nomor atau beberapa kata."
         }
-        AskKnown => "mengklaim sudah tahu **{title}** (`/known`)",
-        AskTell => "diberi tahu (`/tell <question>`)",
-        AskAgent => "menyerahkan bagian ini ke agen (`/handoff` atau `/delegate`)",
+        AskKnown => "catat bahwa saya sudah tahu **{title}** (tanpa pengecekan)",
+        AskTell => "langsung beri tahu saya",
+        AskAgent => "biar agen yang mengerjakan bagian ini",
+        AskCheck => "uji saya tentang **{title}**",
+        AskNote => "hanya catatan",
+        AskWhichPart => {
+            "Bagian mana yang kamu maksud: {choices}? Tidak ada yang dicatat sampai kamu bilang."
+        }
         Or => " atau ",
         Undone => {
             "Dibatalkan: klaimmu atas **{title}** ditarik. Catatan menyimpannya sebagai ditarik."
@@ -111,8 +120,9 @@ fn line(l: Line) -> &'static str {
         NothingWaiting => "Tidak ada yang menunggu OK-mu.",
         NextStep => "Berikutnya: {at} · {question}",
         NextStepNoPlace => {
-            "Berikutnya: belum ada tempat di sumbermu yang menyebut **{concept}**; `/find <terms>` mencarinya. · {question}"
+            "Berikutnya: belum ada di sumbermu yang menyebut **{concept}**; tanyakan padaku di mana mencarinya. · {question}"
         }
+        StepPart => "Untuk apa bagian ini, dengan kata-katamu sendiri?",
         StepWideExample => "Temukan satu tempat di mana {concept} dipakai. Apa fungsinya di sana?",
         StepWidePurpose => "Untuk apa {concept} di bagian ini, dengan kata-katamu sendiri?",
         StepWideMechanism => "Bagaimana {concept} bekerja, langkah demi langkah?",

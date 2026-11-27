@@ -12,7 +12,9 @@ fn line(l: Line) -> &'static str {
         CandidateFor => "Kandidat für **{title}**:",
         IsItRight => "Stimmt das? Sag, warum.",
         PassedOneMore => "Bestanden. Noch einer:",
-        PartHint => "Denk hier laut. `/summary` · `/known` · `/delegate`",
+        PartHint => {
+            "Denk hier laut: deine Überlegungen beim Arbeiten, dann den Teil in deinen eigenen Worten, wenn du so weit bist. Wenn du ihn schon kennst oder der Agent ihn machen soll, sag es einfach."
+        }
         RestsOn => "Beruht auf",
         ToldNotShown => "Als gesagt vermerkt: {labels}.",
         GapNeeds => "Zuerst braucht es **{concept}**: {why}.",
@@ -24,7 +26,7 @@ fn line(l: Line) -> &'static str {
         AddGapParts => "Einen Teil für {names} hinzufügen?",
         And => " und ",
         ProposedChange => "Vorgeschlagene Kartenänderung:",
-        AcceptReject => "`/accept` oder `/reject`.",
+        AcceptReject => "Sag ja, um es zu übernehmen, oder nein.",
         Needs => "braucht {deps}",
         FixedReply => "Das beurteilst du gerade. Erst dein Urteil.",
         GateCapped => {
@@ -33,7 +35,9 @@ fn line(l: Line) -> &'static str {
         GateUnavailable => {
             "(Prüfung nicht erreichbar, Antwort zurückgehalten. Versuch es gleich noch einmal.)"
         }
-        Understood => "**{title}** verstanden. `/next` · `/handoff`",
+        Understood => {
+            "**{title}** verstanden. Sag, wenn du weitermachen oder ihn an den Agenten geben willst."
+        }
         KeepWorking => "Arbeite weiter und erklär es dann noch einmal.",
         AllResolved => "Alle Teile sind erledigt.",
         NoOtherPart => "Kein weiterer offener Teil.",
@@ -74,7 +78,7 @@ fn line(l: Line) -> &'static str {
         FindNone => "Keine Zeile in diesem Ordner enthält {terms}.",
         WebNone => "Online passte nichts zu {terms}.",
         ShowKnown => {
-            "Vermerkt: Du kennst **{title}** schon. Eine Behauptung, kein Nachweis. `/undo` (Esc) nimmt es zurück."
+            "Vermerkt: Du kennst **{title}** schon. Eine Behauptung, kein Nachweis. Sag „rückgängig“ oder drück Esc, um es zurückzunehmen."
         }
         ShowTell => {
             "Ich sag's dir, wie gewünscht. Vermerkt als gesagt, nie als verstanden. Esc, bevor es da ist, bricht ab."
@@ -96,11 +100,14 @@ fn line(l: Line) -> &'static str {
         NotRunDelegate => "Nicht ausgeführt: **{title}** wurde nicht abgegeben.",
         NotRunStale => "Nicht ausgeführt: Was auf dein OK wartete, gilt nicht mehr.",
         AskWhich => {
-            "Meintest du {choices}? Nichts wird vermerkt, bis du es sagst. Sonst mach einfach weiter."
+            "Was meintest du: {choices}? Nichts wird vermerkt, bis du es sagst; eine Zahl oder ein paar Worte reichen."
         }
-        AskKnown => "dass du **{title}** schon kennst (`/known`)",
-        AskTell => "dass ich es dir sage (`/tell <question>`)",
-        AskAgent => "dass der Agent den Teil übernimmt (`/handoff` oder `/delegate`)",
+        AskKnown => "vermerken, dass ich **{title}** schon kenne (ohne Prüfung)",
+        AskTell => "sag es mir einfach",
+        AskAgent => "lass den Agenten diesen Teil machen",
+        AskCheck => "prüf mich zu **{title}**",
+        AskNote => "nur eine Notiz",
+        AskWhichPart => "Welchen Teil meinst du: {choices}? Nichts wird vermerkt, bis du es sagst.",
         Or => " oder ",
         Undone => {
             "Rückgängig: Deine Behauptung zu **{title}** ist zurückgezogen. Der Verlauf hält sie als zurückgezogen fest."
@@ -111,8 +118,9 @@ fn line(l: Line) -> &'static str {
         NothingWaiting => "Nichts wartet auf dein OK.",
         NextStep => "Als Nächstes: {at} · {question}",
         NextStepNoPlace => {
-            "Als Nächstes: Noch keine Stelle in deinen Quellen nennt **{concept}**; `/find <terms>` durchsucht sie. · {question}"
+            "Als Nächstes: Noch nichts in deinen Quellen nennt **{concept}**; frag mich, wo du suchen sollst. · {question}"
         }
+        StepPart => "Wozu ist dieser Teil da, in deinen Worten?",
         StepWideExample => "Finde eine Stelle, an der {concept} vorkommt. Was bewirkt es dort?",
         StepWidePurpose => "Wozu dient {concept} in diesem Teil, in deinen Worten?",
         StepWideMechanism => "Wie funktioniert {concept}, Schritt für Schritt?",

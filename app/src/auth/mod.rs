@@ -98,8 +98,7 @@ fn read_macos_keychain(service: &str) -> Result<Option<String>> {
 impl Credentials {
     /// `auth.json` in the config folder ([`crate::paths`]).
     pub fn system() -> Self {
-        let store: Arc<dyn SecretStore> =
-            Arc::new(FileStore::new(chatgpt::config_dir().join("auth.json")));
+        let store: Arc<dyn SecretStore> = Arc::new(FileStore::new(crate::paths::auth_file()));
         Self {
             chatgpt: Arc::new(ChatGpt::new(store.clone())),
             store,

@@ -311,7 +311,13 @@ fn render_numbered_block(
         // a drag copies no numbers or marks.
         for raw_line in block {
             let expanded = raw_line.replace('\t', "    ");
-            let (_, mut rest) = split_gutter(&expanded);
+            let (_, code) = split_gutter(&expanded);
+            let fitted = if prose {
+                fit_indent(code, total_w)
+            } else {
+                code.into()
+            };
+            let mut rest = fitted.as_ref();
             if rest.is_empty() {
                 out.push(Line::default());
             }
@@ -331,6 +337,12 @@ fn render_numbered_block(
         let (gutter, code) = split_gutter(&expanded);
         let g = gutter.width();
         let code_w = total_w.saturating_sub(g);
+        let fitted = if prose {
+            fit_indent(code, code_w)
+        } else {
+            code.into()
+        };
+        let code = fitted.as_ref();
         if code_w < 8 {
             // Too narrow for a gutter: the line as it is, cut to fit.
             let mut rest = expanded.as_str();
@@ -376,6 +388,29 @@ fn render_numbered_block(
         }
     }
     out.extend(wrap_hanging(&spans, width, 3));
+}
+
+/// A prose line laid out far to the right (a PDF page's label, such as
+/// `FuB 1.19`, under 70 columns of `pdftotext -layout` spaces) with less
+/// indent, so its first word isn't cut in two at the row's edge: the text
+/// keeps to the right as far as it fits.
+fn fit_indent(code: &str, avail: usize) -> std::borrow::Cow<'_, str> {
+    let text = code.trim_start_matches(' ');
+    let lead = code.len() - text.len();
+    let whole = text.width();
+    let first = text.split_whitespace().next().unwrap_or("").width();
+    let lead = if lead == 0 || lead + whole <= avail {
+        return code.into();
+    } else if whole <= avail {
+        // All of it fits on one row: as far right as it can be.
+        avail - whole
+    } else if lead + first > avail {
+        // At least the first word whole on the first row.
+        avail.saturating_sub(first)
+    } else {
+        return code.into();
+    };
+    format!("{}{text}", " ".repeat(lead)).into()
 }
 
 /// `   12  code` → (`   12  `, `code`); a line without a number has no gutter.
@@ -1491,6 +1526,28 @@ mod tests {
         assert_eq!(cmd.style.fg, Some(Color::Cyan));
         let note = last.iter().find(|s| s.content.contains("shown")).unwrap();
         assert!(note.style.add_modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn a_far_right_page_label_keeps_its_words_whole() {
+        let label = format!("{}FuB 1.19", " ".repeat(72));
+        let src = format!("```text numbered\n   2  {label}\n```");
+        let rows: Vec<String> = render(&src, 60, Style::default())
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert!(rows.iter().any(|r| r.ends_with("FuB 1.19")), "{rows:?}");
+        assert!(rows.iter().all(|r| r.width() <= 60), "{rows:?}");
+        assert_eq!(fit_indent("  short", 40), "  short");
+        assert_eq!(fit_indent("      FuB 1.19", 10), "  FuB 1.19");
+        assert_eq!(
+            fit_indent("      a long line of words", 10),
+            "      a long line of words"
+        );
+        assert_eq!(
+            fit_indent("         Maxwell-Gleichungen", 12),
+            "Maxwell-Gleichungen"
+        );
     }
 
     #[test]

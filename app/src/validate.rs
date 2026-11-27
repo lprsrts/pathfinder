@@ -257,6 +257,8 @@ mod tests {
             intent: Intent::Accept,
             part: None,
             reply: String::new(),
+            ack: String::new(),
+            question: String::new(),
             map_change: None,
             concepts: vec![],
             misconception: None,
@@ -292,6 +294,8 @@ mod tests {
             intent: Intent::Log,
             part: None,
             reply: "Noted.".into(),
+            ack: String::new(),
+            question: String::new(),
             map_change: Some(MapChange {
                 goal: None,
                 brief: "drop a".into(),
@@ -311,6 +315,8 @@ mod tests {
             intent: Intent::Log,
             part: None,
             reply: "Noted.".into(),
+            ack: String::new(),
+            question: String::new(),
             map_change: Some(MapChange {
                 goal: None,
                 brief: "add b".into(),

@@ -600,8 +600,16 @@ struct TempPrompt {
 
 impl TempPrompt {
     fn write(text: &str) -> Result<Self> {
+        // Pathfinder's private scratch folder, not the shared temp folder:
+        // the agent's sandboxed commands can't read it.
+        Self::write_in(&crate::paths::scratch_dir(), text)
+    }
+
+    fn write_in(dir: &Path, text: &str) -> Result<Self> {
         use std::io::Write;
-        let path = std::env::temp_dir().join(format!(
+        crate::paths::ensure_private_dir(dir)
+            .with_context(|| format!("making {}", dir.display()))?;
+        let path = dir.join(format!(
             "pathfinder-prompt-{}.md",
             uuid::Uuid::new_v4().simple()
         ));
@@ -820,7 +828,8 @@ mod tests {
 
     #[test]
     fn long_prompts_go_through_a_private_file_removed_after() {
-        let file = TempPrompt::write("be brief").unwrap();
+        let dir = std::env::temp_dir().join(format!("pf-prompt-{}", uuid::Uuid::new_v4().simple()));
+        let file = TempPrompt::write_in(&dir, "be brief").unwrap();
         let path = file.path.clone();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "be brief");
         #[cfg(unix)]
@@ -831,6 +840,7 @@ mod tests {
         }
         drop(file);
         assert!(!path.exists());
+        std::fs::remove_dir(&dir).ok();
         assert!(!prompt_needs_file("short") || cfg!(windows));
     }
 

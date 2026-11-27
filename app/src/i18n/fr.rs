@@ -12,7 +12,9 @@ fn line(l: Line) -> &'static str {
         CandidateFor => "Candidat pour **{title}** :",
         IsItRight => "C'est juste ? Dis pourquoi.",
         PassedOneMore => "Réussi. Encore un :",
-        PartHint => "Réfléchis à voix haute ici. `/summary` · `/known` · `/delegate`",
+        PartHint => {
+            "Réfléchis à voix haute ici : ton raisonnement au fil du travail, puis la partie dans tes propres mots quand tu es prêt. Si tu la connais déjà ou veux que l'agent la fasse, dis-le simplement."
+        }
         RestsOn => "Repose sur",
         ToldNotShown => "Noté comme dit : {labels}.",
         GapNeeds => "Il faut d'abord **{concept}** : {why}.",
@@ -24,14 +26,16 @@ fn line(l: Line) -> &'static str {
         AddGapParts => "Ajouter une partie pour {names} ?",
         And => " et ",
         ProposedChange => "Modification de carte proposée :",
-        AcceptReject => "`/accept` ou `/reject`.",
+        AcceptReject => "Dis oui pour l'ajouter, ou non.",
         Needs => "nécessite {deps}",
         FixedReply => "C'est ce que tu es en train de juger. D'abord ton verdict.",
         GateCapped => {
             "(Vérifications partagées épuisées pour aujourd'hui ; les réponses sur le candidat attendent ton verdict. Clé personnelle : `pathfinder auth set typesafe`.)"
         }
         GateUnavailable => "(Vérification injoignable, réponse retenue. Réessaie dans un instant.)",
-        Understood => "**{title}** compris. `/next` · `/handoff`",
+        Understood => {
+            "**{title}** compris. Dis-moi quand tu veux continuer, ou le confier à l'agent."
+        }
         KeepWorking => "Continue, puis explique-le à nouveau.",
         AllResolved => "Toutes les parties sont résolues.",
         NoOtherPart => "Aucune autre partie non résolue.",
@@ -72,7 +76,7 @@ fn line(l: Line) -> &'static str {
         FindNone => "Aucune ligne de ce dossier ne contient {terms}.",
         WebNone => "Rien en ligne ne correspond à {terms}.",
         ShowKnown => {
-            "Noté : tu connais déjà **{title}**. Une affirmation, pas une preuve. `/undo` (Esc) l'annule."
+            "Noté : tu connais déjà **{title}**. Une affirmation, pas une preuve. Dis « annuler » ou appuie sur Échap pour le retirer."
         }
         ShowTell => {
             "Je te le dis, comme demandé. Noté comme dit, jamais comme compris. Esc avant l'arrivée annule."
@@ -94,11 +98,16 @@ fn line(l: Line) -> &'static str {
         NotRunDelegate => "Non lancé : **{title}** n'a pas été délégué.",
         NotRunStale => "Non lancé : ce qui attendait ton accord ne s'applique plus.",
         AskWhich => {
-            "Tu voulais dire {choices} ? Rien n'est noté tant que tu ne le dis pas. Sinon, continue."
+            "Tu voulais dire : {choices} ? Rien n'est noté tant que tu ne le dis pas ; un numéro ou quelques mots suffisent."
         }
-        AskKnown => "que tu connais déjà **{title}** (`/known`)",
-        AskTell => "qu'on te le dise (`/tell <question>`)",
-        AskAgent => "confier la partie à l'agent (`/handoff` ou `/delegate`)",
+        AskKnown => "noter que je connais déjà **{title}** (sans vérification)",
+        AskTell => "dis-le-moi simplement",
+        AskAgent => "laisse l'agent faire cette partie",
+        AskCheck => "vérifie-moi sur **{title}**",
+        AskNote => "juste une note",
+        AskWhichPart => {
+            "Quelle partie veux-tu dire : {choices} ? Rien n'est noté tant que tu ne le dis pas."
+        }
         Or => " ou ",
         Undone => {
             "Annulé : ton affirmation sur **{title}** est retirée. Le dossier la garde comme retirée."
@@ -109,8 +118,9 @@ fn line(l: Line) -> &'static str {
         NothingWaiting => "Rien n'attend ton accord.",
         NextStep => "Ensuite : {at} · {question}",
         NextStepNoPlace => {
-            "Ensuite : aucun endroit de tes sources ne nomme encore **{concept}** ; `/find <terms>` les parcourt. · {question}"
+            "Ensuite : rien dans tes sources ne nomme encore **{concept}** ; demande-moi où chercher. · {question}"
         }
+        StepPart => "À quoi sert cette partie, avec tes mots ?",
         StepWideExample => "Trouve un endroit où {concept} est utilisé. Qu'y fait-il ?",
         StepWidePurpose => "À quoi sert {concept} dans cette partie, avec tes mots ?",
         StepWideMechanism => "Comment fonctionne {concept}, étape par étape ?",

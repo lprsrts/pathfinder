@@ -235,22 +235,179 @@ pub fn cache_dir() -> PathBuf {
     dir(Kind::Cache)
 }
 
-/// Folders a sandboxed command must not read: wherever the config (with
-/// the secrets) resolves to, plus the XDG and platform places it could be
-/// in under another environment.
-pub fn secret_dirs() -> Vec<PathBuf> {
-    let mut dirs = vec![config_dir()];
-    if let Some(home) = home() {
-        dirs.push(native(Kind::Config, &home));
-        dirs.push(xdg_base(Kind::Config, &home).join(NAME));
-        dirs.push(xdg_base(Kind::Config, &home).join(OLD_NAME));
+/// `auth.json`: the sign-ins and keys, in the config folder.
+pub fn auth_file() -> PathBuf {
+    config_dir().join("auth.json")
+}
+
+/// The TUI's log, next to the database.
+pub fn tui_log(db: &Path) -> PathBuf {
+    db.with_file_name("tui.log")
+}
+
+/// The previous TUI log, kept when the log grows too big.
+pub fn tui_log_old(db: &Path) -> PathBuf {
+    tui_log(db).with_extension("log.1")
+}
+
+/// When `pathfinder update` last looked for a release, next to the database.
+pub fn latest_version_stamp(db: &Path) -> PathBuf {
+    db.with_file_name("latest-version")
+}
+
+/// Where staged handoffs keep their copies: `staging/` next to the
+/// database. Each copy may hold a planted flaw, so another run must not see
+/// it.
+pub fn staging_root(db: &Path) -> PathBuf {
+    db.parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(env::temp_dir)
+        .join("staging")
+}
+
+/// Pathfinder's own scratch files (the eval database, a long system prompt
+/// for the Claude CLI, git index copies): in the state folder rather than
+/// the shared temp folder, so they are private like the rest.
+pub fn scratch_dir() -> PathBuf {
+    state_dir().join("tmp")
+}
+
+/// Makes `dir` (and any missing parents) readable by this user only, and
+/// checks it is a real folder: not a link someone planted where Pathfinder
+/// was going to make it, which would send its private files elsewhere.
+pub fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
+    if !dir.exists() {
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(dir)?;
+    }
+    let meta = std::fs::symlink_metadata(dir)?;
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return Err(std::io::Error::other(format!(
+            "{} is not a plain folder",
+            dir.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Opens a private file without following a link at its name (where the
+/// system can): a link planted there can't redirect what Pathfinder writes.
+pub fn no_follow(options: &mut std::fs::OpenOptions) -> &mut std::fs::OpenOptions {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    options
+}
+
+/// Everything private to Pathfinder: what a sandboxed command must neither
+/// read nor write (theory A2: the Agent never sees concept states or the
+/// ledger). This is the one list. A new private file goes under one of
+/// these folders, or is added here; `private_paths_cover_every_private_file`
+/// fails otherwise.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Private {
+    /// Folders hidden whole.
+    pub dirs: Vec<PathBuf>,
+    /// Files hidden one by one, where their folder isn't Pathfinder's own
+    /// (a database set with `PATHFINDER_DB_PATH`).
+    pub files: Vec<PathBuf>,
+    /// The folders among `dirs` that Pathfinder makes anyway (the config,
+    /// data, state and cache folders, the staging root). The Linux sandbox
+    /// makes them before a command, so a mask covers them from the start:
+    /// one made while a command runs is hidden too, and a command can't
+    /// plant a link where one will be.
+    pub made: Vec<PathBuf>,
+}
+
+impl Private {
+    /// Whether `path` is one of these files or inside one of these folders.
+    /// Both sides are compared as given; pass absolute paths.
+    pub fn covers(&self, path: &Path) -> bool {
+        self.files.iter().any(|f| f == path) || self.dirs.iter().any(|d| path.starts_with(d))
+    }
+
+    /// Every entry, folders first.
+    pub fn all(&self) -> impl Iterator<Item = &PathBuf> {
+        self.dirs.iter().chain(&self.files)
+    }
+}
+
+/// [`Private`] for the current setup: the folders wherever they resolve,
+/// the places they could be under another environment or an older name,
+/// and the database the config names, with everything kept beside it.
+pub fn private_paths() -> Private {
+    private_paths_for(&crate::config::Config::load().db_path)
+}
+
+/// [`Private`] with the database at `db` (`PATHFINDER_DB_PATH` may put it
+/// anywhere, even in the workspace; a relative one is taken from the
+/// current folder, as SQLite opens it).
+pub fn private_paths_for(db: &Path) -> Private {
+    let mut dirs = Vec::new();
+    let mut made = Vec::new();
+    for kind in [Kind::Config, Kind::Data, Kind::State, Kind::Cache] {
+        made.push(dir(kind));
+        dirs.push(dir(kind));
+        if let Some(base) = abs_var(kind.xdg_var()) {
+            dirs.push(base.join(NAME));
+            dirs.push(base.join(OLD_NAME));
+        }
+        if let Some(home) = home() {
+            dirs.push(native(kind, &home));
+            dirs.push(xdg_base(kind, &home).join(NAME));
+            dirs.push(xdg_base(kind, &home).join(OLD_NAME));
+            if let Some((earlier, _)) = earlier_native(kind, &home) {
+                dirs.push(earlier);
+            }
+        }
     }
     if let Some(root) = abs_var("PATHFINDER_HOME") {
+        made.push(root.clone());
         dirs.push(root);
     }
-    dirs.sort();
-    dirs.dedup();
-    dirs
+    let db = if db.is_absolute() {
+        db.to_path_buf()
+    } else {
+        env::current_dir().unwrap_or_default().join(db)
+    };
+    // The database's folder is hidden whole only when it is one of
+    // Pathfinder's own; elsewhere (the workspace, the home folder) only what
+    // Pathfinder keeps there.
+    made.push(staging_root(&db));
+    dirs.push(staging_root(&db));
+    let mut files = Vec::new();
+    // SQLite follows a linked database to its target and keeps the journal
+    // beside the target; Pathfinder's own files stay beside the link.
+    let mut dbs = vec![db.clone()];
+    if let Ok(target) = db.canonicalize()
+        && target != db
+    {
+        dbs.push(target);
+    }
+    for db in &dbs {
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            let mut name = db.clone().into_os_string();
+            name.push(suffix);
+            files.push(PathBuf::from(name));
+        }
+    }
+    files.push(tui_log(&db));
+    files.push(tui_log_old(&db));
+    files.push(latest_version_stamp(&db));
+    for list in [&mut dirs, &mut files, &mut made] {
+        list.sort();
+        list.dedup();
+    }
+    Private { dirs, files, made }
 }
 
 /// `pathfinder paths`.
@@ -318,12 +475,73 @@ mod tests {
     }
 
     #[test]
-    fn secrets_are_hidden_wherever_they_could_be() {
-        let dirs = secret_dirs();
-        assert!(dirs.contains(&config_dir()));
-        if let Some(home) = home() {
-            assert!(dirs.contains(&xdg_default(Kind::Config, &home)));
-            assert!(dirs.contains(&native(Kind::Config, &home)));
+    fn private_paths_cover_every_private_file() {
+        let cfg = crate::config::Config::load();
+        let private = private_paths();
+        let mut wal = cfg.db_path.clone().into_os_string();
+        wal.push("-wal");
+        let abs = |p: PathBuf| {
+            if p.is_absolute() {
+                p
+            } else {
+                env::current_dir().unwrap().join(p)
+            }
+        };
+        // Every file Pathfinder keeps, through the functions that name it.
+        let known = [
+            crate::config::default_config_path(),
+            auth_file(),
+            crate::telemetry::consent::path(),
+            config_dir().join("install.json"),
+            cfg.db_path.clone(),
+            PathBuf::from(wal),
+            crate::bugreport::tui_log(),
+            tui_log_old(&cfg.db_path),
+            latest_version_stamp(&cfg.db_path),
+            staging_root(&cfg.db_path)
+                .join("session")
+                .join("part-1234abcd"),
+            crate::crash::log_path(),
+            state_dir().join("chatgpt.lock"),
+            state_dir().join("milestones.json"),
+            state_dir().join("bug-report-12345678.txt"),
+            crate::catalog::cache_path(),
+            scratch_dir().join("pathfinder-eval-1.sqlite"),
+        ];
+        for path in known {
+            let path = abs(path);
+            assert!(private.covers(&path), "{} isn't private", path.display());
         }
+        // Both conventions and the old name, so another environment can't
+        // expose them.
+        if let Some(home) = home() {
+            for kind in [Kind::Config, Kind::Data, Kind::State, Kind::Cache] {
+                assert!(private.covers(&native(kind, &home)));
+                assert!(private.covers(&xdg_base(kind, &home).join(OLD_NAME)));
+                assert!(private.covers(&xdg_default(kind, &home)));
+            }
+        }
+    }
+
+    #[test]
+    fn a_database_elsewhere_hides_only_what_pathfinder_keeps_there() {
+        let root = if cfg!(windows) { "C:\\work" } else { "/work" };
+        let ws = PathBuf::from(root).join("proj");
+        let db = ws.join("data").join("harness.sqlite");
+        let private = private_paths_for(&db);
+        assert!(!private.covers(&ws.join("data").join("notes.txt")));
+        assert!(!private.covers(&ws));
+        for name in [
+            "harness.sqlite",
+            "harness.sqlite-wal",
+            "harness.sqlite-shm",
+            "harness.sqlite-journal",
+            "tui.log",
+            "tui.log.1",
+            "latest-version",
+        ] {
+            assert!(private.covers(&ws.join("data").join(name)), "{name}");
+        }
+        assert!(private.covers(&ws.join("data").join("staging").join("s").join("p")));
     }
 }

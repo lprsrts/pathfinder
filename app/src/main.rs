@@ -133,10 +133,10 @@ async fn run(args: Vec<String>) -> Result<()> {
         if std::fs::metadata(&log).is_ok_and(|m| m.len() > LOG_MAX) {
             std::fs::rename(&log, log.with_extension("log.1")).ok();
         }
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log)?;
+        // Not through a link: one planted where the log goes (a database in
+        // the workspace) would show the log to the agent's commands.
+        let file =
+            paths::no_follow(std::fs::OpenOptions::new().create(true).append(true)).open(&log)?;
         tracing_subscriber::fmt()
             .with_env_filter(filter())
             .with_writer(std::sync::Mutex::new(file))
@@ -193,8 +193,11 @@ async fn run(args: Vec<String>) -> Result<()> {
             // read your real one.
             let cfg = Config::load();
             let record = Store::open(&cfg.db_path)?;
-            let scratch =
-                env::temp_dir().join(format!("pathfinder-eval-{}.sqlite", std::process::id()));
+            // In Pathfinder's own scratch folder, hidden from the agent's
+            // commands like the real database.
+            let dir = paths::scratch_dir();
+            paths::ensure_private_dir(&dir)?;
+            let scratch = dir.join(format!("pathfinder-eval-{}.sqlite", std::process::id()));
             let store = Arc::new(Store::open(&scratch)?);
             let creds = Arc::new(Credentials::system());
             let engine = Arc::new(RouterEngine::new(

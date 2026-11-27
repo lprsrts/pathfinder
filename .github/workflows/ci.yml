@@ -41,6 +41,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ${{ matrix.crate }}
+      # The agent's sandbox on Linux is bubblewrap. Ubuntu 24.04 lets
+      # AppArmor refuse unprivileged user namespaces, which bwrap needs.
+      - if: runner.os == 'Linux' && matrix.crate == 'app'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
+      # On Linux and macOS the sandbox tests must run, not skip: a missing
+      # sandbox fails them.
       - run: cargo test --locked
+        env:
+          PATHFINDER_REQUIRE_SANDBOX_TESTS: ${{ (matrix.crate == 'app' && runner.os != 'Windows') && '1' || '' }}

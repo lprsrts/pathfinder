@@ -12,7 +12,9 @@ fn line(l: Line) -> &'static str {
         CandidateFor => "关于 **{title}** 的候选解释：",
         IsItRight => "这对吗？说说理由。",
         PassedOneMore => "通过。再来一个：",
-        PartHint => "在这里把思路说出来。`/summary` · `/known` · `/delegate`",
+        PartHint => {
+            "在这里把思路说出来：边做边写下你的推理，准备好后用自己的话讲讲这一部分。如果你已经掌握了，或想让智能体来做，直接说就行。"
+        }
         RestsOn => "依赖于",
         ToldNotShown => "已记为“被告知”：{labels}。",
         GapNeeds => "需要先掌握 **{concept}**：{why}。",
@@ -24,14 +26,14 @@ fn line(l: Line) -> &'static str {
         AddGapParts => "为 {names} 添加一个部分？",
         And => "和",
         ProposedChange => "建议的地图修改：",
-        AcceptReject => "`/accept` 或 `/reject`。",
+        AcceptReject => "说“是”即可加入，或说“不”。",
         Needs => "需要 {deps}",
         FixedReply => "这正是你在评判的内容。先给出你的判断。",
         GateCapped => {
             "（今天的共享检查次数已用完；关于候选解释的回复要等你给出判断。使用自己的密钥：`pathfinder auth set typesafe`。）"
         }
         GateUnavailable => "（无法连接检查服务，回复已暂缓。请稍后再试。）",
-        Understood => "**{title}** 已理解。`/next` · `/handoff`",
+        Understood => "**{title}** 已理解。想继续或交给智能体时告诉我。",
         KeepWorking => "继续做，然后再解释一遍。",
         AllResolved => "所有部分都已解决。",
         NoOtherPart => "没有其他未解决的部分。",
@@ -69,7 +71,9 @@ fn line(l: Line) -> &'static str {
         FindHits => "**{n}** 条匹配 {terms}：",
         FindNone => "此文件夹中没有包含 {terms} 的行。",
         WebNone => "网上没有与 {terms} 匹配的内容。",
-        ShowKnown => "已记录：你已经掌握 **{title}**。这是声明，不是证据。`/undo`（Esc）可撤回。",
+        ShowKnown => {
+            "已记录：你已经掌握 **{title}**。这是声明，不是证据。说“撤回”或按 Esc 即可撤回。"
+        }
         ShowTell => "按你的要求告诉你。记为“被告知”，绝不记为“已理解”。答案到达前按 Esc 可取消。",
         ShowHandoff => {
             "把 **{title}** 交给智能体？它在暂存副本里工作，结果由你审查。Enter 执行 · Esc 取消。"
@@ -85,10 +89,15 @@ fn line(l: Line) -> &'static str {
         NotRunHandoff => "未执行：**{title}** 没有交给智能体。",
         NotRunDelegate => "未执行：**{title}** 没有交出。",
         NotRunStale => "未执行：等待你确认的事项已不再适用。",
-        AskWhich => "你是指{choices}？在你说之前不会记录任何内容。否则请继续。",
-        AskKnown => "声明你已掌握 **{title}**（`/known`）",
-        AskTell => "让我直接告诉你（`/tell <question>`）",
-        AskAgent => "把这部分交给智能体（`/handoff` 或 `/delegate`）",
+        AskWhich => {
+            "你指的是哪一个：{choices}？在你说之前不会记录任何内容；回一个数字或几个字就行。"
+        }
+        AskKnown => "记下我已掌握 **{title}**（不检查）",
+        AskTell => "直接告诉我",
+        AskAgent => "让智能体做这一部分",
+        AskCheck => "就 **{title}** 考考我",
+        AskNote => "只是一条笔记",
+        AskWhichPart => "你指的是哪一部分：{choices}？在你说之前不会记录任何内容。",
         Or => "，还是",
         Undone => "已撤回：你对 **{title}** 的声明已撤回。记录中会保留为已撤回。",
         NothingToUndo => {
@@ -97,8 +106,9 @@ fn line(l: Line) -> &'static str {
         NothingWaiting => "没有等待你确认的事项。",
         NextStep => "下一步：{at} · {question}",
         NextStepNoPlace => {
-            "下一步：你的资料中还没有提到 **{concept}** 的地方；`/find <terms>` 可以搜索。 · {question}"
+            "下一步：你的资料中还没有提到 **{concept}** 的地方；问我该去哪里找。 · {question}"
         }
+        StepPart => "这部分是做什么用的？用你自己的话说。",
         StepWideExample => "找一处用到 {concept} 的地方。它在那里起什么作用？",
         StepWidePurpose => "在这部分里，{concept} 是做什么用的？用你自己的话说。",
         StepWideMechanism => "{concept} 是怎样一步步工作的？",

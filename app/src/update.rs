@@ -203,16 +203,23 @@ pub async fn available() -> Option<String> {
         if let Some(dir) = stamp.parent() {
             std::fs::create_dir_all(dir).ok();
         }
-        std::fs::write(&stamp, &offered).ok();
+        // Not through a link planted at its name.
+        crate::paths::no_follow(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true),
+        )
+        .open(&stamp)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, offered.as_bytes()))
+        .ok();
         offered
     };
     newer(version.trim(), env!("CARGO_PKG_VERSION")).then(|| version.trim().to_string())
 }
 
 fn stamp_path() -> PathBuf {
-    crate::config::Config::load()
-        .db_path
-        .with_file_name("latest-version")
+    crate::paths::latest_version_stamp(&crate::config::Config::load().db_path)
 }
 
 /// `pathfinder update [--check]`.
