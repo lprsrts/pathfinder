@@ -582,6 +582,8 @@ mod tests {
         policy
     }
 
+    // Only the Unix profile tests below build policies by hand.
+    #[cfg(unix)]
     fn policy_at(workspace: &Path, private: Private) -> Policy {
         Policy {
             workspace: workspace.to_path_buf(),
