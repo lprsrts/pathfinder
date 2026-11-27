@@ -1,12 +1,11 @@
 # Joining the Pathfinder beta
 
-Thanks for trying Pathfinder. It's in a closed beta: it works, it has rough edges, and what you notice is what makes it better.
+Thanks for trying Pathfinder. It's in a closed beta: it works but I need testers that can bring real use cases with real problems.
 
 ## What you need
 
-- A Mac (Apple silicon or Intel). Linux works if you build it from source.
-- Access to models. Pathfinder's use counts against that account.
-- Optional: `brew install poppler`, so Pathfinder can read PDFs page by page.
+- Access to AI models. Either API keys, a subscription, or your own server.
+- Optional: `poppler`, so Pathfinder can read PDFs page by page.
 
 ## Install
 
@@ -14,7 +13,7 @@ Thanks for trying Pathfinder. It's in a closed beta: it works, it has rough edge
 curl -fsSL https://pathfinder.lprsrts.com/install.sh | sh
 ```
 
-This installs `pathfinder` into `~/.local/bin` (or `$XDG_BIN_HOME`, or `$PATHFINDER_BIN_DIR`). It is signed and notarised by Apple. If the installer says the folder isn't on your PATH, run the line it prints for your shell.
+This installs `pathfinder` into `~/.local/bin` (or `$XDG_BIN_HOME`, or `$PATHFINDER_BIN_DIR`). On a Mac it is signed and notarised by Apple. If the installer says the folder isn't on your PATH, run the line it prints for your shell.
 
 ## Start
 
@@ -47,11 +46,10 @@ F1 shows the keys. The [guide](guide.md) walks through a session.
 
 ## Known issues
 
-- Linux and Windows builds are new. Windows has no OS sandbox, so every command the agent runs asks first; report anything that behaves differently from macOS.
-- Without poppler, PDFs are read only when you attach them.
-- The gate needs you to have joined, or a decision key of your own (`pathfinder auth set typesafe`). The shared gate allows a daily number of checks per person; when they're used up, Pathfinder holds back replies about the candidate until you've judged it.
+- Windows has no OS sandbox, so every command the agent runs asks first.
+- The gate needs you to have joined, or a decision key of your own (Ctrl+P → Gate key, or `pathfinder auth login typesafe`). The shared gate allows a daily number of checks per person; when they're used up, Pathfinder holds back replies about the candidate until you've judged it.
 - OpenAlex allows a small number of searches a day without a key; past it, online search notes that OpenAlex wasn't searched. `pathfinder auth set openalex` adds a free key.
-- Without poppler, PDFs can't be quoted page by page, so questions about them get fewer sources.
+- Without poppler, PDFs are read only when you attach them and can't be quoted page by page, so questions about them get fewer sources.
 - Open models of 8B parameters or less make the gate and the judging unreliable.
 
 ## Your data

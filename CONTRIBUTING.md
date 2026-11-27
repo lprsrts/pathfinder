@@ -6,9 +6,26 @@ Thanks for wanting to help. Bug reports, ideas and small fixes are all welcome.
 
 `/bug what happened` in Pathfinder (or `pathfinder bug "what happened"`) collects what helps and shows it to you first. Or open an issue with the bug template.
 
-## Building and testing
+## Building from source
 
-You need a recent stable Rust toolchain and `git` (some tests make repositories). There are three crates, each built on its own:
+You need a recent stable Rust toolchain, and `git` for the tests (some make repositories).
+
+```sh
+cd app
+cargo build --release      # the program is target/release/pathfinder
+```
+
+On Linux the agent's sandbox needs bubblewrap (`bwrap`); without it, every command the agent runs asks first. `poppler` lets Pathfinder read PDFs page by page.
+
+The repository has three crates, each built and tested on its own:
+
+| Folder | What it is |
+|---|---|
+| [app/](app/) | The Pathfinder program: the terminal UI, models, sandbox, gate and record |
+| [schema/](schema/) | The usage events and API types the app and the collector share |
+| [collector/](collector/) | The beta service: sign-in, consented usage events, shared threads, bug reports, the shared gate, releases ([README](collector/README.md)) |
+
+## Testing
 
 ```sh
 (cd app && cargo test)
