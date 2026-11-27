@@ -1,4 +1,4 @@
-//! A thread's settings, by the ids Zed's agent protocol and the TUI use.
+//! A thread's settings, by the ids the TUI and the stored thread use.
 
 pub const FAST_MODEL: &str = "system1";
 pub const FAST_EFFORT: &str = "fast_effort";

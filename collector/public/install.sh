@@ -33,6 +33,11 @@ case "$(uname -s)/$(uname -m)" in
     Darwin/*) target=universal-apple-darwin ;;
     Linux/x86_64) target=x86_64-unknown-linux-gnu ;;
     Linux/aarch64 | Linux/arm64) target=aarch64-unknown-linux-gnu ;;
+    MINGW* | MSYS* | CYGWIN*)
+        echo "On Windows, install Pathfinder from PowerShell instead:" >&2
+        echo "  irm https://pathfinder.lprsrts.com/install.ps1 | iex" >&2
+        exit 1
+        ;;
     *)
         echo "Sorry, there's no Pathfinder build for $(uname -s) $(uname -m) yet." >&2
         exit 1

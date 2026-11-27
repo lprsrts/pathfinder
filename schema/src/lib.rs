@@ -24,7 +24,7 @@ pub struct Envelope {
     pub v: u32,
     /// Random per event, so a retried upload isn't counted twice.
     pub id: String,
-    /// Random per app run (a thread opened in the TUI or Zed).
+    /// Random per app run (a TUI run).
     pub session: String,
     /// Unix seconds, rounded down to the minute.
     pub at: i64,
@@ -174,6 +174,8 @@ pub enum Milestone {
 #[serde(rename_all = "snake_case")]
 pub enum Surface {
     Tui,
+    /// No longer sent (the Zed server was removed); kept so older clients'
+    /// events still parse.
     Zed,
 }
 

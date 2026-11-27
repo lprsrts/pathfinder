@@ -136,25 +136,76 @@ pub fn full_specs() -> Vec<ToolSpec> {
                 "additionalProperties": false
             }),
         },
-        ToolSpec {
+        bash_spec(super::sandbox::available().is_some()),
+    ]);
+    specs
+}
+
+/// The shell `bash` commands run in, named where it isn't `sh`.
+fn shell_note() -> String {
+    match super::shell::current() {
+        super::shell::Shell::Posix => String::new(),
+        super::shell::Shell::GitBash(_) => " with Git Bash".into(),
+        super::shell::Shell::PowerShell(_) => {
+            " with PowerShell (write PowerShell, not POSIX sh)".into()
+        }
+    }
+}
+
+/// The `bash` tool. With a sandbox the model is told what it confines and
+/// how to ask past it; without one (Windows, Linux without a working
+/// bubblewrap, or `PATHFINDER_NO_SANDBOX`) it is told the truth: every
+/// command runs with the user's full access, and the user approves each.
+fn bash_spec(sandboxed: bool) -> ToolSpec {
+    let shell = shell_note();
+    let lead = format!(
+        "Run a shell command in the workspace{shell}; the user watches it run. Returns its output and exit code. Use it for building, testing and running code; use the file tools to read and change files."
+    );
+    if !sandboxed {
+        return ToolSpec {
             name: "bash".into(),
-            description: "Run a shell command in the workspace; the user watches it run. Returns its output and exit code. Use it for building, testing and running code; use the file tools to read and change files. Commands run in a sandbox: they can read files, write only inside the workspace (not .git) and the temp folders, and have no network. When a command truly needs the internet (installing packages, fetching), set `network`; when it must write elsewhere or into .git (e.g. `git commit`), set `outside_sandbox`. Both need a `justification`, and the user is asked first.".into(),
+            description: format!(
+                "{lead} There is no sandbox on this system: every command runs with the user's full access and the user approves each one. Prefer the file tools; avoid commands that change things outside the workspace."
+            ),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "command": {"type": "string"},
-                    "timeout_secs": {"type": "integer", "description": "Default 120, at most 600."},
-                    "network": {"type": "boolean", "description": "Allow network access (the user is asked)."},
-                    "outside_sandbox": {"type": "boolean", "description": "Run without the sandbox (the user is asked)."},
-                    "justification": {"type": "string", "description": "Why `network` or `outside_sandbox` is needed, in one sentence for the user."}
+                    "timeout_secs": {"type": "integer", "description": "Default 120, at most 600."}
                 },
                 "required": ["command"],
                 "additionalProperties": false
             }),
-        },
-    ]);
-    specs
+        };
+    }
+    ToolSpec {
+        name: "bash".into(),
+        description: format!(
+            "{lead} Commands run in a sandbox: they can read files, write only inside the workspace (not .git) and the temp folders, and have no network. When a command truly needs the internet (installing packages, fetching), set `network`; when it must write elsewhere or into .git (e.g. `git commit`), set `outside_sandbox`. Both need a `justification`, and the user is asked first."
+        ),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "command": {"type": "string"},
+                "timeout_secs": {"type": "integer", "description": "Default 120, at most 600."},
+                "network": {"type": "boolean", "description": "Allow network access (the user is asked)."},
+                "outside_sandbox": {"type": "boolean", "description": "Run without the sandbox (the user is asked)."},
+                "justification": {"type": "string", "description": "Why `network` or `outside_sandbox` is needed, in one sentence for the user."}
+            },
+            "required": ["command"],
+            "additionalProperties": false
+        }),
+    }
 }
+
+/// How to install poppler (`pdftotext`, `pdftoppm`) on this system.
+const POPPLER_HINT: &str = if cfg!(target_os = "macos") {
+    "`brew install poppler`"
+} else if cfg!(windows) {
+    "`winget install oschwartz10612.Poppler` or `scoop install poppler`, then add its `bin` folder to PATH"
+} else {
+    "`sudo apt install poppler-utils`, or the `poppler` package on Fedora and Arch"
+};
 
 /// A file a tool changed: `old` is None for a new file.
 #[derive(Debug, Clone, PartialEq)]
@@ -470,12 +521,16 @@ fn str_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
         .filter(|s| !s.is_empty())
 }
 
+/// `path` relative to `root`, as the model sees it: always with `/`, so
+/// Windows paths read like everywhere else (and `confine` takes `/` back).
 fn rel(root: &Path, path: &Path) -> String {
-    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    path.strip_prefix(&root)
-        .unwrap_or(path)
-        .display()
-        .to_string()
+    let root = dunce::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let shown = path.strip_prefix(&root).unwrap_or(path).to_string_lossy();
+    if cfg!(windows) {
+        shown.replace('\\', "/")
+    } else {
+        shown.into_owned()
+    }
 }
 
 /// Pages `view` renders at most per call: images are costly.
@@ -534,7 +589,7 @@ pub fn view(
         .output()
         .map_err(|_| {
             format!(
-                "can't render `{path}`: `pdftoppm` isn't installed (`brew install poppler`). Ask the user to attach a screenshot instead."
+                "can't render `{path}`: `pdftoppm` isn't installed ({POPPLER_HINT}). Ask the user to attach a screenshot instead."
             )
         })?;
     let mut pages: Vec<PathBuf> = fs::read_dir(&dir)
@@ -632,7 +687,7 @@ fn run_pdftotext(file: &Path, path: &str) -> Result<std::process::Output, String
         .spawn()
         .map_err(|_| {
             format!(
-                "can't read the PDF `{path}`: `pdftotext` isn't installed (`brew install poppler`). Ask the user to attach it instead."
+                "can't read the PDF `{path}`: `pdftotext` isn't installed ({POPPLER_HINT}). Ask the user to attach it instead."
             )
         })?;
     let mut stdout = child.stdout.take().expect("piped");
@@ -996,6 +1051,22 @@ fn grep(args: &Value, env: &ToolEnv<'_>) -> Result<String, String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn bash_says_whether_commands_are_confined() {
+        let jailed = bash_spec(true);
+        assert!(jailed.description.contains("Commands run in a sandbox"));
+        assert!(jailed.parameters["properties"]["outside_sandbox"].is_object());
+        let open = bash_spec(false);
+        assert!(
+            open.description
+                .contains("There is no sandbox on this system")
+        );
+        assert!(!open.description.contains("Commands run in a sandbox"));
+        for k in ["network", "outside_sandbox", "justification"] {
+            assert!(open.parameters["properties"].get(k).is_none(), "{k}");
+        }
+    }
+
     fn workspace() -> PathBuf {
         let dir = std::env::temp_dir().join(format!("harness-tools-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(dir.join("src")).unwrap();
@@ -1006,7 +1077,7 @@ mod tests {
         )
         .unwrap();
         fs::write(dir.join("blob.bin"), [0u8, 1, 2]).unwrap();
-        dir.canonicalize().unwrap()
+        dunce::canonicalize(dir).unwrap()
     }
 
     #[test]

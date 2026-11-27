@@ -165,7 +165,7 @@ pub struct Config {
     pub claude_bin: String,
     #[serde(default = "default_codex_bin")]
     pub codex_bin: String,
-    /// The models offered in Zed's pickers. Entries with an unknown route
+    /// The models offered in the model pickers. Entries with an unknown route
     /// (e.g. the removed `pi`) are skipped with a warning.
     #[serde(default, deserialize_with = "lenient_models")]
     pub models: Vec<ModelEntry>,

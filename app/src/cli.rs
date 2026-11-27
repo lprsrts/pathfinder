@@ -1,5 +1,4 @@
-//! Terminal commands: `pathfinder auth …` and `pathfinder models`. Zed's sign-in
-//! buttons run these too (as `pathfinder acp auth …`).
+//! Terminal commands: `pathfinder auth …` and `pathfinder models`.
 
 use std::io::{self, BufRead, IsTerminal, Write};
 

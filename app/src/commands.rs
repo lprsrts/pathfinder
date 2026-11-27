@@ -2,7 +2,7 @@
 //! shared by the TUI and other frontends.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use crate::domain::{PartStatus, Session, SessionMode};
 
@@ -178,9 +178,17 @@ pub const TASK: [(&str, &str); 20] = [
 ];
 
 const LOCAL_ARGS: [(&str, &str, &str); 3] = [
-    ("/attach", "<file|clear>", "attach a PDF or image, or clear attachments"),
+    (
+        "/attach",
+        "<file|clear>",
+        "attach a PDF or image, or clear attachments",
+    ),
     ("/share", "[note]", "send this thread (shown in full first)"),
-    ("/bug", "[what happened]", "send a bug report (shown in full first)"),
+    (
+        "/bug",
+        "[what happened]",
+        "send a bug report (shown in full first)",
+    ),
 ];
 
 const TASK_META: [(&str, &str, &str); 20] = [
@@ -192,18 +200,34 @@ const TASK_META: [(&str, &str, &str); 20] = [
     ("/why", "", "your record, or what the current part rests on"),
     ("/map", "", "the plan as a diagram"),
     ("/plan", "[goal]", "build the plan now"),
-    ("/summary", "[text]", "explain the current part; a candidate follows"),
+    (
+        "/summary",
+        "[text]",
+        "explain the current part; a candidate follows",
+    ),
     ("/next", "", "move to the next open part"),
     ("/focus", "<number or id>", "switch to a part"),
     ("/known", "[id]", "skip a part you already know"),
-    ("/handoff", "[notes]", "give an understood part to the agent"),
-    ("/delegate", "[notes]", "hand a part off without understanding it"),
+    (
+        "/handoff",
+        "[notes]",
+        "give an understood part to the agent",
+    ),
+    (
+        "/delegate",
+        "[notes]",
+        "hand a part off without understanding it",
+    ),
     ("/approve", "", "accept the agent's result"),
     ("/object", "<reason>", "send the result back"),
     ("/accept", "", "accept a proposed change to the plan"),
     ("/reject", "", "reject a proposed change to the plan"),
     ("/replan", "[what changed]", "ask for a change to the plan"),
-    ("/coverage", "", "how much of the agent's work you can vouch for"),
+    (
+        "/coverage",
+        "",
+        "how much of the agent's work you can vouch for",
+    ),
 ];
 
 /// Metadata for every known slash command, local first then task.
@@ -510,7 +534,10 @@ pub(crate) fn expand_tilde(path: &str) -> String {
             .map(|h| h.to_string_lossy().into_owned())
             .unwrap_or_else(|| "~".to_string());
     }
-    if let Some(rest) = path.strip_prefix("~/")
+    let rest = path
+        .strip_prefix("~/")
+        .or_else(|| path.strip_prefix("~\\").filter(|_| cfg!(windows)));
+    if let Some(rest) = rest
         && let Some(home) = home_dir()
     {
         return format!("{}/{rest}", home.to_string_lossy().trim_end_matches('/'));
@@ -518,7 +545,18 @@ pub(crate) fn expand_tilde(path: &str) -> String {
     path.to_string()
 }
 
+/// Where a typed path splits into folders: `/`, and on Windows `\\` too.
+fn is_separator(c: char) -> bool {
+    c == '/' || (cfg!(windows) && c == '\\')
+}
+
+/// Undoes shell-style backslash escapes (`My\ Docs`). On Windows a backslash
+/// is the path separator, never an escape, so the path is kept as typed
+/// (quotes are how a Windows path with spaces is written).
 pub(crate) fn unescape_shell_path(raw: &str) -> String {
+    if cfg!(windows) {
+        return raw.to_string();
+    }
     let mut out = String::with_capacity(raw.len());
     let mut chars = raw.chars().peekable();
     while let Some(c) = chars.next() {
@@ -607,6 +645,17 @@ fn attach_arg_slice(input: &str) -> Option<&str> {
 }
 
 fn format_path_arg(path: &str, escape_only: bool) -> String {
+    if cfg!(windows) {
+        // No backslash escapes on Windows: quote a path with spaces. A folder
+        // keeps its quote open so completion can carry on inside it.
+        return if !path.contains(char::is_whitespace) {
+            path.to_string()
+        } else if escape_only {
+            format!("\"{path}")
+        } else {
+            format!("\"{path}\"")
+        };
+    }
     if escape_only {
         let mut out = String::with_capacity(path.len());
         for c in path.chars() {
@@ -652,7 +701,7 @@ fn matches_for_slice(raw_arg: &str, cwd: &Path, filter: PathFilter) -> Vec<Attac
         }];
     }
 
-    let (dir_display, file_prefix) = match unquoted.rfind('/') {
+    let (dir_display, file_prefix) = match unquoted.rfind(is_separator) {
         Some(pos) => (&unquoted[..=pos], &unquoted[pos + 1..]),
         None => ("", unquoted.as_str()),
     };
@@ -662,13 +711,15 @@ fn matches_for_slice(raw_arg: &str, cwd: &Path, filter: PathFilter) -> Vec<Attac
     } else {
         let expanded_dir = expand_tilde(dir_display);
         let p = Path::new(&expanded_dir);
-        if p.is_absolute() {
+        // Not just `is_absolute`: on Windows `\x` (no drive) and `D:x` (no
+        // root) aren't absolute, yet each names a folder outside the workspace.
+        if p.has_root() || matches!(p.components().next(), Some(Component::Prefix(_))) {
             if filter == PathFilter::Openable {
                 // `/open` is confined to the workspace.
-                let Ok(root) = cwd.canonicalize() else {
+                let Ok(root) = dunce::canonicalize(cwd) else {
                     return Vec::new();
                 };
-                if !p.canonicalize().is_ok_and(|c| c.starts_with(&root)) {
+                if !dunce::canonicalize(p).is_ok_and(|c| c.starts_with(&root)) {
                     return Vec::new();
                 }
             }
@@ -701,9 +752,7 @@ fn matches_for_slice(raw_arg: &str, cwd: &Path, filter: PathFilter) -> Vec<Attac
             let is_dir = path.is_dir();
             let include = match filter {
                 PathFilter::Attachable => is_dir || crate::llm::attachable_type(&path).is_some(),
-                PathFilter::Openable => {
-                    is_dir || crate::sources::is_openable(&path)
-                }
+                PathFilter::Openable => is_dir || crate::sources::is_openable(&path),
                 PathFilter::Checkable => {
                     is_dir
                         || crate::llm::attachable_type(&path).is_some()
@@ -736,7 +785,7 @@ fn matches_for_slice(raw_arg: &str, cwd: &Path, filter: PathFilter) -> Vec<Attac
 
     if filter == PathFilter::Attachable
         && !unquoted.is_empty()
-        && !unquoted.contains('/')
+        && !unquoted.contains(is_separator)
         && "clear".starts_with(&unquoted.to_ascii_lowercase())
     {
         out.push(AttachCandidate {
@@ -779,10 +828,7 @@ pub fn complete_path(input: &str, cwd: &Path) -> Option<String> {
         return Some(format!("{cmd} {}", first.arg));
     }
     // Compare unquoted raw paths for common prefix so quotes don't truncate mid-name.
-    let unquoted: Vec<String> = candidates
-        .iter()
-        .map(|c| parse_path_arg(&c.arg))
-        .collect();
+    let unquoted: Vec<String> = candidates.iter().map(|c| parse_path_arg(&c.arg)).collect();
     let first_raw = &unquoted[0];
     let common: String = first_raw
         .chars()
@@ -890,15 +936,16 @@ mod tests {
     #[test]
     fn contextual_actions_reflect_session_state() {
         let mut s = Session::new("s".into(), PathBuf::from("."));
-        assert!(
-            contextual_actions(&s)
-                .iter()
-                .any(|a| a.command == "/plan")
-        );
+        assert!(contextual_actions(&s).iter().any(|a| a.command == "/plan"));
 
         s.mode = SessionMode::Working;
         s.map = Map {
-            parts: vec![Part::new("p1".into(), "Part 1".into(), String::new(), vec![])],
+            parts: vec![Part::new(
+                "p1".into(),
+                "Part 1".into(),
+                String::new(),
+                vec![],
+            )],
         };
         s.active = Some("p1".into());
         let working_cmds: Vec<&str> = contextual_actions(&s)
@@ -946,7 +993,10 @@ mod tests {
     fn attach_open_and_check_arg_parsing_and_completion() {
         assert_eq!(parse_path_arg(r#""my file.pdf""#), "my file.pdf");
         assert_eq!(parse_path_arg(r#"'my file.pdf'"#), "my file.pdf");
-        assert_eq!(parse_path_arg(r#"my\ file\ \(1\).pdf"#), "my file (1).pdf");
+        // Backslash escapes are a Unix shell's; on Windows `\` separates.
+        if !cfg!(windows) {
+            assert_eq!(parse_path_arg(r#"my\ file\ \(1\).pdf"#), "my file (1).pdf");
+        }
         if let Some(home) = std::env::var_os("HOME") {
             let expected = format!("{}/notes.pdf", home.to_string_lossy().trim_end_matches('/'));
             assert_eq!(parse_path_arg("~/notes.pdf"), expected);

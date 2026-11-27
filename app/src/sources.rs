@@ -103,9 +103,10 @@ impl SourceKind {
             "mp4" | "mov" | "mkv" | "webm" | "avi" | "m4v" => Self::Video,
             "txt" | "csv" | "tsv" | "log" => Self::Text,
             "rs" | "py" | "js" | "ts" | "tsx" | "jsx" | "c" | "h" | "cpp" | "hpp" | "cc"
-            | "java" | "go" | "m" | "r" | "jl" | "sh" | "zsh" | "bash" | "tex" | "bib"
-            | "json" | "yaml" | "yml" | "toml" | "html" | "htm" | "css" | "sql" | "ipynb"
-            | "xml" => Self::Code,
+            | "java" | "go" | "m" | "r" | "jl" | "sh" | "zsh" | "bash" | "tex" | "bib" | "json"
+            | "yaml" | "yml" | "toml" | "html" | "htm" | "css" | "sql" | "ipynb" | "xml" => {
+                Self::Code
+            }
             _ => Self::Text,
         }
     }
@@ -406,7 +407,18 @@ fn strip_file_uri(s: &str) -> String {
         out.push(bytes[i]);
         i += 1;
     }
-    String::from_utf8_lossy(&out).into_owned()
+    let path = String::from_utf8_lossy(&out).into_owned();
+    // `file:///C:/x` names `C:/x` on Windows.
+    let drive = path.as_bytes();
+    if cfg!(windows)
+        && drive.len() >= 3
+        && drive[0] == b'/'
+        && drive[1].is_ascii_alphabetic()
+        && drive[2] == b':'
+    {
+        return path[1..].to_string();
+    }
+    path
 }
 
 fn hex_nibble(b: u8) -> Option<u8> {
@@ -508,7 +520,7 @@ pub fn verify_local(cwd: &Path, p: &ProposedHit) -> Result<Hit, Rejected> {
     }
     let raw = p.file.trim().trim_start_matches("./");
     let full = confine(cwd, raw).ok_or_else(|| Rejected::NoSuchFile(raw.to_string()))?;
-    let root = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let root = dunce::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
     let file = full
         .strip_prefix(&root)
         .map(|rel| rel.to_string_lossy().replace('\\', "/"))
@@ -620,7 +632,7 @@ pub fn source_files(cwd: &Path) -> Vec<(PathBuf, String)> {
         "ipynb", "pdf",
     ];
     let mut out = Vec::new();
-    let Ok(root) = cwd.canonicalize() else {
+    let Ok(root) = dunce::canonicalize(cwd) else {
         return out;
     };
     for entry in ignore::WalkBuilder::new(cwd).build().flatten() {
@@ -629,7 +641,7 @@ pub fn source_files(cwd: &Path) -> Vec<(PathBuf, String)> {
             continue;
         }
         // A linked file counts only if it really is inside the folder.
-        if entry.path_is_symlink() && !p.canonicalize().is_ok_and(|r| r.starts_with(&root)) {
+        if entry.path_is_symlink() && !dunce::canonicalize(p).is_ok_and(|r| r.starts_with(&root)) {
             continue;
         }
         let ok = p
@@ -923,11 +935,15 @@ fn suggest_similar(cwd: &Path, wanted: &str) -> Vec<String> {
         .rsplit_once('.')
         .map_or(want_name.as_str(), |(s, _)| s)
         .to_string();
-    let Ok(root) = cwd.canonicalize() else {
+    let Ok(root) = dunce::canonicalize(cwd) else {
         return Vec::new();
     };
     let mut near: Vec<(u8, String)> = Vec::new();
-    for entry in ignore::WalkBuilder::new(&root).build().flatten().take(10_000) {
+    for entry in ignore::WalkBuilder::new(&root)
+        .build()
+        .flatten()
+        .take(10_000)
+    {
         if !entry.path().is_file() {
             continue;
         }
@@ -958,9 +974,8 @@ pub fn open_spec(cwd: &Path, spec: &OpenSpec) -> Result<OpenedSource, String> {
     if raw_rel.is_empty() {
         return Err("`/open <file> [page or line]`".into());
     }
-    let resolved = crate::agent::confine::confine(cwd, raw_rel, false, &[]).map_err(|_| {
-        format!("No file `{raw_rel}` in this workspace.")
-    })?;
+    let resolved = crate::agent::confine::confine(cwd, raw_rel, false, &[])
+        .map_err(|_| format!("No file `{raw_rel}` in this workspace."))?;
     if !resolved.exists() {
         let near = suggest_similar(cwd, raw_rel);
         let mut msg = format!("No file `{raw_rel}` in this workspace.");
@@ -970,7 +985,7 @@ pub fn open_spec(cwd: &Path, spec: &OpenSpec) -> Result<OpenedSource, String> {
         }
         return Err(msg);
     }
-    let root = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let root = dunce::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
     let rel = resolved
         .strip_prefix(&root)
         .map(|p| p.to_string_lossy().replace('\\', "/"))
@@ -1903,7 +1918,11 @@ mod tests {
 
         // Safe fence escaping when markdown contains ```.
         let fenced = open_spec(d.path(), &parse_open_spec("README.md")).unwrap();
-        assert!(fenced.markdown.contains("````markdown\n"), "{}", fenced.markdown);
+        assert!(
+            fenced.markdown.contains("````markdown\n"),
+            "{}",
+            fenced.markdown
+        );
 
         // Directory listing instead of "No file".
         let dir = open_spec(d.path(), &parse_open_spec("sub")).unwrap();

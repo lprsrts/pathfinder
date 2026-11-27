@@ -13,14 +13,28 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, ubuntu-latest]
+        os: [macos-latest, ubuntu-latest, windows-latest]
         crate: [app, schema, collector]
+        # The collector is a Linux server; schema/ still builds everywhere.
+        exclude:
+          - os: windows-latest
+            crate: collector
     runs-on: ${{ matrix.os }}
     defaults:
       run:
         working-directory: ${{ matrix.crate }}
+        # Git Bash on Windows, so every step reads the same on each OS.
+        shell: bash
     steps:
+      # Keep LF line endings on Windows, so `cargo fmt --check` and the
+      # tests' text fixtures see the files as committed.
+      - if: runner.os == 'Windows'
+        working-directory: .
+        run: git config --global core.autocrlf false
       - uses: actions/checkout@v4
+      # aws-lc-sys (rustls's crypto) assembles its x86_64 code with NASM.
+      - if: runner.os == 'Windows'
+        uses: ilammy/setup-nasm@v1
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy

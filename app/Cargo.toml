@@ -10,7 +10,6 @@ readme = "../README.md"
 authors = ["Alper Sarıtaş"]
 
 [dependencies]
-agent-client-protocol = { version = "5.5.1", features = ["stdio"] }
 anyhow = "1"
 rusqlite = { version = "0.43.0", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
@@ -35,3 +34,20 @@ crossterm = { version = "0.29.0", features = ["event-stream"] }
 unicode-width = "0.2.3"
 pathfinder-schema = { path = "../schema" }
 ed25519-dalek = "2"
+dunce = "1"
+flate2 = "1"
+tar = { version = "0.4", default-features = false }
+# The agent's `Today:` line, with the OS time zone on every platform.
+jiff = "1"
+
+[target.'cfg(unix)'.dependencies]
+# Stopping an agent command kills its whole process group (killpg).
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# /copy on Windows: the clipboard API, since clip.exe mangles non-ASCII text.
+clipboard-win = "5.4.3"
+# Staging copies: links to ignored folders (node_modules, target) as junctions.
+junction = "1"
+# Stopping an agent command terminates its Job Object (the whole tree).
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects"] }

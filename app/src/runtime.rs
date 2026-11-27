@@ -44,21 +44,12 @@ pub struct TurnInput {
 #[derive(Debug, Clone, Default)]
 pub struct TurnOutput {
     pub reply: String,
-    pub plan_changed: bool,
 }
 
 impl TurnOutput {
     fn text(reply: impl Into<String>) -> Self {
         Self {
             reply: reply.into(),
-            plan_changed: false,
-        }
-    }
-
-    fn changed(reply: impl Into<String>) -> Self {
-        Self {
-            reply: reply.into(),
-            plan_changed: true,
         }
     }
 }
@@ -351,15 +342,6 @@ impl Runtime {
             .collect();
         all.reverse();
         all
-    }
-
-    /// Saves what the client was shown this turn (serialized updates).
-    pub fn record(&self, id: &str, updates: &[String]) -> Result<()> {
-        self.store.append_transcript(id, updates)
-    }
-
-    pub fn transcript(&self, id: &str) -> Result<Vec<String>> {
-        self.store.load_transcript(id)
     }
 
     pub async fn handle_turn(
@@ -942,10 +924,7 @@ mod command_tests {
             .unwrap();
         assert!(!out_why.reply.contains("Commands:"));
 
-        assert_eq!(
-            turn_step("/MAP", &s, false),
-            pathfinder_schema::Step::Map
-        );
+        assert_eq!(turn_step("/MAP", &s, false), pathfinder_schema::Step::Map);
         assert_eq!(
             turn_step("/Summary", &s, false),
             pathfinder_schema::Step::Summary

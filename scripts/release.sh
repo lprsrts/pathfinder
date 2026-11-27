@@ -17,9 +17,16 @@
 #   PATHFINDER_BUNDLE_ID       code-signing identifier (default com.lprsrts.pathfinder)
 #   PATHFINDER_CF_ZONE, PATHFINDER_CF_TOKEN_SERVICE
 #                              purge the edge cache after publishing (scripts/purge-cache.sh)
+#   PATHFINDER_BUILD_RUN       the GitHub Actions run of .github/workflows/release.yml
+#                              whose Linux and Windows builds to ship; default: the
+#                              newest successful run for this commit, started here
+#                              (on the current branch, which must be pushed) if none
+#   PATHFINDER_OTHER_BUILDS=0  a Mac-only dry run, without the Linux and Windows builds
 #
-# The manifest is signed with the release key in the login keychain
-# (`collector keygen` made it; `collector sign` uses it).
+# The Mac build is made here; the Linux and Windows ones come from GitHub
+# Actions (.github/workflows/release.yml) for the same commit. All of them go
+# into the manifest, which is signed with the release key in the login
+# keychain (`collector keygen` made it; `collector sign` uses it).
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -31,6 +38,10 @@ out="$dist/public/releases"
 notes_file="${1:-}"
 profile="${PATHFINDER_NOTARY_PROFILE:-}"
 notarize="${PATHFINDER_NOTARIZE:-1}"
+other_builds="${PATHFINDER_OTHER_BUILDS:-1}"
+build_run="${PATHFINDER_BUILD_RUN:-}"
+# The builds made by GitHub Actions, by manifest key.
+other_targets=(x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-pc-windows-msvc aarch64-pc-windows-msvc)
 publish_to="${PATHFINDER_PUBLISH_TO:-}"
 collector_url="${PATHFINDER_COLLECTOR_URL:-}"
 bundle_id="${PATHFINDER_BUNDLE_ID:-com.lprsrts.pathfinder}"
@@ -78,8 +89,39 @@ if [[ -n "$publish_to" ]]; then
         || die "the live collector accepts notice $live_notice, this app needs $app_notice: deploy the collector first (scripts/deploy-collector.sh)"
 fi
 
+if [[ "$other_builds" == 1 ]] && ! command -v gh >/dev/null; then
+    die "the Linux and Windows builds come from GitHub Actions through \`gh\`; install it, or PATHFINDER_OTHER_BUILDS=0 for a Mac-only dry run"
+fi
+if [[ -n "$publish_to" && "$other_builds" != 1 ]]; then
+    die "a published release has every platform's build; unset PATHFINDER_OTHER_BUILDS to publish"
+fi
+
 rm -rf "$dist"
 mkdir -p "$out/$version"
+
+# The Linux and Windows builds of this commit, from GitHub Actions. Started
+# first so they build while the Mac one is made and notarised.
+if [[ "$other_builds" == 1 && -z "$build_run" ]]; then
+    build_run="$(gh run list --workflow release.yml --commit "$commit" --status success --limit 1 --json databaseId --jq '.[0].databaseId // empty')"
+    if [[ -z "$build_run" ]]; then
+        branch="$(git -C "$root" symbolic-ref --short -q HEAD)" || die "not on a branch: start release.yml for $commit yourself and set PATHFINDER_BUILD_RUN"
+        [[ "$(git -C "$root" ls-remote origin "refs/heads/$branch" | cut -f1)" == "$commit" ]] \
+            || die "push $branch first: GitHub Actions builds Linux and Windows from origin/$branch"
+        gh workflow run release.yml --ref "$branch" >/dev/null
+        echo "started the Linux and Windows builds on GitHub Actions"
+        for _ in $(seq 30); do
+            sleep 5
+            build_run="$(gh run list --workflow release.yml --commit "$commit" --event workflow_dispatch --limit 1 --json databaseId --jq '.[0].databaseId // empty')"
+            [[ -n "$build_run" ]] && break
+        done
+        [[ -n "$build_run" ]] || die "the release.yml run for $commit didn't appear; set PATHFINDER_BUILD_RUN when it has"
+    fi
+fi
+[[ "$other_builds" == 1 ]] || build_run=""
+if [[ -n "$build_run" ]]; then
+    [[ "$(gh run view "$build_run" --json headSha --jq .headSha)" == "$commit" ]] \
+        || die "run $build_run didn't build $commit"
+fi
 
 # One universal binary for Apple silicon and Intel. Use rustup's toolchain
 # (a Homebrew Rust earlier on PATH has no cross targets).
@@ -121,20 +163,38 @@ ln "$bin" "$dist/pkg/harness"
 cp "$root/LICENSE" "$root/NOTICE" "$dist/pkg/" && cp -R "$root/LICENSES" "$dist/pkg/"
 tar -czf "$out/$mac_tar" -C "$dist/pkg" pathfinder harness LICENSE NOTICE LICENSES
 
+# The Linux and Windows archives, built by GitHub Actions from this commit.
+other_files=()
+if [[ -n "$build_run" ]]; then
+    gh run watch "$build_run" --exit-status >/dev/null || die "the Linux and Windows builds (run $build_run) failed"
+    gh run download "$build_run" --dir "$dist/ci"
+    for target in "${other_targets[@]}"; do
+        found=("$dist/ci/pathfinder-$target"/pathfinder-"$version"-"$target".*)
+        [[ ${#found[@]} -eq 1 && -f "${found[0]}" ]] || die "run $build_run has no $version build for $target"
+        cp "${found[0]}" "$out/$version/"
+        other_files+=("$target=$version/$(basename "${found[0]}")")
+    done
+fi
+
 # The source of exactly this build (AGPL).
 src_tar="$version/pathfinder-$version-source.tar.gz"
 git -C "$root" archive --format=tar.gz --prefix="pathfinder-$version/" -o "$out/$src_tar" HEAD
 
 # The manifest, signed.
-RELEASE_NOTES="$notes" python3 - "$out" "$version" "$mac_tar" "$src_tar" "$commit" <<'PY'
+RELEASE_NOTES="$notes" python3 - "$out" "$version" "$mac_tar" "$src_tar" "$commit" ${other_files[@]+"${other_files[@]}"} <<'PY'
 import hashlib, json, os, sys
-out, version, mac_tar, src_tar, commit = sys.argv[1:]
+out, version, mac_tar, src_tar, commit = sys.argv[1:6]
+others = dict(arg.split("=", 1) for arg in sys.argv[6:])
 def entry(rel):
     data = open(os.path.join(out, rel), "rb").read()
     return {"path": rel, "sha256": hashlib.sha256(data).hexdigest(), "size": len(data)}
 manifest = {
     "version": version,
-    "files": {"universal-apple-darwin": entry(mac_tar), "source": entry(src_tar)},
+    "files": {
+        "universal-apple-darwin": entry(mac_tar),
+        **{target: entry(rel) for target, rel in others.items()},
+        "source": entry(src_tar),
+    },
     "notes": os.environ["RELEASE_NOTES"].strip(),
     "commit": commit,
 }
@@ -146,7 +206,7 @@ PY
 cp "$out/latest.json" "$out/latest.json.sig" "$out/$version/"
 
 # The public folder: the pages and installer next to the releases.
-for f in index.html install.sh screenshot.svg pathfinder-demo.mp4 pathfinder-demo.gif icon-1024.png icon-512.png icon-180.png icon-32.png icon-16.png; do
+for f in index.html install.sh install.ps1 screenshot.svg pathfinder-demo.mp4 pathfinder-demo.gif icon-1024.png icon-512.png icon-180.png icon-32.png icon-16.png; do
     [[ -f "$root/collector/public/$f" ]] && cp "$root/collector/public/$f" "$dist/public/"
 done
 cp -R "$root/collector/public/privacy" "$dist/public/"

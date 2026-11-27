@@ -83,7 +83,7 @@ async fn run_jsonl(
         buf
     });
 
-    // Stopping the turn (Zed's stop button, Esc in the TUI) kills the CLI.
+    // Stopping the turn (Esc in the TUI) kills the CLI.
     let cancel = super::turn_ctx().cancel;
     let mut reader = BufReader::new(stdout);
     let mut line = String::new();
@@ -129,7 +129,8 @@ impl CliEngine {
         show_thinking: bool,
     ) -> Result<String> {
         let model = req.model();
-        let mut cmd = Command::new(&self.config.claude_bin);
+        let bin = resolve_bin(&self.config.claude_bin, "PATHFINDER_CLAUDE_BIN")?;
+        let mut cmd = Command::new(&bin);
         cmd.current_dir(&req.cwd).args([
             "-p",
             "--output-format",
@@ -148,7 +149,25 @@ impl CliEngine {
         if let Some(effort) = model.effort.as_deref().filter(|e| !e.is_empty()) {
             cmd.args(["--effort", effort]);
         }
-        cmd.args(["--system-prompt", &req.system_prompt]);
+        // Where Claude Code can't sandbox commands (Windows, Linux without
+        // bubblewrap and socat), full access leaves out Bash: pre-allowing it
+        // there would run the agent's commands unsandboxed without asking.
+        let sandboxed = claude_can_sandbox();
+        let mut system_prompt = std::borrow::Cow::Borrowed(req.system_prompt.as_str());
+        if req.tools == ToolAccess::Full && !sandboxed {
+            system_prompt =
+                std::borrow::Cow::Owned(format!("{}\n\n{NO_SHELL_NOTE}", req.system_prompt));
+        }
+        // Windows caps a whole command line at 32,767 characters and Linux
+        // one argument at 128 KiB: a long prompt goes in a file instead.
+        let _prompt_file = if prompt_needs_file(&system_prompt) {
+            let file = TempPrompt::write(&system_prompt)?;
+            cmd.arg("--system-prompt-file").arg(&file.path);
+            Some(file)
+        } else {
+            cmd.args(["--system-prompt", &system_prompt]);
+            None
+        };
         // Attached files (a pasted screenshot, a PDF from elsewhere) may lie
         // outside the workspace: let Claude Code read their folders.
         for dir in attachment_dirs(&req.files, &req.cwd) {
@@ -160,6 +179,14 @@ impl CliEngine {
             }
             ToolAccess::ReadOnly => {
                 cmd.args(["--tools", "Read,Glob,Grep"]);
+            }
+            ToolAccess::Full if !sandboxed => {
+                cmd.args([
+                    "--tools",
+                    "Read,Glob,Grep,Edit,Write",
+                    "--permission-mode",
+                    "acceptEdits",
+                ]);
             }
             ToolAccess::Full => {
                 cmd.args([
@@ -180,7 +207,7 @@ impl CliEngine {
         let mut thought_streamed = false;
         let (status, stderr) = run_jsonl(
             cmd,
-            &self.config.claude_bin,
+            &bin.to_string_lossy(),
             Some(req.prompt_with_files()),
             |val| {
                 process_claude_event(
@@ -209,7 +236,16 @@ impl CliEngine {
 
     async fn run_codex(&self, req: &EngineRequest, sink: StreamSink, run: &str) -> Result<String> {
         let model = req.model();
-        let mut cmd = Command::new(&self.config.codex_bin);
+        // Codex's Windows sandbox is experimental and opt-in; without it,
+        // `workspace-write` would run the agent's commands unsandboxed.
+        if cfg!(windows) && req.tools == ToolAccess::Full {
+            bail!(
+                "Codex can't sandbox commands on Windows yet. Pick an API or ChatGPT \
+                 model for this, which asks you before each command."
+            );
+        }
+        let bin = resolve_bin(&self.config.codex_bin, "PATHFINDER_CODEX_BIN")?;
+        let mut cmd = Command::new(&bin);
         cmd.arg("exec")
             .args([
                 "--json",
@@ -261,7 +297,7 @@ impl CliEngine {
 
         let mut last_message: Option<String> = None;
         let mut last_error: Option<String> = None;
-        let (status, stderr) = run_jsonl(cmd, &self.config.codex_bin, Some(prompt), |val| {
+        let (status, stderr) = run_jsonl(cmd, &bin.to_string_lossy(), Some(prompt), |val| {
             process_codex_event(
                 val,
                 req.stream_text,
@@ -522,13 +558,198 @@ fn process_codex_event(
     }
 }
 
+/// Told to the model when Claude Code runs without Bash because it can't
+/// sandbox commands on this machine.
+const NO_SHELL_NOTE: &str = "Shell commands are unavailable in this run: Claude Code can't \
+sandbox them on this machine. Read and edit files instead, and tell the user which commands \
+to run themselves.";
+
+/// Whether Claude Code's own sandbox works here: Seatbelt on macOS, and on
+/// Linux bubblewrap and socat. It has none on Windows.
+fn claude_can_sandbox() -> bool {
+    if cfg!(target_os = "macos") {
+        return true;
+    }
+    if cfg!(target_os = "linux") {
+        return matches!(
+            crate::agent::sandbox::available(),
+            Some(crate::agent::sandbox::Kind::Bwrap(_))
+        ) && on_path("socat");
+    }
+    false
+}
+
+fn on_path(name: &str) -> bool {
+    std::env::var_os("PATH")
+        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(name).is_file()))
+}
+
+/// Linux caps one argument at 128 KiB; stay well under it.
+const LONG_ARG: usize = 100_000;
+
+/// Whether the system prompt must go through a file rather than the
+/// command line.
+fn prompt_needs_file(prompt: &str) -> bool {
+    cfg!(windows) || (cfg!(target_os = "linux") && prompt.len() > LONG_ARG)
+}
+
+/// A system prompt written to a private temp file, removed when dropped.
+struct TempPrompt {
+    path: PathBuf,
+}
+
+impl TempPrompt {
+    fn write(text: &str) -> Result<Self> {
+        use std::io::Write;
+        let path = std::env::temp_dir().join(format!(
+            "pathfinder-prompt-{}.md",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&path)
+            .with_context(|| format!("writing {}", path.display()))?;
+        let prompt = Self { path };
+        file.write_all(text.as_bytes())
+            .with_context(|| format!("writing {}", prompt.path.display()))?;
+        Ok(prompt)
+    }
+}
+
+impl Drop for TempPrompt {
+    fn drop(&mut self) {
+        std::fs::remove_file(&self.path).ok();
+    }
+}
+
+/// The program to spawn for a CLI setting such as `claude`. Elsewhere it is
+/// used as is; on Windows a native `.exe` is looked up on PATH, because std
+/// finds only `.exe` files and won't pass long, quoted arguments through a
+/// `.cmd` shim (npm installs those).
+fn resolve_bin(bin: &str, env_var: &str) -> Result<PathBuf> {
+    if !cfg!(windows) {
+        return Ok(PathBuf::from(bin));
+    }
+    let dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+    resolve_windows_bin(bin, env_var, &dirs, |p| p.is_file())
+}
+
+fn windows_target() -> &'static str {
+    if cfg!(target_arch = "aarch64") {
+        "aarch64-pc-windows-msvc"
+    } else {
+        "x86_64-pc-windows-msvc"
+    }
+}
+
+fn is_script(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"))
+}
+
+/// [`resolve_bin`]'s Windows lookup over `dirs` (PATH), with `is_file`
+/// standing in for the disk.
+fn resolve_windows_bin(
+    bin: &str,
+    env_var: &str,
+    dirs: &[PathBuf],
+    is_file: impl Fn(&Path) -> bool,
+) -> Result<PathBuf> {
+    let script_error = |script: &Path| {
+        anyhow!(
+            "{} is a .cmd script, which can't safely carry Pathfinder's long prompts on \
+             Windows. Install the CLI's native Windows build (claude.exe or codex.exe) or \
+             set {env_var} to its .exe.",
+            script.display()
+        )
+    };
+    let given = Path::new(bin);
+    if is_script(given) {
+        return Err(script_error(given));
+    }
+    let with_ext = |p: &Path, ext: &str| {
+        let mut s = p.as_os_str().to_os_string();
+        s.push(".");
+        s.push(ext);
+        PathBuf::from(s)
+    };
+    let has_ext = given.extension().is_some();
+    // A path, not a bare name: only add `.exe` if it's missing.
+    if given.components().count() > 1 || given.is_absolute() {
+        if !has_ext {
+            let exe = with_ext(given, "exe");
+            if is_file(&exe) {
+                return Ok(exe);
+            }
+            if let Some(s) = ["cmd", "bat"]
+                .iter()
+                .map(|e| with_ext(given, e))
+                .find(|s| is_file(s))
+            {
+                return Err(script_error(&s));
+            }
+        }
+        return Ok(given.to_path_buf());
+    }
+    if has_ext {
+        return Ok(dirs
+            .iter()
+            .map(|d| d.join(bin))
+            .find(|p| is_file(p))
+            .unwrap_or_else(|| given.to_path_buf()));
+    }
+    // A native .exe anywhere on PATH wins over npm's shims.
+    if let Some(exe) = dirs
+        .iter()
+        .map(|d| with_ext(&d.join(bin), "exe"))
+        .find(|p| is_file(p))
+    {
+        return Ok(exe);
+    }
+    let shim = dirs.iter().find_map(|d| {
+        ["cmd", "bat"]
+            .iter()
+            .map(|e| with_ext(&d.join(bin), e))
+            .find(|s| is_file(s))
+            .map(|s| (d, s))
+    });
+    if let Some((dir, script)) = shim {
+        // The codex npm package ships its native binary beside the shim.
+        if bin.eq_ignore_ascii_case("codex") {
+            let vendored = dir
+                .join("node_modules")
+                .join("@openai")
+                .join("codex")
+                .join("vendor")
+                .join(windows_target())
+                .join("codex")
+                .join("codex.exe");
+            if is_file(&vendored) {
+                return Ok(vendored);
+            }
+        }
+        return Err(script_error(&script));
+    }
+    // Not found: spawning reports it as before.
+    Ok(given.to_path_buf())
+}
+
 /// Folders of attached files outside `cwd`, once each.
 fn attachment_dirs(files: &[std::path::PathBuf], cwd: &std::path::Path) -> Vec<std::path::PathBuf> {
-    let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let cwd = dunce::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
     let mut dirs: Vec<std::path::PathBuf> = Vec::new();
     for f in files {
         let Some(dir) = f.parent() else { continue };
-        let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+        let dir = dunce::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
         if !dir.starts_with(&cwd) && !dirs.contains(&dir) {
             dirs.push(dir);
         }
@@ -542,6 +763,7 @@ mod tests {
 
     use super::*;
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn stopping_the_turn_kills_the_cli() {
         let mut cmd = Command::new("sh");
@@ -566,6 +788,53 @@ mod tests {
     }
 
     #[test]
+    fn windows_lookup_prefers_native_binaries_over_npm_shims() {
+        let npm = PathBuf::from("/u/npm");
+        let local = PathBuf::from("/u/local");
+        let dirs = vec![npm.clone(), local.clone()];
+        let vendored = npm
+            .join("node_modules/@openai/codex/vendor")
+            .join(windows_target())
+            .join("codex/codex.exe");
+        let files = [
+            npm.join("claude.cmd"),
+            local.join("claude.exe"),
+            npm.join("codex.cmd"),
+            vendored.clone(),
+            npm.join("other.cmd"),
+        ];
+        let is_file = |p: &Path| files.iter().any(|f| f == p);
+        let resolve = |bin: &str| resolve_windows_bin(bin, "VAR", &dirs, is_file);
+        assert_eq!(resolve("claude").unwrap(), local.join("claude.exe"));
+        assert_eq!(resolve("codex").unwrap(), vendored);
+        let err = resolve("other").unwrap_err().to_string();
+        assert!(err.contains("other.cmd") && err.contains("VAR"), "{err}");
+        assert!(resolve("x.cmd").is_err());
+        assert_eq!(resolve("missing").unwrap(), PathBuf::from("missing"));
+        assert_eq!(
+            resolve("/u/local/claude").unwrap(),
+            local.join("claude.exe")
+        );
+        assert!(resolve("/u/npm/other").is_err());
+    }
+
+    #[test]
+    fn long_prompts_go_through_a_private_file_removed_after() {
+        let file = TempPrompt::write("be brief").unwrap();
+        let path = file.path.clone();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "be brief");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        drop(file);
+        assert!(!path.exists());
+        assert!(!prompt_needs_file("short") || cfg!(windows));
+    }
+
+    #[test]
     fn attachments_outside_the_workspace_get_their_folder_added() {
         let ws = std::env::temp_dir().join(format!("pf-ws-{}", uuid::Uuid::new_v4().simple()));
         let out = std::env::temp_dir().join(format!("pf-out-{}", uuid::Uuid::new_v4().simple()));
@@ -573,7 +842,7 @@ mod tests {
         std::fs::create_dir_all(&out).unwrap();
         let files = vec![ws.join("a.pdf"), out.join("x.png"), out.join("y.png")];
         let dirs = attachment_dirs(&files, &ws);
-        assert_eq!(dirs, vec![out.canonicalize().unwrap()]);
+        assert_eq!(dirs, vec![dunce::canonicalize(&out).unwrap()]);
     }
 
     fn recording_sink() -> (StreamSink, Arc<Mutex<Vec<String>>>) {

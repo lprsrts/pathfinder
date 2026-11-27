@@ -66,8 +66,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let attach_rows = u16::from(!app.attachments.is_empty());
     let bottom = if permission {
         let max_perm = area.height.saturating_sub(4).max(5);
-        (permission_lines(app, area.width).len() as u16)
-            .clamp(5, max_perm)
+        (permission_lines(app, area.width).len() as u16).clamp(5, max_perm)
     } else {
         (wrapped_input.len() as u16).clamp(1, 10) + attach_rows
     };
@@ -129,7 +128,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         input(f, app, rows[4], &wrapped_input, cursor_row, cursor_col);
     }
 
-    let palette = if permission { None } else { active_palette(app) };
+    let palette = if permission {
+        None
+    } else {
+        active_palette(app)
+    };
     footer(f, app, rows[5], palette.is_some());
 
     if let Some(kind) = palette {
@@ -141,13 +144,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 }
 
 /// Floating `/` command or `/attach` path palette anchored above the rule.
-fn command_palette(
-    f: &mut Frame,
-    app: &App,
-    area: Rect,
-    bottom_y: u16,
-    kind: PaletteKind,
-) {
+fn command_palette(f: &mut Frame, app: &App, area: Rect, bottom_y: u16, kind: PaletteKind) {
     let avail_h = bottom_y.saturating_sub(area.y);
     if avail_h < 3 || area.width < 20 {
         return;
@@ -865,7 +862,10 @@ fn side_panel(f: &mut Frame, app: &mut App, area: Rect) {
                 ),
             ];
             if part.status == PartStatus::InReview {
-                spans.push(Span::styled(" [review]", Style::default().fg(Color::Yellow)));
+                spans.push(Span::styled(
+                    " [review]",
+                    Style::default().fg(Color::Yellow),
+                ));
             }
             lines.extend(markdown::wrap_hanging(&spans, width, 2));
         }
@@ -1017,7 +1017,10 @@ fn input(
 
     if app.input.is_empty() {
         let ph = fit(&placeholder(app), text_width as usize);
-        f.render_widget(Paragraph::new(Line::from(Span::styled(ph, dim()))), text_area);
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(ph, dim()))),
+            text_area,
+        );
         if app.modal.is_none() && app.selected.is_none() {
             f.set_cursor_position((text_area.x, text_area.y));
         }
@@ -1036,6 +1039,20 @@ fn input(
 }
 
 /// The permission question, drawn where the input was.
+/// What approving a command outside any sandbox grants, and why there's
+/// no sandbox.
+fn no_sandbox_warning() -> &'static str {
+    if crate::agent::sandbox::available().is_some() {
+        "Outside the sandbox: this runs with your full access to your files, credentials and network."
+    } else if cfg!(windows) {
+        "No sandbox: this runs with your full access to your files, credentials and network (Windows has no OS sandbox for Pathfinder)."
+    } else if cfg!(target_os = "linux") {
+        "No sandbox: this runs with your full access to your files, credentials and network (install bubblewrap, `bwrap`, to sandbox commands)."
+    } else {
+        "No sandbox: this runs with your full access to your files, credentials and network (no OS sandbox is available here)."
+    }
+}
+
 fn permission_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     let Some(Modal::Permission {
         title,
@@ -1051,7 +1068,7 @@ fn permission_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         .fg(Color::Cyan)
         .add_modifier(Modifier::BOLD);
     let rev = Style::default().add_modifier(Modifier::REVERSED);
-    let prog = always_key.rsplit(':').next().unwrap_or(always_key);
+    let prog = super::always_label(always_key);
 
     let mut lines = vec![Line::from(Span::styled(
         "Allow the agent to run this?",
@@ -1062,12 +1079,27 @@ fn permission_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         width.saturating_sub(1),
         4,
     ));
+    let unsandboxed = always_key.starts_with("unsandboxed:");
+    if unsandboxed {
+        lines.extend(markdown::wrap_hanging(
+            &[Span::styled(
+                format!("  {}", no_sandbox_warning()),
+                Style::default().fg(Color::Red),
+            )],
+            width.saturating_sub(1),
+            4,
+        ));
+    }
 
     let choices = [
         ("1 / y", "Yes, once".to_string()),
         (
             "2 / a",
-            format!("Yes, always in this thread for `{prog}`"),
+            if unsandboxed {
+                format!("Yes, always in this thread for exactly `{prog}`, without a sandbox")
+            } else {
+                format!("Yes, always in this thread for `{prog}`")
+            },
         ),
         ("3 / n / Esc", "No".to_string()),
     ];
@@ -1075,9 +1107,7 @@ fn permission_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         let chosen = *sel == Some(idx);
         let prefix = if chosen { "▶ " } else { "  " };
         let line_spans = if chosen {
-            vec![
-                Span::styled(format!("{prefix}{k}  {label}"), rev),
-            ]
+            vec![Span::styled(format!("{prefix}{k}  {label}"), rev)]
         } else {
             vec![
                 Span::raw(prefix),
@@ -1130,7 +1160,10 @@ fn footer(f: &mut Frame, app: &App, area: Rect, palette_open: bool) {
             format!("{s1} · {s2} · decisions {decisions} · checks {checks} · {mouse_badge}"),
             dim(),
         ),
-        (format!("{s1} · {s2} · checks {checks} · {mouse_badge}"), dim()),
+        (
+            format!("{s1} · {s2} · checks {checks} · {mouse_badge}"),
+            dim(),
+        ),
         (format!("{s1} · {s2} · {mouse_badge}"), dim()),
         (format!("{s2} · {mouse_badge}"), dim()),
         (
@@ -1149,10 +1182,7 @@ fn footer(f: &mut Frame, app: &App, area: Rect, palette_open: bool) {
     let (left, left_style) = if !app.status.is_empty() {
         (app.status.clone(), Style::default().fg(Color::Yellow))
     } else if palette_open {
-        (
-            "↑↓ palette · Tab complete · Enter run".to_string(),
-            dim(),
-        )
+        ("↑↓ palette · Tab complete · Enter run".to_string(), dim())
     } else {
         let hints: &[&str] = if app.selected.is_some() && app.modal.is_none() {
             &[
@@ -1289,10 +1319,7 @@ fn filterable_list(
     if inner.height < 2 {
         return;
     }
-    let filter_area = Rect {
-        height: 1,
-        ..inner
-    };
+    let filter_area = Rect { height: 1, ..inner };
     let list_area = Rect {
         y: inner.y + 1,
         height: inner.height - 1,
@@ -1308,7 +1335,10 @@ fn filterable_list(
         vec![
             Span::styled(" Filter: ", dim()),
             Span::styled(
-                fit(&format!("type to search…{count}"), inner_w.saturating_sub(9)),
+                fit(
+                    &format!("type to search…{count}"),
+                    inner_w.saturating_sub(9),
+                ),
                 dim(),
             ),
         ]
@@ -1490,7 +1520,10 @@ fn help_modal(f: &mut Frame, area: Rect, scroll: usize) -> usize {
             "complete /command or /attach; when empty, select messages",
         ),
         ("Ctrl+↑", "select messages anytime"),
-        ("Ctrl+N / Ctrl+O / Ctrl+P", "new thread / earlier threads / settings"),
+        (
+            "Ctrl+N / Ctrl+O / Ctrl+P",
+            "new thread / earlier threads / settings",
+        ),
         (
             "Ctrl+T / Ctrl+G / Ctrl+B",
             "thinking / every tool call / plan panel",
@@ -1697,7 +1730,11 @@ fn consent(
             "e, t toggle · Enter: join with email · i: invite code · Esc: not now"
         }
         ConsentStep::Browser(None) => {
-            push_wrapped(&mut lines, &[Span::styled("Starting the sign-in…", dim())], 0);
+            push_wrapped(
+                &mut lines,
+                &[Span::styled("Starting the sign-in…", dim())],
+                0,
+            );
             "Esc: not now · i: invite code instead"
         }
         ConsentStep::Browser(Some(sign_in)) => {
@@ -1726,7 +1763,11 @@ fn consent(
                 ],
                 0,
             );
-            push_wrapped(&mut lines, &[Span::styled("Waiting for you there…", dim())], 0);
+            push_wrapped(
+                &mut lines,
+                &[Span::styled("Waiting for you there…", dim())],
+                0,
+            );
             lines.push(Line::default());
             "o: open page again · i: invite code · Esc: not now"
         }
@@ -1746,10 +1787,7 @@ fn consent(
     if let Some(e) = error {
         push_wrapped(
             &mut lines,
-            &[Span::styled(
-                e.to_string(),
-                Style::default().fg(Color::Red),
-            )],
+            &[Span::styled(e.to_string(), Style::default().fg(Color::Red))],
             0,
         );
     }
@@ -1898,7 +1936,14 @@ mod tests {
         });
         app.session.map = Map {
             parts: (1..=15)
-                .map(|i| Part::new(format!("p{i}"), format!("Part {i} title"), String::new(), vec![]))
+                .map(|i| {
+                    Part::new(
+                        format!("p{i}"),
+                        format!("Part {i} title"),
+                        String::new(),
+                        vec![],
+                    )
+                })
                 .collect(),
         };
         app.session.active = Some("p1".into());

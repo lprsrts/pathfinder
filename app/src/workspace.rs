@@ -144,9 +144,18 @@ fn walk(
             continue;
         }
         let path = entry.path();
+        // `/`-separated on every OS: `depth_of` counts them, and the model
+        // sees these paths.
         let rel = path
             .strip_prefix(root)
-            .map(|p| p.to_string_lossy().to_string())
+            .map(|p| {
+                let rel = p.to_string_lossy();
+                if cfg!(windows) {
+                    rel.replace('\\', "/")
+                } else {
+                    rel.into_owned()
+                }
+            })
             .unwrap_or_else(|_| name.clone());
 
         if !is_dir {

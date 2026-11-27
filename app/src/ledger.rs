@@ -97,13 +97,22 @@ pub fn materialize(root: &Path, tree: &str, dir: &Path) -> Result<Vec<String>> {
     std::fs::create_dir_all(dir)?;
     let scratch = scratch_index(root)?;
     let prefix = format!("--prefix={}/", dir.display());
-    let result = git(root, &["read-tree", tree], Some(&scratch)).and_then(|_| {
-        git(
-            root,
-            &["checkout-index", "-a", "-f", &prefix],
-            Some(&scratch),
-        )
-    });
+    // Staging folders sit deep under the data folder; Windows' 260-character
+    // path limit would otherwise stop the checkout.
+    let checkout: &[&str] = if cfg!(windows) {
+        &[
+            "-c",
+            "core.longpaths=true",
+            "checkout-index",
+            "-a",
+            "-f",
+            &prefix,
+        ]
+    } else {
+        &["checkout-index", "-a", "-f", &prefix]
+    };
+    let result = git(root, &["read-tree", tree], Some(&scratch))
+        .and_then(|_| git(root, checkout, Some(&scratch)));
     std::fs::remove_file(&scratch).ok();
     result?;
     let ignored = git(
@@ -125,12 +134,35 @@ pub fn materialize(root: &Path, tree: &str, dir: &Path) -> Result<Vec<String>> {
         if name.contains('/') || name == ".pathfinder" {
             continue;
         }
-        #[cfg(unix)]
-        if std::os::unix::fs::symlink(root.join(name), dir.join(name)).is_ok() {
+        if link_entry(&root.join(name), &dir.join(name)) {
             linked.push(name.to_string());
         }
     }
     Ok(linked)
+}
+
+/// Links `dst` to `src`; false if it couldn't. On Windows a folder gets an
+/// NTFS junction (no admin or Developer Mode needed, and `remove_dir_all`
+/// removes the junction without following it); a file gets a symbolic link
+/// where Windows allows one, and is otherwise left out.
+fn link_entry(src: &Path, dst: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(src, dst).is_ok()
+    }
+    #[cfg(windows)]
+    {
+        if src.is_dir() {
+            junction::create(src, dst).is_ok()
+        } else {
+            std::os::windows::fs::symlink_file(src, dst).is_ok()
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (src, dst);
+        false
+    }
 }
 
 /// A file's content in a snapshot; `None` if it isn't there.

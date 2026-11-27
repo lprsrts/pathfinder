@@ -19,10 +19,7 @@ use super::provenance::RecordedHunk;
 use super::{PartStatus, Runtime, TurnOutput, gate};
 use crate::decide::Question;
 use crate::domain::{Part, Session, Staging};
-use crate::engine::{
-    BoxFuture, CommandOutput, EngineRequest, EngineTier, Host, Permission, StreamEvent, StreamSink,
-    ToolAccess, run_gated,
-};
+use crate::engine::{EngineRequest, EngineTier, StreamEvent, StreamSink, ToolAccess, run_gated};
 use crate::ledger::{self, Hunk};
 use crate::secrets::Secret;
 use crate::stream::ToolContent;
@@ -103,32 +100,6 @@ const CAUGHT_SYSTEM: &str = r#"A review contained one deliberately planted flaw.
 Return ONLY a JSON object:
 {"caught": true}"#;
 
-/// The client without its file access: edits in a staging copy must not go
-/// through Zed (A8). Permission prompts and the terminal still do.
-struct WithoutFiles(Arc<dyn Host>);
-
-impl Host for WithoutFiles {
-    fn ask<'a>(&'a self, call_id: &'a str, always_key: &'a str) -> BoxFuture<'a, Permission> {
-        self.0.ask(call_id, always_key)
-    }
-
-    fn run_in_terminal<'a>(
-        &'a self,
-        call_id: &'a str,
-        command: &'a str,
-        cwd: &'a Path,
-        timeout: std::time::Duration,
-        cancel: &'a tokio_util::sync::CancellationToken,
-    ) -> Option<BoxFuture<'a, Result<CommandOutput>>> {
-        self.0
-            .run_in_terminal(call_id, command, cwd, timeout, cancel)
-    }
-}
-
-pub(super) fn without_files(host: Arc<dyn Host>) -> Arc<dyn Host> {
-    Arc::new(WithoutFiles(host))
-}
-
 /// Shows the agent's tool calls and command output but holds back its
 /// prose and diffs, which would show the real result before the review.
 fn staged(sink: &StreamSink) -> StreamSink {
@@ -194,9 +165,16 @@ fn still_parses(path: &str, content: &str) -> bool {
     if ext == "json" {
         return serde_json::from_str::<serde_json::Value>(content).is_ok();
     }
-    let checker: &[&str] = match ext {
-        "py" => &["python3", "-m", "py_compile"],
-        "js" | "mjs" | "cjs" => &["node", "--check"],
+    // Checkers to try in turn; the first one installed decides. Windows has
+    // the `py` launcher, and its `python3` is often only a store alias.
+    let checkers: &[&[&str]] = match ext {
+        "py" if cfg!(windows) => &[
+            &["py", "-3", "-m", "py_compile"],
+            &["python3", "-m", "py_compile"],
+            &["python", "-m", "py_compile"],
+        ],
+        "py" => &[&["python3", "-m", "py_compile"]],
+        "js" | "mjs" | "cjs" => &[&["node", "--check"]],
         _ => return true,
     };
     let dir = std::env::temp_dir().join(format!("harness-plant-{}", uuid::Uuid::new_v4().simple()));
@@ -205,17 +183,29 @@ fn still_parses(path: &str, content: &str) -> bool {
     }
     let file = dir.join(format!("check.{ext}"));
     let ok = std::fs::write(&file, content).is_ok()
-        && match std::process::Command::new(checker[0])
-            .args(&checker[1..])
-            .arg(&file)
-            .output()
-        {
-            Ok(out) => out.status.success(),
+        && checkers
+            .iter()
+            .find_map(|checker| {
+                let out = std::process::Command::new(checker[0])
+                    .args(&checker[1..])
+                    .arg(&file)
+                    .output()
+                    .ok()?;
+                (!no_interpreter(&out)).then(|| out.status.success())
+            })
             // No checker installed: nothing to check with.
-            Err(_) => true,
-        };
+            .unwrap_or(true);
     std::fs::remove_dir_all(&dir).ok();
     ok
+}
+
+/// A checker that started but has no interpreter behind it: the Windows
+/// store alias for `python3` prints "Python was not found" and exits 9009,
+/// as cmd does for a missing command.
+fn no_interpreter(out: &std::process::Output) -> bool {
+    cfg!(windows)
+        && (out.status.code() == Some(9009)
+            || String::from_utf8_lossy(&out.stderr).contains("Python was not found"))
 }
 
 /// `content` with lines `start..start+len` (1-based) replaced by `added`.
@@ -382,7 +372,7 @@ impl Runtime {
             p.staging = Some(staging);
         }
         session.push_turn("assistant", &reply);
-        Ok(TurnOutput::changed(reply))
+        Ok(TurnOutput::text(reply))
     }
 
     /// Rolls for a check and, if it comes up, plants a flaw in one
@@ -702,9 +692,8 @@ impl Runtime {
         Ok(c.caught)
     }
 
-    /// Writes the agent's real result to your files, through Zed when it
-    /// offers file access (so it shows in Review Changes). A file you
-    /// changed since the handoff began is left alone and named.
+    /// Writes the agent's real result to your files. A file you changed
+    /// since the handoff began is left alone and named.
     async fn apply_staged(&self, session: &Session, staging: &Staging) -> String {
         let Some(root) = ledger::repo_root(&session.cwd) else {
             return "The workspace is no longer a git repository; nothing was written.".into();
@@ -718,7 +707,6 @@ impl Runtime {
                 return format!("Couldn't read the staged result ({e:#}); nothing was written.");
             }
         };
-        let host = crate::engine::turn_ctx().host;
         let (mut written, mut conflicts) = (Vec::new(), Vec::new());
         for f in files {
             let path = root.join(&f.path);
@@ -733,10 +721,7 @@ impl Runtime {
                     if let Some(parent) = path.parent() {
                         std::fs::create_dir_all(parent).ok();
                     }
-                    match host.as_ref().and_then(|h| h.write_file(&path, &content)) {
-                        Some(write) => write.await.is_ok(),
-                        None => std::fs::write(&path, &content).is_ok(),
-                    }
+                    std::fs::write(&path, &content).is_ok()
                 }
                 None => std::fs::remove_file(&path).is_ok(),
             };
@@ -806,7 +791,7 @@ mod tests {
 
     use crate::decide::{Answer, Decide, Decision};
     use crate::domain::{Map, SessionMode};
-    use crate::engine::{Engine, noop_sink};
+    use crate::engine::{BoxFuture, Engine, noop_sink};
     use crate::runtime::TurnInput;
     use crate::store::Store;
 

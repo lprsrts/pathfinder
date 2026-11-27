@@ -1,6 +1,6 @@
 //! Where Pathfinder keeps its files, whatever the setup: XDG variables or
-//! none, macOS, Linux or Windows conventions, an unset `HOME`, or an app
-//! (Zed) started without the shell's environment.
+//! none, macOS, Linux or Windows conventions, an unset `HOME`, or a
+//! launcher that doesn't pass the shell's environment.
 //!
 //! For each kind of file, the first of these that applies:
 //!
@@ -10,11 +10,15 @@
 //!    `XDG_STATE_HOME`, `XDG_CACHE_HOME`), on any system, when it is an
 //!    absolute path; the XDG spec says to ignore relative ones.
 //! 3. A folder an earlier version or the other convention already made, so
-//!    nothing is lost: the platform's own place, then the XDG default.
+//!    nothing is lost: the platform's own place, the place an earlier
+//!    version used on this platform (`%APPDATA%\Pathfinder` for the
+//!    database on Windows), then the XDG default.
 //! 4. The platform's own place: `~/Library/Application Support/com.lprsrts.pathfinder`
 //!    (`~/Library/Caches/…` for the cache) on macOS, `%APPDATA%\Pathfinder`
-//!    (`%LOCALAPPDATA%\Pathfinder` for the cache) on Windows, and the XDG
-//!    defaults (`~/.config/harness`, `~/.local/share/harness`, …) elsewhere.
+//!    for the config and `%LOCALAPPDATA%\Pathfinder` for the database,
+//!    state and cache on Windows (the database stays out of the roaming
+//!    profile), and the XDG defaults (`~/.config/harness`,
+//!    `~/.local/share/harness`, …) elsewhere.
 //!
 //! `pathfinder paths` prints what this resolves to.
 
@@ -104,14 +108,42 @@ fn native(kind: Kind, home: &Path) -> PathBuf {
         let roaming = abs_var("APPDATA").unwrap_or_else(|| home.join("AppData").join("Roaming"));
         let local = abs_var("LOCALAPPDATA").unwrap_or_else(|| home.join("AppData").join("Local"));
         match kind {
-            Kind::Config | Kind::Data => roaming.join(WINDOWS_NAME),
-            Kind::State => local.join(WINDOWS_NAME),
+            // Settings are small and follow the user between machines.
+            Kind::Config => roaming.join(WINDOWS_NAME),
+            // The database (and the staging copies near it) would be synced
+            // with a roaming profile: it stays on this machine.
+            Kind::Data | Kind::State => local.join(WINDOWS_NAME),
             Kind::Cache => local.join(WINDOWS_NAME).join("cache"),
         }
     }
     #[cfg(not(any(target_os = "macos", windows)))]
     {
         xdg_default(kind, home)
+    }
+}
+
+/// Where an earlier version kept files of this kind on this platform, when
+/// that differs from `native`, and the file whose presence shows it is in
+/// use (the folder alone can be another kind's).
+fn earlier_native(kind: Kind, home: &Path) -> Option<(PathBuf, PathBuf)> {
+    #[cfg(windows)]
+    {
+        // Earlier versions kept the database in the roaming profile, in the
+        // folder the config still uses: only the database itself counts.
+        if kind == Kind::Data {
+            let roaming =
+                abs_var("APPDATA").unwrap_or_else(|| home.join("AppData").join("Roaming"));
+            let dir = roaming.join(WINDOWS_NAME);
+            // `config::default_db_path`'s file name.
+            let db = dir.join("harness.sqlite");
+            return Some((dir, db));
+        }
+        None
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (kind, home);
+        None
     }
 }
 
@@ -169,6 +201,17 @@ fn resolve(kind: Kind, exists: impl Fn(&Path) -> bool) -> PathBuf {
             });
     };
     let native = native(kind, &home);
+    // Checked before `native` exists: on Windows the database's new folder
+    // is also the state folder, which earlier versions already made, so
+    // the folder alone doesn't show where the database is.
+    if let Some((earlier, marker)) = earlier_native(kind, &home)
+        && marker.is_file()
+        && marker
+            .file_name()
+            .is_none_or(|name| !native.join(name).is_file())
+    {
+        return earlier;
+    }
     if exists(&native) {
         return native;
     }
@@ -234,7 +277,7 @@ pub fn print() {
     }
     println!(
         "\nSet PATHFINDER_HOME to keep everything in one folder, or the XDG_*_HOME variables.\n\
-         Apps started outside your shell (Zed) don't see your shell's variables: set them\n\
+         Apps started outside your shell don't see your shell's variables: set them\n\
          in that app's settings too, or rely on these defaults."
     );
 }

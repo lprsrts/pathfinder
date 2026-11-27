@@ -4,6 +4,7 @@
 
 pub mod confine;
 pub mod sandbox;
+pub mod shell;
 pub mod tools;
 
 use std::fmt::Write as _;
@@ -200,11 +201,8 @@ fn cap(s: String) -> String {
 /// Where and when the agent works, for the system prompt: the date matters
 /// for deadlines and exams, the access level for what it may try.
 fn environment(req: &EngineRequest) -> String {
-    let date = std::process::Command::new("date")
-        .arg("+%Y-%m-%d (%A), %H:%M %Z")
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    // In-process, with the OS time zone: Windows has no `date` program.
+    let date = jiff::fmt::strtime::format("%Y-%m-%d (%A), %H:%M %Z", &jiff::ZonedDateTime::now())
         .unwrap_or_default();
     let access = match req.tools {
         ToolAccess::None => "none: answer from what you are given",
@@ -213,8 +211,22 @@ fn environment(req: &EngineRequest) -> String {
             "full: you can edit files and run commands (the user approves commands)"
         }
     };
+    // The tool is called `bash` everywhere; where that isn't sh in a
+    // sandbox, say what it really runs.
+    let shell_line = if req.tools == ToolAccess::Full && cfg!(windows) {
+        let shell = shell::current();
+        let note = match shell {
+            shell::Shell::PowerShell(_) => {
+                "commands are PowerShell, not POSIX sh; there is no sandbox here, so the user approves every command"
+            }
+            _ => "there is no sandbox here, so the user approves every command",
+        };
+        format!("\nShell: {} ({note})", shell.name())
+    } else {
+        String::new()
+    };
     let mut env = format!(
-        "\n\n<environment>\nWorkspace: {}\nToday: {date}\nPlatform: {}\nTool access: {access}\n</environment>",
+        "\n\n<environment>\nWorkspace: {}\nToday: {date}\nPlatform: {}{shell_line}\nTool access: {access}\n</environment>",
         req.cwd.display(),
         std::env::consts::OS,
     );
@@ -506,7 +518,7 @@ async fn run_call(
             call.name,
             invalid.unwrap_or_default()
         )),
-        "edit" | "write" if full => change_file(call, &env, req).await.map(|(msg, c)| {
+        "edit" | "write" if full => change_file(call, &env).map(|(msg, c)| {
             sink(StreamEvent::ToolUpdate {
                 id: id.clone(),
                 content: ToolContent::Diff {
@@ -566,37 +578,15 @@ async fn run_call(
     }
 }
 
-/// `edit` and `write`. Through the client when it offers file access, so
-/// the change shows up in its review of the agent's edits; here otherwise.
-async fn change_file(
+/// `edit` and `write`.
+fn change_file(
     call: &crate::llm::ToolCall,
     env: &ToolEnv<'_>,
-    req: &EngineRequest,
 ) -> Result<(String, tools::Change), String> {
     let (path, full) = tools::change_target(&call.args, env)?;
-    let host = req.ctx.host.as_deref();
-    let old = match host.and_then(|h| h.read_file(&full)) {
-        // A file the client can't open is read here, which also tells a
-        // missing file from an unreadable one.
-        Some(read) => match read.await {
-            Ok(text) => Some(text),
-            Err(_) => tools::read_existing(&full, &path)?,
-        },
-        None => tools::read_existing(&full, &path)?,
-    };
+    let old = tools::read_existing(&full, &path)?;
     let (message, new) = tools::apply_change(&call.name, &call.args, &path, old.as_deref())?;
-    match host.and_then(|h| h.write_file(&full, &new)) {
-        Some(write) => {
-            if let Some(parent) = full.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| format!("can't create folders for {path}: {e}"))?;
-            }
-            write
-                .await
-                .map_err(|e| format!("can't write {path}: {e}"))?;
-        }
-        None => tools::write_here(&full, &path, &new)?,
-    }
+    tools::write_here(&full, &path, &new)?;
     Ok((
         message,
         tools::Change {
@@ -607,8 +597,7 @@ async fn change_file(
     ))
 }
 
-/// `bash`: asks the user, then runs in the client's terminal when it has
-/// one, else here.
+/// `bash`: asks the user when it must, then runs here.
 async fn run_command(
     id: &str,
     args: &serde_json::Value,
@@ -641,40 +630,24 @@ async fn run_command(
         network,
     };
     let ask = jail.is_none() || network || crate::config::Config::load().ask_every_command;
-    if let Some(host) = &req.ctx.host
-        && ask
-    {
-        // "Always allow" covers later commands with the same program and
-        // the same kind of access.
-        let program = command.split_whitespace().next().unwrap_or(command);
-        let key = match (jail.is_some(), network) {
-            (false, _) => format!("unsandboxed:{program}"),
-            (true, true) => format!("network:{program}"),
-            (true, false) => program.to_string(),
+    if ask {
+        // Fail closed: a command that needs approval never runs unasked.
+        let Some(host) = &req.ctx.host else {
+            return Err("This command needs the user's approval (it runs without a sandbox, or with network), and nothing can ask them in this mode.".into());
         };
+        let key = always_key(command, jail.is_some(), network);
         if host.ask(id, &key).await == Permission::Denied {
             return Err("The user declined to run this command.".into());
         }
     }
     let started = std::time::Instant::now();
-    let merged = format!("{{ {command}\n}} 2>&1");
+    // Output and errors share one pipe (see `run_local`), so no shell-level
+    // `2>&1` is needed and any shell's syntax works.
     let local_argv = match &jail {
-        Some(kind) => sandbox::wrap(kind, &policy, &merged),
-        None => vec!["/bin/sh".into(), "-c".into(), merged],
+        Some(kind) => sandbox::wrap(kind, &policy, command),
+        None => shell::current().argv(command),
     };
-    let terminal_line = match &jail {
-        Some(kind) => sandbox::shell_join(&sandbox::wrap(kind, &policy, command)),
-        None => command.to_string(),
-    };
-    let terminal = req
-        .ctx
-        .host
-        .as_ref()
-        .and_then(|h| h.run_in_terminal(id, &terminal_line, &req.cwd, timeout, cancel));
-    let output = match terminal {
-        Some(run) => run.await.map_err(|e| e.to_string())?,
-        None => run_local(id, command, local_argv, &req.cwd, timeout, cancel, sink).await?,
-    };
+    let output = run_local(id, command, local_argv, &req.cwd, timeout, cancel, sink).await?;
     let took = started.elapsed().as_secs_f32();
     let status = match output.exit_code {
         Some(0) => format!("Exit code 0 ({took:.1}s)"),
@@ -718,35 +691,63 @@ async fn run_local(
     cancel: &tokio_util::sync::CancellationToken,
     sink: &StreamSink,
 ) -> Result<CommandOutput, String> {
-    use tokio::io::AsyncReadExt;
-    let mut child = tokio::process::Command::new(&argv[0])
-        .args(&argv[1..])
+    use std::io::Read as _;
+    // One pipe for both output and errors, so they interleave as written,
+    // on every OS and in every shell.
+    let (mut reader, writer) =
+        std::io::pipe().map_err(|e| format!("can't make an output pipe: {e}"))?;
+    let errors = writer
+        .try_clone()
+        .map_err(|e| format!("can't make an output pipe: {e}"))?;
+    let mut cmd = tokio::process::Command::new(&argv[0]);
+    cmd.args(&argv[1..])
         .current_dir(cwd)
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| format!("can't start the command: {e}"))?;
-    let mut stdout = child.stdout.take().ok_or("no output pipe")?;
+        .stdout(writer)
+        .stderr(errors)
+        .kill_on_drop(true);
+    shell::prepare(&mut cmd);
+    let spawned = cmd.spawn();
+    // Closes our copies of the write end: the output ends when the
+    // command's processes close theirs.
+    drop(cmd);
+    let mut child = spawned.map_err(|e| format!("can't start the command: {e}"))?;
+    let mut tree = shell::Tree::of(&child);
+    // The pipe is blocking; a thread (not the runtime's blocking pool, which
+    // shutdown would wait on) reads it.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 8192];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.blocking_send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+    });
     // Enough to keep the start and the end; `cap` cuts the middle.
     const KEEP: usize = 4 * MAX_TOOL_OUTPUT;
     let mut head: Vec<u8> = Vec::new();
     let mut tail: std::collections::VecDeque<u8> = std::collections::VecDeque::new();
     let mut dropped = false;
-    let mut buf = [0u8; 8192];
     let deadline = tokio::time::Instant::now() + timeout;
     let mut finished = true;
     loop {
-        let n = tokio::select! {
-            r = stdout.read(&mut buf) => r.unwrap_or(0),
+        let chunk = tokio::select! {
+            c = rx.recv() => c,
             _ = tokio::time::sleep_until(deadline) => { finished = false; break }
             _ = cancel.cancelled() => { finished = false; break }
         };
-        if n == 0 {
+        let Some(chunk) = chunk else {
             break;
-        }
-        for &b in &buf[..n] {
+        };
+        for &b in &chunk {
             if head.len() < KEEP / 2 {
                 head.push(b);
             } else {
@@ -759,8 +760,12 @@ async fn run_local(
         }
     }
     let exit_code = if finished {
-        child.wait().await.ok().and_then(|s| s.code())
+        let code = child.wait().await.ok().and_then(|s| s.code());
+        tree.release();
+        code
     } else {
+        // Everything it started, not only the shell.
+        tree.kill();
         child.kill().await.ok();
         None
     };
@@ -838,8 +843,36 @@ async fn complete_with_retry(
     }
 }
 
+/// What an "Always allow" answer covers. Inside the sandbox it covers later
+/// commands with the same program and the same kind of access. Without a
+/// sandbox nothing confines the command, so it covers only this exact
+/// command line: allowing `ls` must not let `ls && rm -rf ~` through.
+fn always_key(command: &str, sandboxed: bool, network: bool) -> String {
+    let program = command.split_whitespace().next().unwrap_or(command);
+    match (sandboxed, network) {
+        (false, _) => format!("unsandboxed:{}", command.trim()),
+        (true, true) => format!("network:{program}"),
+        (true, false) => program.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn always_key_is_exact_without_a_sandbox() {
+        use super::always_key;
+        assert_eq!(
+            always_key("ls -la", true, false),
+            always_key("ls src", true, false)
+        );
+        assert_ne!(
+            always_key("ls", false, false),
+            always_key("ls && rm -rf ~", false, false)
+        );
+        assert_eq!(always_key("ls ", false, false), "unsandboxed:ls");
+        assert_eq!(always_key("curl https://x.y", true, true), "network:curl");
+    }
+
     use std::collections::VecDeque;
     use std::fs;
     use std::sync::Mutex;
@@ -926,7 +959,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("harness-agent-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("Cargo.toml"), "[package]\nname = \"demo\"\n").unwrap();
-        dir.canonicalize().unwrap()
+        dunce::canonicalize(dir).unwrap()
     }
 
     fn recorder() -> (StreamSink, Arc<Mutex<Vec<String>>>) {
@@ -1047,22 +1080,12 @@ mod tests {
         fs::remove_dir_all(ws).unwrap();
     }
 
-    /// Answers every permission prompt the same way; no terminals.
+    /// Answers every permission prompt the same way.
     struct FakeHost(Permission);
 
     impl crate::engine::Host for FakeHost {
         fn ask<'a>(&'a self, _: &'a str, _: &'a str) -> BoxFuture<'a, Permission> {
             Box::pin(async move { self.0 })
-        }
-        fn run_in_terminal<'a>(
-            &'a self,
-            _: &'a str,
-            _: &'a str,
-            _: &'a std::path::Path,
-            _: Duration,
-            _: &'a CancellationToken,
-        ) -> Option<BoxFuture<'a, Result<CommandOutput>>> {
-            None
         }
     }
 
@@ -1138,70 +1161,6 @@ mod tests {
             panic!("expected tool results");
         };
         assert!(results[0].is_error && results[0].content.contains("declined"));
-        fs::remove_dir_all(ws).unwrap();
-    }
-
-    /// A client with file access: records writes instead of touching disk.
-    #[derive(Default)]
-    struct FileHost(Mutex<Vec<(PathBuf, String)>>);
-
-    impl crate::engine::Host for FileHost {
-        fn ask<'a>(&'a self, _: &'a str, _: &'a str) -> BoxFuture<'a, Permission> {
-            Box::pin(async { Permission::Once })
-        }
-        fn run_in_terminal<'a>(
-            &'a self,
-            _: &'a str,
-            _: &'a str,
-            _: &'a std::path::Path,
-            _: Duration,
-            _: &'a CancellationToken,
-        ) -> Option<BoxFuture<'a, Result<CommandOutput>>> {
-            None
-        }
-        fn read_file<'a>(
-            &'a self,
-            path: &'a std::path::Path,
-        ) -> Option<BoxFuture<'a, Result<String>>> {
-            Some(Box::pin(async move { Ok(fs::read_to_string(path)?) }))
-        }
-        fn write_file<'a>(
-            &'a self,
-            path: &'a std::path::Path,
-            content: &'a str,
-        ) -> Option<BoxFuture<'a, Result<()>>> {
-            self.0
-                .lock()
-                .unwrap()
-                .push((path.to_path_buf(), content.to_string()));
-            Some(Box::pin(async { Ok(()) }))
-        }
-    }
-
-    #[tokio::test]
-    async fn edits_go_through_the_client_when_it_offers_files() {
-        let ws = workspace();
-        let (engine, _) = scripted(vec![
-            Ok(vec![call(
-                "e1",
-                "edit",
-                json!({"path": "Cargo.toml", "old_string": "demo", "new_string": "neuron"}),
-            )]),
-            Ok(vec![Part::Text("Done.".into())]),
-        ]);
-        let host = Arc::new(FileHost::default());
-        let mut req = request(ws.clone(), ToolAccess::Full);
-        req.ctx.host = Some(host.clone());
-        engine.run_text(&req, recorder().0).await.unwrap();
-        let writes = host.0.lock().unwrap();
-        assert_eq!(writes.len(), 1);
-        assert!(writes[0].0.ends_with("Cargo.toml") && writes[0].1.contains("neuron"));
-        // The client applies it; Pathfinder didn't write the file itself.
-        assert!(
-            fs::read_to_string(ws.join("Cargo.toml"))
-                .unwrap()
-                .contains("demo")
-        );
         fs::remove_dir_all(ws).unwrap();
     }
 
@@ -1287,6 +1246,7 @@ mod tests {
         assert_eq!(cleared, [true, true, false, false, false]);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn command_output_survives_a_timeout() {
         let ws = workspace();
@@ -1294,7 +1254,7 @@ mod tests {
         let out = run_local(
             "t",
             cmd,
-            vec!["/bin/sh".into(), "-c".into(), format!("{{ {cmd}\n}} 2>&1")],
+            shell::current().argv(cmd),
             &ws,
             Duration::from_millis(500),
             &CancellationToken::new(),
@@ -1309,6 +1269,56 @@ mod tests {
             out.output
         );
         fs::remove_dir_all(ws).unwrap();
+    }
+
+    /// A timeout ends what the command started too, not only the shell.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_timeout_kills_the_whole_tree() {
+        let ws = workspace();
+        let cmd = "sleep 30 & echo $! > child.pid; wait";
+        let out = run_local(
+            "t",
+            cmd,
+            shell::current().argv(cmd),
+            &ws,
+            Duration::from_millis(500),
+            &CancellationToken::new(),
+            &recorder().0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.exit_code, None);
+        let pid = fs::read_to_string(ws.join("child.pid")).unwrap();
+        let pid: i32 = pid.trim().parse().unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // SAFETY: signal 0 only checks that the process exists.
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        assert!(!alive, "the backgrounded sleep survived");
+        fs::remove_dir_all(ws).unwrap();
+    }
+
+    /// With nothing to ask, a command that needs approval doesn't run.
+    #[tokio::test]
+    async fn commands_needing_approval_fail_closed_without_a_host() {
+        let ws = workspace();
+        let req = request(ws.clone(), ToolAccess::Full);
+        assert!(req.ctx.host.is_none());
+        let args = json!({"command": "touch ran", "network": true, "justification": "test"});
+        let err = run_command("b", &args, &req, &recorder().0)
+            .await
+            .unwrap_err();
+        assert!(err.contains("nothing can ask"), "{err}");
+        assert!(!ws.join("ran").exists());
+        fs::remove_dir_all(ws).unwrap();
+    }
+
+    #[test]
+    fn the_prompt_knows_the_date() {
+        let req = request(std::env::temp_dir(), ToolAccess::ReadOnly);
+        let env = environment(&req);
+        let today = env.lines().find_map(|l| l.strip_prefix("Today: ")).unwrap();
+        assert!(today.len() >= "2026-01-01 (Monday), 00:00".len(), "{today}");
     }
 
     #[tokio::test]

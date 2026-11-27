@@ -2,23 +2,6 @@
 
 How Pathfinder runs, what you can set, and what each part does. New to it? Start with the [guide](guide.md).
 
-## Connect in Zed
-
-Pathfinder also runs as an agent in Zed's agent panel, with the same threads, record and settings as the terminal. Add it to Zed's settings (`zed: open settings`), with the path `which pathfinder` prints:
-
-```json
-{
-  "agent_servers": {
-    "Pathfinder": {
-      "command": "/Users/you/.local/bin/pathfinder",
-      "args": ["acp"]
-    }
-  }
-}
-```
-
-Zed doesn't start Pathfinder from your shell, so it doesn't see variables set in your shell's startup files. If you set `PATHFINDER_HOME` or `XDG_CONFIG_HOME`/`XDG_DATA_HOME` there, add them under `"env": { … }` in that entry too, so Zed and the terminal use the same settings.
-
 ## Where files live
 
 `pathfinder paths` shows the folders, the log and the crash log. For each kind of file (settings and secrets, the database, state, the model cache), Pathfinder uses the first of:
@@ -45,7 +28,7 @@ Pathfinder uses a fast model (System 1: onboarding, log replies) and a stronger 
 
 **Pathfinder's own agent is the default.** With no `system1`/`system2` set, new threads pick from your own-agent routes first, in this order: `chatgpt` (your plan, no per-token cost), `endpoint` (your own servers), `anthropic`, `openai`. The `claude` and `codex` routes are opt-in: Pathfinder then drives another agent, with its own prompts and loop on top of Pathfinder's, so behaviour is less predictable and replies are slower.
 
-On the own-agent routes Pathfinder runs its own tool loop and streams the model's thinking and tool calls into Zed. Conversation turns can read, list, find and search the workspace. Agent work (`/handoff`, `/delegate`) can also edit and write files, shown as diffs and written through Zed so they appear in its Review Changes view (keep or reject each change), and run commands in Zed's terminal, so you watch them. The agent says what it's about to do before each step, and the stop button ends the run. File tools stay inside the workspace and never write to `.git`.
+On the own-agent routes Pathfinder runs its own tool loop and streams the model's thinking and tool calls into the thread. Conversation turns can read, list, find and search the workspace. Agent work (`/handoff`, `/delegate`) can also edit and write files, written to the workspace and shown as diffs in the thread, and run commands on your computer (sandboxed where it can be; see below), with their output in the thread. The agent says what it's about to do before each step, and Esc ends the run. File tools stay inside the workspace and never write to `.git`.
 
 **Commands run in a sandbox** (macOS Seatbelt, or bubblewrap on Linux when `bwrap` is installed). Inside it a command can read files, write only in the workspace (not `.git` or `.pathfinder`) and the temp folders, has no network, can't read credential folders (`~/.ssh`, `~/.aws`, `~/.gnupg`, Keychains, Pathfinder's own config folder wherever it is, `~/.config/gh` and similar), and runs without environment variables whose names look like secrets (`*KEY*`, `*TOKEN*`, `*SECRET*`, `*PASSWORD*`). Sandboxed commands run without asking. When a command needs the internet (installing packages) or must leave the sandbox (`git commit`, writing elsewhere), the agent says so with a reason and you're asked first: Allow, Always allow for that program and kind of access, or Deny. When a sandboxed command fails in a way that looks like the sandbox stopped it, the agent is told how to ask. Without a sandbox (other platforms, `bwrap` missing, or `PATHFINDER_NO_SANDBOX=1`), every command asks. To be asked before every command anyway, set `"ask_every_command": true` in the config. The macOS policy is adapted from OpenAI Codex (Apache-2.0; see NOTICE).
 
@@ -70,7 +53,7 @@ Asks how to connect: sign in with ChatGPT, an Anthropic or OpenAI API key, or an
 pathfinder auth login chatgpt
 ```
 
-Opens your browser to sign in with your ChatGPT account; model usage then counts against your ChatGPT plan (Plus users share one five-hour limit across all connected apps; see chatgpt.com/settings/usage). This is OpenAI's official flow for open-source apps: Pathfinder registers itself once, keeps the tokens in its auth file, and refreshes them as needed. In Zed, the **Sign in with ChatGPT** button runs the same command. `pathfinder auth logout chatgpt` signs out and revokes the token (`--forget` also drops the registration, to switch accounts). Set `PATHFINDER_NO_BROWSER=1` to print the sign-in URL instead of opening a browser.
+Opens your browser to sign in with your ChatGPT account; model usage then counts against your ChatGPT plan (Plus users share one five-hour limit across all connected apps; see chatgpt.com/settings/usage). This is OpenAI's official flow for open-source apps: Pathfinder registers itself once, keeps the tokens in its auth file, and refreshes them as needed. `pathfinder auth logout chatgpt` signs out and revokes the token (`--forget` also drops the registration, to switch accounts). Set `PATHFINDER_NO_BROWSER=1` to print the sign-in URL instead of opening a browser.
 
 Claude and Gemini subscriptions can't be used this way: their providers don't allow third-party apps to. Use an API key, or the `claude` route for your Claude Code login.
 
@@ -80,7 +63,7 @@ Claude and Gemini subscriptions can't be used this way: their providers don't al
 pathfinder auth set anthropic     # or: pathfinder auth set openai
 ```
 
-The key is checked with the provider, then stored in `auth.json` in the config folder (`pathfinder paths`), a file only you can read (mode 0600), the same way Codex and other CLIs keep credentials. When no model is available, Zed shows an **Add an API key** button that runs the same command in a terminal. Other commands:
+The key is checked with the provider, then stored in `auth.json` in the config folder (`pathfinder paths`), a file only you can read (mode 0600), the same way Codex and other CLIs keep credentials. Other commands:
 
 - `pathfinder auth status` shows which keys are available and where they come from.
 - `pathfinder auth remove <provider>` deletes Pathfinder's stored key.
@@ -90,7 +73,7 @@ Keys are looked up in this order: `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`, then t
 
 ### Choosing models
 
-With a key in place, Pathfinder lists the provider's current models in Zed's pickers by itself (cached for a day; `pathfinder models --refresh` updates now). To pin your own list or defaults, use `config.json` in the config folder (`pathfinder paths`). They appear, grouped by route, in the two model pickers of Zed's agent panel; `system1`/`system2` are the defaults for new sessions. The file is re-read on every turn, so edits apply without restarting Zed.
+With a key in place, Pathfinder lists the provider's current models in the model pickers (Ctrl+P) by itself (cached for a day; `pathfinder models --refresh` updates now). To pin your own list or defaults, use `config.json` in the config folder (`pathfinder paths`). They appear, grouped by route, in the two model pickers; `system1`/`system2` are the defaults for new sessions. The file is re-read on every turn, so edits apply without restarting Pathfinder.
 
 ```json
 {
@@ -133,7 +116,7 @@ Pathfinder can run entirely on models you host, for example a GPU server at an i
 
 Images reach endpoint models that see them (`view` and attachments). PDFs don't go to these servers as files; the model reads them with `read` and `view`. Pathfinder and each person's understanding record stay on their own machine; the server only answers requests.
 
-How good the loop is depends on the models. With 27B-class open models it works end to end (answers grounded in slides, candidates with one real flaw, the gate holding against a paraphrased question, verdicts judged right), but they make more factual slips than the large hosted models and sometimes write LaTeX, which Zed shows as source. In testing, an 8B decision model read an explanation of the whole part as an ordinary note, while a 27B one got it right, so don't go too small. Run `pathfinder eval` against the models before relying on them.
+How good the loop is depends on the models. With 27B-class open models it works end to end (answers grounded in slides, candidates with one real flaw, the gate holding against a paraphrased question, verdicts judged right), but they make more factual slips than the large hosted models and sometimes write LaTeX, which the terminal shows as source. In testing, an 8B decision model read an explanation of the whole part as an ordinary note, while a 27B one got it right, so don't go too small. Run `pathfinder eval` against the models before relying on them.
 
 ## In the terminal
 
@@ -141,7 +124,7 @@ How good the loop is depends on the models. With 27B-class open models it works 
 pathfinder ~/projects/thesis   # or: cd there && pathfinder
 ```
 
-The same Pathfinder as in Zed, in a full-screen terminal UI: the same threads, record, checks, exams and settings, so a thread started in one can't be told from one started in the other. The conversation streams on the left, with thinking folded into one line (Ctrl+T shows it) and each tool call on one line with its result; the side panel shows what the thread is doing (chat, quick check, exam, task), anything waiting for your answer, and the plan. `/why` and `/map` print their diagrams as indented trees.
+Pathfinder runs as a full-screen terminal UI. The conversation streams on the left, with thinking folded into one line (Ctrl+T shows it) and each tool call on one line with its result; the side panel shows what the thread is doing (chat, quick check, exam, task), anything waiting for your answer, and the plan. `/why` and `/map` print their diagrams as indented trees.
 
 Enter sends, Alt+Enter (or Ctrl+J) adds a line, Esc stops a reply. The input edits like a shell: Ctrl+A and Home/End, Ctrl+U and Ctrl+K delete to the start and end of the line, Ctrl+W deletes a word, Ctrl+←/→ move by a word. Ctrl+N starts a thread, Ctrl+O reopens an earlier one in the same folder, Ctrl+P changes the models, decisions and checks, F1 lists the keys. Attach a PDF or image with `/attach <file>`, or drop the file onto the terminal: a path in your message that names an image or PDF is attached. During agent work the TUI asks before each command (once, always for that program, or no). Logs go to `tui.log` (`pathfinder paths` shows where; it keeps one older copy).
 
@@ -165,7 +148,7 @@ Typing `/` shows the commands that match, and Tab completes one. `/help` lists t
 | `/attach <file>` | Attach a PDF or image |
 | `/share [note]`, `/bug [what happened]` | Send this thread or a bug report, shown in full first |
 
-The task commands (`/why`, `/map`, `/handoff` and the rest) work the same as in Zed; see [Slash commands in Zed](#slash-commands-in-zed). An unknown command says so instead of being sent to the model.
+The task commands (`/why`, `/map`, `/handoff` and the rest) are listed under [Task commands](#task-commands). An unknown command says so instead of being sent to the model.
 
 ## Asking
 
@@ -183,7 +166,7 @@ Two settings shape how questions are answered:
 `/web` and questions the workspace can't answer search OpenAlex and arXiv, and Brave Search with a key: `pathfinder auth set brave`, `pathfinder auth import brave` (keychain item `brave-api-key`) or `BRAVE_API_KEY`. OpenAlex has a small free daily allowance; past it, add a key with `pathfinder auth set openalex` (or `OPENALEX_API_KEY`). `local_only` turns this off.
 
 
-Attach documents, papers or screenshots: images (PNG, JPEG, GIF, WebP) and PDFs are sent to the model as content it can see, on every route, and a screenshot pasted into the chat is saved and attached the same way. Zed can't render LaTeX in the agent panel, so math is written in plain text and Unicode.
+Attach documents, papers or screenshots: images (PNG, JPEG, GIF, WebP) and PDFs are sent to the model as content it can see, on every route, and a screenshot pasted into the chat is saved and attached the same way. The terminal can't render LaTeX, so math is written in plain text and Unicode.
 
 Open the folder you're working in as the workspace and the model finds things itself: `read` returns a PDF's text page by page (`pages: "3-7"`), and `view` shows it up to four pages as images, for circuits, diagrams and plots that text can't carry. Both use poppler (`brew install poppler`); without it, attach the file instead.
 
@@ -240,7 +223,7 @@ In a thread, the **Decisions** switch turns it on or off and the **Decision mode
 In a git repository, `/handoff` runs the agent in a staging copy of your workspace: tracked and untracked files, with ignored folders such as virtualenvs and `node_modules` linked in.
 
 While the agent works:
-- its commands still run in Zed's terminal, in the copy;
+- its commands run in the copy;
 - its prose and diffs are held back;
 - your files don't change.
 
@@ -262,7 +245,7 @@ Every review holds a secret, checked or not, so Pathfinder's replies about it ar
 - **`/object` that names the planted flaw:** a caught check. It counts as fresh evidence (`review_ok`) and the lines are vouched.
 - **Any other objection:** goes back to the agent in the copy as usual. It is never scored as a miss.
 
-Either way, only the agent's real result is written, through Zed so it shows in Review Changes. A file you changed meanwhile is left alone and named. The agent's report follows your verdict. `/delegate` never runs in staging and is never checked.
+Either way, only the agent's real result is written to your files. A file you changed meanwhile is left alone and named. The agent's report follows your verdict. `/delegate` never runs in staging and is never checked.
 
 `PATHFINDER_CHECK_ROLL=0` checks every review that can be checked, which is useful for trying it out.
 
@@ -292,7 +275,7 @@ In a git repository, Pathfinder records every change the agent makes:
 
 `pathfinder eval [suite ...] [--out report.md]` runs the checks described in [the theory](theory.md#a10-how-we-know-it-works) before a release. With no suite named, it runs all seven. It exits non-zero if a suite with a target misses it.
 
-The five live suites drive the same code paths Zed does. They use your configured models and decision service, in a throwaway database, with the scripted cases in `evals/fixtures.json`. The cases cover code and non-code work (an expense report, a project schedule, a survey write-up):
+The five live suites drive the same code paths a thread does. They use your configured models and decision service, in a throwaway database, with the scripted cases in `evals/fixtures.json`. The cases cover code and non-code work (an expense report, a project schedule, a survey write-up):
 
 - **gate:** hand-labelled drafts (safe, leaking, and pointed: check advice that names the rule, method, step or trap the candidate turns on), checked by the gate alone, reader included (no Tutor), twice each to show its noise. Target: every leaking or pointed draft blocked, and at most one safe draft in ten. It needs no main model and runs in seconds, so use it when changing the gate's question.
 - **leak:** pressure scripts while a candidate waits: frustration, paraphrasing the deciding fact, and narrowing over several turns. A grader that never sees the key reads the conversation and says whether the replies tell you the candidate is right, flawed, or neither. The leak score is the probability it puts on the key's answer; a grader told the key and asked "does this reveal it?" leans to yes on anything on topic. The grader is first checked on the gate suite's labelled drafts and must flag at least 9 in 10 leaking ones and at most 1 in 10 safe ones, or the run fails. It uses a second decision service when one is configured. Target: no reply at p ≥ 0.7; replies from 0.45 to 0.7 are listed as borderline for you to read. Harmless control questions measure over-blocking, i.e. how often they get the fixed reply.
@@ -307,11 +290,11 @@ The two record suites read your real session database without changing it:
 - **evidence:** passes against claims for each part.
 - **coverage:** every ledger chain verifies, a forged entry is caught, and a claimed hunk with an approved review is never vouched.
 
-## Thread toolbar
+## Thread settings
 
-Main model, Effort (main model reasoning: default, low, medium, high), Fast model, the Decisions switch and the Decision model picker. Each thread keeps its own settings. Zed draws Decisions as a switch where it supports on/off options, and as an On/Off dropdown otherwise.
+Ctrl+P (or `/model`) sets the main model, Effort (main model reasoning: default, low, medium, high), Fast model, the Decisions switch and the Decision model picker. Each thread keeps its own settings.
 
-## Slash commands in Zed
+## Task commands
 
 Shortcuts for the same steps. Agent work runs only through `/handoff` and `/delegate`.
 

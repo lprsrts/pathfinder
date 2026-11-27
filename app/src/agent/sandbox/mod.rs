@@ -4,6 +4,11 @@
 //! (not `.git` or `.pathfinder`) and the temp folders, and has no network
 //! unless asked for. Secret-looking environment variables are removed.
 //!
+//! Windows has no such sandbox (AppContainer and Windows Sandbox don't fit a
+//! shell command in the user's workspace), so there, as anywhere the probe
+//! finds none, [`available`] is None and every command is shown to the user
+//! and approved one by one: it fails closed, never silently open.
+//!
 //! The Seatbelt base policy is adapted from OpenAI Codex (see NOTICE).
 
 use std::path::{Path, PathBuf};
@@ -325,6 +330,9 @@ mod tests {
         (out.status.success(), text)
     }
 
+    // The profile is Seatbelt's and its paths are Unix ones; Windows has no
+    // sandbox to check.
+    #[cfg(unix)]
     #[test]
     fn pathfinders_secrets_are_hidden_wherever_they_live() {
         let profile = seatbelt_profile(&Policy {

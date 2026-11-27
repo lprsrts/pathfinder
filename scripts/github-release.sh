@@ -6,7 +6,7 @@
 #
 # The notes are the version's section of CHANGELOG.md. Every file in the
 # folder is attached (the archives, and from 0.3.1 the signed manifest), and
-# install.sh. A
+# the installers, install.sh and install.ps1. A
 # release that already exists gets any missing files added. Needs `gh`,
 # signed in to an account that can write to the repository.
 set -euo pipefail
@@ -26,12 +26,12 @@ section="$(awk -v v="$version" '
 [[ -n "${section//[[:space:]]/}" ]] || { echo "error: no \"## $version\" section in CHANGELOG.md" >&2; exit 1; }
 notes="$section
 
-Install or update on a Mac: \`curl -fsSL https://pathfinder.lprsrts.com/install.sh | sh\`, or \`pathfinder update\`. The archive is signed and notarised by Apple; the installer and \`pathfinder update\` check it against the release manifest, which is signed with Pathfinder's release key."
+Install on macOS or Linux: \`curl -fsSL https://pathfinder.lprsrts.com/install.sh | sh\`. Install on Windows (PowerShell): \`irm https://pathfinder.lprsrts.com/install.ps1 | iex\`. Update with \`pathfinder update\`. The Mac archive is signed and notarised by Apple; the installers and \`pathfinder update\` check every archive against the release manifest, which is signed with Pathfinder's release key."
 
 shopt -s nullglob
-# The installer too, so `releases/latest/download/install.sh` works while
-# Pathfinder's server is down.
-files=("$dir"/* "$root/collector/public/install.sh")
+# The installers too, so `releases/latest/download/install.sh` (and
+# install.ps1) work while Pathfinder's server is down.
+files=("$dir"/* "$root/collector/public/install.sh" "$root/collector/public/install.ps1")
 if gh release view "$tag" >/dev/null 2>&1; then
     gh release upload "$tag" "${files[@]}" --clobber >/dev/null
     echo "updated the GitHub release $tag"

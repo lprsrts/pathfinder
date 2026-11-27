@@ -1,6 +1,5 @@
 pub use pathfinder::*;
 
-mod acp;
 mod cli;
 mod tui;
 mod update;
@@ -38,7 +37,6 @@ Usage: pathfinder [command]
   pathfinder help             This text
 
 For developers:
-  pathfinder acp              Run as an agent server over stdio (for Zed)
   pathfinder models [--refresh]
                               The models your keys can use
   pathfinder coverage [--export] [folder]
@@ -75,7 +73,11 @@ async fn main() -> std::process::ExitCode {
                 return ExitCode::from(2);
             }
         }
-        "acp" | "auth" | "data" | "bug" | "update" | "paths" | "models" | "coverage" | "eval" => {}
+        "acp" => {
+            eprintln!("The Zed agent server was removed. Run `pathfinder` in a terminal instead.");
+            return ExitCode::from(2);
+        }
+        "auth" | "data" | "bug" | "update" | "paths" | "models" | "coverage" | "eval" => {}
         other => {
             eprintln!("Unknown command `{other}`.\n\n{}", usage());
             return ExitCode::from(2);
@@ -146,37 +148,11 @@ async fn run(args: Vec<String>) -> Result<()> {
     }
 
     link_new_name();
-    match args.first().map(String::as_str) {
-        Some("tui") => crash::install(pathfinder_schema::Surface::Tui, Some(tui::restore_terminal)),
-        Some("acp") => crash::install(pathfinder_schema::Surface::Zed, None),
-        _ => {}
+    if args.first().map(String::as_str) == Some("tui") {
+        crash::install(pathfinder_schema::Surface::Tui, Some(tui::restore_terminal));
     }
 
-    // Zed's sign-in buttons re-run the agent command with extra arguments,
-    // e.g. `pathfinder acp auth set`.
-    let args: Vec<String> = match args.split_first() {
-        Some((first, rest)) if first == "acp" && !rest.is_empty() => rest.to_vec(),
-        _ => args,
-    };
     match args.first().map(String::as_str) {
-        Some("acp") => {
-            let cfg = Config::load();
-            let cfg_db = cfg.db_path.clone();
-            let store = Arc::new(Store::open(&cfg.db_path)?);
-            let creds = Arc::new(Credentials::system());
-            let engine = Arc::new(RouterEngine::new(
-                CliEngine::new(cfg),
-                ApiEngine::with_credentials(creds.clone()),
-            ));
-            let runtime = Arc::new(
-                Runtime::new(store, engine)
-                    .with_decider(Arc::new(decide::SystemDecider::new(creds.clone()))),
-            );
-            start_telemetry(&cfg_db);
-            let result = acp::run_stdio(runtime, creds).await;
-            stop_telemetry().await;
-            result
-        }
         Some("tui") => {
             let cfg = Config::load();
             let cfg_db = cfg.db_path.clone();
@@ -253,8 +229,8 @@ async fn run(args: Vec<String>) -> Result<()> {
 
 /// Installs from before 0.3 put the program at `harness`, and updated it in
 /// place under that name. Moves it to `pathfinder`, once, and leaves
-/// `harness` as a link to it, so settings that still run `harness` (Zed's)
-/// keep working.
+/// `harness` as a link to it, so anything that still runs `harness` keeps
+/// working.
 fn link_new_name() {
     #[cfg(unix)]
     if let Ok(exe) = env::current_exe()
