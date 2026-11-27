@@ -47,7 +47,7 @@ impl Runtime {
             p.status = PartStatus::InReview;
             p.unreviewed = changes;
         }
-        Ok(TurnOutput::changed(REVIEW_PROMPT))
+        Ok(TurnOutput::text(REVIEW_PROMPT))
     }
 
     pub(super) async fn handle_object(
@@ -146,11 +146,9 @@ impl Runtime {
         if !instructions.is_empty() {
             prompt.push_str(&format!("\n\nUser instructions: {instructions}"));
         }
-        let mut ctx = crate::engine::turn_ctx();
+        let ctx = crate::engine::turn_ctx();
         if staging.is_some() {
             prompt.push_str("\n\nYou are working in a copy of the user's workspace (your working directory). Edit and run things there as usual; the user reviews the result before it reaches their files.");
-            // Edits stay in the copy: never through the client's files.
-            ctx.host = ctx.host.map(review::without_files);
         }
         let req = EngineRequest {
             tier: EngineTier::System2,

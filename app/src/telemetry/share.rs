@@ -30,7 +30,7 @@ pub fn scrub_paths(text: &str, cwd: &Path) -> String {
 /// that contains the given one is replaced whole).
 fn spellings(p: &Path) -> Vec<String> {
     let mut all = vec![p.display().to_string()];
-    if let Ok(real) = p.canonicalize() {
+    if let Ok(real) = dunce::canonicalize(p) {
         all.push(real.display().to_string());
     }
     all.sort_by_key(|s| std::cmp::Reverse(s.len()));

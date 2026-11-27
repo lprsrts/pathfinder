@@ -13,8 +13,6 @@ pathfinder
 
 Pathfinder finds and reads the files there by itself: code, notes, papers, PDFs, figures included. F1 shows the keys. Start a new thread (Ctrl+N) for each topic or task.
 
-In Zed, open the folder as the project and start a new Pathfinder thread in the agent panel. Everything below works the same there.
-
 ## Ask, and get told where to look
 
 Ask in your own words, in any language. Pathfinder doesn't answer: like a librarian with a catalogue, it points to where your material addresses the question and shows a short verbatim line from there.
@@ -74,7 +72,7 @@ In the terminal there are also `/help`, `/quit` (or `/exit`), `/new` (or `/clear
 
 ## Models
 
-`pathfinder auth login` connects models. Ctrl+P (the toolbar in Zed) picks them for a thread: a fast one for quick replies and a main one for candidates, judging and agent work. See the [reference](reference.md#models-and-routes).
+`pathfinder auth login` connects models. Ctrl+P picks them for a thread: a fast one for quick replies and a main one for candidates, judging and agent work. See the [reference](reference.md#models-and-routes).
 
 ## If something's off
 

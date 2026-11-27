@@ -38,6 +38,6 @@ impl Runtime {
             None => lead,
         };
         session.push_turn("assistant", &reply);
-        TurnOutput::changed(reply)
+        TurnOutput::text(reply)
     }
 }

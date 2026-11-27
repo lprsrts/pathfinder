@@ -701,7 +701,7 @@ impl Runtime {
             session.active = Some(next_id.clone());
             sink(StreamEvent::TextDelta("\n\n".into()));
             let ask = self.write_candidate(session, &next_id, files, sink).await?;
-            return Ok(TurnOutput::changed(ask));
+            return Ok(TurnOutput::text(ask));
         }
         // A quick check is one candidate: record it and go back to chat.
         if session.quick_check {
@@ -710,7 +710,7 @@ impl Runtime {
             }
             session.push_turn("assistant", &verdict.feedback);
             end_quick_check(session);
-            return Ok(TurnOutput::changed(String::new()));
+            return Ok(TurnOutput::text(String::new()));
         }
         if verdict.pass && !understood {
             let next = format!(
@@ -736,6 +736,6 @@ impl Runtime {
             )
         };
         session.push_turn("assistant", format!("{}{next}", verdict.feedback));
-        Ok(TurnOutput::changed(next))
+        Ok(TurnOutput::text(next))
     }
 }

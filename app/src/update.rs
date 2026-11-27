@@ -10,7 +10,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
-use pathfinder_schema::{Release, UpdateOutcome};
+use pathfinder_schema::{Release, ReleaseFile, UpdateOutcome};
 use sha2::{Digest, Sha256};
 
 /// The release signing key's public half (`collector keygen`).
@@ -28,8 +28,16 @@ fn target() -> Option<&'static str> {
         ("macos", _) => Some("universal-apple-darwin"),
         ("linux", "x86_64") => Some("x86_64-unknown-linux-gnu"),
         ("linux", "aarch64") => Some("aarch64-unknown-linux-gnu"),
+        ("windows", "x86_64") => Some("x86_64-pc-windows-msvc"),
+        ("windows", "aarch64") => Some("aarch64-pc-windows-msvc"),
         _ => None,
     }
+}
+
+/// This machine's build in `release`, if it has one.
+fn build_for(release: &Release) -> Option<(&'static str, &ReleaseFile)> {
+    let target = target()?;
+    release.files.get(target).map(|file| (target, file))
 }
 
 fn releases_url() -> String {
@@ -174,6 +182,7 @@ pub async fn available() -> Option<String> {
     if crate::envvar::get("PATHFINDER_NO_UPDATE_CHECK").is_ok() {
         return None;
     }
+    tidy();
     let stamp = stamp_path();
     let fresh = std::fs::metadata(&stamp)
         .and_then(|m| m.modified())
@@ -184,11 +193,18 @@ pub async fn available() -> Option<String> {
         std::fs::read_to_string(&stamp).ok()?
     } else {
         let release = latest().await.ok()?;
+        // A release without a build for this machine isn't worth announcing:
+        // `pathfinder update` couldn't install it. The stamp then stays empty.
+        let offered = if build_for(&release).is_some() {
+            release.version
+        } else {
+            String::new()
+        };
         if let Some(dir) = stamp.parent() {
             std::fs::create_dir_all(dir).ok();
         }
-        std::fs::write(&stamp, &release.version).ok();
-        release.version
+        std::fs::write(&stamp, &offered).ok();
+        offered
     };
     newer(version.trim(), env!("CARGO_PKG_VERSION")).then(|| version.trim().to_string())
 }
@@ -202,6 +218,7 @@ fn stamp_path() -> PathBuf {
 /// `pathfinder update [--check]`.
 pub async fn run(args: &[String]) -> Result<()> {
     let current = env!("CARGO_PKG_VERSION");
+    tidy();
     let release = latest().await?;
     if !newer(&release.version, current) {
         println!("Pathfinder {current} is the newest version.");
@@ -215,15 +232,17 @@ pub async fn run(args: &[String]) -> Result<()> {
         println!("\n{}\n", release.notes.trim());
     }
     if args.iter().any(|a| a == "--check") {
-        println!("Run `pathfinder update` to install it.");
+        if build_for(&release).is_some() {
+            println!("Run `pathfinder update` to install it.");
+        } else {
+            println!("It has no build for this platform yet.");
+        }
         return Ok(());
     }
     let target = target().context("there's no release for this platform yet")?;
-    let file = release
-        .files
-        .get(target)
+    let (_, file) = build_for(&release)
         .with_context(|| format!("release {} has no build for {target}", release.version))?;
-    let exe = std::env::current_exe()?.canonicalize()?;
+    let exe = dunce::canonicalize(std::env::current_exe()?)?;
     let dir = exe.parent().context("the binary has no folder")?;
 
     print!("Downloading {} MB… ", file.size / 1_000_000 + 1);
@@ -275,25 +294,7 @@ async fn record(outcome: UpdateOutcome) {
 
 /// Unpacks the archive and swaps the binary in place.
 fn install(archive: &[u8], staging: &Path, exe: &Path) -> Result<()> {
-    let tarball = staging.join("release.tar.gz");
-    std::fs::write(&tarball, archive)?;
-    let status = std::process::Command::new("tar")
-        .arg("-xzf")
-        .arg(&tarball)
-        .arg("-C")
-        .arg(staging)
-        .status()
-        .context("running tar")?;
-    if !status.success() {
-        bail!("couldn't unpack the release");
-    }
-    // Releases carry the program as `pathfinder` (and as `harness`, for
-    // apps before 0.3 that look for that name).
-    let new = ["pathfinder", "harness"]
-        .iter()
-        .map(|name| staging.join(name))
-        .find(|p| p.is_file())
-        .context("the release has no `pathfinder` program")?;
+    let new = unpack(archive, staging)?;
     #[cfg(target_os = "macos")]
     {
         let ok = std::process::Command::new("codesign")
@@ -310,10 +311,118 @@ fn install(archive: &[u8], staging: &Path, exe: &Path) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&new, std::fs::Permissions::from_mode(0o755))?;
     }
+    swap(&new, exe)
+}
+
+/// Writes the release's program into `staging` and returns its path. The
+/// archive (a `.tar.gz` on every platform) is read in-process, so no `tar`
+/// program is needed, and only a top-level regular file with an expected
+/// name is written. Releases carry the program as `pathfinder` (and as
+/// `harness`, for apps before 0.3 that look for that name), with `.exe` on
+/// Windows.
+fn unpack(archive: &[u8], staging: &Path) -> Result<PathBuf> {
+    use std::env::consts::EXE_SUFFIX;
+    use std::path::Component;
+    let names = [
+        format!("pathfinder{EXE_SUFFIX}"),
+        format!("harness{EXE_SUFFIX}"),
+    ];
+    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(archive));
+    for entry in archive.entries().context("couldn't unpack the release")? {
+        let mut entry = entry.context("couldn't unpack the release")?;
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
+        let path = entry.path().context("couldn't unpack the release")?;
+        let mut parts = path
+            .components()
+            .filter(|c| !matches!(c, Component::CurDir));
+        let name = match (parts.next(), parts.next()) {
+            (Some(Component::Normal(name)), None) => name.to_string_lossy().into_owned(),
+            _ => continue,
+        };
+        if !names.contains(&name) {
+            continue;
+        }
+        let mut out = std::fs::File::create(staging.join(&name))?;
+        std::io::copy(&mut entry, &mut out).context("couldn't unpack the release")?;
+    }
+    names
+        .iter()
+        .map(|name| staging.join(name))
+        .find(|p| p.is_file())
+        .context("the release has no `pathfinder` program")
+}
+
+/// Puts `new` where `exe` is.
+#[cfg(not(windows))]
+fn swap(new: &Path, exe: &Path) -> Result<()> {
     // A rename on the same disk is atomic; the running process keeps its
     // old inode.
-    std::fs::rename(&new, exe).with_context(|| format!("replacing {}", exe.display()))?;
+    std::fs::rename(new, exe).with_context(|| format!("replacing {}", exe.display()))
+}
+
+/// Puts `new` where `exe` is. Windows won't overwrite a running program but
+/// will rename it, so this binary moves aside first and comes back if the new
+/// one can't take its place. The old copy is deleted on the next run
+/// ([`tidy`]).
+#[cfg(windows)]
+fn swap(new: &Path, exe: &Path) -> Result<()> {
+    let mut aside = set_aside(exe);
+    // A copy left by an earlier update; if it's still running, use a fresh name.
+    if std::fs::remove_file(&aside).is_err() && aside.exists() {
+        let mut name = aside.into_os_string();
+        name.push(format!("-{}", std::process::id()));
+        aside = PathBuf::from(name);
+    }
+    std::fs::rename(exe, &aside).with_context(|| format!("moving {} aside", exe.display()))?;
+    if let Err(e) = std::fs::rename(new, exe) {
+        return Err(match std::fs::rename(&aside, exe) {
+            Ok(()) => anyhow!(e).context(format!("replacing {}", exe.display())),
+            Err(back) => anyhow!(e).context(format!(
+                "replacing {}; the old program is at {} ({back})",
+                exe.display(),
+                aside.display()
+            )),
+        });
+    }
     Ok(())
+}
+
+/// Where an update moves the running binary on Windows: `pathfinder.exe.old`.
+#[cfg(windows)]
+fn set_aside(exe: &Path) -> PathBuf {
+    let mut name = exe.as_os_str().to_owned();
+    name.push(".old");
+    PathBuf::from(name)
+}
+
+/// Deletes the copies an earlier update moved aside (Windows only; elsewhere
+/// the old binary is replaced outright).
+fn tidy() {
+    #[cfg(windows)]
+    {
+        let Ok(exe) = std::env::current_exe() else {
+            return;
+        };
+        let (Some(dir), Some(aside)) = (
+            exe.parent(),
+            set_aside(&exe).file_name().map(|n| n.to_owned()),
+        ) else {
+            return;
+        };
+        let aside = aside.to_string_lossy().into_owned();
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name == aside || name.starts_with(&format!("{aside}-")) {
+                // Fails harmlessly while that copy still runs.
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -336,6 +445,67 @@ mod tests {
         assert!(newer("0.2.0", "0.1.99"));
         assert!(!newer("0.1.0", "0.1.0"));
         assert!(!newer("0.1.0-rc1", "0.1.0"));
+    }
+
+    fn tarball(files: &[(&str, &[u8])]) -> Vec<u8> {
+        let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        let mut tar = tar::Builder::new(gz);
+        for (path, data) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o755);
+            header.set_entry_type(tar::EntryType::Regular);
+            tar.append_data(&mut header, path, *data).unwrap();
+        }
+        tar.into_inner().unwrap().finish().unwrap()
+    }
+
+    #[test]
+    fn unpacks_only_the_top_level_program() {
+        let exe = std::env::consts::EXE_SUFFIX;
+        let staging =
+            std::env::temp_dir().join(format!("pathfinder-unpack-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&staging).unwrap();
+        let harness = format!("harness{exe}");
+        let pathfinder = format!("./pathfinder{exe}");
+        let nested = format!("bin/pathfinder{exe}");
+        let archive = tarball(&[
+            (harness.as_str(), b"old name"),
+            (nested.as_str(), b"nested"),
+            ("README", b"text"),
+            (pathfinder.as_str(), b"program"),
+        ]);
+        let new = unpack(&archive, &staging).unwrap();
+        assert_eq!(new, staging.join(format!("pathfinder{exe}")));
+        assert_eq!(std::fs::read(&new).unwrap(), b"program");
+        assert!(!staging.join("README").exists());
+        assert!(!staging.join("bin").exists());
+
+        let empty = staging.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert!(unpack(&tarball(&[("README", b"text")]), &empty).is_err());
+        assert!(unpack(b"not a tarball", &empty).is_err());
+        std::fs::remove_dir_all(staging).unwrap();
+    }
+
+    #[test]
+    fn only_releases_with_a_build_here_are_offered() {
+        let file = ReleaseFile {
+            path: "0.9.0/x.tar.gz".into(),
+            sha256: String::new(),
+            size: 1,
+        };
+        let mut release = Release {
+            version: "0.9.0".into(),
+            files: Default::default(),
+            notes: String::new(),
+            commit: String::new(),
+        };
+        assert!(build_for(&release).is_none());
+        if let Some(target) = target() {
+            release.files.insert(target.to_string(), file);
+            assert!(build_for(&release).is_some());
+        }
     }
 
     #[test]

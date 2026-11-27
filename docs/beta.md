@@ -47,8 +47,7 @@ F1 shows the keys. The [guide](guide.md) walks through a session.
 
 ## Known issues
 
-- Prebuilt releases are for macOS only.
-- In Zed, math shows as LaTeX source; ask for plain text, or use the terminal app.
+- Linux and Windows builds are new. Windows has no OS sandbox, so every command the agent runs asks first; report anything that behaves differently from macOS.
 - Without poppler, PDFs are read only when you attach them.
 - The gate needs you to have joined, or a decision key of your own (`pathfinder auth set typesafe`). The shared gate allows a daily number of checks per person; when they're used up, Pathfinder holds back replies about the candidate until you've judged it.
 - OpenAlex allows a small number of searches a day without a key; past it, online search notes that OpenAlex wasn't searched. `pathfinder auth set openalex` adds a free key.

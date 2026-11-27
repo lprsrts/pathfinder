@@ -77,7 +77,7 @@ impl std::fmt::Debug for RunContext {
 }
 
 tokio::task_local! {
-    /// The context of the prompt turn being handled; set by the ACP layer.
+    /// The context of the prompt turn being handled; set by the front end (the TUI).
     static TURN: RunContext;
 }
 
@@ -107,42 +107,12 @@ pub struct CommandOutput {
     pub truncated: bool,
 }
 
-/// The client side of agent work: asking the user, and running commands
-/// where they can watch them.
+/// The front end's side of agent work: asking the user before a tool call
+/// runs.
 pub trait Host: Send + Sync {
     /// Asks before the tool call `call_id` (already shown) runs.
     /// `always_key` groups calls an "Always allow" answer covers.
     fn ask<'a>(&'a self, call_id: &'a str, always_key: &'a str) -> BoxFuture<'a, Permission>;
-
-    /// Runs `command` in the client's terminal, shown live in tool call
-    /// `call_id`. None when the client has no terminals.
-    fn run_in_terminal<'a>(
-        &'a self,
-        call_id: &'a str,
-        command: &'a str,
-        cwd: &'a std::path::Path,
-        timeout: std::time::Duration,
-        cancel: &'a CancellationToken,
-    ) -> Option<BoxFuture<'a, Result<CommandOutput>>>;
-
-    /// Reads a file through the client, which sees unsaved edits. None when
-    /// the client doesn't offer it.
-    fn read_file<'a>(
-        &'a self,
-        _path: &'a std::path::Path,
-    ) -> Option<BoxFuture<'a, Result<String>>> {
-        None
-    }
-
-    /// Writes a file through the client, which tracks it for review. None
-    /// when the client doesn't offer it.
-    fn write_file<'a>(
-        &'a self,
-        _path: &'a std::path::Path,
-        _content: &'a str,
-    ) -> Option<BoxFuture<'a, Result<()>>> {
-        None
-    }
 }
 
 pub type StreamSink = Arc<dyn Fn(StreamEvent) + Send + Sync>;

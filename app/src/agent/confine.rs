@@ -12,6 +12,9 @@ pub fn confine(
     write: bool,
     extra_readable: &[PathBuf],
 ) -> Result<PathBuf, String> {
+    // Every comparison below is between paths from std's canonicalize, so
+    // both sides share one form (on Windows the verbatim `\\?\C:\...`). Only
+    // the result and the messages are simplified to the familiar `C:\...`.
     let root = root
         .canonicalize()
         .map_err(|e| format!("workspace unavailable: {e}"))?;
@@ -29,32 +32,53 @@ pub fn confine(
             .filter_map(|p| p.canonicalize().ok())
             .any(|p| p == resolved)
     {
-        return Ok(resolved);
+        return Ok(plain(resolved));
     }
     if !resolved.starts_with(&root) {
         return Err(format!(
             "`{requested}` is outside the workspace; only paths under {} are allowed",
-            root.display()
+            dunce::simplified(&root).display()
         ));
     }
-    if write
-        && resolved
+    if write {
+        let first = resolved
             .strip_prefix(&root)
-            .is_ok_and(|rel| rel.starts_with(".git"))
-    {
-        return Err("writing inside .git is not allowed".to_string());
+            .ok()
+            .and_then(|rel| rel.components().next());
+        if let Some(Component::Normal(first)) = first {
+            if is_protected(first, ".git") {
+                return Err("writing inside .git is not allowed".to_string());
+            }
+            if is_protected(first, ".pathfinder") {
+                return Err(
+                    "writing inside .pathfinder is not allowed: it holds the record of your understanding"
+                        .to_string(),
+                );
+            }
+        }
     }
-    if write
-        && resolved
-            .strip_prefix(&root)
-            .is_ok_and(|rel| rel.starts_with(".pathfinder"))
-    {
-        return Err(
-            "writing inside .pathfinder is not allowed: it holds the record of your understanding"
-                .to_string(),
-        );
-    }
-    Ok(resolved)
+    Ok(plain(resolved))
+}
+
+/// The plain form of a canonical path (`C:\...` rather than `\\?\C:\...` on
+/// Windows, whenever that names the same file); unchanged elsewhere.
+fn plain(path: PathBuf) -> PathBuf {
+    dunce::simplified(&path).to_path_buf()
+}
+
+/// Whether a workspace-relative first component names the protected folder
+/// `name`. Case is ignored: on NTFS and on default (case-insensitive) APFS,
+/// `.GIT` is `.git`, and a folder that doesn't exist yet isn't canonicalized
+/// to its on-disk case. On Windows, Win32 also drops trailing dots and spaces
+/// (`.git. `) and reads `name:stream` / `name::$INDEX_ALLOCATION` as `name`.
+fn is_protected(component: &std::ffi::OsStr, name: &str) -> bool {
+    let text = component.to_string_lossy();
+    #[cfg(windows)]
+    let text = {
+        let base = text.split(':').next().unwrap_or("");
+        base.trim_end_matches(['.', ' ']).to_string()
+    };
+    text.eq_ignore_ascii_case(name)
 }
 
 /// Canonicalizes the longest existing prefix and appends the rest normally.
@@ -98,7 +122,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("harness-confine-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(dir.join("src")).unwrap();
         fs::write(dir.join("src/a.rs"), "x").unwrap();
-        dir.canonicalize().unwrap()
+        // The plain form `confine` returns (`C:\...` on Windows).
+        dunce::canonicalize(dir).unwrap()
     }
 
     #[test]
@@ -116,6 +141,12 @@ mod tests {
         assert!(confine(&ws, "new/dir/b.rs", true, &[]).is_ok());
         assert!(confine(&ws, ".git/hooks/pre-commit", true, &[]).is_err());
         assert!(confine(&ws, ".git/config", false, &[]).is_ok());
+        // Protected folders are matched without regard to case, even before
+        // they exist.
+        assert!(confine(&ws, ".GIT/hooks/pre-commit", true, &[]).is_err());
+        assert!(confine(&ws, ".Pathfinder/x.json", true, &[]).is_err());
+        assert!(confine(&ws, "src/../.pathfinder/x.json", true, &[]).is_err());
+        assert!(confine(&ws, ".gitignore", true, &[]).is_ok());
         fs::remove_dir_all(ws).unwrap();
     }
 

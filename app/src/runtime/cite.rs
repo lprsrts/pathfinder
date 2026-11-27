@@ -262,10 +262,8 @@ impl Runtime {
                 Ok(pages) if pages.iter().all(|p| p.trim().is_empty()) => photos.push(full.clone()),
                 Ok(pages) => {
                     work = pages.join("\n");
-                    let root = session
-                        .cwd
-                        .canonicalize()
-                        .unwrap_or_else(|_| session.cwd.clone());
+                    let root =
+                        dunce::canonicalize(&session.cwd).unwrap_or_else(|_| session.cwd.clone());
                     let rel = full
                         .strip_prefix(&root)
                         .map(|p| p.to_string_lossy().replace('\\', "/"))
@@ -309,10 +307,7 @@ impl Runtime {
                 return Ok(TurnOutput::text(reply));
             };
             work = lines.join("\n");
-            let root = session
-                .cwd
-                .canonicalize()
-                .unwrap_or_else(|_| session.cwd.clone());
+            let root = dunce::canonicalize(&session.cwd).unwrap_or_else(|_| session.cwd.clone());
             let names: Vec<String> = photos
                 .iter()
                 .map(|p| {

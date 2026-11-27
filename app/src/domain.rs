@@ -307,7 +307,7 @@ impl Map {
         lines.join("\n")
     }
 
-    /// The map as a Mermaid flowchart for the user (Zed renders it): parts
+    /// The map as a Mermaid flowchart for the user: parts
     /// with their status, an arrow from each part to the parts that need it,
     /// the active part marked. `status` names a status in the user's
     /// language.

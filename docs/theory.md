@@ -137,7 +137,7 @@ Legend for all diagrams: **solid** arrows carry ordinary data, **thick** arrows 
 
 ```mermaid
 flowchart TB
-    U([You, in Zed])
+    U([You, in the terminal])
 
     subgraph H[Harness: the only writer]
         direction LR
@@ -229,7 +229,7 @@ flowchart TD
     RV --> OUT
     LD --> OUT
     F --> AS
-    OUT[emit to Zed] --> TX[(one transaction:<br/>transcript · events · ledger)]
+    OUT[emit to the thread] --> TX[(one transaction:<br/>thread · events · ledger)]
 ```
 
 ## A4. Data model
@@ -421,7 +421,7 @@ sequenceDiagram
 sequenceDiagram
     participant A as Agent
     participant O as Orchestrator
-    participant Z as Zed (file access)
+    participant W as Your files
     participant T as Tagger (decision)
     participant LM as Understanding model
     participant L as Ledger
@@ -434,7 +434,7 @@ sequenceDiagram
     LM-->>O: states + event ids
     Note over O: reviewable if all shown or solid,<br/>claimed if remaining are only claimed,<br/>else delegated (untagged counts as delegated)
     alt /delegate
-        O->>Z: write through Zed (Review Changes)
+        O->>W: write the edit
     else /handoff
         O->>O: run in staging copy, hold edits until verdict (A8)
     end
@@ -469,7 +469,7 @@ sequenceDiagram
     participant D as Decision model
     participant U as You
     participant J as Judge
-    participant Z as Zed (file access)
+    participant W as Your files
     AG->>O: handoff finishes in staging copy (live diffs & report held)
     O->>O: check this review? Off 0 · Light 0.15 shown / 0.05 solid · Normal 0.25 / 0.15
     opt checked
@@ -485,7 +485,7 @@ sequenceDiagram
         U->>J: objection
         alt names the planted flaw
             J-->>O: caught → review_ok on its concepts
-            O->>Z: write real edits through Zed (Review Changes)
+            O->>W: write real edits
         else names a real issue on another hunk
             J-->>O: real objection (retire planted secret, not review_missed)
             O->>AG: send objection back to agent in staging
@@ -495,12 +495,12 @@ sequenceDiagram
     else /approve on a checked review
         O->>U: reveal planted vs real
         O->>O: review_missed → concept shaky, not recorded as reviewed
-        O->>Z: write real edits through Zed (Review Changes)
+        O->>W: write real edits
     else /approve on an unchecked review
         O->>O: recorded as approved
-        O->>Z: write real edits through Zed (Review Changes)
+        O->>W: write real edits
     end
-    Note over O,U: Never on /delegate (§6). Real edits reach disk only after verdict.<br/>During /handoff the agent's commands still run in Zed's terminal (in the staging copy);<br/>its diffs appear only in the review. Live diffs stay a /delegate feature.
+    Note over O,U: Never on /delegate (§6). Real edits reach disk only after verdict.<br/>During /handoff the agent's commands run in the staging copy;<br/>its diffs appear only in the review. Live diffs stay a /delegate feature.
 ```
 
 ## A9. Building it from today's code

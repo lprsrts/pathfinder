@@ -6,7 +6,7 @@
 
 Pathfinder makes sure you understand the work you do with AI. It points you to where your sources answer a question, checks you at the moments that matter, and keeps an honest record of what you understood, what you only claimed, and what you handed off to the agent.
 
-It runs in your terminal (or in Zed), on your own computer, with your own model account.
+It runs in your terminal, on your own computer, with your own model account.
 
 <img src="collector/public/pathfinder-demo.gif" alt="A real Pathfinder session over lecture notes and an exercise sheet on DC machines: a question answered with quoted lines from the notes, /check finding the wrong step in a worked exercise, /find, a candidate judged, and /why">
 
@@ -70,7 +70,7 @@ The repository has three crates:
 
 | Folder | What it is |
 |---|---|
-| [app/](app/) | The Pathfinder program: the terminal UI, the Zed agent server, models, sandbox, gate and record |
+| [app/](app/) | The Pathfinder program: the terminal UI, models, sandbox, gate and record |
 | [schema/](schema/) | The usage events and API types the app and the collector share |
 | [collector/](collector/) | The beta service: sign-in, consented usage events, shared threads, bug reports, the shared gate, releases ([README](collector/README.md)) |
 
@@ -79,7 +79,7 @@ The repository has three crates:
 ## Documentation
 
 - [docs/guide.md](docs/guide.md): using Pathfinder
-- [docs/reference.md](docs/reference.md): models and routes, keys, Zed, settings, the gate, checked review, coverage, evals, commands
+- [docs/reference.md](docs/reference.md): models and routes, keys, settings, the gate, checked review, coverage, evals, commands
 - [docs/beta.md](docs/beta.md): joining the beta
 - [docs/theory.md](docs/theory.md): why it works the way it does
 - [CHANGELOG.md](CHANGELOG.md)

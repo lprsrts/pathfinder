@@ -2,7 +2,7 @@
 //! sessions before each release: `pathfinder eval [suite ...] [--out FILE]`.
 //!
 //! The live suites (leak, discrimination, checks, tagging) drive the same
-//! runtime code paths Zed does, on your configured models and decision
+//! runtime code paths a thread does, on your configured models and decision
 //! service, in a throwaway database. The record suites (evidence,
 //! coverage) read your real session database, read-only.
 

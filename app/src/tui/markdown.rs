@@ -1,7 +1,7 @@
 //! Markdown for the terminal: the subset Pathfinder's replies use
 //! (headings, blockquotes, bold, italic, links, inline code, ordered and
 //! unordered lists, fenced code blocks, aligned tables), word-wrapped to a
-//! width. Mermaid blocks, which Zed draws, become a list of nodes with what
+//! width. Mermaid blocks become a list of nodes with what
 //! feeds into each.
 
 use ratatui::style::{Color, Modifier, Style};
@@ -278,10 +278,7 @@ fn is_table_separator(trimmed: &str) -> bool {
     if !trimmed.contains('|') || !trimmed.contains('-') {
         return false;
     }
-    if !trimmed
-        .chars()
-        .all(|c| matches!(c, '|' | '-' | ':' | ' '))
-    {
+    if !trimmed.chars().all(|c| matches!(c, '|' | '-' | ':' | ' ')) {
         return false;
     }
     let cells = split_table_cells(trimmed);
@@ -743,15 +740,14 @@ pub fn wrap_hanging(spans: &[Span<'static>], width: u16, hang: usize) -> Vec<Lin
     let mut current: Vec<Span<'static>> = Vec::new();
     let mut used = 0usize;
 
-    let push_wrap = |current: &mut Vec<Span<'static>>,
-                     used: &mut usize,
-                     lines: &mut Vec<Line<'static>>| {
-        lines.push(Line::from(std::mem::take(current)));
-        if hang > 0 {
-            current.push(Span::raw(" ".repeat(hang)));
-        }
-        *used = hang;
-    };
+    let push_wrap =
+        |current: &mut Vec<Span<'static>>, used: &mut usize, lines: &mut Vec<Line<'static>>| {
+            lines.push(Line::from(std::mem::take(current)));
+            if hang > 0 {
+                current.push(Span::raw(" ".repeat(hang)));
+            }
+            *used = hang;
+        };
 
     for span in spans {
         // Words with the spaces before them, so spacing survives wrapping.
@@ -1115,9 +1111,15 @@ mod tests {
         let src = "| Part | Status | Count |\n| :--- | :---: | ---: |\n| **Forward** | `done` | 12 |\n| Backward propagation | open | 3 |";
         let lines = render(src, 42, Style::default());
         let text = plain(&lines);
-        assert!(text[0].contains("Part") && text[0].contains("│"), "{text:?}");
+        assert!(
+            text[0].contains("Part") && text[0].contains("│"),
+            "{text:?}"
+        );
         assert!(text[1].contains("─┼─"), "{text:?}");
-        assert!(text[2].contains("Forward") && text[2].contains("done"), "{text:?}");
+        assert!(
+            text[2].contains("Forward") && text[2].contains("done"),
+            "{text:?}"
+        );
         for l in &text {
             assert!(l.width() <= 42, "{l:?} width={}", l.width());
         }
@@ -1143,7 +1145,11 @@ mod tests {
         assert!(two.style.add_modifier.contains(Modifier::ITALIC));
         let full: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(full.contains("snake_case_var"), "{full}");
-        assert!(!spans.iter().any(|s| s.content == "case" && s.style.add_modifier.contains(Modifier::ITALIC)));
+        assert!(
+            !spans
+                .iter()
+                .any(|s| s.content == "case" && s.style.add_modifier.contains(Modifier::ITALIC))
+        );
 
         let link_label = spans.iter().find(|s| s.content == "docs").unwrap();
         assert!(link_label.style.add_modifier.contains(Modifier::UNDERLINED));
@@ -1194,25 +1200,20 @@ mod tests {
         let m = "ab\n\ncd\n";
         assert_eq!(
             wrap_input(m, 3, 10),
-            (
-                vec!["ab".into(), "".into(), "cd".into(), "".into()],
-                1,
-                0
-            )
+            (vec!["ab".into(), "".into(), "cd".into(), "".into()], 1, 0)
         );
         assert_eq!(
             wrap_input(m, m.len(), 10),
-            (
-                vec!["ab".into(), "".into(), "cd".into(), "".into()],
-                3,
-                0
-            )
+            (vec!["ab".into(), "".into(), "cd".into(), "".into()], 3, 0)
         );
 
         // Overlong word + wide Unicode characters.
         let u = "你好世界你好";
         let (lines, row, col) = wrap_input(u, "你好世界".len(), 5);
-        assert_eq!(lines, vec!["你好".to_string(), "世界".into(), "你好".into()]);
+        assert_eq!(
+            lines,
+            vec!["你好".to_string(), "世界".into(), "你好".into()]
+        );
         assert_eq!((row, col), (2, 0));
         for l in &lines {
             assert!(l.width() <= 5, "{l:?}");

@@ -1,6 +1,10 @@
 //! Where secrets live: `auth.json` in the config folder ([`crate::paths`]), readable only by you,
 //! like Codex's `auth.json`. A plain file instead of the OS keychain, because
 //! macOS asks again after every rebuild of an unsigned binary. Memory in tests.
+//!
+//! On macOS and Linux the file has mode 0600. Windows has no mode bits: the
+//! file inherits the ACL of `%APPDATA%`, which grants only you, SYSTEM and
+//! Administrators, so other users can't read it there either.
 
 use std::collections::BTreeMap;
 #[cfg(test)]
@@ -20,7 +24,8 @@ pub trait SecretStore: Send + Sync {
     fn delete(&self, name: &str) -> Result<bool>;
 }
 
-/// A flat JSON object of name → secret, written atomically with mode 0600.
+/// A flat JSON object of name → secret, written atomically with mode 0600
+/// (on Windows, the profile folder's ACL).
 pub struct FileStore {
     path: PathBuf,
 }

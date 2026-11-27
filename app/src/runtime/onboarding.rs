@@ -176,13 +176,13 @@ impl Runtime {
             sink(StreamEvent::TextDelta(lead.clone()));
             session.push_turn("assistant", lead.trim());
             let ask = self.write_candidate(session, &part_id, files, sink).await?;
-            return Ok(TurnOutput::changed(ask));
+            return Ok(TurnOutput::text(ask));
         }
 
-        // The map itself shows in Zed's plan panel (and on `/map`).
+        // The map itself shows in the TUI's side panel (and on `/map`).
         let rest = self.enter_part(session, true);
         session.push_turn("assistant", format!("{}\n\n{rest}", proposal.brief));
-        Ok(TurnOutput::changed(format!("\n\n{rest}")))
+        Ok(TurnOutput::text(format!("\n\n{rest}")))
     }
 
     /// §3: the model proposes map changes; you accept or reject them.
@@ -263,7 +263,7 @@ impl Runtime {
                 } else if session.mode == SessionMode::Done && !session.map.all_resolved() {
                     session.advance();
                 }
-                Ok(TurnOutput::changed(i18n::line(
+                Ok(TurnOutput::text(i18n::line(
                     session.language.as_deref(),
                     i18n::Line::MapUpdated,
                 )))
@@ -281,11 +281,11 @@ impl Runtime {
                 session.active = Some(id);
                 session.mode = SessionMode::Working;
                 session.pending_candidate = None;
-                TurnOutput::changed(self.enter_part(session, false))
+                TurnOutput::text(self.enter_part(session, false))
             }
             None if session.map.all_resolved() => {
                 session.advance();
-                TurnOutput::changed(i18n::line(
+                TurnOutput::text(i18n::line(
                     session.language.as_deref(),
                     i18n::Line::AllResolved,
                 ))
@@ -310,6 +310,6 @@ impl Runtime {
         session.active = Some(id);
         session.mode = SessionMode::Working;
         session.pending_candidate = None;
-        TurnOutput::changed(self.enter_part(session, false))
+        TurnOutput::text(self.enter_part(session, false))
     }
 }

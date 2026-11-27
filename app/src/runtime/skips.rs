@@ -36,7 +36,7 @@ impl Runtime {
         session.mode = SessionMode::Working;
         let reply = format!("{lead}\n\n{}", self.enter_part(session, false));
         session.push_turn("assistant", &reply);
-        Ok(TurnOutput::changed(reply))
+        Ok(TurnOutput::text(reply))
     }
 
     pub(super) async fn handle_delegate(

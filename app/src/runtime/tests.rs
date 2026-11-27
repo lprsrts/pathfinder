@@ -176,7 +176,7 @@ async fn understood_part_is_handed_off_reviewed_objected_and_approved() {
 
     let out = turn(&rt, "add a /status command").await;
     assert!(out.reply.contains("Command routing"));
-    // The map lives in Zed's plan panel; replies only introduce the part.
+    // The map lives in the side panel; replies only introduce the part.
     assert!(!out.reply.contains("Map:"));
     assert!(!out.reply.contains("What status reports"));
     assert_eq!(

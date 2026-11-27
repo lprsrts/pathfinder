@@ -1,6 +1,5 @@
-//! `pathfinder tui [folder]`: Pathfinder in the terminal. The same runtime as
-//! the Zed connection, so threads, the record, checks and exams behave the
-//! same; this is only another front door.
+//! `pathfinder tui [folder]`: Pathfinder in the terminal, the front end to
+//! the runtime (threads, the record, checks and exams).
 
 mod commands;
 mod markdown;
@@ -26,9 +25,7 @@ use tokio_util::sync::CancellationToken;
 static KEYBOARD_ENHANCED: AtomicBool = AtomicBool::new(false);
 
 use crate::domain::Session;
-use crate::engine::{
-    BoxFuture, CommandOutput, Host, Permission, RunContext, StreamEvent, StreamSink, with_turn,
-};
+use crate::engine::{BoxFuture, Host, Permission, RunContext, StreamEvent, StreamSink, with_turn};
 use crate::runtime::{CHECKS, EFFORTS, OptionValue, Runtime, TurnInput, TurnOutput};
 use crate::stream::ToolContent;
 
@@ -159,7 +156,7 @@ pub enum ConsentStep {
     Invite(String),
 }
 
-/// The settings the toolbar offers in Zed: (option id, name).
+/// The thread settings Ctrl+P offers: (option id, name).
 pub const SETTINGS: [(&str, &str); 7] = [
     (crate::options::FAST_MODEL, "Fast model"),
     (crate::options::FAST_EFFORT, "Fast model effort"),
@@ -311,15 +308,14 @@ impl App {
                     .into(),
             ));
             if self.status.is_empty() {
-                self.status =
-                    "No models configured — run `pathfinder auth login` first.".into();
+                self.status = "No models configured — run `pathfinder auth login` first.".into();
             }
         }
     }
 }
 
 pub async fn run(rt: Arc<Runtime>, cwd: PathBuf) -> Result<()> {
-    let cwd = cwd.canonicalize().unwrap_or(cwd);
+    let cwd = dunce::canonicalize(&cwd).unwrap_or(cwd);
     let (tx, mut rx) = mpsc::unbounded_channel();
     let session = rt.create_session(uuid::Uuid::new_v4().to_string(), cwd.clone())?;
     let mut app = App::new(rt, cwd, session, tx);
@@ -357,11 +353,11 @@ pub async fn run(rt: Arc<Runtime>, cwd: PathBuf) -> Result<()> {
     app.check_models_on_startup();
 
     let mut terminal = ratatui::init();
-    crossterm::execute!(
-        std::io::stdout(),
-        EnableBracketedPaste,
-        EnableMouseCapture
-    )?;
+    // Each may be missing (a legacy Windows console has no bracketed
+    // paste); the TUI works without either, and an early return here would
+    // leave the terminal raw.
+    let _ = crossterm::execute!(std::io::stdout(), EnableBracketedPaste);
+    let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
     if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false)
         && crossterm::execute!(
             std::io::stdout(),
@@ -373,11 +369,48 @@ pub async fn run(rt: Arc<Runtime>, cwd: PathBuf) -> Result<()> {
     }
     let mut events = EventStream::new();
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(120));
+    let mut paste_until: Option<std::time::Instant> = None;
     let result: Result<()> = async {
         loop {
             terminal.draw(|f| view::draw(f, &mut app))?;
             tokio::select! {
                 ev = events.next() => match ev {
+                    // A Windows console never reports a paste: take the keys
+                    // already waiting with this one and see if they're one.
+                    Some(Ok(first @ Event::Key(_))) if cfg!(windows) => {
+                        let mut batch = vec![first];
+                        loop {
+                            // Polled with this task's waker, so the stream
+                            // still wakes the loop when it runs dry.
+                            let next = std::future::poll_fn(|cx| {
+                                std::task::Poll::Ready(events.poll_next_unpin(cx))
+                            })
+                            .await;
+                            match next {
+                                std::task::Poll::Ready(Some(Ok(ev))) => batch.push(ev),
+                                std::task::Poll::Ready(Some(Err(e))) => return Err(e.into()),
+                                _ => break,
+                            }
+                        }
+                        let now = std::time::Instant::now();
+                        let continuing = paste_until.is_some_and(|t| now < t);
+                        if let Some(text) = paste_burst(&batch, continuing) {
+                            app.on_paste(&text);
+                            paste_until = Some(now + PASTE_GAP);
+                        } else {
+                            paste_until = None;
+                            for ev in batch {
+                                match ev {
+                                    Event::Key(key) if key.kind != KeyEventKind::Release => {
+                                        app.on_key(key)
+                                    }
+                                    Event::Paste(text) => app.on_paste(&text),
+                                    Event::Mouse(mouse) => app.on_mouse(mouse),
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
                     Some(Ok(Event::Key(key))) if key.kind != KeyEventKind::Release => app.on_key(key),
                     Some(Ok(Event::Paste(text))) => app.on_paste(&text),
                     Some(Ok(Event::Mouse(mouse))) => app.on_mouse(mouse),
@@ -456,14 +489,56 @@ fn print_transcript(app: &App) {
     let _ = std::io::Write::flush(&mut out);
 }
 
-/// Puts `text` on the system clipboard: the platform's tool, else OSC 52,
+/// How long after a paste further keys still belong to it.
+const PASTE_GAP: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// A paste that arrived as key presses, as on Windows, where each line
+/// break would otherwise be an Enter that sends half a message. Keys that
+/// were waiting together are a paste when all are plain text and a line
+/// break is among them, or when they follow a paste straight on.
+fn paste_burst(batch: &[Event], continuing: bool) -> Option<String> {
+    let mut text = String::new();
+    let mut newline = false;
+    for ev in batch {
+        let Event::Key(key) = ev else {
+            return None;
+        };
+        if key.kind == KeyEventKind::Release {
+            continue;
+        }
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        match key.code {
+            // AltGr arrives as Ctrl+Alt.
+            KeyCode::Char(c) if ctrl == alt => text.push(c),
+            KeyCode::Enter if !ctrl && !alt => {
+                text.push('\n');
+                newline = true;
+            }
+            KeyCode::Tab if !ctrl && !alt => text.push('\t'),
+            _ => return None,
+        }
+    }
+    let keys = text.chars().count();
+    (keys > 0 && (continuing || (newline && keys >= 2))).then_some(text)
+}
+
+/// Puts `text` on the system clipboard: the platform's clipboard (the
+/// Windows clipboard API, else pbcopy, wl-copy, xclip or xsel), else OSC 52,
 /// which most terminals pass to the clipboard (over SSH too).
 fn copy_to_clipboard(text: &str) -> std::result::Result<(), String> {
     use std::io::Write;
+    // Not clip.exe: it reads stdin in the console code page and mangles
+    // anything outside ASCII.
+    #[cfg(windows)]
+    if clipboard_win::set_clipboard_string(text).is_ok() {
+        return Ok(());
+    }
     for (cmd, args) in [
         ("pbcopy", &[][..]),
         ("wl-copy", &[][..]),
         ("xclip", &["-selection", "clipboard"][..]),
+        ("xsel", &["--clipboard", "--input"][..]),
     ] {
         if let Ok(mut child) = std::process::Command::new(cmd)
             .args(args)
@@ -508,17 +583,6 @@ impl Host for TuiHost {
             }
             answer.await.unwrap_or(Permission::Denied)
         })
-    }
-
-    fn run_in_terminal<'a>(
-        &'a self,
-        _call_id: &'a str,
-        _command: &'a str,
-        _cwd: &'a Path,
-        _timeout: std::time::Duration,
-        _cancel: &'a CancellationToken,
-    ) -> Option<BoxFuture<'a, Result<CommandOutput>>> {
-        None
     }
 }
 
@@ -821,7 +885,9 @@ impl App {
                     }
                 }
             }
-            KeyCode::Tab if self.input.starts_with('/') && !self.input.contains(char::is_whitespace) => {
+            KeyCode::Tab
+                if self.input.starts_with('/') && !self.input.contains(char::is_whitespace) =>
+            {
                 let matches = commands::search_for(&self.input, Some(&self.session));
                 if !matches.is_empty()
                     && let Some(done) =
@@ -1051,12 +1117,18 @@ impl App {
             KeyCode::Char('d') if alt && !ctrl => self.delete_word_forward(),
             // Contextual quick actions while waiting on a change, review, or candidate.
             KeyCode::Char('a')
-                if alt && !ctrl && self.running.is_none() && self.session.pending_change.is_some() =>
+                if alt
+                    && !ctrl
+                    && self.running.is_none()
+                    && self.session.pending_change.is_some() =>
             {
                 self.run_task_shortcut("/accept");
             }
             KeyCode::Char('r')
-                if alt && !ctrl && self.running.is_none() && self.session.pending_change.is_some() =>
+                if alt
+                    && !ctrl
+                    && self.running.is_none()
+                    && self.session.pending_change.is_some() =>
             {
                 self.run_task_shortcut("/reject");
             }
@@ -1772,7 +1844,7 @@ impl App {
                         app.always.insert(always_key.clone());
                         format!(
                             "✓ Allowed, and from now on in this thread for `{}`.",
-                            always_key.rsplit(':').next().unwrap_or(&always_key)
+                            always_label(&always_key)
                         )
                     }
                     _ => "✓ Allowed once.".to_string(),
@@ -2156,10 +2228,7 @@ impl App {
                             {
                                 Ok(s) => {
                                     self.session = s;
-                                    match self
-                                        .rt
-                                        .set_default_option(option, make_value(&raw_val))
-                                    {
+                                    match self.rt.set_default_option(option, make_value(&raw_val)) {
                                         Ok(()) => {
                                             self.status =
                                                 format!("{title} set (saved as default).");
@@ -2274,6 +2343,15 @@ impl App {
 }
 
 /// The kind of permission an always-key stands for.
+/// The part of an "Always allow" key a person reads: the program, or for an
+/// unsandboxed command the whole command line (which may itself contain `:`).
+pub(crate) fn always_label(always_key: &str) -> &str {
+    always_key
+        .split_once(':')
+        .filter(|(kind, _)| matches!(*kind, "unsandboxed" | "network"))
+        .map_or(always_key, |(_, rest)| rest)
+}
+
 fn permission_scope(always_key: &str) -> pathfinder_schema::PermissionScope {
     use pathfinder_schema::PermissionScope as S;
     match always_key.split_once(':').map(|(k, _)| k) {
@@ -2370,12 +2448,7 @@ impl App {
         match step {
             ConsentStep::Choose => match key.code {
                 KeyCode::Up | KeyCode::Char('k') => {
-                    keep!(
-                        ConsentStep::Choose,
-                        error,
-                        false,
-                        scroll.saturating_sub(1)
-                    )
+                    keep!(ConsentStep::Choose, error, false, scroll.saturating_sub(1))
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
                     keep!(
@@ -2399,12 +2472,9 @@ impl App {
                     threads = !threads;
                     keep!(ConsentStep::Choose, None, false, scroll)
                 }
-                KeyCode::Char('i') => keep!(
-                    ConsentStep::Invite(String::new()),
-                    None,
-                    false,
-                    max_scroll
-                ),
+                KeyCode::Char('i') => {
+                    keep!(ConsentStep::Invite(String::new()), None, false, max_scroll)
+                }
                 KeyCode::Enter => {
                     let mut consent = crate::telemetry::Consent::load();
                     consent.events = events;
@@ -2800,6 +2870,49 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::SHIFT)
     }
 
+    fn burst(keys: &[KeyEvent]) -> Vec<Event> {
+        keys.iter()
+            .flat_map(|k| {
+                let mut up = *k;
+                up.kind = KeyEventKind::Release;
+                [Event::Key(*k), Event::Key(up)]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn keys_waiting_together_with_a_line_break_are_a_paste() {
+        let keys = [
+            key(KeyCode::Char('a')),
+            shift(KeyCode::Char('B')),
+            key(KeyCode::Enter),
+            KeyEvent::new(
+                KeyCode::Char('@'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+        ];
+        assert_eq!(paste_burst(&burst(&keys), false).as_deref(), Some("aB\n@"));
+        // A lone Enter is a send, unless it follows a paste straight on.
+        assert_eq!(paste_burst(&burst(&[key(KeyCode::Enter)]), false), None);
+        assert_eq!(
+            paste_burst(&burst(&[key(KeyCode::Enter)]), true).as_deref(),
+            Some("\n")
+        );
+        // Typing without a line break stays typing.
+        let typed = [key(KeyCode::Char('a')), key(KeyCode::Char('b'))];
+        assert_eq!(paste_burst(&burst(&typed), false), None);
+        // Shortcuts and other keys are never pasted.
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(
+            paste_burst(&burst(&[ctrl_c, key(KeyCode::Enter)]), true),
+            None
+        );
+        assert_eq!(
+            paste_burst(&burst(&[key(KeyCode::Esc), key(KeyCode::Enter)]), false),
+            None
+        );
+    }
+
     #[test]
     fn dropped_paths_are_attached_when_they_exist() {
         let dir = std::env::temp_dir().join(format!("pf-tui-{}", uuid::Uuid::new_v4().simple()));
@@ -3144,10 +3257,11 @@ mod tests {
     fn attachments_startup_note_and_contextual_shortcuts() {
         let (mut app, _rx, store) = test_app();
         app.apply_startup_model_note(true);
-        assert!(app
-            .entries
-            .iter()
-            .any(|e| matches!(e, Entry::Note(n) if n.contains("No models are configured"))));
+        assert!(
+            app.entries
+                .iter()
+                .any(|e| matches!(e, Entry::Note(n) if n.contains("No models are configured")))
+        );
 
         // Quoted /attach with spaces, Backspace removal, and /attach clear.
         let file = app.cwd.join("my doc.pdf");
@@ -3167,10 +3281,7 @@ mod tests {
         assert!(app.last_sent.is_empty());
 
         // Threads load clears attachments.
-        let mut s2 = app
-            .rt
-            .create_session("t2".into(), app.cwd.clone())
-            .unwrap();
+        let mut s2 = app.rt.create_session("t2".into(), app.cwd.clone()).unwrap();
         s2.history.push(TurnRecord {
             role: "user".into(),
             content: "hello".into(),
