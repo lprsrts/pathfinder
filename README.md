@@ -32,7 +32,7 @@ If pathfinder.lprsrts.com is down, the same installer and release are on GitHub:
 
 This installs one program, `pathfinder`, into `~/.local/bin` (or `$XDG_BIN_HOME`, or `$PATHFINDER_BIN_DIR`). It is signed and notarised by Apple, and the installer checks it against a signed release manifest. Linux users can build from source (below).
 
-You need access to models; `pathfinder auth login` connects them, and usage counts against that account. The gate also needs a decision key: TypeSafe (`pathfinder auth set typesafe`), OpenAI or Google (see [decision services](docs/reference.md#while-you-judge)). Optional: `poppler` (`brew install poppler`) lets Pathfinder read PDFs page by page.
+You need access to models; `pathfinder auth login` connects them: sign in with your ChatGPT plan, use an API key (Anthropic or OpenAI, pay per use), or add your own server. Usage counts against that account. `/login` does the same inside Pathfinder. Claude Code and Codex use their own logins (`claude`, then `/login`; `codex login`) and show up by themselves once installed. The gate also needs a decision key: TypeSafe (Settings, Ctrl+P → Gate key, or `pathfinder auth login typesafe`), OpenAI or Google (see [decision services](docs/reference.md#while-you-judge)). Optional: `poppler` (`brew install poppler`) lets Pathfinder read PDFs page by page.
 
 ## First run
 

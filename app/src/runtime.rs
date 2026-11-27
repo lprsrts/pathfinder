@@ -25,12 +25,14 @@ use crate::validate::{
 use crate::workspace::WorkspaceSnapshot;
 
 mod cite;
+mod commit;
 mod concepts;
 pub mod eval;
 mod evidence;
 mod gate;
 mod handoff;
 mod onboarding;
+mod path;
 mod provenance;
 mod record;
 mod review;
@@ -44,12 +46,45 @@ pub struct TurnInput {
 #[derive(Debug, Clone, Default)]
 pub struct TurnOutput {
     pub reply: String,
+    /// What the reply is, for a frontend that shows kinds apart.
+    pub shown: Shown,
+}
+
+/// What a turn's reply is. `reply` holds it as markdown either way.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Shown {
+    /// The model's words, or a local view such as the map.
+    #[default]
+    Reply,
+    /// A source `/open` showed: its path, the part shown
+    /// (`lines 20–24 of 391`) and the numbered block in markdown.
+    Source {
+        title: String,
+        range: String,
+        body: String,
+    },
+    /// `/find` hits, the best first, and how many lines matched in all.
+    Search {
+        query: String,
+        hits: Vec<crate::sources::Hit>,
+        total: usize,
+    },
+    /// A local notice: nothing found, an error, how to use a command.
+    Notice,
 }
 
 impl TurnOutput {
     fn text(reply: impl Into<String>) -> Self {
         Self {
             reply: reply.into(),
+            shown: Shown::Reply,
+        }
+    }
+
+    fn notice(reply: impl Into<String>) -> Self {
+        Self {
+            reply: reply.into(),
+            shown: Shown::Notice,
         }
     }
 }
@@ -73,6 +108,11 @@ impl Decide for NoDecider {
 /// Decides whether the next candidate is flawed (§5.3).
 fn random_flaw() -> bool {
     uuid::Uuid::new_v4().as_bytes()[0] & 1 == 1
+}
+
+tokio::task_local! {
+    /// The model list a turn read at its start (see [`Runtime::models`]).
+    static TURN_CATALOG: Vec<ModelEntry>;
 }
 
 pub struct Runtime {
@@ -142,16 +182,28 @@ impl Runtime {
         }
     }
 
+    /// Reads settings from `config` instead of `config.json` (for tests).
+    pub fn with_config(mut self, config: fn() -> Config) -> Self {
+        self.config = config;
+        self
+    }
+
     pub fn with_decider(mut self, decider: Arc<dyn Decide>) -> Self {
         self.decider = decider;
         self
     }
 
+    /// The thread's models. Inside a turn they come from the model list the
+    /// turn read at its start, so a list refreshed in the background
+    /// meanwhile applies from the next turn, never between two calls of one.
     fn models(&self, session: &Session) -> Result<TierModels> {
         let config = (self.config)();
+        let catalog = TURN_CATALOG
+            .try_with(Clone::clone)
+            .unwrap_or_else(|_| config.catalog());
         let pick = |choice: &Option<String>, system2| {
             config
-                .pick(choice.as_deref(), system2)
+                .pick_in(&catalog, choice.as_deref(), system2)
                 .ok_or_else(|| anyhow!(NO_MODEL))
         };
         let mut system1 = pick(&session.system1, false)?;
@@ -163,6 +215,17 @@ impl Runtime {
             system2.effort = Some(effort.clone());
         }
         Ok(TierModels { system1, system2 })
+    }
+
+    /// The settings this runtime reads (on every call, so edits apply).
+    pub fn config(&self) -> Config {
+        (self.config)()
+    }
+
+    /// Fast and main model: what the thread or config asks for and what
+    /// runs, read fresh so a refreshed model list applies from the next turn.
+    pub fn tier_picks(&self, session: &Session) -> [crate::config::TierPick; 2] {
+        (self.config)().tiers(session.system1.as_deref(), session.system2.as_deref())
     }
 
     pub fn model_choices(&self, session: &Session) -> ModelChoices {
@@ -344,6 +407,20 @@ impl Runtime {
         all
     }
 
+    /// The threads in `cwd` with the seconds since each was last saved,
+    /// the most recent first.
+    pub fn threads_in(&self, cwd: &std::path::Path) -> Vec<(Session, u64)> {
+        let mut all: Vec<(Session, u64)> = self
+            .store
+            .all_sessions_aged()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(s, _)| s.cwd == cwd)
+            .collect();
+        all.reverse();
+        all
+    }
+
     pub async fn handle_turn(
         &self,
         session_id: &str,
@@ -366,27 +443,50 @@ impl Runtime {
             pathfinder_schema::Tool,
             u32,
         >::new()));
+        // Thoughts and tool calls, kept with the reply they came before.
+        let steps = Arc::new(std::sync::Mutex::new(crate::domain::StepLog::default()));
+        let turns_before = session.history.len();
         let sink: StreamSink = {
             let tools = tools.clone();
+            let steps = steps.clone();
             let inner = sink;
             Arc::new(move |event: StreamEvent| {
-                if let StreamEvent::ToolStart(t) = &event {
-                    *tools.lock().unwrap().entry(tool_kind(t.kind)).or_default() += 1;
+                {
+                    let mut log = steps.lock().unwrap();
+                    match &event {
+                        StreamEvent::ToolStart(t) => {
+                            *tools.lock().unwrap().entry(tool_kind(t.kind)).or_default() += 1;
+                            log.tool_start(&t.id, &t.title);
+                        }
+                        StreamEvent::Thought(t) => log.thought(t),
+                        StreamEvent::ToolUpdate { id, content } => {
+                            log.tool_detail(id, content.summary())
+                        }
+                        StreamEvent::ToolEnd { id, ok } => log.tool_end(id, *ok),
+                        StreamEvent::TextDelta(_) => {}
+                    }
                 }
                 inner(event)
             })
         };
-        let (output, counters) = crate::telemetry::with_turn_counters(self.dispatch_turn(
-            &mut session,
-            text,
-            files,
-            sink,
-        ))
-        .await;
+        let catalog = (self.config)().catalog();
+        let (output, counters) = TURN_CATALOG
+            .scope(
+                catalog.clone(),
+                crate::telemetry::with_turn_counters(self.dispatch_turn(
+                    &mut session,
+                    text,
+                    files,
+                    sink,
+                )),
+            )
+            .await;
+        // What a confirmation ran, if anything: counted as that step.
+        let ran = session.ran_commitment.take();
         if crate::telemetry::enabled() {
             crate::telemetry::set_locale(session.language.as_deref().unwrap_or(""));
-            let (route, model) = self
-                .models(&session)
+            let (route, model) = TURN_CATALOG
+                .sync_scope(catalog, || self.models(&session))
                 .map(|m| {
                     let route = serde_json::to_value(m.system2.route)
                         .ok()
@@ -405,7 +505,14 @@ impl Runtime {
             } else {
                 "other".into()
             };
-            let step = turn_step(text, &session, had_candidate);
+            // A plain message answered with a fixed notice (a show-back, an
+            // ask, an undo): no step of the loop ran yet.
+            let notice = matches!(&output, Ok(o) if o.shown == Shown::Notice);
+            let step = if notice && !text.starts_with('/') && ran.is_none() {
+                pathfinder_schema::Step::Other
+            } else {
+                turn_step(text, &session, had_candidate, ran)
+            };
             crate::telemetry::emit(pathfinder_schema::Event::Turn {
                 route,
                 model,
@@ -424,9 +531,23 @@ impl Runtime {
                 crate::telemetry::emit(pathfinder_schema::Event::Error { code });
             }
         }
+        if output.is_err() {
+            // A failed message still counts as a step: a claim is undoable
+            // only right away, never past a message sent after it (§15).
+            // The failed turn's own changes are not kept.
+            if let Ok(Some(mut stored)) = self.store.load_session(session_id) {
+                stored.turn += 1;
+                let _ = self.store.save_session(&stored);
+            }
+        }
         let output = output?;
+        keep_steps(&mut session, turns_before, steps.lock().unwrap().take());
 
         self.retire_stale_secrets(&session);
+        // Counted once the turn is done, so a claim made in turn n is
+        // undoable while `turn` is n + 1: in the next turn, and in a
+        // frontend between the two (`Session::undoable`).
+        session.turn += 1;
         self.store.save_session(&session)?;
         Ok(output)
     }
@@ -467,7 +588,45 @@ impl Runtime {
         let cmd = words.next().unwrap_or("").to_ascii_lowercase();
         let arg = words.next().unwrap_or("").trim();
 
-        match cmd.as_str() {
+        // Something waits for your OK (§15): a command that only looks
+        // leaves it waiting; any other drops it with a "not run" line, as a
+        // plain message does, so it never runs against a state it wasn't
+        // shown back for.
+        let looks = matches!(
+            cmd.as_str(),
+            "/confirm" | "/cancel" | "/why" | "/map" | "/coverage" | "/find" | "/open" | "/web"
+        );
+        let dropped = if looks {
+            None
+        } else {
+            self.drop_pending(session)
+        };
+        if let Some(line) = &dropped {
+            sink(StreamEvent::TextDelta(format!("{line}\n\n")));
+        }
+        let before = session.history.len();
+        let out = self.run_command(session, &cmd, arg, files, sink).await;
+        if let Some(line) = dropped
+            && let Some(reply) = session
+                .history
+                .iter_mut()
+                .skip(before)
+                .find(|t| t.role == "assistant")
+        {
+            reply.content = format!("{line}\n\n{}", reply.content);
+        }
+        out
+    }
+
+    async fn run_command(
+        &self,
+        session: &mut Session,
+        cmd: &str,
+        arg: &str,
+        files: &[PathBuf],
+        sink: StreamSink,
+    ) -> Result<TurnOutput> {
+        match cmd {
             "/map" => Ok(TurnOutput::text(render_map_and_pending(session))),
             "/plan" => {
                 if !arg.is_empty() {
@@ -502,6 +661,9 @@ impl Runtime {
             "/find" => Ok(self.handle_find(session, arg).await),
             "/open" => Ok(self.handle_open(session, arg).await),
             "/web" => Ok(self.handle_web(session, arg, sink).await),
+            "/undo" => self.undo(session),
+            "/confirm" => self.confirm(session, sink).await,
+            "/cancel" => self.cancel(session, sink).await,
             _ => Ok(TurnOutput::text(COMMANDS_HELP)),
         }
     }
@@ -543,6 +705,26 @@ fn exam_questions_asked(session: &Session) -> Vec<String> {
 /// The decision model's step for a verdict on a waiting candidate.
 const VERDICT: &str = "verdict";
 
+/// The Router's step for "let the agent do it" (§15): code picks a handoff
+/// or a delegation from the part's status, never a model.
+const AGENT: &str = "agent";
+
+/// The Router's step for "just tell me" (§11, §15).
+const TELL: &str = "tell";
+
+/// The Router's step for taking back the last claim (§15).
+const UNDO: &str = "undo";
+
+/// The Router's step for agreeing to what waits for your OK (§15).
+const CONFIRM: &str = "confirm";
+
+/// The steps that change what the record says about you (§15).
+const COMMITMENTS: [&str; 4] = [VERDICT, "known", AGENT, TELL];
+
+/// An unsure Router asks which you meant once this much of its weight is
+/// on commitments (§15).
+const UNSURE_COMMITMENT: f64 = 0.4;
+
 /// While a candidate waits, a log, move or skip needs this much to skip
 /// the judge.
 const CONFIDENT_STEP: f64 = 0.9;
@@ -554,6 +736,21 @@ const CANDIDATE_HIDDEN: &str = "(candidate hidden while the user judges it)";
 
 pub(crate) const REVIEW_PROMPT: &str =
     "\n\nReview the result: `/approve`, or `/object <what's wrong and why>` to send it back.";
+
+/// Keeps a turn's steps with the first reply it added to the history.
+fn keep_steps(session: &mut Session, turns_before: usize, steps: Vec<crate::domain::Step>) {
+    if steps.is_empty() {
+        return;
+    }
+    if let Some(reply) = session
+        .history
+        .iter_mut()
+        .skip(turns_before)
+        .find(|t| t.role == "assistant")
+    {
+        reply.steps = steps;
+    }
+}
 
 /// Makes sure the user has seen `full`: if streaming didn't show it, send it
 /// now, so it stays ahead of anything that follows.
@@ -719,6 +916,8 @@ First decide what the latest message is (`intent`):
 - `move`: they want to go on to the next part, or to a named one (put its id in `part`). For `known`, also put a part they name to go to in `part`.
 - `accept` / `reject`: they answer a waiting map change ("yes, add it", "no, keep the map").
 - `replan`: they ask to change the plan, or say something that changes the whole task's scope or purpose (a new constraint or aim).
+- `agent`: they ask for the agent to do this part (do it for them, hand it off, delegate it).
+- `tell`: they ask to be told the answer or an explanation outright, rather than pointed to sources.
 For anything but `log`, set `reply` to "" and `map_change` to null: Pathfinder takes the step.
 
 For `log`, set `reply` to "ok". Pathfinder never answers in its own words: a question gets pointers into the sources, found separately, and a log entry gets no comment.
@@ -805,9 +1004,24 @@ fn tool_kind(kind: crate::stream::ToolKind) -> pathfinder_schema::Tool {
     }
 }
 
-/// What kind of turn this was, for usage events.
-fn turn_step(text: &str, session: &Session, had_candidate: bool) -> pathfinder_schema::Step {
+/// What kind of turn this was, for usage events. `pending`: what waited
+/// for your OK when the turn began, so `/confirm` counts as what it ran.
+fn turn_step(
+    text: &str,
+    session: &Session,
+    had_candidate: bool,
+    ran: Option<crate::domain::CommitKind>,
+) -> pathfinder_schema::Step {
+    use crate::domain::CommitKind;
     use pathfinder_schema::Step;
+    // A confirmation, typed or in plain words, counts as what it ran; one
+    // that ran nothing (stale, or nothing waiting) is no step of the loop.
+    match ran {
+        Some(CommitKind::Verdict) => return Step::Verdict,
+        Some(CommitKind::Handoff) => return Step::Handoff,
+        Some(CommitKind::Delegate) => return Step::Delegate,
+        None => {}
+    }
     if let Some(cmd) = text.strip_prefix('/') {
         let word = cmd
             .split_whitespace()
@@ -924,9 +1138,12 @@ mod command_tests {
             .unwrap();
         assert!(!out_why.reply.contains("Commands:"));
 
-        assert_eq!(turn_step("/MAP", &s, false), pathfinder_schema::Step::Map);
         assert_eq!(
-            turn_step("/Summary", &s, false),
+            turn_step("/MAP", &s, false, None),
+            pathfinder_schema::Step::Map
+        );
+        assert_eq!(
+            turn_step("/Summary", &s, false, None),
             pathfinder_schema::Step::Summary
         );
     }
@@ -985,6 +1202,13 @@ mod command_tests {
             .await
             .unwrap();
         assert!(out.reply.contains("    2  beta"), "{}", out.reply);
+        // A frontend can show it as a source: path, range, numbered block.
+        let Shown::Source { title, range, body } = &out.shown else {
+            panic!("{:?}", out.shown);
+        };
+        assert_eq!(title, "my notes.md");
+        assert_eq!(range, "lines 1–3 of 3");
+        assert!(body.starts_with("```markdown numbered\n"), "{body}");
 
         let reloaded = rt.load_session("s-open").unwrap().unwrap();
         assert_eq!(reloaded.history.len(), 2);
@@ -1005,6 +1229,8 @@ mod command_tests {
             .await
             .unwrap();
         assert!(err_out.reply.contains("missing.md"), "{}", err_out.reply);
+        assert_eq!(err_out.shown, Shown::Notice, "an error isn't a reply");
+
         let reloaded = rt.load_session("s-open").unwrap().unwrap();
         assert_eq!(reloaded.history.len(), 4);
         assert_eq!(reloaded.history[3].role, "assistant");
@@ -1017,6 +1243,36 @@ mod command_tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind, EventKind::Read);
         assert_eq!(events[0].reference.as_deref(), Some("my notes.md#2"));
+
+        // `/find`: the hits and how many lines matched in all.
+        let found = rt
+            .handle_turn(
+                "s-open",
+                TurnInput {
+                    text: "/find beta".into(),
+                    files: vec![],
+                },
+                crate::engine::noop_sink(),
+            )
+            .await
+            .unwrap();
+        let Shown::Search { query, hits, total } = &found.shown else {
+            panic!("{:?}", found.shown);
+        };
+        assert_eq!((query.as_str(), hits.len(), *total), ("beta", 1, 1));
+        assert!(found.reply.starts_with("**1** for"), "{}", found.reply);
+        let none = rt
+            .handle_turn(
+                "s-open",
+                TurnInput {
+                    text: "/find zzzqqq".into(),
+                    files: vec![],
+                },
+                crate::engine::noop_sink(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(none.shown, Shown::Notice);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

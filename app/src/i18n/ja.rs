@@ -73,6 +73,69 @@ fn line(l: Line) -> &'static str {
         FindHits => "**{n}** 件（{terms}）：",
         FindNone => "このフォルダーに {terms} を含む行はありません。",
         WebNone => "オンラインで {terms} に一致するものはありませんでした。",
+        ShowKnown => {
+            "記録しました: **{title}** はもう知っている、と。根拠ではなく申告です。`/undo` (Esc) で取り消せます。"
+        }
+        ShowTell => {
+            "ご要望どおりお答えします。理解ではなく「教わった」と記録されます。届く前に Esc で取り消せます。"
+        }
+        ShowHandoff => {
+            "**{title}** をエージェントに渡しますか？ステージング用のコピーで作業し、結果はあなたが確認します。Enter で実行 · Esc で取消。"
+        }
+        ShowHandoffInPlace => {
+            "**{title}** をエージェントに渡しますか？ここは git リポジトリではないので、ステージングも確認付きレビューもなくファイルを直接編集します。Enter で実行 · Esc で取消。"
+        }
+        ShowDelegate => {
+            "**{title}** を理解しないまま任せますか？委任として記録され、結果を保証することにはなりません。Enter で実行 · Esc で取消。"
+        }
+        ShowVerdict => {
+            "これを候補への判定として採点しますか？「{words}」 Enter で採点 · Esc でメモとして残す。"
+        }
+        NotRunVerdict => "判定としては採点せず、メモとして残しました。",
+        NotRunHandoff => "未実行: **{title}** はエージェントに渡していません。",
+        NotRunDelegate => "未実行: **{title}** は委任していません。",
+        NotRunStale => "未実行: 承認を待っていた内容はもう当てはまりません。",
+        AskWhich => {
+            "{choices}という意味ですか？ はっきりするまで何も記録しません。違えばそのまま続けてください。"
+        }
+        AskKnown => "**{title}** をもう知っている (`/known`)",
+        AskTell => "答えを教えてほしい (`/tell <question>`)",
+        AskAgent => "このパートをエージェントに任せる (`/handoff` または `/delegate`)",
+        Or => "、または",
+        Undone => {
+            "取り消しました: **{title}** についての申告は撤回されました。記録には撤回として残ります。"
+        }
+        NothingToUndo => {
+            "取り消せるものはありません。取り消せるのは直前のステップの申告だけです。採点済みの判定、レビュー、引き渡し、委任、教わった答えはそのまま残ります。"
+        }
+        NothingWaiting => "承認を待っているものはありません。",
+        NextStep => "次: {at} · {question}",
+        NextStepNoPlace => {
+            "次: 手元の資料にはまだ **{concept}** が出てくる箇所がありません。`/find <terms>` で検索できます。 · {question}"
+        }
+        StepWideExample => {
+            "{concept} が使われている箇所を一つ探してください。そこで何をしていますか？"
+        }
+        StepWidePurpose => "このパートで {concept} は何のためにありますか？自分の言葉で。",
+        StepWideMechanism => "{concept} はどう動きますか？一歩ずつ。",
+        StepNarrowExample => {
+            "{concept} が効いている行を一つ選んでください。違っていたら何が変わりますか？"
+        }
+        StepNarrowPurpose => "{concept} はなぜまさにそこで必要で、ないと何が壊れますか？",
+        StepNarrowMechanism => {
+            "{concept} を一歩ずつ追ってください。まず何が起き、次に何が起きますか？"
+        }
+        Horizon => "見通し: {what}。",
+        HorizonNeeds => "前提: {parts}",
+        HorizonLeads => "次へ: {parts}",
+        EvidenceRatio => "合格: {passes} · 申告: {claims}。",
+        ClaimWithdrawn => "**{concept}** の申告を撤回 ({date})。",
+        StepHistory => "ここまでの道のり: {kinds}。",
+        StepKindRate => "{kind} {judged} 回中 {passes} 回が合格につながった",
+        SteeredTimes => "あなたが {n} 回方向を指定",
+        StepHistoryNote => {
+            "Pathfinder があなたの学び方について記録するのはこれだけで、このフォルダーのローカル記録に残ります。"
+        }
     }
 }
 

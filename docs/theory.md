@@ -132,7 +132,7 @@ Two kinds of message are treated differently:
 - **Intent**: asking, looking something up, opening a source, exploring. Pathfinder acts on it directly.
 - **A commitment**: something that changes what the record says about you. Claiming you know a part, asking to be told (section 11), handing a part off or delegating it (sections 6 and 7), giving a verdict on a candidate.
 
-A commitment read from plain language is still a model's proposal (section 9). Before it counts, it is shown back to you in one line, saying what will be recorded, and it can be undone in one step. Pathfinder never records a commitment you didn't see, so the record stays something you said, not something a model guessed about you. When a decision model is unsure whether you meant a commitment, it asks instead of guessing.
+A commitment read from plain language is still a model's proposal (section 9). Before it counts, it is shown back to you in one line, saying what will be recorded, and it can be undone in one step. Undoing never lowers the bar: a claim can be taken back right after you make it, but a verdict that has been judged, or an answer you have seen, is evidence about you and stays. So a commitment that starts work or settles a check (handing off, delegating, a verdict) waits for your OK instead of being undone afterwards. Pathfinder never records a commitment you didn't see, so the record stays something you said, not something a model guessed about you. When a decision model is unsure whether you meant a commitment, it asks instead of guessing.
 
 ## 16. The path: an exact next step, a loose horizon
 
@@ -231,7 +231,7 @@ The Agent never sees concept states or the ledger, so it can't shape its work to
 
 ## A3. A turn
 
-*§4–§7, §15: every message becomes one step; a commitment read from plain words is shown back and can be undone (a typed command is already explicit and skips this); writes happen once, at the end.*
+*§4–§7, §15: every message becomes one step; a commitment read from plain words is shown back: a claim can be undone in the next step, a tell cancelled until its answer shows, and a verdict, handoff or delegation waits for your OK (a typed command is already explicit and skips this); writes happen once, at the end.*
 
 ```mermaid
 flowchart TD
@@ -240,14 +240,15 @@ flowchart TD
     R -->|"commitment, unsure"| Q[ask which you meant · §15] --> OUT
     R -->|log| X[Extractor] & T[Tutor]
     R -->|summary| S[choose targets · A5] --> E[Examiner] --> K[register key · A6]
-    R -->|"verdict · known · handoff · delegate · tell"| SB[shown back in one line<br/>undoable in one step · §15]
-    R -->|"log < 0.9 while a candidate waits"| J
-    SB -->|verdict| J[Judge] --> RT[write pass/fail · retire key]
+    R -->|"known · tell"| SB[shown back in one line · §15<br/>claim: undo next step · tell: Esc until shown]
+    R -->|"verdict · agent: handoff or delegate by part status"| OK[shown back · waits for Enter · §15<br/>Esc cancels · a verdict stays a note]
+    R -->|"log · move · known · agent < 0.9, or unsure, while a candidate waits"| OK
+    OK -->|verdict| J[Judge, no tools] --> RT[write pass/fail · retire key]
     SB -->|known| C[claim events] --> GP[walk prerequisites · gaps]
     SB -->|tell| TL[Tutor answers · told events · §11]
     R -->|move · replan · accept · reject| MV[map and focus]
-    SB -->|handoff| AH[Agent in staging] --> TH[Tagger] --> LH[ledger] --> RV[review · A8]
-    SB -->|delegate| AD[Agent] --> TD[Tagger] --> LD[ledger: all delegated]
+    OK -->|handoff| AH[Agent in staging] --> TH[Tagger] --> LH[ledger] --> RV[review · A8]
+    OK -->|delegate| AD[Agent] --> TD[Tagger] --> LD[ledger: all delegated]
     TL --> AS
     T --> V[code checks each quote against its source · renders the reply] --> AS{active secret?}
     AS -->|no| OUT
@@ -264,6 +265,8 @@ flowchart TD
     F --> AS
     OUT[emit to the thread] --> TX[(one transaction:<br/>thread · events · ledger)]
 ```
+
+A verdict read from plain words, even at low confidence while a candidate waits (any `log`, `move`, `known` or `agent` below 0.9, or no sure step at all, is shown back as a possible verdict), goes through your OK rather than straight to the Judge, because a judged verdict can't be undone (§15 wins over speed); Esc keeps the message as a note, so a question about the candidate is still answered. Exam answers and quick checks still go straight to the Judge: you asked to be asked. Undo appends a `retracted` event that only a claim can be the target of, so no undo can drop a pass, a fail or a review.
 
 ## A4. Data model
 
@@ -305,8 +308,8 @@ erDiagram
     EVENT {
         int id PK
         text concept FK
-        text kind "claim touched misconception_shown pass fail misconception_resolved delegated review_ok review_missed user"
-        text ref "candidate, misconception, ledger, message"
+        text kind "claim touched misconception_shown pass fail misconception_resolved delegated review_ok review_missed user retracted step"
+        text ref "candidate, misconception, ledger, message, retracted event, part"
         json detail
         text at
     }

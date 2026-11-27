@@ -310,6 +310,15 @@ fn add_endpoint_at(path: &Path, ep: &Endpoint) -> anyhow::Result<()> {
     })
 }
 
+fn remove_endpoint_at(path: &Path, id: &str) -> anyhow::Result<()> {
+    update_config_json(path, |obj| {
+        if let Some(list) = obj.get_mut("endpoints").and_then(|v| v.as_array_mut()) {
+            list.retain(|e| e.get("id").and_then(|v| v.as_str()) != Some(id));
+        }
+        Ok(())
+    })
+}
+
 fn set_optional_json<T: Serialize>(
     obj: &mut serde_json::Map<String, serde_json::Value>,
     key: &str,
@@ -383,6 +392,11 @@ impl Config {
         add_endpoint_at(&default_config_path(), ep)
     }
 
+    /// Removes the endpoint `id` from `config.json`, keeping the rest.
+    pub fn remove_endpoint(id: &str) -> anyhow::Result<()> {
+        remove_endpoint_at(&default_config_path(), id)
+    }
+
     /// Updates default model/effort/decision/check fields in `config.json`,
     /// preserving all other settings.
     pub fn save_defaults(defaults: &DefaultSettings) -> anyhow::Result<()> {
@@ -417,16 +431,32 @@ impl Config {
     }
 
     /// The picker list: pinned models, then discovered ones not already
-    /// pinned.
+    /// pinned (the API lists from the model cache, and the Claude Code and
+    /// Codex CLIs when their programs are installed), then endpoints.
     pub fn catalog(&self) -> Vec<ModelEntry> {
-        let cache = crate::catalog::ModelCache::load();
+        let clis = if self.discover && !self.local_only {
+            CliAccounts::detect(self)
+        } else {
+            CliAccounts::default()
+        };
+        self.catalog_from(&crate::catalog::ModelCache::load(), clis)
+    }
+
+    /// [`Config::catalog`] for a given cache and installed CLIs.
+    pub fn catalog_from(
+        &self,
+        cache: &crate::catalog::ModelCache,
+        clis: CliAccounts,
+    ) -> Vec<ModelEntry> {
         let discovered = if self.discover {
-            cache.entries()
+            let mut found = cache.entries();
+            found.extend(cli_entries(cache, clis));
+            found
         } else {
             Vec::new()
         };
         let mut all = self.merged(discovered);
-        all.extend(self.endpoint_entries(&cache));
+        all.extend(self.endpoint_entries(cache));
         if self.local_only {
             all.retain(|m| m.route == Route::Endpoint);
         }
@@ -472,7 +502,7 @@ impl Config {
         for entry in discovered {
             if !out
                 .iter()
-                .any(|m| m.route == entry.route && m.model == entry.model)
+                .any(|m| m.id == entry.id || (m.route == entry.route && m.model == entry.model))
             {
                 out.push(entry);
             }
@@ -480,8 +510,10 @@ impl Config {
         out
     }
 
+    /// The entry with this id, or the one an older id now names (see
+    /// [`resolve`]).
     pub fn entry(&self, id: &str) -> Option<ModelEntry> {
-        self.catalog().into_iter().find(|m| m.id == id)
+        resolve(&self.catalog(), id).cloned()
     }
 
     /// The entry for a tier: the session's pick if still listed, else the
@@ -490,6 +522,284 @@ impl Config {
     pub fn pick(&self, choice: Option<&str>, system2: bool) -> Option<ModelEntry> {
         pick_from(&self.catalog(), self, choice, system2)
     }
+
+    /// [`Config::pick`] from a catalog read earlier (a turn's snapshot).
+    pub fn pick_in(
+        &self,
+        catalog: &[ModelEntry],
+        choice: Option<&str>,
+        system2: bool,
+    ) -> Option<ModelEntry> {
+        pick_from(catalog, self, choice, system2)
+    }
+
+    /// Both tiers from one catalog read: what was asked for and what runs.
+    pub fn tiers(&self, fast: Option<&str>, main: Option<&str>) -> [TierPick; 2] {
+        let catalog = self.catalog();
+        [
+            tier_from(&catalog, self, fast, false),
+            tier_from(&catalog, self, main, true),
+        ]
+    }
+}
+
+/// Which external CLIs are installed, so their accounts are offered.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CliAccounts {
+    pub claude: bool,
+    pub codex: bool,
+}
+
+impl CliAccounts {
+    /// Looks for `claude_bin` and `codex_bin` (after their
+    /// `PATHFINDER_*_BIN` overrides) as files or on `PATH`.
+    pub fn detect(cfg: &Config) -> Self {
+        Self {
+            claude: bin_resolves(&cfg.claude_bin),
+            codex: bin_resolves(&cfg.codex_bin),
+        }
+    }
+}
+
+/// Whether `bin` names a program: a path to a file, or a bare name found on
+/// `PATH` (with `.exe` on Windows). Remembered per name for this process, as
+/// pickers read the catalog on every draw.
+pub fn bin_resolves(bin: &str) -> bool {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(Default::default);
+    if let Some(known) = seen.lock().ok().and_then(|m| m.get(bin).copied()) {
+        return known;
+    }
+    let dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+    let found = bin_on(bin, &dirs);
+    if let Ok(mut m) = seen.lock() {
+        m.insert(bin.to_string(), found);
+    }
+    found
+}
+
+/// [`bin_resolves`] over `dirs` (PATH).
+fn bin_on(bin: &str, dirs: &[PathBuf]) -> bool {
+    let bin = bin.trim();
+    if bin.is_empty() {
+        return false;
+    }
+    let is_file = |p: &Path| {
+        p.is_file()
+            || (cfg!(windows) && p.extension().is_none() && p.with_extension("exe").is_file())
+    };
+    let given = Path::new(bin);
+    if given.is_absolute() || given.components().count() > 1 {
+        return is_file(given);
+    }
+    dirs.iter().any(|d| is_file(&d.join(given)))
+}
+
+/// Claude Code's models: (alias passed to `claude --model`, label, effort).
+const CLAUDE_MODELS: [(&str, &str, &str); 3] = [
+    ("haiku", "Haiku", "low"),
+    ("sonnet", "Sonnet", "high"),
+    ("opus", "Opus", "high"),
+];
+
+/// Codex's models when ChatGPT's list isn't cached: (model, label).
+const CODEX_MODELS: [(&str, &str); 2] =
+    [("gpt-6-luna", "GPT-6 Luna"), ("gpt-6.2-sol", "GPT-6.2 Sol")];
+
+/// A model's kind: the last dash-separated part of its name (`luna` in
+/// `gpt-6-luna`, `sol` in `gpt-6.2-sol`).
+fn kind(model: &str) -> &str {
+    model.rsplit('-').next().unwrap_or(model)
+}
+
+/// Entries for the installed CLIs: `claude-haiku`, `claude-sonnet` and
+/// `claude-opus` for Claude Code, and `codex-<model>` for Codex. Codex signs
+/// in with a ChatGPT plan, so when that plan's list is cached (signed in
+/// with ChatGPT here too) it offers the newest model of each kind from it,
+/// not the whole list again under the same plan; else a built-in pair.
+/// Small models (`luna`, `mini`) default to low effort.
+pub fn cli_entries(cache: &crate::catalog::ModelCache, clis: CliAccounts) -> Vec<ModelEntry> {
+    let mut out = Vec::new();
+    if clis.claude {
+        out.extend(
+            CLAUDE_MODELS
+                .iter()
+                .map(|(model, label, effort)| ModelEntry {
+                    id: format!("claude-{model}"),
+                    label: (*label).into(),
+                    route: Route::Claude,
+                    model: (*model).into(),
+                    effort: Some((*effort).into()),
+                    endpoint: None,
+                }),
+        );
+    }
+    if clis.codex {
+        // Newest first in the cache: the first of each kind.
+        let mut listed: Vec<(String, String)> = Vec::new();
+        for m in cache
+            .providers
+            .get(Route::Chatgpt.provider_id())
+            .into_iter()
+            .flatten()
+        {
+            if !listed.iter().any(|(id, _)| kind(id) == kind(&m.id)) {
+                listed.push((m.id.clone(), m.label.clone()));
+            }
+        }
+        let models = if listed.is_empty() {
+            CODEX_MODELS
+                .iter()
+                .map(|(m, l)| (m.to_string(), l.to_string()))
+                .collect()
+        } else {
+            listed
+        };
+        out.extend(models.into_iter().map(|(model, label)| {
+            let small = ["luna", "mini"].iter().any(|h| model.contains(h));
+            ModelEntry {
+                id: format!("codex-{model}"),
+                label,
+                route: Route::Codex,
+                effort: Some(if small { "low" } else { "high" }.into()),
+                model,
+                endpoint: None,
+            }
+        }));
+    }
+    out
+}
+
+/// The entry with id `id`, or for an id older versions saved: `claude-<x>`
+/// and `codex-<x>` (as in `codex-luna`, `codex-sol`) name that CLI's model
+/// called `x`, else the first whose name has `x` as a part (`gpt-6.2-sol`),
+/// else the one of the same kind (`codex-gpt-6-luna` once Codex offers a
+/// newer Luna).
+pub fn resolve<'a>(catalog: &'a [ModelEntry], id: &str) -> Option<&'a ModelEntry> {
+    if let Some(m) = catalog.iter().find(|m| m.id == id) {
+        return Some(m);
+    }
+    let (route, name) = if let Some(rest) = id.strip_prefix("claude-") {
+        (Route::Claude, rest)
+    } else {
+        (Route::Codex, id.strip_prefix("codex-")?)
+    };
+    if name.is_empty() {
+        return None;
+    }
+    let of_route = || catalog.iter().filter(move |m| m.route == route);
+    of_route()
+        .find(|m| m.model == name)
+        .or_else(|| of_route().find(|m| m.model.split('-').any(|part| part == name)))
+        .or_else(|| of_route().find(|m| kind(&m.model) == kind(name)))
+}
+
+/// Who runs a model and who pays for it: a section of the model pickers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Account {
+    ChatgptPlan,
+    ClaudeCode,
+    CodexCli,
+    AnthropicApi,
+    OpenaiApi,
+    /// An entry of `endpoints`, by id.
+    Endpoint(String),
+}
+
+impl Account {
+    pub fn of(entry: &ModelEntry) -> Self {
+        match entry.route {
+            Route::Chatgpt => Self::ChatgptPlan,
+            Route::Claude => Self::ClaudeCode,
+            Route::Codex => Self::CodexCli,
+            Route::Anthropic => Self::AnthropicApi,
+            Route::Openai => Self::OpenaiApi,
+            Route::Endpoint => Self::Endpoint(entry.endpoint.clone().unwrap_or_default()),
+        }
+    }
+
+    /// The fixed accounts first, in this order, then endpoints.
+    fn rank(&self) -> u8 {
+        match self {
+            Self::ChatgptPlan => 0,
+            Self::ClaudeCode => 1,
+            Self::CodexCli => 2,
+            Self::AnthropicApi => 3,
+            Self::OpenaiApi => 4,
+            Self::Endpoint(_) => 5,
+        }
+    }
+
+    /// The section header: the account and who pays.
+    pub fn header(&self) -> String {
+        match self {
+            Self::ChatgptPlan => "ChatGPT sign-in · ChatGPT plan".into(),
+            Self::ClaudeCode => "Claude Code · Claude subscription".into(),
+            Self::CodexCli => "Codex CLI · ChatGPT plan".into(),
+            Self::AnthropicApi => "Anthropic API · pay per use".into(),
+            Self::OpenaiApi => "OpenAI API · pay per use".into(),
+            Self::Endpoint(id) => format!("{id} · your server"),
+        }
+    }
+
+    /// A short tag for where only the label shows (settings, footer).
+    pub fn short(&self) -> String {
+        match self {
+            Self::ChatgptPlan => "ChatGPT".into(),
+            Self::ClaudeCode => "Claude Code".into(),
+            Self::CodexCli => "Codex CLI".into(),
+            Self::AnthropicApi => "Anthropic API".into(),
+            Self::OpenaiApi => "OpenAI API".into(),
+            Self::Endpoint(id) => id.clone(),
+        }
+    }
+
+    /// For an account whose CLI keeps its own login (Pathfinder never
+    /// signs in there): where to sign in, in a few words.
+    pub fn own_login(&self) -> Option<&'static str> {
+        match self {
+            Self::ClaudeCode => Some("own login: run `claude`, /login there"),
+            Self::CodexCli => Some("own login: run `codex login`"),
+            _ => None,
+        }
+    }
+
+    /// Billed per request to an API key rather than covered by a plan.
+    pub fn pay_per_use(&self) -> bool {
+        matches!(self, Self::AnthropicApi | Self::OpenaiApi)
+    }
+}
+
+/// The catalog in sections by account, in [`Account`]'s order (endpoints
+/// in the order they first appear); entries keep their order inside each.
+pub fn by_account(catalog: &[ModelEntry]) -> Vec<(Account, Vec<&ModelEntry>)> {
+    let mut groups: Vec<(Account, Vec<&ModelEntry>)> = Vec::new();
+    for m in catalog {
+        let account = Account::of(m);
+        match groups.iter_mut().find(|(a, _)| *a == account) {
+            Some((_, list)) => list.push(m),
+            None => groups.push((account, vec![m])),
+        }
+    }
+    // Stable: endpoints keep their first-seen order.
+    groups.sort_by_key(|(a, _)| a.rank());
+    groups
+}
+
+/// One tier's model: what the thread or config asked for, and what runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TierPick {
+    /// The thread's pick, else the configured default; None when neither
+    /// is set and the model is chosen automatically.
+    pub wanted: Option<String>,
+    /// The model that runs; None when no model is set up at all.
+    pub entry: Option<ModelEntry>,
+    /// `wanted` isn't in the catalog, so another model runs instead.
+    pub fallback: bool,
 }
 
 /// Model-name hints for a sensible default per tier when none is configured.
@@ -502,7 +812,35 @@ fn pick_from(
     choice: Option<&str>,
     system2: bool,
 ) -> Option<ModelEntry> {
-    let find = |id: &str| catalog.iter().find(|m| m.id == id).cloned();
+    tier_from(catalog, cfg, choice, system2).entry
+}
+
+fn tier_from(
+    catalog: &[ModelEntry],
+    cfg: &Config,
+    choice: Option<&str>,
+    system2: bool,
+) -> TierPick {
+    let default = if system2 { &cfg.system2 } else { &cfg.system1 };
+    let wanted = choice.or(default.as_deref()).map(str::to_string);
+    let entry = auto_pick(catalog, cfg, choice, system2);
+    let fallback = wanted.as_deref().is_some_and(|w| {
+        resolve(catalog, w).is_none_or(|found| entry.as_ref().is_none_or(|e| e.id != found.id))
+    });
+    TierPick {
+        wanted,
+        entry,
+        fallback,
+    }
+}
+
+fn auto_pick(
+    catalog: &[ModelEntry],
+    cfg: &Config,
+    choice: Option<&str>,
+    system2: bool,
+) -> Option<ModelEntry> {
+    let find = |id: &str| resolve(catalog, id).cloned();
     let default = if system2 { &cfg.system2 } else { &cfg.system1 };
     let hints: &[&str] = if system2 { &MAIN_HINTS } else { &FAST_HINTS };
     // Pathfinder's own harness before the CLIs: within each route in this
@@ -565,6 +903,13 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(v["quote_cap"], 30);
         assert_eq!(v["endpoints"].as_array().unwrap().len(), 2);
+        // Removing one keeps the others and the rest of the file.
+        remove_endpoint_at(&path, "old").unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v["quote_cap"], 30);
+        assert_eq!(v["endpoints"][0]["id"], "lab");
+        assert_eq!(v["endpoints"].as_array().unwrap().len(), 1);
         // A file that can't be read as text is left alone, not replaced.
         let mut bytes = br#"{"label": "Gr"#.to_vec();
         bytes.extend([0xfc, b'n', b'"', b'}']);
@@ -718,6 +1063,212 @@ mod tests {
             ..Config::default()
         };
         assert!(empty.pick(None, true).is_none());
+    }
+
+    fn cached(models: &[(&str, &str)]) -> crate::catalog::ModelCache {
+        let mut cache = crate::catalog::ModelCache::default();
+        cache.providers.insert(
+            "chatgpt".into(),
+            models
+                .iter()
+                .map(|(id, label)| crate::catalog::CachedModel {
+                    id: (*id).into(),
+                    label: (*label).into(),
+                })
+                .collect(),
+        );
+        cache
+    }
+
+    const BOTH: CliAccounts = CliAccounts {
+        claude: true,
+        codex: true,
+    };
+
+    #[test]
+    fn installed_clis_list_their_accounts() {
+        let cfg = Config::default();
+        let empty = crate::catalog::ModelCache::default();
+        let all = cfg.catalog_from(&empty, BOTH);
+        let ids: Vec<&str> = all.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "claude-haiku",
+                "claude-sonnet",
+                "claude-opus",
+                "codex-gpt-6-luna",
+                "codex-gpt-6.2-sol"
+            ]
+        );
+        let effort = |id: &str| {
+            all.iter()
+                .find(|m| m.id == id)
+                .and_then(|m| m.effort.clone())
+                .unwrap()
+        };
+        assert_eq!(effort("claude-haiku"), "low");
+        assert_eq!(effort("claude-opus"), "high");
+        assert_eq!(effort("codex-gpt-6-luna"), "low");
+        assert_eq!(effort("codex-gpt-6.2-sol"), "high");
+        assert_eq!(all[1].route, Route::Claude);
+        assert_eq!(all[1].model, "sonnet");
+        assert_eq!(all[1].label, "Sonnet");
+
+        // Only what is installed.
+        let claude_only = CliAccounts {
+            claude: true,
+            codex: false,
+        };
+        assert!(
+            cfg.catalog_from(&empty, claude_only)
+                .iter()
+                .all(|m| m.route == Route::Claude)
+        );
+
+        // Codex offers the ChatGPT plan's models when they are listed.
+        // Codex offers the newest of each kind the ChatGPT plan lists.
+        let cache = cached(&[
+            ("gpt-6.3-sol", "GPT-6.3 Sol"),
+            ("gpt-6-mini", "GPT-6 Mini"),
+            ("gpt-6.2-sol", "GPT-6.2 Sol"),
+            ("gpt-5-mini", "GPT-5 Mini"),
+        ]);
+        let codex: Vec<String> = cfg
+            .catalog_from(&cache, BOTH)
+            .into_iter()
+            .filter(|m| m.route == Route::Codex)
+            .map(|m| format!("{} {}", m.id, m.effort.unwrap()))
+            .collect();
+        assert_eq!(codex, ["codex-gpt-6.3-sol high", "codex-gpt-6-mini low"]);
+        // A Codex id saved before a newer model of its kind still resolves.
+        let listed = cfg.catalog_from(&cache, BOTH);
+        assert_eq!(
+            resolve(&listed, "codex-gpt-6.2-sol").map(|m| m.id.as_str()),
+            Some("codex-gpt-6.3-sol")
+        );
+
+        // A pinned entry wins over the listed one with its id or model.
+        let pinned = Config {
+            models: vec![ModelEntry {
+                label: "My Sonnet".into(),
+                model: "sonnet".into(),
+                effort: Some("medium".into()),
+                ..entry("claude-sonnet", Route::Claude)
+            }],
+            ..Config::default()
+        };
+        let merged = pinned.catalog_from(&empty, BOTH);
+        let sonnets: Vec<&ModelEntry> = merged.iter().filter(|m| m.model == "sonnet").collect();
+        assert_eq!(sonnets.len(), 1);
+        assert_eq!(sonnets[0].label, "My Sonnet");
+
+        // `discover: false` and `local_only` list no CLI.
+        let off = Config {
+            discover: false,
+            ..Config::default()
+        };
+        assert!(off.catalog_from(&empty, BOTH).is_empty());
+        let local = Config {
+            local_only: true,
+            ..Config::default()
+        };
+        assert!(local.catalog_from(&empty, BOTH).is_empty());
+    }
+
+    #[test]
+    fn ids_older_versions_saved_still_resolve() {
+        let cfg = Config::default();
+        let catalog = cfg.catalog_from(&crate::catalog::ModelCache::default(), BOTH);
+        let id = |old: &str| resolve(&catalog, old).map(|m| m.id.as_str());
+        assert_eq!(id("claude-haiku"), Some("claude-haiku"));
+        assert_eq!(id("codex-luna"), Some("codex-gpt-6-luna"));
+        assert_eq!(id("codex-sol"), Some("codex-gpt-6.2-sol"));
+        assert_eq!(id("codex-gpt-6-luna"), Some("codex-gpt-6-luna"));
+        assert_eq!(id("codex-terra"), None);
+        assert_eq!(id("claude-"), None);
+        assert_eq!(id("chatgpt:gpt-6-luna"), None);
+        // A thread that saved `codex-sol` keeps it, without a fallback.
+        let tier = tier_from(&catalog, &cfg, Some("codex-sol"), true);
+        assert_eq!(tier.entry.unwrap().id, "codex-gpt-6.2-sol");
+        assert!(!tier.fallback);
+    }
+
+    #[test]
+    fn a_missing_configured_model_is_a_visible_fallback() {
+        let cfg = Config {
+            system2: Some("chatgpt:gpt-6.2-sol".into()),
+            ..Config::default()
+        };
+        let empty = crate::catalog::ModelCache::default();
+        let before = cfg.catalog_from(&empty, BOTH);
+        let tier = tier_from(&before, &cfg, None, true);
+        assert_eq!(tier.wanted.as_deref(), Some("chatgpt:gpt-6.2-sol"));
+        assert!(tier.fallback);
+        assert_eq!(tier.entry.unwrap().id, "claude-sonnet");
+        // No default asked for: chosen automatically, not a fallback.
+        let fast = tier_from(&before, &cfg, None, false);
+        assert!(fast.wanted.is_none() && !fast.fallback);
+        // A thread's stale pick falls back too, even to the default.
+        let stale = tier_from(&before, &cfg, Some("gone"), false);
+        assert!(stale.fallback);
+        assert_eq!(stale.wanted.as_deref(), Some("gone"));
+        // Once the list has it, the configured model runs.
+        let after = cfg.catalog_from(&cached(&[("gpt-6.2-sol", "GPT-6.2 Sol")]), BOTH);
+        let tier = tier_from(&after, &cfg, None, true);
+        assert!(!tier.fallback);
+        assert_eq!(tier.entry.unwrap().id, "chatgpt:gpt-6.2-sol");
+    }
+
+    #[test]
+    fn sections_follow_the_account_order() {
+        let mut ep = entry("lab:qwen", Route::Endpoint);
+        ep.endpoint = Some("lab".into());
+        let catalog = vec![
+            entry("openai:gpt-6", Route::Openai),
+            ep,
+            entry("codex-gpt-6-luna", Route::Codex),
+            entry("anthropic:claude-opus", Route::Anthropic),
+            entry("claude-haiku", Route::Claude),
+            entry("chatgpt:gpt-6-luna", Route::Chatgpt),
+            entry("claude-opus", Route::Claude),
+        ];
+        let sections: Vec<(String, usize)> = by_account(&catalog)
+            .into_iter()
+            .map(|(a, list)| (a.header(), list.len()))
+            .collect();
+        let headers: Vec<&str> = sections.iter().map(|(h, _)| h.as_str()).collect();
+        assert_eq!(
+            headers,
+            [
+                "ChatGPT sign-in · ChatGPT plan",
+                "Claude Code · Claude subscription",
+                "Codex CLI · ChatGPT plan",
+                "Anthropic API · pay per use",
+                "OpenAI API · pay per use",
+                "lab · your server"
+            ]
+        );
+        assert_eq!(sections[1].1, 2);
+    }
+
+    #[test]
+    fn a_cli_is_found_by_path_or_on_path() {
+        let dir = std::env::temp_dir().join(format!("pf-bin-{}", uuid::Uuid::new_v4().simple()));
+        fs::create_dir_all(&dir).unwrap();
+        let name = if cfg!(windows) {
+            "fakecli.exe"
+        } else {
+            "fakecli"
+        };
+        fs::write(dir.join(name), b"").unwrap();
+        assert!(bin_on("fakecli", std::slice::from_ref(&dir)));
+        assert!(!bin_on("fakecli", &[]));
+        assert!(!bin_on("othercli", std::slice::from_ref(&dir)));
+        assert!(bin_on(dir.join(name).to_str().unwrap(), &[]));
+        assert!(!bin_on(dir.join("missing").to_str().unwrap(), &[]));
+        assert!(!bin_on("  ", std::slice::from_ref(&dir)));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

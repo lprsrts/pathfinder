@@ -73,6 +73,63 @@ fn line(l: Line) -> &'static str {
         FindHits => "**{n}**건 ({terms}):",
         FindNone => "이 폴더에는 {terms}이(가) 들어 있는 줄이 없어요.",
         WebNone => "온라인에서 {terms}와(과) 일치하는 결과가 없어요.",
+        ShowKnown => {
+            "기록했어요: **{title}**을(를) 이미 안다고요. 근거가 아니라 주장이에요. `/undo` (Esc)로 되돌릴 수 있어요."
+        }
+        ShowTell => {
+            "요청대로 알려 드릴게요. 이해가 아니라 '들음'으로 기록돼요. 답이 오기 전에 Esc를 누르면 취소돼요."
+        }
+        ShowHandoff => {
+            "**{title}**을(를) 에이전트에게 넘길까요? 스테이징 사본에서 작업하고 결과는 직접 검토해요. Enter 실행 · Esc 취소."
+        }
+        ShowHandoffInPlace => {
+            "**{title}**을(를) 에이전트에게 넘길까요? git 저장소가 아니라서 스테이징이나 확인된 검토 없이 파일을 바로 고쳐요. Enter 실행 · Esc 취소."
+        }
+        ShowDelegate => {
+            "**{title}**을(를) 이해하지 않고 넘길까요? 넘김으로 기록되고, 결과를 보증하지 않게 돼요. Enter 실행 · Esc 취소."
+        }
+        ShowVerdict => {
+            "이것을 후보에 대한 판정으로 채점할까요? “{words}” Enter 채점 · Esc 메모로 남기기."
+        }
+        NotRunVerdict => "판정으로 채점하지 않고 메모로 남겼어요.",
+        NotRunHandoff => "실행 안 됨: **{title}**을(를) 에이전트에게 넘기지 않았어요.",
+        NotRunDelegate => "실행 안 됨: **{title}**을(를) 넘기지 않았어요.",
+        NotRunStale => "실행 안 됨: 승인을 기다리던 일이 더 이상 해당되지 않아요.",
+        AskWhich => {
+            "{choices} 뜻이었나요? 말해 주기 전까지는 아무것도 기록하지 않아요. 아니면 그냥 계속하세요."
+        }
+        AskKnown => "**{title}**을(를) 이미 안다는 (`/known`)",
+        AskTell => "답을 알려 달라는 (`/tell <question>`)",
+        AskAgent => "이 부분을 에이전트에게 맡기라는 (`/handoff` 또는 `/delegate`)",
+        Or => " 또는 ",
+        Undone => "되돌렸어요: **{title}**에 대한 주장을 철회했어요. 기록에는 철회로 남아요.",
+        NothingToUndo => {
+            "되돌릴 것이 없어요. 직전 단계의 주장만 철회할 수 있어요. 채점된 판정, 검토, 넘김, 이해 없는 넘김, 들은 답은 그대로 남아요."
+        }
+        NothingWaiting => "승인을 기다리는 것이 없어요.",
+        NextStep => "다음: {at} · {question}",
+        NextStepNoPlace => {
+            "다음: 자료에 아직 **{concept}**이(가) 나오는 곳이 없어요. `/find <terms>`로 찾아볼 수 있어요. · {question}"
+        }
+        StepWideExample => "{concept}이(가) 쓰이는 곳을 하나 찾아보세요. 거기서 무엇을 하나요?",
+        StepWidePurpose => "이 부분에서 {concept}은(는) 무엇을 위한 건가요? 자기 말로요.",
+        StepWideMechanism => "{concept}은(는) 어떻게 작동하나요? 한 단계씩요.",
+        StepNarrowExample => "{concept}이(가) 중요한 줄을 하나 고르세요. 다르면 무엇이 바뀔까요?",
+        StepNarrowPurpose => "{concept}이(가) 왜 바로 거기에 필요하고, 없으면 무엇이 깨지나요?",
+        StepNarrowMechanism => {
+            "{concept}을(를) 한 단계씩 따라가 보세요. 먼저 무엇이, 다음에 무엇이 일어나나요?"
+        }
+        Horizon => "전망: {what}.",
+        HorizonNeeds => "필요: {parts}",
+        HorizonLeads => "이어짐: {parts}",
+        EvidenceRatio => "통과: {passes} · 주장: {claims}.",
+        ClaimWithdrawn => "**{concept}**에 대한 주장 철회 ({date}).",
+        StepHistory => "여기까지 온 길: {kinds}.",
+        StepKindRate => "{kind} {judged}번 중 {passes}번 통과로 이어짐",
+        SteeredTimes => "직접 방향을 정한 횟수 {n}",
+        StepHistoryNote => {
+            "Pathfinder가 학습 방식에 대해 남기는 건 이것뿐이며, 이 폴더의 로컬 기록에 있어요."
+        }
     }
 }
 

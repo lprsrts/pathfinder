@@ -5,7 +5,10 @@
 //! an existing `<provider>-api-key` macOS keychain item into the file once;
 //! nothing else touches the keychain, so there are no prompts.
 
+pub mod accounts;
 pub mod chatgpt;
+pub mod connect;
+pub mod flow;
 pub mod secrets;
 
 use std::collections::HashMap;

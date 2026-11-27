@@ -51,6 +51,23 @@ You don't need to ask for a check. It comes at the moments that matter, and ther
 
 Passing a candidate or a test question is what puts an idea on your record as shown. `/why` shows, per idea, what you've shown, claimed or only been told.
 
+## Say it in plain words
+
+Everything above works without a command. "I already know this part", "just tell me", "let the agent do this one" and "it's right, because …" are read like the commands they stand for. When one of them would change your record, Pathfinder shows it back in one line before anything rests on it:
+
+- **"I already know this"** is recorded at once as your claim and shown back. Esc (or `/undo`, or "no, take that back") withdraws it, but only right away, before your next message. The record keeps it as withdrawn.
+- **"Just tell me"** is shown back first, then answered and recorded as told. Esc while the answer is still coming cancels it and records nothing; once you've seen the answer, it stays on your record.
+- **"Let the agent do it"** waits for your OK: Enter hands the part off (or delegates it, if you haven't understood it yet), Esc cancels. Nothing runs before you press Enter.
+- **A verdict on a candidate** in your own words waits for Enter too, since a judged verdict is final. Esc keeps your message as a note, so a question about the candidate still gets its answer.
+
+A verdict, a review, a handoff, a delegation and an answer you were told can never be undone: taking them back would make your record look better than it is. When Pathfinder can't tell whether you meant one of these, it asks which, with the command for each, and records nothing until you say. Typed commands (`/known`, `/tell`, `/handoff`, `/delegate`) are already explicit and run as they are. A typed command that changes things (such as `/summary` or `/plan`) drops what waited for your OK, and says so.
+
+## The next step
+
+In a task, each part ends with where to go next: the exact place (`Next: src/gate.rs:30-50`) and one open question to take there, and the part's horizon: what it needs and what it leads to, never the order to get there. A concept you haven't touched gets a wide step; a shaky one gets a narrow one. Say "give me an example first" or "start from what it's for" and the next step changes. While a candidate or a review waits, no next step is shown.
+
+Over time Pathfinder leans on the kinds of step that led you to a pass. That is the only thing it keeps about how you learn: `/why` shows it in full ("How you got here: wide·example 3 of 4 led to a pass …"), and it lives in the same local database as the rest of your record.
+
 ## Commands, if you want them
 
 | Command | What it does |
@@ -59,24 +76,25 @@ Passing a candidate or a test question is what puts an idea on your record as sh
 | `/web <terms>` | Search papers and the web |
 | `/check <your work>` | The first step that doesn't hold, without the why |
 | `/tell <question>` | A reasoned answer, recorded as told |
-| `/why` | Your record: every idea you've touched here and whether you've shown it, claimed it or were only told |
+| `/why` | Your record: every idea you've touched here and whether you've shown it, claimed it or were only told, claims you withdrew, and which kinds of next step led you to a pass |
 | `/map` | In a task: its parts as a diagram |
 | `/summary <your explanation>` | In a task: explain the current part; a candidate follows |
 | `/next`, `/known` | In a task: the next part; skip a part you know (recorded as your claim) |
+| `/confirm`, `/cancel`, `/undo` | Run or drop what waits for your OK (Enter, Esc); take back a claim you just made in plain words (Esc) |
 | `/handoff`, `/delegate` | Give a part to the agent, understood or not |
 | `/accept`, `/reject` | Answer a proposed extra part for something a part rests on |
 | `/share [note]` | Send this thread (you see it all first) |
 | `/bug [what happened]` | Send a bug report (you see it all first) |
 
-In the terminal there are also `/help`, `/quit` (or `/exit`), `/new` (or `/clear`), `/resume`, `/model`, `/status`, `/copy`, `/join`, `/data` and `/update`. Type `/` to see what matches, and Tab to complete. `/help` lists everything, keys included.
+In the terminal there are also `/help`, `/quit` (or `/exit`), `/new` (or `/clear`), `/resume`, `/model`, `/status`, `/login`, `/logout`, `/copy`, `/join`, `/data` and `/update`. Type `/` to see what matches, and Tab to complete. `/help` lists everything, keys included.
 
 ## Models
 
-`pathfinder auth login` connects models. Ctrl+P picks them for a thread: a fast one for quick replies and a main one for candidates, judging and agent work. See the [reference](reference.md#models-and-routes).
+`pathfinder auth login` connects models in two steps: how to connect (your ChatGPT plan, an API key you pay per use, or your own server), then, for a key, which provider (type to filter, Esc goes back). Each row shows its state, such as `✓ signed in as …` or `✓ stored`. `/login` shows the same panel inside Pathfinder, in place of the input, and opens by itself the first time no account works. Claude Code and Codex keep their own logins (`claude`, then `/login`; `codex login`); the gate's key is in Settings (Ctrl+P). Ctrl+P picks models for a thread: a fast one for quick replies and a main one for candidates, judging and agent work. See the [reference](reference.md#models-and-routes).
 
 ## If something's off
 
 - **"I can't see the file":** start Pathfinder in the folder that holds it, or attach the file.
-- **No models:** run `pathfinder auth login`, or `pathfinder auth status` to see what's connected.
+- **No models:** `/login` (or `pathfinder auth login`), or `pathfinder auth status` to see what's connected.
 - **A reply was held back** while you judged a candidate: that's the gate. Give your verdict, and the answer follows.
 - **Anything else:** `/bug what happened`.

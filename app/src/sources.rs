@@ -666,14 +666,20 @@ const MAX_FIND_FILES: usize = 5000;
 /// `/find`: lines in the workspace's sources that contain the terms, most
 /// terms first. Raw lines, nothing else.
 pub fn find(cwd: &Path, terms: &[String], limit: usize) -> Vec<Hit> {
+    find_counted(cwd, terms, limit).0
+}
+
+/// [`find`], plus how many lines matched in all (searched files only).
+pub fn find_counted(cwd: &Path, terms: &[String], limit: usize) -> (Vec<Hit>, usize) {
     let terms: Vec<String> = terms
         .iter()
         .map(|t| term_form(t))
         .filter(|t| !t.is_empty())
         .collect();
     if terms.is_empty() {
-        return Vec::new();
+        return (Vec::new(), 0);
     }
+    let mut total = 0usize;
     let mut scored: Vec<(usize, usize, Hit)> = Vec::new();
     let mut seq = 0;
     // Most terms first, then the earliest; only the best `limit` are kept.
@@ -694,6 +700,7 @@ pub fn find(cwd: &Path, terms: &[String], limit: usize) -> Vec<Hit> {
                 if n == 0 {
                     continue;
                 }
+                total += 1;
                 seq += 1;
                 if scored.len() >= limit.max(64) * 4 {
                     best(&mut scored);
@@ -715,7 +722,64 @@ pub fn find(cwd: &Path, terms: &[String], limit: usize) -> Vec<Hit> {
     }
     // Need every term when there are enough such lines; else the best.
     best(&mut scored);
-    scored.into_iter().map(|(_, _, h)| h).collect()
+    (scored.into_iter().map(|(_, _, h)| h).collect(), total)
+}
+
+/// An `/open` reply split for a frontend: the path, what part of it is
+/// shown (`lines 20–24 of 391`, `page 3 of 12`, `12 items`) and the rest
+/// (the numbered block and its footer, or the folder's list). None for a
+/// notice (an error, an image, an empty folder).
+pub fn split_source(markdown: &str) -> Option<(String, String, String)> {
+    let (first, rest) = markdown.split_once('\n').unwrap_or((markdown, ""));
+    let after = first.strip_prefix('`')?;
+    let (title, range) = after.split_once('`')?;
+    let range = range.trim();
+    let range = if range.starts_with("lines ") || range.starts_with("page ") {
+        range.to_string()
+    } else {
+        let n = range.strip_prefix('(')?.strip_suffix(" items):")?;
+        n.parse::<usize>().ok()?;
+        format!("{n} items")
+    };
+    Some((
+        title.to_string(),
+        range,
+        rest.trim_matches('\n').to_string(),
+    ))
+}
+
+/// How many lines a stored `/find` reply says matched: the `48` of its
+/// leading `**12/48**`, else the hits it lists.
+pub fn find_total(reply: &str) -> Option<usize> {
+    let count = reply.strip_prefix("**")?.split("**").next()?;
+    let (_, total) = count.split_once('/')?;
+    total.parse().ok()
+}
+
+/// A `/find` reply's hit row (`` - `file:12`  text ``) read back.
+pub fn parse_hit(row: &str) -> Option<Hit> {
+    let (at, quote) = row.strip_prefix("- `")?.split_once("`  ")?;
+    let local = |file: &str, page: Option<usize>, line: &str| {
+        Some(Locator::Local {
+            file: file.to_string(),
+            page,
+            line: line.parse().ok()?,
+        })
+    };
+    let at = match at.rsplit_once(" l.") {
+        Some((head, line)) => {
+            let (file, page) = head.rsplit_once(" p.")?;
+            local(file, Some(page.parse().ok()?), line)?
+        }
+        None => {
+            let (file, line) = at.rsplit_once(':')?;
+            local(file, None, line)?
+        }
+    };
+    Some(Hit {
+        at,
+        quote: quote.to_string(),
+    })
 }
 
 /// Parses `/open` arguments:
@@ -1115,10 +1179,19 @@ pub fn open_spec(cwd: &Path, spec: &OpenSpec) -> Result<OpenedSource, String> {
             body.push_str(&format!("{:>4}  {}\n", i + 1, l.trim_end()));
         }
         let fence = safe_fence(&body);
-        let out = format!(
-            "`{rel_display}` page {n} of {}\n\n{fence}text\n{body}{fence}",
+        let mut out = format!(
+            "`{rel_display}` page {n} of {}\n\n{fence}text numbered\n{body}{fence}",
             pages.len()
         );
+        if n < pages.len() {
+            out.push_str(&format!(
+                "\npages {}–{} not shown · `/open {} {}`",
+                n + 1,
+                pages.len(),
+                open_arg(&rel_display),
+                n + 1
+            ));
+        }
         return Ok(OpenedSource {
             markdown: out,
             target: OpenTarget {
@@ -1166,11 +1239,14 @@ pub fn open_spec(cwd: &Path, spec: &OpenSpec) -> Result<OpenedSource, String> {
     }
     let fence = safe_fence(&body);
     let lang = lang_tag(&resolved);
-    let out = format!(
-        "`{rel_display}` lines {}–{end} of {}\n\n{fence}{lang}\n{body}{fence}",
+    let mut out = format!(
+        "`{rel_display}` lines {}–{end} of {}\n\n{fence}{lang} numbered\n{body}{fence}",
         start + 1,
         lines.len()
     );
+    if end < lines.len() {
+        out.push_str(&next_range_footer(&rel_display, end, lines.len(), WINDOW));
+    }
     Ok(OpenedSource {
         markdown: out,
         target: OpenTarget {
@@ -1184,6 +1260,28 @@ pub fn open_spec(cwd: &Path, spec: &OpenSpec) -> Result<OpenedSource, String> {
     })
 }
 
+/// A path as `/open` takes it back: quoted when it has spaces.
+fn open_arg(rel: &str) -> String {
+    if rel.contains(char::is_whitespace) {
+        format!("'{rel}'")
+    } else {
+        rel.to_string()
+    }
+}
+
+/// The line after a numbered block that was cut: what isn't shown and the
+/// `/open` that shows the next `window` lines. The TUI draws it as the
+/// block's `└─` row.
+fn next_range_footer(rel: &str, end: usize, total: usize, window: usize) -> String {
+    let next_end = (end + window).min(total);
+    format!(
+        "\n{}–{total} not shown · `/open {}:{}-{next_end}`",
+        end + 1,
+        open_arg(rel),
+        end + 1
+    )
+}
+
 /// `/open`: a numbered view of a file, a PDF page, or lines around a line.
 pub fn open(cwd: &Path, file: &str, at: Option<usize>) -> Result<String, String> {
     let spec = OpenSpec {
@@ -1193,6 +1291,15 @@ pub fn open(cwd: &Path, file: &str, at: Option<usize>) -> Result<String, String>
         line: None,
     };
     open_spec(cwd, &spec).map(|o| o.markdown)
+}
+
+/// How many lines a workspace source has (on `page` for a PDF), for
+/// clamping a range of lines to it.
+pub fn line_count(cwd: &Path, file: &str, page: Option<usize>) -> Option<usize> {
+    let full = confine(cwd, file)?;
+    let pages = pages(&full, file).ok()?;
+    let text = pages.get(page.unwrap_or(1).checked_sub(1)?)?;
+    Some(text.lines().count())
 }
 
 /// A part's note reduced to a pointer: the first workspace file it names,
@@ -1416,6 +1523,69 @@ pub fn render(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn find_counts_every_matching_line_beyond_the_limit() {
+        let body: String = (0..30).map(|i| format!("gate line {i}\n")).collect();
+        let d = ws(&[("a.rs", &body), ("b.md", "the gate\nnothing\n")]);
+        let (hits, total) = find_counted(d.path(), &["gate".to_string()], 12);
+        assert_eq!((hits.len(), total), (12, 31));
+        assert_eq!(find(d.path(), &["gate".to_string()], 12), hits);
+    }
+
+    #[test]
+    fn an_open_reply_splits_into_path_range_and_block() {
+        let d = ws(&[
+            ("src/x.rs", "fn a() {}\nfn b() {}\n"),
+            ("notes/one.md", "hi"),
+        ]);
+        let opened = open_spec(d.path(), &parse_open_spec("src/x.rs")).unwrap();
+        let (title, range, body) = split_source(&opened.markdown).unwrap();
+        assert_eq!(
+            (title.as_str(), range.as_str()),
+            ("src/x.rs", "lines 1–2 of 2")
+        );
+        assert!(
+            body.starts_with("```rust numbered\n    1  fn a() {}"),
+            "{body}"
+        );
+        let dir = open_spec(d.path(), &parse_open_spec("notes")).unwrap();
+        let (title, range, body) = split_source(&dir.markdown).unwrap();
+        assert_eq!((title.as_str(), range.as_str()), ("notes/", "1 items"));
+        assert_eq!(body, "- `notes/one.md`");
+        // Notices aren't sources.
+        assert_eq!(split_source("No file `x` in this workspace."), None);
+        assert_eq!(
+            split_source("`a.png` is an image. Attach it with `/attach a.png`."),
+            None
+        );
+    }
+
+    #[test]
+    fn find_rows_read_back_into_hits() {
+        for at in [
+            Locator::Local {
+                file: "app/src/a b.rs".into(),
+                page: None,
+                line: 42,
+            },
+            Locator::Local {
+                file: "paper.pdf".into(),
+                page: Some(3),
+                line: 7,
+            },
+        ] {
+            let hit = Hit {
+                at,
+                quote: "  let x = `y`;".into(),
+            };
+            let row = format!("- `{}`  {}", hit.at, hit.quote);
+            assert_eq!(parse_hit(&row), Some(hit));
+        }
+        assert_eq!(parse_hit("**2** for `x`:"), None);
+        assert_eq!(find_total("**12/48** for `x`:\n\n- `a:1`  x"), Some(48));
+        assert_eq!(find_total("**2** for `x`:"), None);
+    }
 
     fn ws(files: &[(&str, &str)]) -> tempdir::Dir {
         let d = tempdir::Dir::new();
@@ -1919,14 +2089,33 @@ mod tests {
         // Line range + language tag.
         let r = open_spec(d.path(), &parse_open_spec("sub/notes.md:5-10")).unwrap();
         assert!(r.markdown.contains("lines 5–10 of 40"), "{}", r.markdown);
-        assert!(r.markdown.contains("```markdown\n"), "{}", r.markdown);
+        assert!(
+            r.markdown.contains("```markdown numbered\n"),
+            "{}",
+            r.markdown
+        );
+        assert!(
+            r.markdown
+                .ends_with("```\n11–40 not shown · `/open sub/notes.md:11-40`"),
+            "{}",
+            r.markdown
+        );
+        let whole = open_spec(d.path(), &parse_open_spec("sub/notes.md")).unwrap();
+        assert!(whole.markdown.ends_with("```"), "{}", whole.markdown);
+        let cut = open_spec(d.path(), &parse_open_spec("sub/notes.md:1-3")).unwrap();
+        assert!(
+            cut.markdown
+                .ends_with("4–40 not shown · `/open sub/notes.md:4-40`"),
+            "{}",
+            cut.markdown
+        );
         assert_eq!(r.target.lines, Some((5, 10)));
         assert_eq!(r.target.kind, SourceKind::Markdown);
 
         // Safe fence escaping when markdown contains ```.
         let fenced = open_spec(d.path(), &parse_open_spec("README.md")).unwrap();
         assert!(
-            fenced.markdown.contains("````markdown\n"),
+            fenced.markdown.contains("````markdown numbered\n"),
             "{}",
             fenced.markdown
         );

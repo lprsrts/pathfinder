@@ -41,6 +41,9 @@ impl Engine for FakeEngine {
             assert_eq!(req.tools, tools, "tool access mismatch");
             assert_eq!(req.tier, tier, "engine tier mismatch");
             self.prompts.lock().unwrap().push(req.prompt.clone());
+            if reply == ENGINE_DOWN {
+                return Err(anyhow!("the model is unreachable"));
+            }
             // Stream raw text in small chunks, as the CLIs do.
             if req.stream_text {
                 let chars: Vec<char> = reply.chars().collect();
@@ -56,6 +59,9 @@ impl Engine for FakeEngine {
 }
 
 use EngineTier::{System1 as S1, System2 as S2};
+
+/// A scripted reply that makes the engine call fail.
+const ENGINE_DOWN: &str = "!engine down";
 
 /// The source search finds nothing.
 const NO_HITS: &str = r#"{"hits":[],"search_terms":[]}"#;
@@ -164,7 +170,7 @@ async fn understood_part_is_handed_off_reviewed_objected_and_approved() {
                 r#"{"candidate":"Add it only in runtime.rs.","key_reason":"Zed never sees it unless acp.rs advertises it."}"#,
             ),
             (
-                ReadOnly,
+                ToolAccess::None,
                 S2,
                 r#"{"pass":true,"feedback":"Yes: it must be advertised in acp.rs."}"#,
             ),
@@ -176,9 +182,16 @@ async fn understood_part_is_handed_off_reviewed_objected_and_approved() {
 
     let out = turn(&rt, "add a /status command").await;
     assert!(out.reply.contains("Command routing"));
-    // The map lives in the side panel; replies only introduce the part.
+    // The map lives in the side panel; replies only introduce the part and
+    // its horizon (§16): what it leads to, not the map.
     assert!(!out.reply.contains("Map:"));
-    assert!(!out.reply.contains("What status reports"));
+    assert!(!out.reply.contains("`report`"));
+    assert!(
+        out.reply
+            .contains("Horizon: leads to **What status reports**."),
+        "{}",
+        out.reply
+    );
     assert_eq!(
         rt.load_session("s").unwrap().unwrap().active.as_deref(),
         Some("route")
@@ -199,7 +212,16 @@ async fn understood_part_is_handed_off_reviewed_objected_and_approved() {
     let s = rt.load_session("s").unwrap().unwrap();
     assert!(!s.pending_candidate.as_ref().unwrap().key_correct);
 
-    turn(&rt, "Wrong: acp.rs must advertise it or Zed won't show it").await;
+    // A verdict in plain words is shown back and judged only on your OK.
+    let shown = turn(&rt, "Wrong: acp.rs must advertise it or Zed won't show it").await;
+    assert!(
+        shown.reply.starts_with("Judge this as your verdict"),
+        "{}",
+        shown.reply
+    );
+    assert_eq!(shown.shown, Shown::Notice);
+    assert_eq!(status(&rt, "route"), PartStatus::Open);
+    turn(&rt, "/confirm").await;
     assert_eq!(status(&rt, "route"), PartStatus::Understood);
 
     turn(&rt, "/handoff").await;
@@ -351,7 +373,7 @@ async fn failed_judgment_keeps_part_open() {
             (ReadOnly, S1, r#"{"reply":"Ok.","map_change":null}"#),
             (ReadOnly, S2, r#"{"candidate":"c","key_reason":"r"}"#),
             (
-                ReadOnly,
+                ToolAccess::None,
                 S2,
                 r#"{"pass":false,"feedback":"It was correct."}"#,
             ),
@@ -361,7 +383,8 @@ async fn failed_judgment_keeps_part_open() {
     turn(&rt, "goal").await;
     turn(&rt, "thinking").await;
     turn(&rt, "/summary s").await;
-    let out = turn(&rt, "looks wrong").await;
+    turn(&rt, "looks wrong").await;
+    let out = turn(&rt, "/confirm").await;
     assert!(out.reply.contains("explain it again"));
     let s = rt.load_session("s").unwrap().unwrap();
     assert_eq!(s.map.get("route").unwrap().status, PartStatus::Open);
@@ -394,7 +417,7 @@ async fn an_exam_asks_grades_and_goes_on_until_stopped() {
                 r#"{"candidate":"Warum schlägt der Router Namen nach, statt sie zu probieren?","key_reason":"Nachschlagen ist O(1); Probieren hängt von der Reihenfolge ab."}"#,
             ),
             (
-                ReadOnly,
+                ToolAccess::None,
                 S2,
                 r#"{"is_judgment":true,"pass":false,"feedback":"Nicht ganz: es geht um Nachschlagen in O(1)."}"#,
             ),
@@ -405,7 +428,7 @@ async fn an_exam_asks_grades_and_goes_on_until_stopped() {
             ),
             // "genug" isn't an answer: the exam ends and chat goes on.
             (
-                ReadOnly,
+                ToolAccess::None,
                 S2,
                 r#"{"is_judgment":false,"pass":false,"feedback":""}"#,
             ),
@@ -475,7 +498,7 @@ async fn an_ignored_quick_check_is_dropped_without_a_record() {
             (ReadOnly, S2, r#"{"candidate":"c","key_reason":"r"}"#),
             // Not a verdict: the check is dropped, the question answered.
             (
-                ReadOnly,
+                ToolAccess::None,
                 S2,
                 r#"{"is_judgment":false,"pass":false,"feedback":""}"#,
             ),
@@ -530,7 +553,7 @@ async fn a_claim_of_understanding_gets_one_candidate_then_chat_goes_on() {
                 r#"{"candidate":"Namen werden der Reihe nach probiert.","key_reason":"Es wird nachgeschlagen, nicht probiert."}"#,
             ),
             (
-                ReadOnly,
+                ToolAccess::None,
                 S2,
                 r#"{"is_judgment":true,"pass":true,"feedback":"Richtig: nachgeschlagen."}"#,
             ),
@@ -602,19 +625,19 @@ async fn understanding_comes_from_evidence_per_concept() {
             ),
             (ReadOnly, S2, r#"{"candidate":"c1","key_reason":"r"}"#),
             (
-                ReadOnly,
+                ToolAccess::None,
                 S2,
                 r#"{"is_judgment":true,"pass":true,"feedback":"Right."}"#,
             ),
             (ReadOnly, S2, r#"{"candidate":"c2","key_reason":"r"}"#),
             (
-                ReadOnly,
+                ToolAccess::None,
                 S2,
                 r#"{"is_judgment":true,"pass":false,"feedback":"No.","misconception":"The registry is a global singleton."}"#,
             ),
             (ReadOnly, S2, r#"{"candidate":"c3","key_reason":"r"}"#),
             (
-                ReadOnly,
+                ToolAccess::None,
                 S2,
                 r#"{"is_judgment":true,"pass":true,"feedback":"Caught it."}"#,
             ),
@@ -647,7 +670,8 @@ async fn understanding_comes_from_evidence_per_concept() {
         s.pending_candidate.as_ref().unwrap().targets,
         vec!["dispatch", "handlers"]
     );
-    let out = turn(&rt, "right, the name picks the handler").await;
+    turn(&rt, "right, the name picks the handler").await;
+    let out = turn(&rt, "/confirm").await;
     assert!(!out.reply.contains("understood"));
     let s = rt.load_session("s").unwrap().unwrap();
     assert_eq!(s.map.get("route").unwrap().status, PartStatus::Open);
@@ -659,6 +683,7 @@ async fn understanding_comes_from_evidence_per_concept() {
     // A failed verdict that shows a wrong belief opens a misconception;
     // the next candidate is flawed on purpose and embodies it.
     turn(&rt, "it's right").await;
+    turn(&rt, "/confirm").await;
     turn(&rt, "/summary the registry maps names to handlers").await;
     let prompt = engine.prompts.lock().unwrap().last().cloned().unwrap();
     assert!(prompt.contains("The registry is a global singleton."));
@@ -669,6 +694,7 @@ async fn understanding_comes_from_evidence_per_concept() {
     assert!(pending.misconception.is_some());
 
     turn(&rt, "wrong: it assumes one global registry").await;
+    turn(&rt, "/confirm").await;
     let s = rt.load_session("s").unwrap().unwrap();
     assert_eq!(s.map.get("route").unwrap().status, PartStatus::Understood);
     let why = rt.why(&s);
@@ -888,7 +914,6 @@ async fn a_review_check_allows_fewer_bits_than_a_candidate() {
 
 #[tokio::test]
 async fn the_gate_holds_replies_while_you_judge() {
-    const NOT_JUDGED: &str = r#"{"is_judgment":false,"pass":false,"feedback":""}"#;
     let cite = |quote: &str| {
         format!(r#"{{"hits":[{{"file":"router.md","page":null,"quote":"{quote}"}}]}}"#)
     };
@@ -903,7 +928,6 @@ async fn the_gate_holds_replies_while_you_judge() {
                 r#"{"candidate":"Unknown commands fall back to help.","key_reason":"The router has no fallback for unknown names, they are rejected"}"#,
             ),
             // A source line that settles the candidate: held by the pre-check.
-            (ReadOnly, S2, NOT_JUDGED),
             (ReadOnly, S1, &log_reply("ok")),
             (
                 ReadOnly,
@@ -911,15 +935,13 @@ async fn the_gate_holds_replies_while_you_judge() {
                 &cite("The router has no fallback for unknown names, they are rejected."),
             ),
             // A general source line passes.
-            (ReadOnly, S2, NOT_JUDGED),
             (ReadOnly, S1, &log_reply("ok")),
             (ReadOnly, S2, &cite("Dispatch maps a name to a handler.")),
             // The check errors: withheld.
-            (ReadOnly, S2, NOT_JUDGED),
             (ReadOnly, S1, &log_reply("ok")),
             (ReadOnly, S2, &cite("Dispatch maps a name to a handler.")),
             (
-                ReadOnly,
+                ToolAccess::None,
                 S2,
                 r#"{"is_judgment":true,"pass":true,"feedback":"Right: there is no fallback."}"#,
             ),
@@ -957,28 +979,32 @@ async fn the_gate_holds_replies_while_you_judge() {
         .unwrap();
     assert!(rt.store.secret(&id).unwrap().unwrap().active);
 
+    // With no step decided, a message while a candidate waits is shown
+    // back as a possible verdict; Esc keeps it as a note.
     turn(&rt, "does it fall back?").await;
+    turn(&rt, "/cancel").await;
     let s = rt.load_session("s").unwrap().unwrap();
-    assert_eq!(
-        s.history.last().unwrap().content,
-        crate::secrets::FIXED_REPLY
-    );
+    let last = &s.history.last().unwrap().content;
+    assert!(last.starts_with("Not judged as a verdict"), "{last}");
+    assert!(last.ends_with(crate::secrets::FIXED_REPLY), "{last}");
 
     turn(&rt, "what is dispatch?").await;
+    turn(&rt, "/cancel").await;
     let s = rt.load_session("s").unwrap().unwrap();
-    assert_eq!(
-        s.history.last().unwrap().content,
+    assert!(s.history.last().unwrap().content.ends_with(
         "**Where to look:**\n\n- `router.md:1`\n  > Dispatch maps a name to a handler."
-    );
+    ));
 
     // The check fails: the fixed reply, and why it was held back.
     turn(&rt, "what is a handler?").await;
+    turn(&rt, "/cancel").await;
     let s = rt.load_session("s").unwrap().unwrap();
     let held = &s.history.last().unwrap().content;
-    assert!(held.starts_with(crate::secrets::FIXED_REPLY), "{held}");
+    assert!(held.contains(crate::secrets::FIXED_REPLY), "{held}");
     assert!(held.contains("Check unreachable"), "{held}");
 
     turn(&rt, "it's wrong, unknown names are rejected").await;
+    turn(&rt, "/confirm").await;
     assert!(!rt.store.secret(&id).unwrap().unwrap().active);
     turn(&rt, "/next").await;
     turn(&rt, "what is dispatch?").await;
@@ -1014,12 +1040,7 @@ async fn chat_drives_the_loop() {
                 S2,
                 r#"{"candidate":"w = 0.5 so z = 99","key_reason":"r"}"#,
             ),
-            // A question while the candidate waits: not a verdict.
-            (
-                ReadOnly,
-                S2,
-                r#"{"is_judgment":false,"pass":false,"feedback":""}"#,
-            ),
+            // A question while the candidate waits, kept as a note (Esc).
             (
                 ReadOnly,
                 S1,
@@ -1027,7 +1048,7 @@ async fn chat_drives_the_loop() {
             ),
             (ReadOnly, S2, NO_HITS),
             (
-                ReadOnly,
+                ToolAccess::None,
                 S2,
                 r#"{"is_judgment":true,"pass":true,"feedback":"Right."}"#,
             ),
@@ -1053,7 +1074,13 @@ async fn chat_drives_the_loop() {
     assert_eq!(part.log, vec!["thinking".to_string()]);
     assert_eq!(part.summary.as_deref(), Some("I get it: it routes by name"));
 
-    let out = turn(&rt, "what does dispatch mean here?").await;
+    let shown = turn(&rt, "what does dispatch mean here?").await;
+    assert!(
+        shown.reply.contains("“what does dispatch mean here?”"),
+        "{}",
+        shown.reply
+    );
+    let out = turn(&rt, "/cancel").await;
     assert!(!out.reply.contains("understood"));
     // The chat reply never sees the waiting candidate.
     let log_prompt = engine.prompts.lock().unwrap().last().cloned().unwrap();
@@ -1063,6 +1090,7 @@ async fn chat_drives_the_loop() {
     assert!(s.pending_candidate.is_some());
 
     turn(&rt, "it's correct because names map to handlers").await;
+    turn(&rt, "/confirm").await;
     let s = rt.load_session("s").unwrap().unwrap();
     assert_eq!(s.map.get("route").unwrap().status, PartStatus::Understood);
 
@@ -1076,8 +1104,28 @@ async fn chat_drives_the_loop() {
     assert_eq!(s.map.get(&next).unwrap().status, PartStatus::Known);
 }
 
-/// Scripted decision answers: (step, probability, part).
-struct FakeDecider(Mutex<VecDeque<(&'static str, f64, Option<&'static str>)>>);
+/// One scripted Router answer: the step and its probability, the part
+/// it names, every option's probability (`all`, else the rest is split
+/// evenly) and a steer (§16).
+#[derive(Clone, Default)]
+struct Scripted {
+    step: &'static str,
+    p: f64,
+    part: Option<&'static str>,
+    all: Vec<(&'static str, f64)>,
+    steer: Option<&'static str>,
+}
+
+fn says(step: &'static str, p: f64) -> Scripted {
+    Scripted {
+        step,
+        p,
+        ..Default::default()
+    }
+}
+
+/// Scripted decision answers, and the step options offered on each call.
+struct FakeDecider(Mutex<VecDeque<Scripted>>, Mutex<Vec<Vec<String>>>);
 
 impl Decide for FakeDecider {
     fn decide<'a>(
@@ -1090,29 +1138,49 @@ impl Decide for FakeDecider {
         if questions[0].name != "step" {
             return Box::pin(async { Ok(None) });
         }
+        assert!(
+            questions.iter().any(|q| q.name == "steer"),
+            "the router always asks for a steer"
+        );
         let next = self.0.lock().unwrap().pop_front();
         let offered: Vec<String> = questions[0].options.iter().map(|o| o.0.clone()).collect();
+        self.1.lock().unwrap().push(offered.clone());
         Box::pin(async move {
-            let (step, probability, part) = next.expect("unexpected decision call");
+            let script = next.expect("unexpected decision call");
             assert!(
-                offered.iter().any(|o| o == step),
-                "{step} not offered: {offered:?}"
+                offered.iter().any(|o| o == script.step),
+                "{} not offered: {offered:?}",
+                script.step
             );
             let mut answers = std::collections::HashMap::new();
             answers.insert(
                 "step".to_string(),
                 crate::decide::Answer {
-                    choice: step.into(),
-                    probability,
-                    ..Default::default()
+                    choice: script.step.into(),
+                    probability: script.p,
+                    all: script
+                        .all
+                        .iter()
+                        .map(|(k, v)| (k.to_string(), *v))
+                        .collect(),
                 },
             );
-            if let Some(part) = part {
+            if let Some(part) = script.part {
                 answers.insert(
                     "part".to_string(),
                     crate::decide::Answer {
                         choice: part.into(),
                         probability: 0.9,
+                        ..Default::default()
+                    },
+                );
+            }
+            if let Some(steer) = script.steer {
+                answers.insert(
+                    "steer".to_string(),
+                    crate::decide::Answer {
+                        choice: steer.into(),
+                        probability: 0.8,
                         ..Default::default()
                     },
                 );
@@ -1126,7 +1194,27 @@ impl Decide for FakeDecider {
 }
 
 fn with_decisions(rt: Runtime, steps: Vec<(&'static str, f64, Option<&'static str>)>) -> Runtime {
-    rt.with_decider(Arc::new(FakeDecider(Mutex::new(steps.into()))))
+    with_script(
+        rt,
+        steps
+            .into_iter()
+            .map(|(step, p, part)| Scripted {
+                step,
+                p,
+                part,
+                ..Default::default()
+            })
+            .collect(),
+    )
+    .0
+}
+
+fn with_script(rt: Runtime, script: Vec<Scripted>) -> (Runtime, Arc<FakeDecider>) {
+    let decider = Arc::new(FakeDecider(
+        Mutex::new(script.into()),
+        Mutex::new(Vec::new()),
+    ));
+    (rt.with_decider(decider.clone()), decider)
 }
 
 #[test]
@@ -1253,9 +1341,10 @@ async fn only_a_clear_move_drops_a_waiting_candidate() {
                 r#"{"intent":"log","reply":"Ok.","map_change":null}"#,
             ),
             (ReadOnly, S2, r#"{"candidate":"z = 99","key_reason":"r"}"#),
-            // An unsure move goes to the judge, which hands it back to chat.
+            // An unsure move is shown back as a verdict; confirmed, the judge
+            // sees it isn't one and hands it back to chat.
             (
-                ReadOnly,
+                ToolAccess::None,
                 S2,
                 r#"{"is_judgment":false,"pass":false,"feedback":""}"#,
             ),
@@ -1279,7 +1368,9 @@ async fn only_a_clear_move_drops_a_waiting_candidate() {
     turn(&rt, "goal").await;
     turn(&rt, "thinking").await;
     turn(&rt, "/summary names map to handlers").await;
-    turn(&rt, "is it right? I just want to move on").await;
+    let shown = turn(&rt, "is it right? I just want to move on").await;
+    assert!(shown.reply.starts_with("Judge this as your verdict"));
+    turn(&rt, "/confirm").await;
     let s = rt.load_session("s").unwrap().unwrap();
     assert!(s.pending_candidate.is_some(), "the candidate keeps waiting");
     assert_eq!(s.active.as_deref(), Some("route"));
@@ -1317,7 +1408,7 @@ async fn a_question_about_a_waiting_candidate_skips_the_judge() {
                 r#"{"intent":"summary","reply":"It means x.","map_change":null}"#,
             ),
             (ReadOnly, S2, NO_HITS),
-            (ReadOnly, S2, r#"{"pass":true,"feedback":"Right."}"#),
+            (ToolAccess::None, S2, r#"{"pass":true,"feedback":"Right."}"#),
         ]),
         false,
     );
@@ -1352,6 +1443,7 @@ async fn a_question_about_a_waiting_candidate_skips_the_judge() {
             .is_some()
     );
     turn(&rt, "right, names map to handlers").await;
+    turn(&rt, "/confirm").await;
     let s = rt.load_session("s").unwrap().unwrap();
     assert_eq!(s.map.get("route").unwrap().status, PartStatus::Understood);
 }
@@ -1615,5 +1707,1215 @@ async fn tell_is_held_while_you_judge_without_a_decision_service() {
     assert_eq!(
         s.history.last().unwrap().content,
         crate::secrets::FIXED_REPLY
+    );
+}
+
+static LATE_LISTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// [`test_config`] asking for a main model `late` that is listed only once
+/// [`LATE_LISTED`] is set, as after a background refresh.
+fn late_config() -> Config {
+    let mut cfg = test_config();
+    cfg.system2 = Some("late".into());
+    if LATE_LISTED.load(std::sync::atomic::Ordering::SeqCst) {
+        let mut late = cfg.models[1].clone();
+        late.id = "late".into();
+        cfg.models.push(late);
+    }
+    cfg
+}
+
+#[tokio::test]
+async fn a_list_refreshed_mid_turn_applies_from_the_next_turn() {
+    let (rt, _) = runtime(FakeEngine::new(vec![]), false);
+    let rt = rt.with_config(late_config);
+    let s = rt.load_session("s").unwrap().unwrap();
+    let start = rt.config().catalog();
+    let (first, second) = TURN_CATALOG
+        .scope(start, async {
+            let first = rt.models(&s).unwrap().system2.id;
+            // The refresh lands between two calls of the same turn.
+            LATE_LISTED.store(true, std::sync::atomic::Ordering::SeqCst);
+            tokio::task::yield_now().await;
+            (first, rt.models(&s).unwrap().system2.id)
+        })
+        .await;
+    assert_eq!((first.as_str(), second.as_str()), ("main", "main"));
+    // The next turn reads the list again.
+    assert_eq!(rt.models(&s).unwrap().system2.id, "late");
+}
+
+/// Thinks, reads a file, then answers: what a CLI agent streams.
+struct SteppingEngine;
+
+impl Engine for SteppingEngine {
+    fn run_text<'a>(
+        &'a self,
+        _req: &'a EngineRequest,
+        sink: StreamSink,
+    ) -> BoxFuture<'a, Result<String>> {
+        Box::pin(async move {
+            use crate::engine::StreamEvent as E;
+            sink(E::Thought("Look at ".into()));
+            sink(E::Thought("the gate.".into()));
+            sink(E::ToolStart(crate::stream::ToolStart {
+                id: "t1".into(),
+                title: "Read gate.rs".into(),
+                kind: crate::stream::ToolKind::Read,
+                path: None,
+            }));
+            sink(E::ToolUpdate {
+                id: "t1".into(),
+                content: crate::stream::ToolContent::Text("a\nb".into()),
+            });
+            sink(E::ToolEnd {
+                id: "t1".into(),
+                ok: true,
+            });
+            Ok("The gate checks the draft.".into())
+        })
+    }
+}
+
+#[tokio::test]
+async fn thoughts_and_tool_calls_are_kept_with_the_reply_they_came_before() {
+    let engine = Arc::new(SteppingEngine);
+    let mut rt = Runtime::new(Arc::new(Store::open_in_memory().unwrap()), engine);
+    rt.config = test_config;
+    let dir = std::env::temp_dir().join(format!("harness-rt-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    rt.create_session("s".into(), dir).unwrap();
+
+    turn(&rt, "/tell What does the gate check?").await;
+    let s = rt.load_session("s").unwrap().unwrap();
+    let user = &s.history[0];
+    assert_eq!(user.role, "user");
+    assert!(user.steps.is_empty());
+    let reply = s.history.iter().find(|t| t.role == "assistant").unwrap();
+    assert_eq!(
+        reply.steps,
+        vec![
+            crate::domain::Step::Thought {
+                text: "Look at the gate.".into()
+            },
+            crate::domain::Step::Tool {
+                id: "t1".into(),
+                title: "Read gate.rs".into(),
+                ok: Some(true),
+                detail: "a\nb".into(),
+            },
+        ]
+    );
+}
+
+// §15 and §16: commitments from plain words, and the next step.
+
+use crate::domain::{CommitKind, Staging};
+use crate::engine::StreamEvent;
+use crate::understanding::{ConceptState, Event};
+
+/// A thread on `MAP_CONCEPTS` with the gap proposal turned down: `route`
+/// (dispatch, handlers, registry) is active and open.
+async fn on_concepts(rt: &Runtime) {
+    turn(rt, "goal").await;
+    turn(rt, "/reject").await;
+}
+
+fn session(rt: &Runtime) -> Session {
+    rt.load_session("s").unwrap().unwrap()
+}
+
+fn events_of(rt: &Runtime, concept: &str) -> Vec<Event> {
+    let s = session(rt);
+    let ws = crate::understanding::workspace_key(&s.cwd);
+    rt.store.events(&ws, &[concept.to_string()]).unwrap()
+}
+
+fn state_of(rt: &Runtime, concept: &str) -> ConceptState {
+    let s = session(rt);
+    let views = rt.concept_views(&s, &[concept.to_string()]).unwrap();
+    crate::understanding::state_of(&views, concept)
+}
+
+fn set_status(rt: &Runtime, id: &str, status: PartStatus) {
+    let mut s = session(rt);
+    s.map.get_mut(id).unwrap().status = status;
+    rt.store.save_session(&s).unwrap();
+}
+
+#[tokio::test]
+async fn a_plain_claim_is_shown_back_and_undone() {
+    let (rt, engine) = runtime(
+        FakeEngine::new(vec![
+            (ReadOnly, S1, ONBOARD_READY),
+            (ReadOnly, S2, MAP_CONCEPTS),
+        ]),
+        false,
+    );
+    let rt = with_decisions(rt, vec![("known", 0.8, None)]);
+    on_concepts(&rt).await;
+    let out = turn(&rt, "I already know routing").await;
+    assert!(
+        out.reply.starts_with(
+            "Recorded: you already know **Command routing**. A claim, not evidence. `/undo` (Esc) takes it back."
+        ),
+        "{}",
+        out.reply
+    );
+    let s = session(&rt);
+    assert_eq!(s.map.get("route").unwrap().status, PartStatus::Known);
+    assert_eq!(s.active.as_deref(), Some("report"));
+    assert!(s.undoable(), "undoable from the frontend, between turns");
+    assert_eq!(state_of(&rt, "dispatch"), ConceptState::Claimed);
+
+    let out = turn(&rt, "/undo").await;
+    assert_eq!(out.shown, Shown::Notice);
+    assert!(
+        out.reply
+            .starts_with("Undone: your claim on **Command routing** is withdrawn."),
+        "{}",
+        out.reply
+    );
+    let s = session(&rt);
+    assert_eq!(s.map.get("route").unwrap().status, PartStatus::Open);
+    assert_eq!(s.active.as_deref(), Some("route"));
+    assert!(
+        s.pending_change.is_none(),
+        "a gap the claim raised goes with it"
+    );
+    assert_eq!(s.gaps_raised, vec!["closures".to_string()]);
+    assert!(s.last_commitment.is_none());
+    assert_eq!(state_of(&rt, "dispatch"), ConceptState::Unknown);
+    // Compensating events: the claim stays on the log, withdrawn.
+    let events = events_of(&rt, "dispatch");
+    let claim = events.iter().find(|e| e.kind == EventKind::Claim).unwrap();
+    assert!(events.iter().any(|e| e.kind == EventKind::Retracted
+        && e.reference.as_deref() == Some(claim.id.to_string().as_str())));
+    assert!(
+        turn(&rt, "/undo")
+            .await
+            .reply
+            .starts_with("Nothing to undo.")
+    );
+
+    // /why keeps it visible as withdrawn, and shows the step history.
+    let why = turn(&rt, "/why").await.reply;
+    assert!(
+        why.contains("Claim on **Dispatch by name** withdrawn ("),
+        "{why}"
+    );
+    assert!(why.contains("Passes: 0 · claims: 0."), "{why}");
+    assert!(
+        why.contains("How you got here: wide·purpose 0 of 0 led to a pass"),
+        "{why}"
+    );
+    assert!(why.contains("That is all Pathfinder keeps"), "{why}");
+    assert!(engine.replies.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn undo_reaches_only_the_last_step() {
+    let (rt, _) = runtime(
+        FakeEngine::new(vec![
+            (ReadOnly, S1, ONBOARD_READY),
+            (ReadOnly, S2, MAP_CONCEPTS),
+            (ReadOnly, S1, &log_reply("ok")),
+        ]),
+        false,
+    );
+    let rt = with_decisions(rt, vec![("known", 0.8, None), ("log", 0.9, None)]);
+    on_concepts(&rt).await;
+    turn(&rt, "I already know routing").await;
+    turn(&rt, "the report lists the fields").await;
+    assert!(
+        turn(&rt, "/undo")
+            .await
+            .reply
+            .starts_with("Nothing to undo.")
+    );
+    assert_eq!(status(&rt, "route"), PartStatus::Known);
+    assert_eq!(state_of(&rt, "dispatch"), ConceptState::Claimed);
+}
+
+#[tokio::test]
+async fn a_failed_message_still_closes_the_undo_window() {
+    let (rt, _) = runtime(
+        FakeEngine::new(vec![
+            (ReadOnly, S1, ONBOARD_READY),
+            (ReadOnly, S2, MAP_CONCEPTS),
+            (ReadOnly, S1, ENGINE_DOWN),
+        ]),
+        false,
+    );
+    let rt = with_decisions(rt, vec![("known", 0.8, None), ("log", 0.9, None)]);
+    on_concepts(&rt).await;
+    turn(&rt, "I already know routing").await;
+    let failed = rt
+        .handle_turn(
+            "s",
+            TurnInput {
+                text: "the report lists the fields".into(),
+                files: vec![],
+            },
+            noop_sink(),
+        )
+        .await;
+    assert!(failed.is_err());
+    assert!(!session(&rt).undoable());
+    assert!(
+        turn(&rt, "/undo")
+            .await
+            .reply
+            .starts_with("Nothing to undo.")
+    );
+    assert_eq!(status(&rt, "route"), PartStatus::Known);
+}
+
+#[tokio::test]
+async fn a_plain_undo_is_read_by_the_router() {
+    let (rt, _) = runtime(
+        FakeEngine::new(vec![
+            (ReadOnly, S1, ONBOARD_READY),
+            (ReadOnly, S2, MAP_CONCEPTS),
+        ]),
+        false,
+    );
+    let (rt, decider) = with_script(rt, vec![says("known", 0.8), says("undo", 0.8)]);
+    on_concepts(&rt).await;
+    turn(&rt, "I already know routing").await;
+    let out = turn(&rt, "wait, no, take that back").await;
+    assert!(out.reply.starts_with("Undone:"), "{}", out.reply);
+    assert_eq!(status(&rt, "route"), PartStatus::Open);
+    let offered = decider.1.lock().unwrap();
+    let has = |i: usize, o: &str| offered[i].iter().any(|x| x == o);
+    // Agent and tell are always offered; undo only right after a claim,
+    // confirm only while something waits.
+    assert!(has(0, "agent") && has(0, "tell"));
+    assert!(!has(0, "undo") && !has(0, "confirm"));
+    assert!(has(1, "undo") && !has(1, "confirm"));
+}
+
+#[tokio::test]
+async fn a_typed_known_is_not_shown_back() {
+    let (rt, _) = runtime(
+        FakeEngine::new(vec![
+            (ReadOnly, S1, ONBOARD_READY),
+            (ReadOnly, S2, MAP_CONCEPTS),
+        ]),
+        false,
+    );
+    on_concepts(&rt).await;
+    let out = turn(&rt, "/known").await;
+    assert!(
+        out.reply
+            .starts_with("**Command routing** recorded as already known."),
+        "{}",
+        out.reply
+    );
+    assert!(session(&rt).last_commitment.is_none());
+    assert!(
+        turn(&rt, "/undo")
+            .await
+            .reply
+            .starts_with("Nothing to undo.")
+    );
+    assert_eq!(status(&rt, "route"), PartStatus::Known);
+}
+
+#[tokio::test]
+async fn a_plain_verdict_waits_for_confirm() {
+    let (rt, engine) = runtime(
+        FakeEngine::new(vec![
+            (ReadOnly, S1, ONBOARD_READY),
+            (ReadOnly, S2, MAP),
+            (ReadOnly, S1, &log_reply("ok")),
+            (ReadOnly, S2, r#"{"candidate":"c","key_reason":"r"}"#),
+            (
+                ToolAccess::None,
+                S2,
+                r#"{"is_judgment":true,"pass":true,"feedback":"Right."}"#,
+            ),
+        ]),
+        false,
+    );
+    let rt = with_decisions(rt, vec![("log", 0.9, None), ("verdict", 0.8, None)]);
+    turn(&rt, "goal").await;
+    turn(&rt, "thinking").await;
+    turn(&rt, "/summary names map to handlers").await;
+    let shown = turn(&rt, "it's right, names map to handlers").await;
+    assert_eq!(
+        shown.reply,
+        "Judge this as your verdict on the candidate? “it's right, names map to handlers” Enter judges · Esc keeps it as a note."
+    );
+    assert_eq!(shown.shown, Shown::Notice);
+    assert_eq!(engine.replies.lock().unwrap().len(), 1, "no judge yet");
+    let s = session(&rt);
+    assert!(s.pending_candidate.is_some());
+    assert_eq!(
+        s.pending_commitment.as_ref().map(|p| p.kind),
+        Some(CommitKind::Verdict)
+    );
+
+    turn(&rt, "/confirm").await;
+    assert!(engine.replies.lock().unwrap().is_empty());
+    let s = session(&rt);
+    assert_eq!(s.map.get("route").unwrap().status, PartStatus::Understood);
+    assert!(s.pending_commitment.is_none() && s.pending_candidate.is_none());
+    let said = s
+        .history
+        .iter()
+        .filter(|t| t.content == "it's right, names map to handlers")
+        .count();
+    assert_eq!(said, 1, "the verdict is in the thread once");
+    assert!(
+        turn(&rt, "/confirm")
+            .await
+            .reply
+            .starts_with("Nothing is waiting")
+    );
+}
+
+#[tokio::test]
+async fn cancel_keeps_a_verdict_as_a_note() {
+    let (rt, engine) = runtime(
+        FakeEngine::new(vec![
+            (ReadOnly, S1, ONBOARD_READY),
+            (ReadOnly, S2, MAP_CONCEPTS),
+            (ReadOnly, S1, &log_reply("ok")),
+            (ReadOnly, S2, r#"{"candidate":"c","key_reason":"r"}"#),
+            // Esc: one Tutor call, as a log entry; no judge.
+            (ReadOnly, S1, &log_reply("ok")),
+        ]),
+        false,
+    );
+    let rt = with_decisions(rt, vec![("log", 0.9, None), ("verdict", 0.8, None)]);
+    on_concepts(&rt).await;
+    turn(&rt, "thinking").await;
+    turn(&rt, "/summary names map to handlers").await;
+    turn(&rt, "I'd say the lookup part holds").await;
+    turn(&rt, "/cancel").await;
+    assert!(engine.replies.lock().unwrap().is_empty());
+    let s = session(&rt);
+    assert!(s.pending_candidate.is_some(), "the candidate still waits");
+    assert!(s.pending_commitment.is_none());
+    assert!(
+        s.map
+            .get("route")
+            .unwrap()
+            .log
+            .contains(&"I'd say the lookup part holds".to_string())
+    );
+    assert!(
+        s.history
+            .last()
+            .unwrap()
+            .content
+            .starts_with("Not judged as a verdict: kept as a note.")
+    );
+    let events = events_of(&rt, "dispatch");
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::Pass | EventKind::Fail))
+    );
+}
+
+#[tokio::test]
+async fn undo_never_touches_a_judged_verdict() {
+    let (rt, _) = runtime(
+        FakeEngine::new(vec![
+            (ReadOnly, S1, ONBOARD_READY),
+            (ReadOnly, S2, MAP_CONCEPTS),
+            (ReadOnly, S1, &log_reply("ok")),
+            (ReadOnly, S2, r#"{"candidate":"c","key_reason":"r"}"#),
+            (
+                ToolAccess::None,
+                S2,
+                r#"{"is_judgment":true,"pass":false,"feedback":"It was correct."}"#,
+            ),
+        ]),
+        false,
+    );
+    let rt = with_decisions(rt, vec![("log", 0.9, None), ("verdict", 0.8, None)]);
+    on_concepts(&rt).await;
+    turn(&rt, "thinking").await;
+    turn(&rt, "/summary names map to handlers").await;
+    turn(&rt, "it's wrong").await;
+    turn(&rt, "/confirm").await;
+    assert_eq!(state_of(&rt, "dispatch"), ConceptState::Shaky);
+    assert!(
+        turn(&rt, "/undo")
+            .await
+            .reply
+            .starts_with("Nothing to undo.")
+    );
+    assert_eq!(state_of(&rt, "dispatch"), ConceptState::Shaky);
+    let fails = events_of(&rt, "dispatch")
+        .iter()
+        .filter(|e| e.kind == EventKind::Fail)
+        .count();
+    assert_eq!(fails, 1);
+    assert!(
+        !events_of(&rt, "dispatch")
+            .iter()
+            .any(|e| e.kind == EventKind::Retracted)
+    );
+}
+
+#[tokio::test]
+async fn a_plain_handoff_runs_nothing_before_confirm() {
+    let (rt, engine) = runtime(
+        FakeEngine::new(vec![
+            (ReadOnly, S1, ONBOARD_READY),
+            (ReadOnly, S2, MAP),
+            (Full, S2, "Added /status."),
+        ]),
+        false,
+    );
+    let (rt, decider) = with_script(
+        rt,
+        vec![
+            says("agent", 0.8),
+            says("agent", 0.8),
+            says("confirm", 0.95),
+        ],
+    );
+    turn(&rt, "goal").await;
+    set_status(&rt, "route", PartStatus::Understood);
+    let out = turn(&rt, "let the agent do this part").await;
+    assert_eq!(
+        session(&rt).waiting_for_ok(),
+        Some((CommitKind::Handoff, "Command routing"))
+    );
+    assert!(
+        out.reply
+            .starts_with("Hand **Command routing** to the agent? This isn't a git repository"),
+        "{}",
+        out.reply
+    );
+    assert_eq!(engine.replies.lock().unwrap().len(), 1, "nothing ran");
+    let out = turn(&rt, "/cancel").await;
+    assert_eq!(
+        out.reply,
+        "Not run: **Command routing** wasn't handed to the agent."
+    );
+    assert_eq!(status(&rt, "route"), PartStatus::Understood);
+    assert!(session(&rt).pending_commitment.is_none());
+
+    turn(&rt, "ok, have the agent do it").await;
+    turn(&rt, "yes, go ahead").await;
+    assert!(engine.replies.lock().unwrap().is_empty());
+    assert_eq!(status(&rt, "route"), PartStatus::InReview);
+    let offered = decider.1.lock().unwrap();
+    assert!(offered[2].iter().any(|o| o == "confirm"));
+}
+
+#[tokio::test]
+async fn a_plain_delegate_on_an_open_part() {
+    let (rt, _) = runtime(
+        FakeEngine::new(vec![
+            (ReadOnly, S1, ONBOARD_READY),
+            (ReadOnly, S2, MAP_CONCEPTS),
+            (Full, S2, "Wrote it."),
+        ]),
+        false,
+    );
+    let rt = with_decisions(rt, vec![("agent", 0.8, None)]);
+    on_concepts(&rt).await;
+    let out = turn(&rt, "just have the agent do routing").await;
+    assert!(
+        out.reply
+            .starts_with("Delegate **Command routing** without understanding it?"),
+        "{}",
+        out.reply
+    );
+    assert_eq!(status(&rt, "route"), PartStatus::Open);
+    turn(&rt, "/confirm").await;
+    assert_eq!(status(&rt, "route"), PartStatus::Delegated);
+    assert!(
+        events_of(&rt, "dispatch")
+            .iter()
+            .any(|e| e.kind == EventKind::Delegated)
+    );
+}
+
+#[tokio::test]
+async fn agent_on_a_known_part_is_refused_at_once() {
+    let (rt, _) = runtime(
+        FakeEngine::new(vec![(ReadOnly, S1, ONBOARD_READY), (ReadOnly, S2, MAP)]),
+        false,
+    );
+    let rt = with_decisions(rt, vec![("agent", 0.8, None)]);
+    turn(&rt, "goal").await;
+    set_status(&rt, "route", PartStatus::Known);
+    let out = turn(&rt, "let the agent do it").await;
+    assert_eq!(
+        out.reply,
+        "**Command routing** is already claimed as known."
+    );
+    assert!(session(&rt).pending_commitment.is_none());
+}
+
+#[tokio::test]
+async fn a_plain_message_drops_a_pending_commitment() {
+    let (rt, engine) = runtime(
+        FakeEngine::new(vec![
+            (ReadOnly, S1, ONBOARD_READY),
+            (ReadOnly, S2, MAP),
+            (ReadOnly, S1, &log_reply("ok")),
+        ]),
+        false,
+    );
+    let rt = with_decisions(rt, vec![("agent", 0.8, None), ("log", 0.95, None)]);
+    turn(&rt, "goal").await;
+    set_status(&rt, "route", PartStatus::Understood);
+    turn(&rt, "let the agent do this").await;
+    turn(&rt, "actually, let me think about the edge cases first").await;
+    let s = session(&rt);
+    assert!(s.pending_commitment.is_none());
+    assert_eq!(s.map.get("route").unwrap().status, PartStatus::Understood);
+    let last = &s.history.last().unwrap().content;
+    assert!(
+        last.starts_with("Not run: **Command routing** wasn't handed to the agent."),
+        "{last}"
+    );
+    assert!(engine.replies.lock().unwrap().is_empty(), "no agent call");
+}
+
+#[tokio::test]
+async fn a_plain_tell_is_held_and_recorded_as_told() {
+    let (rt, engine) = runtime(
+        FakeEngine::new(vec![
+            (ReadOnly, S1, ONBOARD_READY),
+            (ReadOnly, S2, MAP_CONCEPTS),
+            (ReadOnly, S2, "Names are looked up in a table."),
+        ]),
+        false,
+    );
+    let rt = with_decisions(rt, vec![("tell", 0.8, None)]);
+    on_concepts(&rt).await;
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let record = seen.clone();
+    let sink: StreamSink = Arc::new(move |ev| {
+        if let StreamEvent::TextDelta(t) = ev {
+            record.lock().unwrap().push(t);
+        }
+    });
+    rt.handle_turn(
+        "s",
+        TurnInput {
+            text: "just tell me how dispatch by name works".into(),
+            files: vec![],
+        },
+        sink,
+    )
+    .await
+    .unwrap();
+    let seen = seen.lock().unwrap().clone();
+    assert!(
+        seen[0].starts_with("Telling you, as you asked."),
+        "{seen:?}"
+    );
+    // Held: the answer arrives whole, after the show-back.
+    assert_eq!(seen[1], "**Told**\n\nNames are looked up in a table.");
+    assert!(engine.replies.lock().unwrap().is_empty());
+    assert!(
+        events_of(&rt, "dispatch")
+            .iter()
+            .any(|e| e.kind == EventKind::Told)
+    );
+    assert_eq!(state_of(&rt, "dispatch"), ConceptState::Unknown);
+    assert!(
+        turn(&rt, "/undo")
+            .await
+            .reply
+            .starts_with("Nothing to undo.")
+    );
+}
+
+#[tokio::test]
+async fn tell_is_gated_while_a_review_secret_is_active() {
+    let (rt, engine) = runtime(
+        FakeEngine::new(vec![
+            (ReadOnly, S1, ONBOARD_READY),
+            (ReadOnly, S2, MAP),
+            (ReadOnly, S2, "It falls back to help."),
+            (
+                ReadOnly,
+                S1,
+                r#"{"intent":"tell","reply":"","map_change":null}"#,
+            ),
+            (ReadOnly, S2, "It falls back to help."),
+        ]),
+        false,
+    );
+    let rt = rt.with_decider(Arc::new(GateDecider(
+        Mutex::new(vec![Some(0.9), Some(0.9)].into()),
+        Mutex::new(VecDeque::new()),
+    )));
+    turn(&rt, "goal").await;
+    // A review in staging with a planted hunk: no candidate waits.
+    let mut s = session(&rt);
+    let secret = crate::secrets::Secret {
+        id: "sec-plant".into(),
+        kind: "planted_flaw".into(),
+        payload: serde_json::json!({"candidate": "+ return HANDLERS.get(name, help)", "correct": false, "reason": "unknown names fall back"}),
+        probe: "whether a hunk is planted, or where".into(),
+        opened_at_turn: s.history.len(),
+        active: true,
+    };
+    rt.store.add_secret("s", &secret).unwrap();
+    let route = s.map.get_mut("route").unwrap();
+    route.status = PartStatus::InReview;
+    route.staging = Some(Staging {
+        dir: s.cwd.join("staging"),
+        base: String::new(),
+        result: None,
+        secret: Some("sec-plant".into()),
+        report: String::new(),
+        linked: vec![],
+    });
+    rt.store.save_session(&s).unwrap();
+    assert!(s.pending_candidate.is_none());
+
+    turn(&rt, "/tell does it fall back to help?").await;
+    let s = session(&rt);
+    assert_eq!(
+        s.history.last().unwrap().content,
+        crate::secrets::FIXED_REPLY
+    );
+    turn(&rt, "just tell me whether unknown names fall back").await;
+    let s = session(&rt);
+    let last = &s.history.last().unwrap().content;
+    assert!(last.ends_with(crate::secrets::FIXED_REPLY), "{last}");
+    assert!(!last.contains("falls back to help"), "{last}");
+    assert!(engine.replies.lock().unwrap().is_empty());
+    let ws = crate::understanding::workspace_key(&s.cwd);
+    assert!(
+        rt.store.concepts(&ws).unwrap().is_empty(),
+        "nothing recorded as told"
+    );
+    assert!(rt.store.secret("sec-plant").unwrap().unwrap().active);
+}
+
+#[tokio::test]
+async fn an_unsure_commitment_asks() {
+    let (rt, engine) = runtime(
+        FakeEngine::new(vec![(ReadOnly, S1, ONBOARD_READY), (ReadOnly, S2, MAP)]),
+        false,
+    );
+    let (rt, _) = with_script(
+        rt,
+        vec![Scripted {
+            step: "known",
+            p: 0.45,
+            all: vec![("known", 0.45), ("log", 0.3), ("tell", 0.25)],
+            ..Default::default()
+        }],
+    );
+    turn(&rt, "goal").await;
+    let out = turn(&rt, "routing, I sort of know that, or do I").await;
+    assert_eq!(
+        out.reply,
+        "Did you mean to claim you already know **Command routing** (`/known`) or to be told (`/tell <question>`)? Nothing is recorded until you say. Otherwise just go on."
+    );
+    assert_eq!(out.shown, Shown::Notice);
+    let s = session(&rt);
+    assert_eq!(s.map.get("route").unwrap().status, PartStatus::Open);
+    assert!(s.map.get("route").unwrap().log.is_empty());
+    assert!(s.pending_commitment.is_none() && s.last_commitment.is_none());
+    assert!(engine.replies.lock().unwrap().is_empty());
+    let n = s.history.len();
+    assert_eq!(
+        s.history[n - 2].content,
+        "routing, I sort of know that, or do I"
+    );
+}
+
+#[tokio::test]
+async fn an_unsure_non_commitment_falls_back_to_the_llm() {
+    let (rt, engine) = runtime(
+        FakeEngine::new(vec![
+            (ReadOnly, S1, ONBOARD_READY),
+            (ReadOnly, S2, MAP),
+            (ReadOnly, S1, &log_reply("ok")),
+        ]),
+        false,
+    );
+    let (rt, _) = with_script(
+        rt,
+        vec![Scripted {
+            step: "log",
+            p: 0.5,
+            all: vec![
+                ("log", 0.5),
+                ("move", 0.3),
+                ("known", 0.2),
+                ("agent", 0.0),
+                ("tell", 0.0),
+            ],
+            ..Default::default()
+        }],
+    );
+    turn(&rt, "goal").await;
+    let out = turn(&rt, "the router keeps a table").await;
+    assert!(!out.reply.contains("Did you mean"));
+    assert!(engine.replies.lock().unwrap().is_empty());
+    assert_eq!(
+        session(&rt).map.get("route").unwrap().log,
+        vec!["the router keeps a table".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn the_llm_intent_known_is_shown_back() {
+    let (rt, _) = runtime(
+        FakeEngine::new(vec![
+            (ReadOnly, S1, ONBOARD_READY),
+            (ReadOnly, S2, MAP),
+            (
+                ReadOnly,
+                S1,
+                r#"{"intent":"known","reply":"","map_change":null}"#,
+            ),
+        ]),
+        false,
+    );
+    rt.set_option("s", "decisions", OptionValue::Bool(false))
+        .unwrap();
+    turn(&rt, "goal").await;
+    let out = turn(&rt, "I know routing already").await;
+    assert!(
+        out.reply
+            .starts_with("Recorded: you already know **Command routing**."),
+        "{}",
+        out.reply
+    );
+    assert!(turn(&rt, "/undo").await.reply.starts_with("Undone:"));
+    assert_eq!(status(&rt, "route"), PartStatus::Open);
+}
+
+#[tokio::test]
+async fn fixed_lines_never_carry_the_key() {
+    const CAND: &str = "CANDTEXT-7f";
+    const KEY: &str = "KEYREASON-9c";
+    let candidate = format!(r#"{{"candidate":"{CAND}","key_reason":"{KEY}"}}"#);
+    let (rt, _) = runtime(
+        FakeEngine::new(vec![
+            (ReadOnly, S1, ONBOARD_READY),
+            (ReadOnly, S2, MAP_CONCEPTS),
+            (ReadOnly, S1, &log_reply("ok")),
+            (ReadOnly, S2, &candidate),
+            (ReadOnly, S1, &log_reply("ok")),
+        ]),
+        false,
+    );
+    let rt = with_decisions(
+        rt,
+        vec![
+            ("log", 0.9, None),
+            ("verdict", 0.8, None),
+            ("log", 0.95, None),
+            ("agent", 0.95, None),
+        ],
+    );
+    on_concepts(&rt).await;
+    turn(&rt, "thinking").await;
+    turn(&rt, "/summary names map to handlers").await;
+    let from = session(&rt).history.len();
+    let mut shown = vec![
+        turn(&rt, "I think it is wrong").await.reply,
+        turn(&rt, "hmm, let me think about it").await.reply,
+        turn(&rt, "let the agent do it").await.reply,
+        turn(&rt, "/cancel").await.reply,
+        turn(&rt, "/undo").await.reply,
+        turn(&rt, "/confirm").await.reply,
+        turn(&rt, "/why").await.reply,
+    ];
+    let mut s = session(&rt);
+    assert!(
+        rt.next_step(&mut s, None, false).is_none(),
+        "no next step while a secret is active"
+    );
+    assert!(
+        s.map
+            .get("route")
+            .unwrap()
+            .log
+            .contains(&"I think it is wrong".to_string()),
+        "a verdict you went past stays a note, as the line says"
+    );
+    shown.extend(s.history[from..].iter().map(|t| t.content.clone()));
+    for line in &shown {
+        assert!(!line.contains(CAND) && !line.contains(KEY), "{line}");
+    }
+    assert!(
+        shown
+            .iter()
+            .any(|l| l.starts_with("Judge this as your verdict"))
+    );
+    assert!(
+        shown
+            .iter()
+            .any(|l| l.starts_with("Not judged as a verdict"))
+    );
+    assert!(
+        shown
+            .iter()
+            .any(|l| l.starts_with("Delegate **Command routing**"))
+    );
+    assert!(!shown.iter().any(|l| l.contains("Next:")));
+}
+
+#[test]
+fn confirm_is_counted_as_its_command() {
+    use pathfinder_schema::Step;
+    let s = Session::new("s".into(), PathBuf::from("."));
+    assert_eq!(
+        turn_step("/confirm", &s, false, Some(CommitKind::Handoff)),
+        Step::Handoff
+    );
+    assert_eq!(
+        turn_step("/confirm", &s, true, Some(CommitKind::Verdict)),
+        Step::Verdict
+    );
+    assert_eq!(
+        turn_step("/confirm", &s, false, Some(CommitKind::Delegate)),
+        Step::Delegate
+    );
+    assert_eq!(turn_step("/confirm", &s, false, None), Step::Other);
+    // Only a confirmation that ran sets what ran; these never do.
+    assert_eq!(turn_step("/undo", &s, false, None), Step::Other);
+    assert_eq!(turn_step("/cancel", &s, false, None), Step::Other);
+}
+
+#[tokio::test]
+async fn judgment_is_saved_before_the_next_candidate() {
+    let (rt, _) = runtime(
+        FakeEngine::new(vec![
+            (ReadOnly, S1, ONBOARD_READY),
+            (ReadOnly, S2, MAP_CONCEPTS),
+            (ReadOnly, S1, &log_reply("ok")),
+            (ReadOnly, S2, r#"{"candidate":"c1","key_reason":"r"}"#),
+            (
+                ToolAccess::None,
+                S2,
+                r#"{"is_judgment":true,"pass":true,"feedback":"Right."}"#,
+            ),
+            // Writing the next candidate fails.
+            (ReadOnly, S2, ENGINE_DOWN),
+        ]),
+        false,
+    );
+    on_concepts(&rt).await;
+    turn(&rt, "thinking").await;
+    turn(&rt, "/summary it routes by name to a handler").await;
+    turn(&rt, "right, the name picks the handler").await;
+    let failed = rt
+        .handle_turn(
+            "s",
+            TurnInput {
+                text: "/confirm".into(),
+                files: vec![],
+            },
+            noop_sink(),
+        )
+        .await;
+    assert!(failed.is_err());
+    let s = session(&rt);
+    assert!(
+        s.pending_candidate.is_none(),
+        "the judged candidate isn't left waiting"
+    );
+    assert!(s.pending_commitment.is_none());
+    let passes = events_of(&rt, "dispatch")
+        .iter()
+        .filter(|e| e.kind == EventKind::Pass)
+        .count();
+    assert_eq!(passes, 1);
+    // Nothing can be judged (and passed) a second time.
+    assert!(
+        turn(&rt, "/confirm")
+            .await
+            .reply
+            .starts_with("Nothing is waiting")
+    );
+}
+
+#[tokio::test]
+async fn entering_a_part_shows_the_next_step_and_horizon() {
+    let (rt, _) = runtime(
+        FakeEngine::new(vec![
+            (ReadOnly, S1, ONBOARD_READY),
+            (ReadOnly, S2, MAP_CONCEPTS),
+        ]),
+        false,
+    );
+    let cwd = session(&rt).cwd;
+    let mut notes: Vec<String> = (1..=35).map(|i| format!("filler {i}")).collect();
+    notes[29] = "Dispatch by name: the router looks the name up.".into();
+    std::fs::write(cwd.join("notes.md"), notes.join("\n")).unwrap();
+    let out = turn(&rt, "goal").await;
+    assert!(
+        out.reply.contains(
+            "Next: `notes.md:20-35` · What is Dispatch by name for in this part, in your own words?"
+        ),
+        "{}",
+        out.reply
+    );
+    assert!(
+        out.reply
+            .contains("Horizon: leads to **What status reports**."),
+        "{}",
+        out.reply
+    );
+    let steps: Vec<Event> = events_of(&rt, "dispatch")
+        .into_iter()
+        .filter(|e| e.kind == EventKind::Step)
+        .collect();
+    assert_eq!(steps.len(), 1);
+    assert_eq!(steps[0].detail["kind"], "wide-purpose");
+    assert_eq!(steps[0].detail["steered"], false);
+    assert_eq!(steps[0].reference.as_deref(), Some("route"));
+    let last = session(&rt).last_step.unwrap();
+    assert_eq!(
+        (last.concept.as_str(), last.kind.as_str()),
+        ("dispatch", "wide-purpose")
+    );
+    // A step is activity, never evidence.
+    assert_eq!(state_of(&rt, "dispatch"), ConceptState::Unknown);
+}
+
+#[tokio::test]
+async fn a_steer_changes_the_next_step_and_keeps_the_message() {
+    let (rt, engine) = runtime(
+        FakeEngine::new(vec![
+            (ReadOnly, S1, ONBOARD_READY),
+            (ReadOnly, S2, MAP_CONCEPTS),
+            (ReadOnly, S1, &log_reply("ok")),
+        ]),
+        false,
+    );
+    let (rt, _) = with_script(
+        rt,
+        vec![Scripted {
+            step: "log",
+            p: 0.8,
+            steer: Some("example"),
+            ..Default::default()
+        }],
+    );
+    on_concepts(&rt).await;
+    let text = "I think dispatch looks the name up; give me an example first";
+    turn(&rt, text).await;
+    let s = session(&rt);
+    // Your words stay on the log, and the Tutor answered them.
+    assert_eq!(s.map.get("route").unwrap().log, vec![text.to_string()]);
+    assert!(engine.replies.lock().unwrap().is_empty(), "the Tutor ran");
+    let reply = &s.history.last().unwrap().content;
+    assert!(
+        reply.ends_with(
+            "Next: no place in your sources names **Dispatch by name** yet; `/find <terms>` searches them. · Find one place where Dispatch by name is used. What does it do there?"
+        ),
+        "{reply}"
+    );
+    let steered: Vec<Event> = events_of(&rt, "dispatch")
+        .into_iter()
+        .filter(|e| e.kind == EventKind::Step && e.detail["steered"] == true)
+        .collect();
+    assert_eq!(steered.len(), 1);
+    assert_eq!(steered[0].detail["kind"], "wide-example");
+    let why = turn(&rt, "/why").await.reply;
+    assert!(why.contains("steered by you 1 times"), "{why}");
+}
+
+// Adversarial review (§15): a verdict held for your OK must be judged
+// against the candidate it was shown back for, never a newer one.
+#[tokio::test]
+async fn a_pending_verdict_is_never_judged_against_a_newer_candidate() {
+    let (rt, engine) = runtime(
+        FakeEngine::new(vec![
+            (ReadOnly, S1, ONBOARD_READY),
+            (ReadOnly, S2, MAP),
+            (ReadOnly, S1, &log_reply("ok")),
+            (
+                ReadOnly,
+                S2,
+                r#"{"candidate":"first candidate","key_reason":"r1"}"#,
+            ),
+            // A second `/summary` replaces the waiting candidate.
+            (
+                ReadOnly,
+                S2,
+                r#"{"candidate":"second candidate","key_reason":"r2"}"#,
+            ),
+            // Only reached if `/confirm` judges the old words against the
+            // new candidate.
+            (
+                ToolAccess::None,
+                S2,
+                r#"{"is_judgment":true,"pass":true,"feedback":"Right."}"#,
+            ),
+        ]),
+        false,
+    );
+    let rt = with_decisions(rt, vec![("log", 0.9, None), ("verdict", 0.8, None)]);
+    turn(&rt, "goal").await;
+    turn(&rt, "thinking").await;
+    turn(&rt, "/summary names map to handlers").await;
+    let shown = turn(&rt, "the first one is right").await;
+    assert!(shown.reply.starts_with("Judge this as your verdict"));
+    // A typed command replaces the candidate; the verdict still waits.
+    turn(&rt, "/summary a second take").await;
+    let s = session(&rt);
+    assert_eq!(
+        s.pending_candidate.as_ref().map(|c| c.candidate.as_str()),
+        Some("second candidate")
+    );
+    // The typed command dropped the verdict, said so, and kept your words
+    // as a note.
+    assert!(s.pending_commitment.is_none());
+    assert!(
+        s.history.iter().any(|t| t.role == "assistant"
+            && t.content
+                .starts_with("Not judged as a verdict: kept as a note.")),
+        "{:#?}",
+        s.history
+    );
+    assert!(
+        s.map
+            .get("route")
+            .unwrap()
+            .log
+            .contains(&"the first one is right".to_string())
+    );
+    // Even if it still waited, it would never be judged against the
+    // newer candidate: confirming checks the candidate's id.
+    let mut held = s.clone();
+    held.pending_commitment = Some(crate::domain::PendingCommitment {
+        kind: CommitKind::Verdict,
+        part: "route".into(),
+        text: "the first one is right".into(),
+        files: vec![],
+        candidate: Some("cand-first".into()),
+    });
+    let stale = rt.confirm(&mut held, noop_sink()).await.unwrap();
+    assert!(stale.reply.starts_with("Not run"), "{}", stale.reply);
+    assert!(held.pending_candidate.is_some());
+    let out = turn(&rt, "/confirm").await;
+    let s = session(&rt);
+    assert_eq!(
+        s.map.get("route").unwrap().status,
+        PartStatus::Open,
+        "words about the first candidate were judged against the second: {}",
+        out.reply
+    );
+    assert_eq!(
+        engine.replies.lock().unwrap().len(),
+        1,
+        "the Judge must not be called"
+    );
+}
+
+/// Streams the whole answer, then the turn ends without finishing (a
+/// dropped connection, or Esc pressed after reading it).
+struct StreamsThenStops;
+
+impl Engine for StreamsThenStops {
+    fn run_text<'a>(
+        &'a self,
+        req: &'a EngineRequest,
+        sink: StreamSink,
+    ) -> BoxFuture<'a, Result<String>> {
+        Box::pin(async move {
+            if req.stream_text {
+                sink(crate::engine::StreamEvent::TextDelta(
+                    "A closure captures its environment by reference or by move.".into(),
+                ));
+            }
+            Err(anyhow!("stopped"))
+        })
+    }
+}
+
+// Adversarial review (§11, §15): an answer you have seen is recorded as
+// told. A typed `/tell` with no secret active streams the answer, so a turn
+// stopped after the text arrived records nothing.
+#[tokio::test]
+async fn a_streamed_tell_you_read_is_recorded_as_told() {
+    let mut rt = Runtime::new(
+        Arc::new(Store::open_in_memory().unwrap()),
+        Arc::new(StreamsThenStops),
+    );
+    rt.config = test_config;
+    let dir = std::env::temp_dir().join(format!("harness-rt-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    rt.create_session("s".into(), dir).unwrap();
+    let seen = Arc::new(Mutex::new(String::new()));
+    let sink: StreamSink = {
+        let seen = seen.clone();
+        Arc::new(move |e| {
+            if let crate::engine::StreamEvent::TextDelta(t) = e {
+                seen.lock().unwrap().push_str(&t);
+            }
+        })
+    };
+    let out = rt
+        .handle_turn(
+            "s",
+            TurnInput {
+                text: "/tell what does a closure capture".into(),
+                files: vec![],
+            },
+            sink,
+        )
+        .await;
+    assert!(out.is_err());
+    assert!(
+        seen.lock().unwrap().contains("captures its environment"),
+        "the answer was shown"
+    );
+    let told = rt
+        .store
+        .event_counts("s")
+        .unwrap()
+        .into_iter()
+        .filter(|((_, kind), _)| kind == "told")
+        .count();
+    assert!(told > 0, "an answer you read left no told mark");
+}
+
+// Adversarial review (telemetry): a `/confirm` that ran nothing is not a
+// verdict, and a handoff confirmed by a plain "yes" is a handoff, not a log.
+#[tokio::test]
+async fn confirm_turns_are_counted_by_what_ran() {
+    let (rt, _engine) = runtime(
+        FakeEngine::new(vec![(ReadOnly, S1, ONBOARD_READY), (ReadOnly, S2, MAP)]),
+        false,
+    );
+    turn(&rt, "goal").await;
+    // Stale: the verdict waited, but no candidate does any more, so the
+    // confirmation runs nothing and is counted as no step of the loop.
+    let mut s = session(&rt);
+    s.pending_commitment = Some(crate::domain::PendingCommitment {
+        kind: CommitKind::Verdict,
+        part: "route".into(),
+        text: "it's right".into(),
+        files: vec![],
+        candidate: Some("cand-gone".into()),
+    });
+    let out = rt.confirm(&mut s, noop_sink()).await.unwrap();
+    assert!(out.reply.starts_with("Not run"), "{}", out.reply);
+    assert_eq!(s.ran_commitment, None);
+    assert_eq!(
+        turn_step("/confirm", &s, false, s.ran_commitment),
+        pathfinder_schema::Step::Other,
+        "a /confirm that judged nothing is counted as a verdict"
+    );
+    // A plain "yes, do it" the Router read as confirm, running a handoff.
+    assert_eq!(
+        turn_step("yes, do it", &s, false, Some(CommitKind::Handoff)),
+        pathfinder_schema::Step::Handoff,
+        "a handoff confirmed in plain words is counted as a log turn"
     );
 }

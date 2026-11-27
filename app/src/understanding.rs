@@ -81,6 +81,14 @@ pub enum EventKind {
     Read,
     /// You searched the sources (`/find`, `/web`). Activity, never evidence.
     Searched,
+    /// A claim you took back with `/undo` (§15). `ref` is the claim's event
+    /// id. It withdraws only a claim: aimed at anything else it does
+    /// nothing, so an undo never raises the record.
+    Retracted,
+    /// A next step Pathfinder showed you (§16): `ref` is the part,
+    /// `detail` `{"kind": "wide-example", "steered": bool}`. Activity, never
+    /// evidence.
+    Step,
 }
 
 impl EventKind {
@@ -99,6 +107,8 @@ impl EventKind {
             Self::Told => "told",
             Self::Read => "read",
             Self::Searched => "searched",
+            Self::Retracted => "retracted",
+            Self::Step => "step",
         }
     }
 
@@ -117,6 +127,8 @@ impl EventKind {
             "told" => Self::Told,
             "read" => Self::Read,
             "searched" => Self::Searched,
+            "retracted" => Self::Retracted,
+            "step" => Self::Step,
             _ => return None,
         })
     }
@@ -224,7 +236,11 @@ pub fn concept_view(events: &[Event], now: i64) -> ConceptView {
     let (mut passes, mut fails, mut flawed_passes) = (0, 0, 0);
     let mut last_evidence = None;
     let mut ids = Vec::new();
+    let withdrawn = retracted_claims(events);
     for e in events {
+        if e.kind == EventKind::Claim && withdrawn.contains(&e.id) {
+            continue;
+        }
         let before = state;
         match e.kind {
             EventKind::Claim if state == Unknown => state = Claimed,
@@ -279,6 +295,23 @@ pub fn concept_view(events: &[Event], now: i64) -> ConceptView {
         event_ids: ids,
         now,
     }
+}
+
+/// The ids `retracted` events point at that are claims (§15). A
+/// retraction aimed at any other kind is ignored: undo only lowers the
+/// record.
+pub fn retracted_claims(events: &[Event]) -> HashSet<i64> {
+    let claims: HashSet<i64> = events
+        .iter()
+        .filter(|e| e.kind == EventKind::Claim)
+        .map(|e| e.id)
+        .collect();
+    events
+        .iter()
+        .filter(|e| e.kind == EventKind::Retracted)
+        .filter_map(|e| e.reference.as_deref()?.parse::<i64>().ok())
+        .filter(|id| claims.contains(id))
+        .collect()
 }
 
 /// Views for every concept in `events`, grouped by concept.
@@ -489,6 +522,170 @@ pub fn lexical_candidates<'a>(text: &str, concepts: &'a [Concept]) -> Vec<&'a Co
     scored.into_iter().take(20).map(|(_, c)| c).collect()
 }
 
+/// How wide a next step is (§16): an orienting look at a concept you have
+/// no evidence on, or a narrow one at a concept that is shaky.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Scope {
+    Wide,
+    Narrow,
+}
+
+/// Where a next step starts (§16): a concrete example, what the concept is
+/// for, or how it works.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Angle {
+    Example,
+    Purpose,
+    Mechanism,
+}
+
+impl Angle {
+    pub const ALL: [Angle; 3] = [Angle::Example, Angle::Purpose, Angle::Mechanism];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Example => "example",
+            Self::Purpose => "purpose",
+            Self::Mechanism => "mechanism",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|a| a.as_str() == s)
+    }
+}
+
+/// The kind of a next step: its scope and its angle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct StepKind {
+    pub scope: Scope,
+    pub angle: Angle,
+}
+
+impl StepKind {
+    /// `wide-example`, `narrow-mechanism`, …
+    pub fn as_str(self) -> String {
+        let scope = match self.scope {
+            Scope::Wide => "wide",
+            Scope::Narrow => "narrow",
+        };
+        format!("{scope}-{}", self.angle.as_str())
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        let (scope, angle) = s.split_once('-')?;
+        let scope = match scope {
+            "wide" => Scope::Wide,
+            "narrow" => Scope::Narrow,
+            _ => return None,
+        };
+        Some(Self {
+            scope,
+            angle: Angle::parse(angle)?,
+        })
+    }
+}
+
+/// Per step kind (`wide-example`, …): (steps that led to a pass, steps
+/// that led to any verdict).
+pub type StepStats = std::collections::BTreeMap<String, (u32, u32)>;
+
+/// Judged steps an angle needs before Pathfinder leans on it.
+pub const LEAN_AFTER: u32 = 2;
+
+/// §16: the next step's kind for a concept, from its state, your steer and
+/// the kinds that led you to passes before. None when the concept already
+/// has evidence and nothing open on it: no step is needed.
+pub fn choose_step(
+    view: &ConceptView,
+    steer: Option<Angle>,
+    stats: &StepStats,
+) -> Option<StepKind> {
+    let scope = if !view.open_misconceptions.is_empty() || view.state == ConceptState::Shaky {
+        Scope::Narrow
+    } else if matches!(
+        view.state,
+        ConceptState::Unknown | ConceptState::Claimed | ConceptState::Delegated
+    ) {
+        Scope::Wide
+    } else {
+        return None;
+    };
+    let default = match scope {
+        Scope::Wide => Angle::Purpose,
+        Scope::Narrow => Angle::Mechanism,
+    };
+    let angle = steer.unwrap_or_else(|| {
+        let rate = |a: Angle| {
+            let kind = StepKind { scope, angle: a }.as_str();
+            stats
+                .get(&kind)
+                .filter(|(_, judged)| *judged >= LEAN_AFTER)
+                .map(|(passes, judged)| *passes as f64 / *judged as f64)
+        };
+        let best = Angle::ALL
+            .into_iter()
+            .filter_map(|a| rate(a).map(|r| (a, r)))
+            .fold(None::<(Angle, f64)>, |best, (a, r)| match best {
+                Some((_, b)) if b >= r => best,
+                _ => Some((a, r)),
+            });
+        match best {
+            // Only something that worked moves it off the default, and a
+            // tie goes to the default.
+            Some((a, r)) if r > 0.0 && rate(default).is_none_or(|d| d < r) => a,
+            _ => default,
+        }
+    });
+    Some(StepKind { scope, angle })
+}
+
+/// §16: which step kinds led to passes. For each `step` on a concept, the
+/// next `pass` or `fail` on that concept before the next `step` on it is
+/// the step's verdict; a later step supersedes an earlier one. Activity
+/// only: nothing here is evidence.
+pub fn step_stats(events: &[Event]) -> StepStats {
+    let mut sorted: Vec<&Event> = events.iter().collect();
+    sorted.sort_by_key(|e| e.id);
+    let mut open: HashMap<&str, String> = HashMap::new();
+    let mut out = StepStats::new();
+    for e in sorted {
+        match e.kind {
+            EventKind::Step => {
+                let Some(kind) = e.detail["kind"]
+                    .as_str()
+                    .filter(|k| StepKind::parse(k).is_some())
+                else {
+                    continue;
+                };
+                out.entry(kind.to_string()).or_default();
+                open.insert(e.concept.as_str(), kind.to_string());
+            }
+            EventKind::Pass | EventKind::Fail => {
+                if let Some(kind) = open.remove(e.concept.as_str()) {
+                    let entry = out.entry(kind).or_default();
+                    entry.1 += 1;
+                    if e.kind == EventKind::Pass {
+                        entry.0 += 1;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// How many steps you steered yourself ("give me an example first").
+pub fn steered_steps(events: &[Event]) -> u32 {
+    events
+        .iter()
+        .filter(|e| e.kind == EventKind::Step && e.detail["steered"].as_bool() == Some(true))
+        .count() as u32
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -682,5 +879,175 @@ mod tests {
             slugify("  Conditional Independence! "),
             "conditional-independence"
         );
+    }
+    fn retract(id: i64, of: i64) -> Event {
+        Event {
+            reference: Some(of.to_string()),
+            ..ev(id, EventKind::Retracted)
+        }
+    }
+
+    fn step(id: i64, concept: &str, kind: &str) -> Event {
+        Event {
+            concept: concept.into(),
+            detail: json!({"kind": kind, "steered": false}),
+            ..ev(id, EventKind::Step)
+        }
+    }
+
+    fn on(concept: &str, e: Event) -> Event {
+        Event {
+            concept: concept.into(),
+            ..e
+        }
+    }
+
+    #[test]
+    fn a_retracted_claim_is_ignored() {
+        use ConceptState::*;
+        assert_eq!(st(&[ev(1, EventKind::Claim), retract(2, 1)]), Unknown);
+        // A later claim still counts.
+        assert_eq!(
+            st(&[
+                ev(1, EventKind::Claim),
+                retract(2, 1),
+                ev(3, EventKind::Claim)
+            ]),
+            Claimed
+        );
+    }
+
+    #[test]
+    fn a_retraction_never_drops_evidence() {
+        use ConceptState::*;
+        assert_eq!(st(&[pass(1, false), retract(2, 1)]), Shown);
+        assert_eq!(st(&[ev(1, EventKind::Fail), retract(2, 1)]), Shaky);
+        let v = concept_view(
+            &[misc(1, EventKind::MisconceptionShown, "m"), retract(2, 1)],
+            2000,
+        );
+        assert_eq!(v.open_misconceptions, vec!["m".to_string()]);
+        assert_eq!(st(&[ev(1, EventKind::Delegated), retract(2, 1)]), Delegated);
+        assert_eq!(
+            st(&[
+                pass(1, false),
+                ev(2, EventKind::ReviewMissed),
+                retract(3, 2)
+            ]),
+            Shaky
+        );
+    }
+
+    #[test]
+    fn a_retraction_of_an_unknown_id_does_nothing() {
+        use ConceptState::*;
+        assert_eq!(st(&[ev(1, EventKind::Claim), retract(2, 99)]), Claimed);
+        let junk = Event {
+            reference: Some("not-an-id".into()),
+            ..ev(2, EventKind::Retracted)
+        };
+        assert_eq!(st(&[ev(1, EventKind::Claim), junk]), Claimed);
+    }
+
+    #[test]
+    fn step_events_are_not_evidence() {
+        use ConceptState::*;
+        assert_eq!(st(&[step(1, "c", "wide-purpose")]), Unknown);
+        assert_eq!(
+            st(&[step(1, "c", "wide-purpose"), ev(2, EventKind::Claim)]),
+            Claimed
+        );
+        assert_eq!(EventKind::parse("retracted"), Some(EventKind::Retracted));
+        assert_eq!(
+            EventKind::parse(EventKind::Step.as_str()),
+            Some(EventKind::Step)
+        );
+    }
+
+    #[test]
+    fn step_stats_count_the_next_verdict() {
+        let one = step_stats(&[step(1, "a", "wide-purpose"), on("a", pass(2, false))]);
+        assert_eq!(one.get("wide-purpose"), Some(&(1, 1)));
+
+        let superseded = step_stats(&[
+            step(1, "a", "wide-example"),
+            step(2, "a", "narrow-mechanism"),
+            on("a", ev(3, EventKind::Fail)),
+        ]);
+        assert_eq!(superseded.get("narrow-mechanism"), Some(&(0, 1)));
+        assert_eq!(superseded.get("wide-example"), Some(&(0, 0)));
+
+        let unjudged = step_stats(&[step(1, "a", "wide-purpose"), on("b", pass(2, false))]);
+        assert_eq!(unjudged.get("wide-purpose"), Some(&(0, 0)));
+
+        // Only the first verdict after a step counts.
+        let twice = step_stats(&[
+            step(1, "a", "wide-purpose"),
+            on("a", pass(2, false)),
+            on("a", pass(3, false)),
+        ]);
+        assert_eq!(twice.get("wide-purpose"), Some(&(1, 1)));
+    }
+
+    #[test]
+    fn choose_step_follows_state_steer_and_history() {
+        let none = StepStats::new();
+        let view = |events: &[Event]| concept_view(events, 2000);
+        let kind = |v: &ConceptView, steer, stats: &StepStats| {
+            choose_step(v, steer, stats).map(|k| k.as_str())
+        };
+        assert_eq!(
+            kind(&view(&[]), None, &none).as_deref(),
+            Some("wide-purpose")
+        );
+        assert_eq!(
+            kind(&view(&[ev(1, EventKind::Fail)]), None, &none).as_deref(),
+            Some("narrow-mechanism")
+        );
+        let misconceived = view(&[pass(1, false), misc(2, EventKind::MisconceptionShown, "m")]);
+        assert_eq!(
+            choose_step(&misconceived, None, &none).map(|k| k.scope),
+            Some(Scope::Narrow)
+        );
+        assert_eq!(kind(&view(&[pass(1, false)]), None, &none), None);
+        assert_eq!(
+            kind(&view(&[]), Some(Angle::Example), &none).as_deref(),
+            Some("wide-example")
+        );
+
+        let mut stats = StepStats::new();
+        stats.insert("wide-example".into(), (2, 2));
+        stats.insert("wide-purpose".into(), (0, 2));
+        assert_eq!(
+            kind(&view(&[]), None, &stats).as_deref(),
+            Some("wide-example")
+        );
+        // A steer still wins.
+        assert_eq!(
+            kind(&view(&[]), Some(Angle::Mechanism), &stats).as_deref(),
+            Some("wide-mechanism")
+        );
+        // One judged step doesn't move it.
+        let mut thin = StepStats::new();
+        thin.insert("wide-example".into(), (1, 1));
+        assert_eq!(
+            kind(&view(&[]), None, &thin).as_deref(),
+            Some("wide-purpose")
+        );
+        // A tie goes to the default.
+        let mut tie = StepStats::new();
+        tie.insert("wide-example".into(), (1, 2));
+        tie.insert("wide-purpose".into(), (1, 2));
+        assert_eq!(
+            kind(&view(&[]), None, &tie).as_deref(),
+            Some("wide-purpose")
+        );
+        assert_eq!(
+            StepKind::parse("narrow-example")
+                .map(|k| k.as_str())
+                .as_deref(),
+            Some("narrow-example")
+        );
+        assert_eq!(StepKind::parse("tall-example"), None);
     }
 }

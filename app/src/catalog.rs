@@ -53,8 +53,15 @@ impl ModelCache {
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir)?;
         }
-        fs::write(&path, serde_json::to_string_pretty(self)?)
-            .with_context(|| format!("writing {}", path.display()))
+        // Written beside it and renamed over it, so a reader in this process
+        // (pickers read the cache on every draw) never sees half a file.
+        let tmp = path.with_extension(format!("json.{}.tmp", uuid::Uuid::new_v4().simple()));
+        fs::write(&tmp, serde_json::to_string_pretty(self)?)
+            .with_context(|| format!("writing {}", tmp.display()))?;
+        fs::rename(&tmp, &path).map_err(|e| {
+            let _ = fs::remove_file(&tmp);
+            anyhow::Error::new(e).context(format!("writing {}", path.display()))
+        })
     }
 
     pub fn is_stale(&self) -> bool {
@@ -215,16 +222,19 @@ fn keep(route: Route, id: &str) -> bool {
 
 /// Refreshes the model lists of endpoints that don't pin theirs, under
 /// `endpoint:<id>`. An endpoint that can't be reached keeps its last list.
+/// Returns how many endpoints answered.
 pub async fn refresh_endpoints(
     cfg: &crate::config::Config,
     creds: &Credentials,
     http: &reqwest::Client,
-) {
+) -> usize {
     let mut cache = ModelCache::load();
+    let mut answered = 0;
     for ep in cfg.endpoints.iter().filter(|e| e.models.is_empty()) {
         let key = ep.key.as_deref().and_then(|k| creds.stored(k));
         match crate::llm::chat::list_models(http, &ep.base_url, key.as_deref()).await {
             Ok(models) => {
+                answered += 1;
                 cache.providers.insert(
                     format!("endpoint:{}", ep.id),
                     models
@@ -242,11 +252,23 @@ pub async fn refresh_endpoints(
     if let Err(e) = cache.save() {
         tracing::warn!("{e:#}");
     }
+    answered
 }
 
 /// Refreshes the cache for these providers. Providers whose list can't be
-/// fetched keep their previous list.
+/// fetched keep their previous list; ones without a key or sign-in are
+/// dropped.
 pub async fn refresh(creds: &Credentials, http: &reqwest::Client, routes: &[Route]) -> ModelCache {
+    refresh_counted(creds, http, routes).await.0
+}
+
+/// [`refresh`], also returning how many providers listed their models.
+async fn refresh_counted(
+    creds: &Credentials,
+    http: &reqwest::Client,
+    routes: &[Route],
+) -> (ModelCache, usize) {
+    let mut listed = 0;
     let mut cache = ModelCache::load();
     for &route in routes {
         let key = if route == Route::Chatgpt {
@@ -271,6 +293,7 @@ pub async fn refresh(creds: &Credentials, http: &reqwest::Client, routes: &[Rout
         };
         match list_models(http, route, &key).await {
             Ok(models) => {
+                listed += 1;
                 cache
                     .providers
                     .insert(route.provider_id().to_string(), models);
@@ -282,7 +305,104 @@ pub async fn refresh(creds: &Credentials, http: &reqwest::Client, routes: &[Rout
     if let Err(e) = cache.save() {
         tracing::warn!("{e:#}");
     }
-    cache
+    (cache, listed)
+}
+
+/// What the refresh at startup fetches: nothing while the cache is fresh.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RefreshPlan {
+    /// Providers to list. Those without a key or sign-in cost no request:
+    /// they are only dropped from the cache.
+    pub cloud: Vec<Route>,
+    /// How many of `cloud` have a key or sign-in.
+    pub cloud_signed_in: usize,
+    /// Endpoints that list their own models (no `models` in config).
+    pub endpoints: usize,
+}
+
+impl RefreshPlan {
+    pub fn is_empty(&self) -> bool {
+        self.cloud.is_empty() && self.endpoints == 0
+    }
+}
+
+/// Plans the startup refresh. Nothing when the cache is fresh
+/// ([`MAX_AGE`]); no provider (cloud) request with `local_only` or
+/// `discover: false`, only the endpoints. `signed_in` says which providers
+/// have a key or sign-in.
+pub fn plan_refresh(
+    cfg: &crate::config::Config,
+    cache: &ModelCache,
+    signed_in: impl Fn(Route) -> bool,
+) -> RefreshPlan {
+    if !cache.is_stale() {
+        return RefreshPlan::default();
+    }
+    let endpoints = cfg.endpoints.iter().filter(|e| e.models.is_empty()).count();
+    if !cfg.discover || cfg.local_only {
+        return RefreshPlan {
+            endpoints,
+            ..RefreshPlan::default()
+        };
+    }
+    let cloud_signed_in = Route::DISCOVERED
+        .into_iter()
+        .filter(|&r| signed_in(r))
+        .count();
+    let cached = Route::DISCOVERED
+        .into_iter()
+        .any(|r| cache.providers.contains_key(r.provider_id()));
+    RefreshPlan {
+        cloud: if cloud_signed_in > 0 || cached {
+            Route::DISCOVERED.to_vec()
+        } else {
+            Vec::new()
+        },
+        cloud_signed_in,
+        endpoints,
+    }
+}
+
+/// Whether a provider has a key or a ChatGPT sign-in, without a request.
+pub fn signed_in(creds: &Credentials, route: Route) -> bool {
+    match route {
+        Route::Chatgpt => creds.chatgpt().signed_in(),
+        _ => creds.lookup(route).is_some(),
+    }
+}
+
+/// How a planned refresh went.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RefreshOutcome {
+    /// Providers and endpoints asked for their list.
+    pub asked: usize,
+    /// Those that answered with one.
+    pub listed: usize,
+}
+
+/// Runs `plan`. Errors are logged, not returned: a provider that can't be
+/// reached keeps its last list.
+pub async fn run_plan(
+    cfg: &crate::config::Config,
+    creds: &Credentials,
+    plan: &RefreshPlan,
+) -> RefreshOutcome {
+    let http = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
+        .build()
+        .unwrap_or_default();
+    let mut outcome = RefreshOutcome {
+        asked: plan.cloud_signed_in + plan.endpoints,
+        listed: 0,
+    };
+    if !plan.cloud.is_empty() {
+        outcome.listed += refresh_counted(creds, &http, &plan.cloud).await.1;
+    }
+    if plan.endpoints > 0 {
+        outcome.listed += refresh_endpoints(cfg, creds, &http).await;
+    }
+    outcome
 }
 
 #[cfg(test)]
@@ -328,6 +448,57 @@ mod tests {
         assert_eq!(entries[0].route, Route::Anthropic);
         assert_eq!(entries[0].model, "claude-sonnet-5-5");
         assert!(!cache.is_stale() || cache.fetched_at == 0);
+    }
+
+    #[test]
+    fn startup_refresh_respects_local_only_and_discover() {
+        use crate::config::{Config, Endpoint};
+        let lab = Endpoint {
+            id: "lab".into(),
+            label: None,
+            base_url: "http://gpu-box:8000/v1".into(),
+            key: None,
+            models: vec![],
+            extra: None,
+        };
+        let stale = ModelCache::default();
+        let all = |_: Route| true;
+        let plan = plan_refresh(&Config::default(), &stale, all);
+        assert_eq!(plan.cloud, Route::DISCOVERED.to_vec());
+        assert_eq!(plan.cloud_signed_in, 3);
+
+        // Local only: the endpoints, no provider request.
+        let local = Config {
+            local_only: true,
+            endpoints: vec![lab.clone()],
+            ..Config::default()
+        };
+        let plan = plan_refresh(&local, &stale, all);
+        assert!(plan.cloud.is_empty());
+        assert_eq!(plan.endpoints, 1);
+        let alone = Config {
+            local_only: true,
+            ..Config::default()
+        };
+        assert!(plan_refresh(&alone, &stale, all).is_empty());
+
+        // Discovery off: no provider request either.
+        let off = Config {
+            discover: false,
+            ..Config::default()
+        };
+        assert!(plan_refresh(&off, &stale, all).is_empty());
+
+        // Nothing signed in and nothing cached: nothing to do.
+        assert!(plan_refresh(&Config::default(), &stale, |_| false).is_empty());
+
+        // A fresh cache isn't refreshed again.
+        let mut fresh = ModelCache {
+            fetched_at: now(),
+            ..ModelCache::default()
+        };
+        fresh.providers.insert("openai".into(), vec![]);
+        assert!(plan_refresh(&Config::default(), &fresh, all).is_empty());
     }
 
     #[tokio::test]

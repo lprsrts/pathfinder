@@ -71,6 +71,69 @@ fn line(l: Line) -> &'static str {
         FindHits => "**{n}** pour {terms} :",
         FindNone => "Aucune ligne de ce dossier ne contient {terms}.",
         WebNone => "Rien en ligne ne correspond à {terms}.",
+        ShowKnown => {
+            "Noté : tu connais déjà **{title}**. Une affirmation, pas une preuve. `/undo` (Esc) l'annule."
+        }
+        ShowTell => {
+            "Je te le dis, comme demandé. Noté comme dit, jamais comme compris. Esc avant l'arrivée annule."
+        }
+        ShowHandoff => {
+            "Confier **{title}** à l'agent ? Il travaille dans une copie de staging et tu relis le résultat. Enter lance · Esc annule."
+        }
+        ShowHandoffInPlace => {
+            "Confier **{title}** à l'agent ? Ce n'est pas un dépôt git : il modifie tes fichiers directement, sans staging ni relecture vérifiée. Enter lance · Esc annule."
+        }
+        ShowDelegate => {
+            "Déléguer **{title}** sans le comprendre ? Ce sera noté comme délégué : tu ne te portes pas garant du résultat. Enter lance · Esc annule."
+        }
+        ShowVerdict => {
+            "Juger ceci comme ton verdict sur le candidat ? « {words} » Enter juge · Esc le garde comme note."
+        }
+        NotRunVerdict => "Pas jugé comme verdict : gardé comme note.",
+        NotRunHandoff => "Non lancé : **{title}** n'a pas été confié à l'agent.",
+        NotRunDelegate => "Non lancé : **{title}** n'a pas été délégué.",
+        NotRunStale => "Non lancé : ce qui attendait ton accord ne s'applique plus.",
+        AskWhich => {
+            "Tu voulais dire {choices} ? Rien n'est noté tant que tu ne le dis pas. Sinon, continue."
+        }
+        AskKnown => "que tu connais déjà **{title}** (`/known`)",
+        AskTell => "qu'on te le dise (`/tell <question>`)",
+        AskAgent => "confier la partie à l'agent (`/handoff` ou `/delegate`)",
+        Or => " ou ",
+        Undone => {
+            "Annulé : ton affirmation sur **{title}** est retirée. Le dossier la garde comme retirée."
+        }
+        NothingToUndo => {
+            "Rien à annuler. Seule une affirmation de ta dernière étape peut être retirée. Un verdict jugé, une relecture, une remise, une délégation et une réponse qu'on t'a donnée restent."
+        }
+        NothingWaiting => "Rien n'attend ton accord.",
+        NextStep => "Ensuite : {at} · {question}",
+        NextStepNoPlace => {
+            "Ensuite : aucun endroit de tes sources ne nomme encore **{concept}** ; `/find <terms>` les parcourt. · {question}"
+        }
+        StepWideExample => "Trouve un endroit où {concept} est utilisé. Qu'y fait-il ?",
+        StepWidePurpose => "À quoi sert {concept} dans cette partie, avec tes mots ?",
+        StepWideMechanism => "Comment fonctionne {concept}, étape par étape ?",
+        StepNarrowExample => {
+            "Choisis une ligne où {concept} compte. Que changerait-il s'il était différent ?"
+        }
+        StepNarrowPurpose => {
+            "Pourquoi {concept} est-il nécessaire exactement là, et qu'est-ce qui casse sans lui ?"
+        }
+        StepNarrowMechanism => {
+            "Suis {concept} étape par étape : que se passe-t-il d'abord, et ensuite ?"
+        }
+        Horizon => "Horizon : {what}.",
+        HorizonNeeds => "dépend de {parts}",
+        HorizonLeads => "mène à {parts}",
+        EvidenceRatio => "Réussites : {passes} · affirmations : {claims}.",
+        ClaimWithdrawn => "Affirmation sur **{concept}** retirée ({date}).",
+        StepHistory => "Comment tu es arrivé ici : {kinds}.",
+        StepKindRate => "{kind} {passes} sur {judged} ont mené à une réussite",
+        SteeredTimes => "orienté par toi {n} fois",
+        StepHistoryNote => {
+            "C'est tout ce que Pathfinder garde sur ta façon d'apprendre, dans le dossier local de ce répertoire."
+        }
     }
 }
 

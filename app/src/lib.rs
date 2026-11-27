@@ -18,6 +18,7 @@ pub mod llm;
 pub mod operator;
 pub mod options;
 pub mod paths;
+pub mod picker;
 pub mod providers;
 pub mod runtime;
 pub mod secrets;
@@ -29,6 +30,19 @@ pub mod understanding;
 pub mod validate;
 pub mod web;
 pub mod workspace;
+
+/// Whether [`open_browser`] opens anything (`PATHFINDER_NO_BROWSER` unset).
+pub fn browser_opens() -> bool {
+    envvar::get_os("PATHFINDER_NO_BROWSER").is_none()
+}
+
+/// Whether this is a remote shell, where a browser on this machine is
+/// usually not the one in front of you.
+pub fn over_ssh() -> bool {
+    ["SSH_CONNECTION", "SSH_TTY", "SSH_CLIENT"]
+        .iter()
+        .any(|v| std::env::var_os(v).is_some())
+}
 
 /// Opens a URL in the default browser, unless `PATHFINDER_NO_BROWSER` is set
 /// (e.g. over SSH), in which case the printed URL is used instead.

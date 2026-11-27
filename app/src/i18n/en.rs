@@ -71,6 +71,65 @@ fn line(l: Line) -> &'static str {
         FindHits => "**{n}** for {terms}:",
         FindNone => "No line in this workspace contains {terms}.",
         WebNone => "Nothing online matched {terms}.",
+        ShowKnown => {
+            "Recorded: you already know **{title}**. A claim, not evidence. `/undo` (Esc) takes it back."
+        }
+        ShowTell => {
+            "Telling you, as you asked. Recorded as told, never as understood. Esc before it arrives cancels it."
+        }
+        ShowHandoff => {
+            "Hand **{title}** to the agent? It works in a staging copy and you review the result. Enter runs · Esc cancels."
+        }
+        ShowHandoffInPlace => {
+            "Hand **{title}** to the agent? This isn't a git repository, so it edits your files directly, with no staging or checked review. Enter runs · Esc cancels."
+        }
+        ShowDelegate => {
+            "Delegate **{title}** without understanding it? It's recorded as delegated: you won't vouch for the result. Enter runs · Esc cancels."
+        }
+        ShowVerdict => {
+            "Judge this as your verdict on the candidate? “{words}” Enter judges · Esc keeps it as a note."
+        }
+        NotRunVerdict => "Not judged as a verdict: kept as a note.",
+        NotRunHandoff => "Not run: **{title}** wasn't handed to the agent.",
+        NotRunDelegate => "Not run: **{title}** wasn't delegated.",
+        NotRunStale => "Not run: what waited for your OK no longer applies.",
+        AskWhich => {
+            "Did you mean {choices}? Nothing is recorded until you say. Otherwise just go on."
+        }
+        AskKnown => "to claim you already know **{title}** (`/known`)",
+        AskTell => "to be told (`/tell <question>`)",
+        AskAgent => "to give the part to the agent (`/handoff` or `/delegate`)",
+        Or => " or ",
+        Undone => {
+            "Undone: your claim on **{title}** is withdrawn. The record keeps it as withdrawn."
+        }
+        NothingToUndo => {
+            "Nothing to undo. Only a claim from your last step can be taken back. A judged verdict, a review, a handoff, a delegation and an answer you were told stay as they are."
+        }
+        NothingWaiting => "Nothing is waiting for your OK.",
+        NextStep => "Next: {at} · {question}",
+        NextStepNoPlace => {
+            "Next: no place in your sources names **{concept}** yet; `/find <terms>` searches them. · {question}"
+        }
+        StepWideExample => "Find one place where {concept} is used. What does it do there?",
+        StepWidePurpose => "What is {concept} for in this part, in your own words?",
+        StepWideMechanism => "How does {concept} work, step by step?",
+        StepNarrowExample => {
+            "Pick one line where {concept} matters. What would change if it were different?"
+        }
+        StepNarrowPurpose => "Why is {concept} needed exactly there, and what breaks without it?",
+        StepNarrowMechanism => "Trace {concept} step by step: what happens first, and what next?",
+        Horizon => "Horizon: {what}.",
+        HorizonNeeds => "needs {parts}",
+        HorizonLeads => "leads to {parts}",
+        EvidenceRatio => "Passes: {passes} · claims: {claims}.",
+        ClaimWithdrawn => "Claim on **{concept}** withdrawn ({date}).",
+        StepHistory => "How you got here: {kinds}.",
+        StepKindRate => "{kind} {passes} of {judged} led to a pass",
+        SteeredTimes => "steered by you {n} times",
+        StepHistoryNote => {
+            "That is all Pathfinder keeps about how you learn, in this folder's local record."
+        }
     }
 }
 

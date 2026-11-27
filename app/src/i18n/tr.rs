@@ -71,6 +71,65 @@ fn line(l: Line) -> &'static str {
         FindHits => "**{n}** sonuç, {terms}:",
         FindNone => "Bu klasörde {terms} içeren satır yok.",
         WebNone => "Çevrimiçi hiçbir şey {terms} ile eşleşmedi.",
+        ShowKnown => {
+            "Kaydedildi: **{title}** konusunu zaten biliyorsun. Bir iddia, kanıt değil. `/undo` (Esc) geri alır."
+        }
+        ShowTell => {
+            "İstediğin gibi söylüyorum. Söylendi olarak kaydedilir, asla anlaşıldı olarak değil. Gelmeden önce Esc iptal eder."
+        }
+        ShowHandoff => {
+            "**{title}** ajana verilsin mi? Bir hazırlık kopyasında çalışır ve sonucu sen incelersin. Enter çalıştırır · Esc iptal eder."
+        }
+        ShowHandoffInPlace => {
+            "**{title}** ajana verilsin mi? Burası bir git deposu değil: dosyalarını doğrudan düzenler, hazırlık kopyası ve kontrollü inceleme olmadan. Enter çalıştırır · Esc iptal eder."
+        }
+        ShowDelegate => {
+            "**{title}** anlamadan devredilsin mi? Devredildi olarak kaydedilir: sonuca kefil olmazsın. Enter çalıştırır · Esc iptal eder."
+        }
+        ShowVerdict => {
+            "Bu, aday hakkındaki kararın olarak değerlendirilsin mi? “{words}” Enter değerlendirir · Esc not olarak tutar."
+        }
+        NotRunVerdict => "Karar olarak değerlendirilmedi: not olarak tutuldu.",
+        NotRunHandoff => "Çalıştırılmadı: **{title}** ajana verilmedi.",
+        NotRunDelegate => "Çalıştırılmadı: **{title}** devredilmedi.",
+        NotRunStale => "Çalıştırılmadı: onayını bekleyen şey artık geçerli değil.",
+        AskWhich => {
+            "Şunu mu demek istedin: {choices}? Sen söyleyene kadar hiçbir şey kaydedilmez. Yoksa devam et."
+        }
+        AskKnown => "**{title}** konusunu zaten bildiğin (`/known`)",
+        AskTell => "sana söylenmesi (`/tell <question>`)",
+        AskAgent => "bölümün ajana verilmesi (`/handoff` veya `/delegate`)",
+        Or => " ya da ",
+        Undone => {
+            "Geri alındı: **{title}** hakkındaki iddian çekildi. Kayıt onu çekilmiş olarak tutar."
+        }
+        NothingToUndo => {
+            "Geri alınacak bir şey yok. Yalnızca son adımındaki bir iddia geri alınabilir. Değerlendirilmiş bir karar, bir inceleme, bir devir, bir anlamadan devir ve sana söylenen bir yanıt olduğu gibi kalır."
+        }
+        NothingWaiting => "Onayını bekleyen bir şey yok.",
+        NextStep => "Sıradaki: {at} · {question}",
+        NextStepNoPlace => {
+            "Sıradaki: kaynaklarında henüz **{concept}** geçen bir yer yok; `/find <terms>` onlarda arar. · {question}"
+        }
+        StepWideExample => "{concept} kavramının kullanıldığı bir yer bul. Orada ne yapıyor?",
+        StepWidePurpose => "{concept} bu bölümde ne işe yarıyor, kendi sözlerinle?",
+        StepWideMechanism => "{concept} adım adım nasıl çalışıyor?",
+        StepNarrowExample => {
+            "{concept} kavramının önemli olduğu bir satır seç. Farklı olsaydı ne değişirdi?"
+        }
+        StepNarrowPurpose => "{concept} neden tam orada gerekli ve o olmadan ne bozulur?",
+        StepNarrowMechanism => "{concept} kavramını adım adım izle: önce ne olur, sonra ne?",
+        Horizon => "Ufuk: {what}.",
+        HorizonNeeds => "gerekenler: {parts}",
+        HorizonLeads => "şuna götürür: {parts}",
+        EvidenceRatio => "Geçilen: {passes} · iddia: {claims}.",
+        ClaimWithdrawn => "**{concept}** hakkındaki iddia çekildi ({date}).",
+        StepHistory => "Buraya nasıl geldin: {kinds}.",
+        StepKindRate => "{kind}: {judged} adımdan {passes} tanesi geçişe götürdü",
+        SteeredTimes => "{n} kez sen yönlendirdin",
+        StepHistoryNote => {
+            "Pathfinder'ın nasıl öğrendiğine dair tuttuğu her şey bu, bu klasörün yerel kaydında."
+        }
     }
 }
 

@@ -69,6 +69,53 @@ fn line(l: Line) -> &'static str {
         FindHits => "**{n}** 条匹配 {terms}：",
         FindNone => "此文件夹中没有包含 {terms} 的行。",
         WebNone => "网上没有与 {terms} 匹配的内容。",
+        ShowKnown => "已记录：你已经掌握 **{title}**。这是声明，不是证据。`/undo`（Esc）可撤回。",
+        ShowTell => "按你的要求告诉你。记为“被告知”，绝不记为“已理解”。答案到达前按 Esc 可取消。",
+        ShowHandoff => {
+            "把 **{title}** 交给智能体？它在暂存副本里工作，结果由你审查。Enter 执行 · Esc 取消。"
+        }
+        ShowHandoffInPlace => {
+            "把 **{title}** 交给智能体？这里不是 git 仓库：它会直接修改你的文件，没有暂存，也没有经检查的审查。Enter 执行 · Esc 取消。"
+        }
+        ShowDelegate => {
+            "在未理解的情况下交出 **{title}**？会记为已交出：你不为结果担保。Enter 执行 · Esc 取消。"
+        }
+        ShowVerdict => "把这句作为你对候选的判断来评判？“{words}” Enter 评判 · Esc 保留为笔记。",
+        NotRunVerdict => "未作为判断评判：已保留为笔记。",
+        NotRunHandoff => "未执行：**{title}** 没有交给智能体。",
+        NotRunDelegate => "未执行：**{title}** 没有交出。",
+        NotRunStale => "未执行：等待你确认的事项已不再适用。",
+        AskWhich => "你是指{choices}？在你说之前不会记录任何内容。否则请继续。",
+        AskKnown => "声明你已掌握 **{title}**（`/known`）",
+        AskTell => "让我直接告诉你（`/tell <question>`）",
+        AskAgent => "把这部分交给智能体（`/handoff` 或 `/delegate`）",
+        Or => "，还是",
+        Undone => "已撤回：你对 **{title}** 的声明已撤回。记录中会保留为已撤回。",
+        NothingToUndo => {
+            "没有可撤回的。只有上一步的声明可以撤回。已评判的判断、审查、移交、未理解的交出以及你被告知的答案都保持不变。"
+        }
+        NothingWaiting => "没有等待你确认的事项。",
+        NextStep => "下一步：{at} · {question}",
+        NextStepNoPlace => {
+            "下一步：你的资料中还没有提到 **{concept}** 的地方；`/find <terms>` 可以搜索。 · {question}"
+        }
+        StepWideExample => "找一处用到 {concept} 的地方。它在那里起什么作用？",
+        StepWidePurpose => "在这部分里，{concept} 是做什么用的？用你自己的话说。",
+        StepWideMechanism => "{concept} 是怎样一步步工作的？",
+        StepNarrowExample => "挑一行 {concept} 起作用的地方。如果它不同，会改变什么？",
+        StepNarrowPurpose => "为什么恰好在那里需要 {concept}？没有它会出什么问题？",
+        StepNarrowMechanism => "一步步追踪 {concept}：先发生什么，接着发生什么？",
+        Horizon => "前景：{what}。",
+        HorizonNeeds => "依赖 {parts}",
+        HorizonLeads => "通向 {parts}",
+        EvidenceRatio => "通过：{passes} · 声明：{claims}。",
+        ClaimWithdrawn => "对 **{concept}** 的声明已撤回（{date}）。",
+        StepHistory => "你是怎么走到这里的：{kinds}。",
+        StepKindRate => "{kind} {judged} 次中有 {passes} 次带来通过",
+        SteeredTimes => "由你引导 {n} 次",
+        StepHistoryNote => {
+            "这就是 Pathfinder 关于你学习方式所保存的全部内容，存在此文件夹的本地记录中。"
+        }
     }
 }
 
