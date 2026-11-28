@@ -76,7 +76,7 @@ impl Runtime {
             .get(&target)
             .cloned()
             .unwrap_or_else(|| understanding::concept_view(&[], understanding::now()));
-        let Some(kind) = understanding::choose_step(&view, steer, &stats) else {
+        let Some(mut kind) = understanding::choose_step(&view, steer, &stats) else {
             return part_step(session);
         };
         let concept = concepts
@@ -89,10 +89,27 @@ impl Runtime {
                 aliases: vec![],
                 created_by: "map".into(),
             });
+        // Avoid repeating the exact same fixed `Next:` question verbatim
+        // once the user has already seen or answered a step on this
+        // concept/kind without advancing.
+        let fixed_for =
+            |k: StepKind| i18n::line(lang, step_question(k)).replace("{concept}", &concept.label);
+        if steer.is_none()
+            && question.is_none()
+            && let Some(prev) = session
+                .last_step
+                .as_ref()
+                .filter(|l| l.concept == target && l.kind == kind.as_str())
+        {
+            let fixed = fixed_for(kind);
+            if prev.repeats >= 1 || (!prev.question.is_empty() && prev.question != fixed) {
+                kind.angle = next_angle(kind.angle);
+            }
+        }
         let model_question = question.is_some();
-        let question = question.map(str::to_string).unwrap_or_else(|| {
-            i18n::line(lang, step_question(kind)).replace("{concept}", &concept.label)
-        });
+        let question = question
+            .map(str::to_string)
+            .unwrap_or_else(|| fixed_for(kind));
         let line = match place(&session.cwd, &concept, kind.scope, &part, &session.map) {
             Some(at) => i18n::line(lang, i18n::Line::NextStep)
                 .replace("{at}", &at)
@@ -101,6 +118,11 @@ impl Runtime {
                 .replace("{concept}", &concept.label)
                 .replace("{question}", &question),
         };
+        let prev_repeats = session
+            .last_step
+            .as_ref()
+            .filter(|l| l.concept == target && l.kind == kind.as_str())
+            .map_or(0, |l| l.repeats.saturating_add(1));
         let repeated = session
             .last_step
             .as_ref()
@@ -120,12 +142,24 @@ impl Runtime {
                         })),
                 ],
             );
-            session.last_step = Some(crate::domain::StepShown {
-                concept: target,
-                kind: kind.as_str(),
-            });
         }
+        session.last_step = Some(crate::domain::StepShown {
+            concept: target,
+            kind: kind.as_str(),
+            question,
+            repeats: if fresh || !repeated { 0 } else { prev_repeats },
+        });
         Some(line)
+    }
+}
+
+/// Rotates to the next angle when a fixed step question would otherwise
+/// repeat verbatim.
+fn next_angle(a: Angle) -> Angle {
+    match a {
+        Angle::Purpose => Angle::Mechanism,
+        Angle::Mechanism => Angle::Example,
+        Angle::Example => Angle::Purpose,
     }
 }
 

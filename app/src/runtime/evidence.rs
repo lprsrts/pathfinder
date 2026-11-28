@@ -144,14 +144,25 @@ impl Runtime {
         }
         let _ = shown;
         // A question gets its sources; a log entry a short acknowledgement
-        // of what you did, adding nothing (§11), and both end with the
+        // of what you did, adding nothing (§11), plus what is still
+        // missing or why it didn't advance the part, and both end with the
         // next step (§16).
         decision.reply = if crate::sources::is_question(text) {
             self.cite_reply(session, text, files, &sink).await?
-        } else if let Some(ack) = plain_ack(&decision.ack, text, &part.title) {
-            ack
         } else {
-            i18n::line(session.language.as_deref(), i18n::Line::Logged).to_string()
+            let mut reply = if let Some(ack) = plain_ack(&decision.ack, text, &part.title) {
+                ack
+            } else {
+                i18n::line(session.language.as_deref(), i18n::Line::Logged).to_string()
+            };
+            if let Some(missing) = one_missing(&decision.missing) {
+                reply.push_str("\n\n");
+                reply.push_str(&missing);
+            } else if matches!(gate, gate::GateMode::Open) && part.log.len() >= 2 {
+                reply.push_str("\n\n");
+                reply.push_str(&self.log_progress_note(session, &part));
+            }
+            reply
         };
         // A map change is the Tutor's words too (its brief and part titles):
         // while a secret is active it passes the Gate with the reply, or is
@@ -1252,6 +1263,51 @@ fn plain_ack(ack: &str, text: &str, title: &str) -> Option<String> {
         !ACK_WORDS.contains(&w.as_str()) && !yours.iter().any(|y| super::refer::alike(&w, y))
     });
     (!adds).then(|| ack.to_string())
+}
+
+/// A short note on what is still missing from a log entry, if the model
+/// wrote one: single line, at most `QUESTION_MAX` chars, at most one
+/// sentence.
+fn one_missing(m: &str) -> Option<String> {
+    let m = m.trim();
+    (!m.is_empty()
+        && !m.contains('\n')
+        && m.chars().count() <= QUESTION_MAX
+        && !more_than_one_sentence(m))
+    .then(|| m.to_string())
+}
+
+impl Runtime {
+    /// Explains why a log entry didn't advance the part on its own and
+    /// which core concepts are still unshown, when the model gave no
+    /// specific `missing` note.
+    fn log_progress_note(&self, session: &Session, part: &Part) -> String {
+        let open: Vec<String> = if part.concepts.is_empty() {
+            Vec::new()
+        } else if let Ok(views) = self.concept_views(session, &part.concepts) {
+            let labels = self.labels(session);
+            part.concepts
+                .iter()
+                .filter(|c| !crate::understanding::state_of(&views, c).has_evidence())
+                .map(|c| {
+                    format!(
+                        "**{}**",
+                        labels.get(c).cloned().unwrap_or_else(|| c.clone())
+                    )
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if open.is_empty() {
+            "Logged notes record your thinking without advancing this part on their own; explain the whole part in your own words when you're ready for a check.".to_string()
+        } else {
+            format!(
+                "Logged notes record your thinking without advancing this part on their own (still open: {}). Explain the whole part in your own words when you're ready for a check.",
+                open.join(", ")
+            )
+        }
+    }
 }
 
 /// The Tutor's open question, if it is one: a single sentence ending in

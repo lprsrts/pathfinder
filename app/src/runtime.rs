@@ -1097,8 +1097,9 @@ For anything but `log`, set `reply` to "" and `map_change` to null: Pathfinder t
 
 For `log`, set `reply` to "ok". Pathfinder never answers in its own words: a question gets pointers into the sources, found separately. For `log`, also write, in the user's language:
 - `ack`: for a log entry (not a question), one short sentence, at most 20 words, saying "you", that names what they just did in their own terms ("You linked Maxwell's equations to the Helmholtz equation."). It adds nothing: no fact, no explanation, no correction, no praise, no judgment of whether they are right, no hint. "" for a question.
+- `missing`: for a log entry (not a question), if the part still has uncovered aspects or their answer left something out, one short sentence, at most 25 words, naming what is still missing or unaddressed for this part — without giving the answer, judging correctness, or hinting at a waiting candidate. "" for a question or if nothing is missing.
 - `question`: one open question for their next step, at most 25 words, written from this part and the place in its sources they should look next (the part's note, the file and page you read). It makes them think further about what they wrote, never contains or hints at the answer, and reads as a natural, grammatical sentence (don't paste a long name into a template). "" if you can't write one.
-- In `ack` and `question`, write math as plain text or Unicode (x², √, ≤, μᵢ), never LaTeX.
+- In `ack`, `missing` and `question`, write math as plain text or Unicode (x², √, ≤, μᵢ), never LaTeX.
 
 If a `log` message reveals the map is wrong (a missing dependency, a part that doesn't belong, a wrong edge, or a new constraint that changes the task's scope), propose a change in `map_change`; the user accepts or rejects it. Otherwise set it to null. A change has `brief` (one sentence to the user, saying "you"), `goal` (only when the message changes what the task is, e.g. a new purpose or scope: the new goal as one sentence starting with a verb, not in first person; otherwise null), `parts` (to add, or update by id: id, title, note, depends_on; new ids are short hyphenated slugs of at most 12 characters) and `remove` (ids of parts with no work yet).
 
@@ -1112,9 +1113,9 @@ For `log`, also record what the message is about, without judging it:
 Call `read` before writing your JSON if a file matters: `reply` ends your turn. If they ask about a figure, diagram, slide or page, open the file and look at that page first (with `view`, or your file tool for PDFs and images); never say you can't see a file that is attached or in the workspace.
 
 Return ONLY a JSON object:
-{"intent": "log", "part": null, "reply": "ok", "ack": "...", "question": "...", "map_change": null, "concepts": [], "misconception": null}
+{"intent": "log", "part": null, "reply": "ok", "ack": "...", "missing": "...", "question": "...", "map_change": null, "concepts": [], "misconception": null}
 or, with a change:
-{"intent": "log", "part": null, "reply": "ok", "ack": "...", "question": "...", "map_change": {"brief": "...", "goal": null, "parts": [], "remove": []}, "concepts": [], "misconception": null}"#;
+{"intent": "log", "part": null, "reply": "ok", "ack": "...", "missing": "...", "question": "...", "map_change": {"brief": "...", "goal": null, "parts": [], "remove": []}, "concepts": [], "misconception": null}"#;
 
 const CANDIDATE_SYSTEM: &str = r#"You make a candidate for the user to judge. Their judgment decides whether they understand the part well enough to direct an agent and tell whether its result is right.
 

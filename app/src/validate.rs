@@ -258,6 +258,7 @@ mod tests {
             part: None,
             reply: String::new(),
             ack: String::new(),
+            missing: String::new(),
             question: String::new(),
             map_change: None,
             concepts: vec![],
@@ -295,6 +296,7 @@ mod tests {
             part: None,
             reply: "Noted.".into(),
             ack: String::new(),
+            missing: String::new(),
             question: String::new(),
             map_change: Some(MapChange {
                 goal: None,
@@ -316,6 +318,7 @@ mod tests {
             part: None,
             reply: "Noted.".into(),
             ack: String::new(),
+            missing: String::new(),
             question: String::new(),
             map_change: Some(MapChange {
                 goal: None,

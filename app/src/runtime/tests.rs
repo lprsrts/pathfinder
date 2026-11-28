@@ -5097,3 +5097,83 @@ async fn delegating_a_part_does_not_mark_a_shared_concept() {
     let card = &s.history.last().unwrap().content;
     assert!(!card.contains("(delegated)"), "{card}");
 }
+
+#[tokio::test]
+async fn answering_a_specific_next_question_never_loops_silently_to_logged_and_same_next() {
+    let (rt, _) = runtime(
+        FakeEngine::new(vec![
+            (ReadOnly, S1, ONBOARD_READY),
+            (ReadOnly, S2, MAP_NOTES),
+            (
+                ReadOnly,
+                S1,
+                r#"{"intent":"log","reply":"ok","ack":"","missing":"","question":"On line 30, how does the table map a name to a handler?","map_change":null,"concepts":["dispatch"],"misconception":null}"#,
+            ),
+            (ReadOnly, S2, "{}"),
+            (ReadOnly, S1, &log_reply("ok")),
+        ]),
+        false,
+    );
+    write_notes(&rt);
+    let (rt, _) = with_script(rt, vec![says("log", 0.9), says("log", 0.9)]);
+    let entered = turn(&rt, "goal").await;
+    assert!(
+        entered
+            .reply
+            .contains("What role does “Dispatch by name” play in this part? Put it in your own words."),
+        "{}",
+        entered.reply
+    );
+
+    // User asks a question and gets "Where to look:" plus a specific Next question.
+    turn(&rt, "How does dispatch find the handler?").await;
+    let q_reply = session(&rt).history.last().unwrap().content.clone();
+    assert!(
+        q_reply.contains("On line 30, how does the table map a name to a handler?"),
+        "{q_reply}"
+    );
+
+    // User answers that specific question directly; even with empty model
+    // ack/missing/question, the harness must explain why it didn't advance
+    // and must not repeat the verbatim StepWidePurpose prompt.
+    turn(&rt, "It looks up the name in the table and calls the handler").await;
+    let reply = session(&rt).history.last().unwrap().content.clone();
+    assert!(
+        reply.contains("still open: **Dispatch by name**"),
+        "{reply}"
+    );
+    assert!(!reply.contains("`/"), "{reply}");
+    assert!(
+        !reply.contains("What role does “Dispatch by name” play in this part?"),
+        "must not repeat the verbatim Next question: {reply}"
+    );
+    assert!(
+        reply.ends_with("· How does “Dispatch by name” work here, step by step?"),
+        "{reply}"
+    );
+}
+
+#[tokio::test]
+async fn log_reply_missing_field_explains_what_is_still_unaddressed() {
+    let (rt, _) = runtime(
+        FakeEngine::new(vec![
+            (ReadOnly, S1, ONBOARD_READY),
+            (ReadOnly, S2, MAP_NOTES),
+            (
+                ReadOnly,
+                S1,
+                r#"{"intent":"log","reply":"ok","ack":"","missing":"You haven't explained what happens when a name is missing from the table yet.","question":"","map_change":null,"concepts":["dispatch"],"misconception":null}"#,
+            ),
+        ]),
+        false,
+    );
+    write_notes(&rt);
+    let (rt, _) = with_script(rt, vec![says("log", 0.9)]);
+    turn(&rt, "goal").await;
+    turn(&rt, "The router keeps a table").await;
+    let reply = session(&rt).history.last().unwrap().content.clone();
+    assert!(
+        reply.contains("You haven't explained what happens when a name is missing from the table yet."),
+        "{reply}"
+    );
+}

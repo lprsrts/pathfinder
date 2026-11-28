@@ -716,6 +716,14 @@ pub struct StepShown {
     pub concept: String,
     /// `wide-example`, `narrow-mechanism`, …
     pub kind: String,
+    /// The question text shown on that step, so the next turn never
+    /// repeats the exact same question verbatim.
+    #[serde(default)]
+    pub question: String,
+    /// How many consecutive times this `(concept, kind)` was shown
+    /// without advancing.
+    #[serde(default)]
+    pub repeats: u32,
 }
 
 impl Session {
@@ -945,6 +953,11 @@ pub struct LogReply {
     /// terms, adding nothing (§11). Empty for a question.
     #[serde(default)]
     pub ack: String,
+    /// For `log`: if the user's message didn't cover everything this part
+    /// asks for, one short sentence naming what is still missing or
+    /// unaddressed, without giving the answer or judging correctness.
+    #[serde(default)]
+    pub missing: String,
     /// For `log`: one open question to take to the next place in your
     /// sources, written from the part and its source (§16).
     #[serde(default)]
