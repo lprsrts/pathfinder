@@ -695,7 +695,7 @@ async fn understanding_comes_from_evidence_per_concept() {
 
     turn(&rt, "dispatch looks the name up").await;
     assert!(
-        rt.why(&rt.load_session("s").unwrap().unwrap())
+        rt.why(&rt.load_session("s").unwrap().unwrap(), "")
             .contains("unknown")
     );
 
@@ -733,7 +733,7 @@ async fn understanding_comes_from_evidence_per_concept() {
     turn(&rt, "/confirm").await;
     let s = rt.load_session("s").unwrap().unwrap();
     assert_eq!(s.map.get("route").unwrap().status, PartStatus::Understood);
-    let why = rt.why(&s);
+    let why = rt.why(&s, "");
     assert!(!why.contains("Open misconception"), "{why}");
     assert!(why.contains("Command registry<br/><small>shown"), "{why}");
     assert!(
@@ -5184,4 +5184,676 @@ async fn log_reply_missing_field_explains_what_is_still_unaddressed() {
         ),
         "{reply}"
     );
+}
+
+#[tokio::test]
+async fn cross_workspace_prior_transfer_check_fast_promotion_and_prompt_privacy() {
+    let secret_ws_name = format!("secret-alpha-repo-{}", uuid::Uuid::new_v4().simple());
+    let dir_a = std::env::temp_dir().join(&secret_ws_name);
+    let dir_b = std::env::temp_dir().join(format!("target-beta-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir_a).unwrap();
+    std::fs::create_dir_all(&dir_b).unwrap();
+
+    let map_b = r#"{"brief":"One part.","concepts":[
+        {"id":"electric-field","label":"Electric field","domain":"electromagnetism","needs":[]}],
+        "parts":[{"id":"gauss","title":"Gauss's law flux","depends_on":[],"concepts":["electric-field"]}]}"#;
+    let engine = Arc::new(FakeEngine::new(vec![
+        (
+            ReadOnly,
+            S1,
+            r#"{"reply":"Got it.","ready_to_map":true,"goal":"Apply electric field to Gauss's law"}"#,
+        ),
+        (ReadOnly, S2, map_b),
+        (
+            ReadOnly,
+            S1,
+            r#"{"intent":"log","reply":"ok","ack":"","missing":"","question":"","map_change":null,"concepts":["electric-field"],"misconception":null}"#,
+        ),
+        (
+            ReadOnly,
+            S2,
+            r#"{"candidate":"Flux equals enclosed charge over epsilon0.","key_reason":"Correct application of Gauss's law."}"#,
+        ),
+        (
+            ToolAccess::None,
+            S2,
+            r#"{"pass":true,"feedback":"Right: the field flux through the closed surface tracks enclosed charge."}"#,
+        ),
+    ]));
+    let store = Arc::new(Store::open_in_memory().unwrap());
+    let mut rt = Runtime::new(store.clone(), engine.clone());
+    rt.flaw_coin = || false;
+    rt.config = test_config;
+
+    // Workspace A establishes Solid evidence on `electric-field`.
+    let sa = rt.create_session("sa".into(), dir_a.clone()).unwrap();
+    let ws_a = crate::understanding::workspace_key(&sa.cwd);
+    store
+        .upsert_workspace_concept(
+            &ws_a,
+            &crate::understanding::Concept {
+                id: "electric-field".into(),
+                label: "Electric field".into(),
+                aliases: vec![],
+                domain: "electromagnetism".into(),
+                created_by: "map".into(),
+            },
+        )
+        .unwrap();
+    rt.append_events(
+        &sa,
+        vec![
+            crate::understanding::NewEvent::new("electric-field", EventKind::Pass)
+                .detail(serde_json::json!({"flawed": false})),
+            crate::understanding::NewEvent::new("electric-field", EventKind::Pass)
+                .detail(serde_json::json!({"flawed": true})),
+        ],
+    );
+
+    // Workspace B starts a new task touching `electric-field`.
+    rt.create_session("sb".into(), dir_b.clone()).unwrap();
+    let say_b = |text: &str| {
+        rt.handle_turn(
+            "sb",
+            TurnInput {
+                text: text.into(),
+                files: vec![],
+            },
+            noop_sink(),
+        )
+    };
+
+    let open = say_b("apply electric field to gauss law").await.unwrap();
+    let sb = rt.load_session("sb").unwrap().unwrap();
+    // Part is NOT skipped (local state is still Unknown, only prior exists).
+    assert_eq!(sb.map.get("gauss").unwrap().status, PartStatus::Open);
+    assert_eq!(sb.active.as_deref(), Some("gauss"));
+
+    // Cross-workspace prior opens directly at a narrow transfer step, not wide-purpose.
+    assert!(
+        open.reply.contains("You've shown Electric field before"),
+        "expected applied/transfer prompt: {}",
+        open.reply
+    );
+    assert!(
+        open.reply.contains("Gauss's law flux"),
+        "expected current workspace part context: {}",
+        open.reply
+    );
+    let last_step = sb.last_step.as_ref().expect("step recorded");
+    assert_eq!(last_step.kind, "narrow-mechanism");
+
+    // Log a turn so we can inspect both Mapper and Tutor prompts for privacy.
+    say_b("The field lines cross the Gaussian surface radially.")
+        .await
+        .unwrap();
+    let prompts = engine.prompts.lock().unwrap().clone();
+    assert!(prompts.len() >= 3);
+    let mapper_prompt = &prompts[1];
+    let tutor_prompt = &prompts[2];
+    // Both prompts must include domain tag and prior state, NEVER raw paths or repo names from ws_a.
+    assert!(
+        mapper_prompt.contains("[electromagnetism]") && mapper_prompt.contains("prior: solid"),
+        "mapper prompt missing domain/prior: {mapper_prompt}"
+    );
+    assert!(
+        tutor_prompt.contains("[electromagnetism]") && tutor_prompt.contains("prior: solid"),
+        "tutor prompt missing domain/prior: {tutor_prompt}"
+    );
+    for p in &prompts {
+        assert!(
+            !p.contains(&secret_ws_name) && !p.contains(&ws_a),
+            "LLM prompt leaked other workspace path/name: {p}"
+        );
+    }
+
+    // 1 local pass (even non-flawed) promotes directly from SolidElsewhere to local Solid!
+    say_b("/summary flux through closed surface equals Q_enc / eps0")
+        .await
+        .unwrap();
+    say_b("Right, it matches Gauss's law").await.unwrap();
+    say_b("/confirm").await.unwrap();
+    let sb = rt.load_session("sb").unwrap().unwrap();
+    let views = rt
+        .concept_views(&sb, &["electric-field".to_string()])
+        .unwrap();
+    let v = views.get("electric-field").unwrap();
+    assert_eq!(v.state, crate::understanding::ConceptState::Solid);
+    assert_eq!(v.prior, None);
+    assert_eq!(v.passes, 1);
+
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+}
+
+#[tokio::test]
+async fn homonym_safe_concept_resolution_uses_domain_tags() {
+    let dir_a = std::env::temp_dir().join(format!("pf-hom-a-{}", uuid::Uuid::new_v4().simple()));
+    let dir_b = std::env::temp_dir().join(format!("pf-hom-b-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir_a).unwrap();
+    std::fs::create_dir_all(&dir_b).unwrap();
+
+    // Captures decision questions and chooses "new" for cross-domain homonyms.
+    struct InspectDecider {
+        seen_questions: Mutex<Vec<crate::decide::Question>>,
+    }
+    impl crate::decide::Decide for InspectDecider {
+        fn decide<'a>(
+            &'a self,
+            _input: &'a str,
+            questions: &'a [crate::decide::Question],
+            _prefer: Option<&'a str>,
+        ) -> BoxFuture<'a, Result<Option<crate::decide::Decision>>> {
+            self.seen_questions
+                .lock()
+                .unwrap()
+                .extend(questions.iter().cloned());
+            let answers = questions
+                .iter()
+                .map(|q| {
+                    (
+                        q.name.clone(),
+                        crate::decide::Answer {
+                            choice: "new".into(),
+                            probability: 0.95,
+                            ..Default::default()
+                        },
+                    )
+                })
+                .collect();
+            Box::pin(async move {
+                Ok(Some(crate::decide::Decision {
+                    by: "Inspect".into(),
+                    answers,
+                }))
+            })
+        }
+    }
+
+    let decider = Arc::new(InspectDecider {
+        seen_questions: Mutex::new(Vec::new()),
+    });
+    let store = Arc::new(Store::open_in_memory().unwrap());
+    let mut rt = Runtime::new(store.clone(), Arc::new(FakeEngine::new(vec![])))
+        .with_decider(decider.clone());
+    rt.config = test_config;
+
+    // Workspace A records physics "field".
+    let sa = rt.create_session("sa".into(), dir_a.clone()).unwrap();
+    let ws_a = crate::understanding::workspace_key(&sa.cwd);
+    store
+        .upsert_workspace_concept(
+            &ws_a,
+            &crate::understanding::Concept {
+                id: "field".into(),
+                label: "Field".into(),
+                aliases: vec![],
+                domain: "electromagnetism".into(),
+                created_by: "map".into(),
+            },
+        )
+        .unwrap();
+    rt.append_events(
+        &sa,
+        vec![crate::understanding::NewEvent::new(
+            "field",
+            EventKind::Pass,
+        )],
+    );
+
+    // Workspace B proposes Rust struct "field".
+    let sb = rt.create_session("sb".into(), dir_b.clone()).unwrap();
+    let resolved = rt
+        .resolve_concepts(
+            &sb,
+            &[crate::domain::ProposedConcept {
+                id: "field".into(),
+                label: "Field".into(),
+                domain: "rust-structs".into(),
+                needs: vec![],
+            }],
+            "map",
+        )
+        .await
+        .unwrap();
+
+    // Must NOT merge with physics `field`; must create disambiguated `field-2`.
+    let rust_field_id = resolved.get("field").unwrap();
+    assert_ne!(rust_field_id, "field");
+    assert_eq!(rust_field_id, "field-2");
+
+    // Decision prompt included both domains so the decider can distinguish homonyms.
+    let qs = decider.seen_questions.lock().unwrap();
+    assert_eq!(qs.len(), 1);
+    assert!(qs[0].instructions.contains("rust-structs"), "{:?}", qs[0]);
+    assert!(
+        qs[0]
+            .options
+            .iter()
+            .any(|(id, desc)| id == "field" && desc.contains("[domain: electromagnetism]")),
+        "{:?}",
+        qs[0].options
+    );
+
+    // Domain is persisted and `field-2` has NO prior from physics `field`.
+    let all = store.all_concepts().unwrap();
+    let rust_c = all.iter().find(|c| c.id == "field-2").unwrap();
+    assert_eq!(rust_c.domain, "rust-structs");
+    let views = rt.concept_views(&sb, &["field-2".to_string()]).unwrap();
+    assert!(views.get("field-2").is_none_or(|v| v.prior.is_none()));
+
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+}
+
+#[tokio::test]
+async fn same_workspace_touched_notes_and_step_angle_carry_over_across_sessions() {
+    let dir = std::env::temp_dir().join(format!("pf-carry-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let map = r#"{"brief":"One part.","concepts":[
+        {"id":"dispatch","label":"Dispatch by name","domain":"cli","needs":[]}],
+        "parts":[{"id":"route","title":"Command routing","depends_on":[],"concepts":["dispatch"]}]}"#;
+    let engine = Arc::new(FakeEngine::new(vec![
+        // Session 1: onboard + map + log entry
+        (ReadOnly, S1, ONBOARD_READY),
+        (ReadOnly, S2, map),
+        (
+            ReadOnly,
+            S1,
+            r#"{"intent":"log","reply":"ok","ack":"","missing":"","question":"","map_change":null,"concepts":["dispatch"],"misconception":null}"#,
+        ),
+        // Session 2: onboard + map + log entry
+        (ReadOnly, S1, ONBOARD_READY),
+        (ReadOnly, S2, map),
+        (
+            ReadOnly,
+            S1,
+            r#"{"intent":"log","reply":"ok","ack":"","missing":"","question":"","map_change":null,"concepts":["dispatch"],"misconception":null}"#,
+        ),
+    ]));
+    let store = Arc::new(Store::open_in_memory().unwrap());
+    let mut rt = Runtime::new(store.clone(), engine.clone());
+    rt.config = test_config;
+
+    // Session 1 opens on `dispatch` -> wide-purpose, then logs a note touching `dispatch`.
+    rt.create_session("s1".into(), dir.clone()).unwrap();
+    rt.handle_turn(
+        "s1",
+        TurnInput {
+            text: "build routing".into(),
+            files: vec![],
+        },
+        noop_sink(),
+    )
+    .await
+    .unwrap();
+    let s1 = rt.load_session("s1").unwrap().unwrap();
+    assert_eq!(s1.last_step.as_ref().unwrap().kind, "wide-purpose");
+    rt.handle_turn(
+        "s1",
+        TurnInput {
+            text: "Dispatch maps each slash command to a handler function".into(),
+            files: vec![],
+        },
+        noop_sink(),
+    )
+    .await
+    .unwrap();
+
+    // Session 2 in the SAME workspace opens fresh on `dispatch`.
+    rt.create_session("s2".into(), dir.clone()).unwrap();
+    rt.handle_turn(
+        "s2",
+        TurnInput {
+            text: "continue routing".into(),
+            files: vec![],
+        },
+        noop_sink(),
+    )
+    .await
+    .unwrap();
+    let s2 = rt.load_session("s2").unwrap().unwrap();
+    // Rotates past `wide-purpose` instead of repeating it verbatim!
+    assert_eq!(
+        s2.last_step.as_ref().unwrap().kind,
+        "wide-mechanism",
+        "expected step angle rotation across sessions"
+    );
+
+    // Send a log turn in Session 2 and verify Tutor prompt receives prior session's Touched digest.
+    rt.handle_turn(
+        "s2",
+        TurnInput {
+            text: "Unknown commands fall back to help text".into(),
+            files: vec![],
+        },
+        noop_sink(),
+    )
+    .await
+    .unwrap();
+    let prompts = engine.prompts.lock().unwrap();
+    let s2_tutor_prompt = prompts.last().unwrap();
+    assert!(
+        s2_tutor_prompt.contains("Recent notes from earlier sessions in this workspace:"),
+        "{s2_tutor_prompt}"
+    );
+    assert!(
+        s2_tutor_prompt.contains("Dispatch maps each slash command to a handler function"),
+        "{s2_tutor_prompt}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn same_workspace_shown_part_advances_immediately_with_carryover_note() {
+    let dir = std::env::temp_dir().join(format!("pf-adv-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let map = r#"{"brief":"Two parts.","concepts":[
+        {"id":"dispatch","label":"Dispatch by name","domain":"cli","needs":[]},
+        {"id":"report","label":"Status report","domain":"cli","needs":["dispatch"]}],
+        "parts":[
+            {"id":"route","title":"Command routing","depends_on":[],"concepts":["dispatch"]},
+            {"id":"status","title":"Status output","depends_on":["route"],"concepts":["report"]}
+        ]}"#;
+    let engine = Arc::new(FakeEngine::new(vec![
+        (ReadOnly, S1, ONBOARD_READY),
+        (ReadOnly, S2, map),
+    ]));
+    let store = Arc::new(Store::open_in_memory().unwrap());
+    let mut rt = Runtime::new(store.clone(), engine);
+    rt.config = test_config;
+
+    // Prior thread in the same workspace already passed `dispatch`.
+    let s1 = rt.create_session("s1".into(), dir.clone()).unwrap();
+    let ws = crate::understanding::workspace_key(&s1.cwd);
+    store
+        .upsert_workspace_concept(
+            &ws,
+            &crate::understanding::Concept {
+                id: "dispatch".into(),
+                label: "Dispatch by name".into(),
+                aliases: vec![],
+                domain: "cli".into(),
+                created_by: "map".into(),
+            },
+        )
+        .unwrap();
+    rt.append_events(
+        &s1,
+        vec![crate::understanding::NewEvent::new(
+            "dispatch",
+            EventKind::Pass,
+        )],
+    );
+
+    // New thread in the same workspace builds the 2-part map.
+    rt.create_session("s2".into(), dir.clone()).unwrap();
+    let out = rt
+        .handle_turn(
+            "s2",
+            TurnInput {
+                text: "add status".into(),
+                files: vec![],
+            },
+            noop_sink(),
+        )
+        .await
+        .unwrap();
+    let s2 = rt.load_session("s2").unwrap().unwrap();
+    assert_eq!(s2.map.get("route").unwrap().status, PartStatus::Understood);
+    assert_eq!(s2.active.as_deref(), Some("status"));
+    assert!(
+        out.reply
+            .contains("Already shown in this workspace: **Command routing**"),
+        "{}",
+        out.reply
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn why_why_all_and_append_only_revisit() {
+    let dir_a = std::env::temp_dir().join(format!("physics-lab-{}", uuid::Uuid::new_v4().simple()));
+    let dir_b = std::env::temp_dir().join(format!("circuits-hw-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir_a).unwrap();
+    std::fs::create_dir_all(&dir_b).unwrap();
+    let name_a = dir_a.file_name().unwrap().to_string_lossy().into_owned();
+
+    let map_b = r#"{"brief":"One part.","concepts":[
+        {"id":"electric-field","label":"Electric field","domain":"electromagnetism","needs":[]}],
+        "parts":[{"id":"cap","title":"Capacitor plates","depends_on":[],"concepts":["electric-field"]}]}"#;
+    let engine = Arc::new(FakeEngine::new(vec![
+        (ReadOnly, S1, ONBOARD_READY),
+        (ReadOnly, S2, map_b),
+    ]));
+    let store = Arc::new(Store::open_in_memory().unwrap());
+    let mut rt = Runtime::new(store.clone(), engine);
+    rt.config = test_config;
+
+    // Workspace A has Solid evidence on `electric-field` and another concept `ohms-law`.
+    let sa = rt.create_session("sa".into(), dir_a.clone()).unwrap();
+    let ws_a = crate::understanding::workspace_key(&sa.cwd);
+    for (id, label) in [
+        ("electric-field", "Electric field"),
+        ("ohms-law", "Ohm's law"),
+    ] {
+        store
+            .upsert_workspace_concept(
+                &ws_a,
+                &crate::understanding::Concept {
+                    id: id.into(),
+                    label: label.into(),
+                    aliases: vec![],
+                    domain: "electromagnetism".into(),
+                    created_by: "map".into(),
+                },
+            )
+            .unwrap();
+    }
+    rt.append_events(
+        &sa,
+        vec![
+            crate::understanding::NewEvent::new("electric-field", EventKind::Pass)
+                .detail(serde_json::json!({"flawed": false})),
+            crate::understanding::NewEvent::new("electric-field", EventKind::Pass)
+                .detail(serde_json::json!({"flawed": true})),
+            crate::understanding::NewEvent::new("ohms-law", EventKind::Pass)
+                .detail(serde_json::json!({"flawed": false})),
+        ],
+    );
+
+    // Workspace B builds map referencing `electric-field`.
+    rt.create_session("sb".into(), dir_b.clone()).unwrap();
+    let say_b = |text: &str| {
+        rt.handle_turn(
+            "sb",
+            TurnInput {
+                text: text.into(),
+                files: vec![],
+            },
+            noop_sink(),
+        )
+    };
+    say_b("capacitor field").await.unwrap();
+
+    // `/why` shows local state AND elsewhere prior with workspace basename.
+    let why = say_b("/why").await.unwrap().reply;
+    assert!(why.contains("unknown"), "{why}");
+    assert!(why.contains(&format!("solid in {name_a}")), "{why}");
+    assert!(why.contains("/revisit"), "{why}");
+
+    // `/why --all` shows the user's global knowledge graph across workspaces.
+    let why_all = say_b("/why --all").await.unwrap().reply;
+    assert!(why_all.contains("Global knowledge record"), "{why_all}");
+    assert!(why_all.contains("Electric field"), "{why_all}");
+    assert!(why_all.contains("Ohm's law"), "{why_all}");
+    assert!(why_all.contains("electromagnetism"), "{why_all}");
+
+    // `/revisit electric-field` appends `EventKind::Revisit` without mutating existing events.
+    let before_events = store
+        .events_for_concepts(&["electric-field".to_string()])
+        .unwrap();
+    let rev = say_b("/revisit electric-field").await.unwrap().reply;
+    assert!(
+        rev.contains("Prior knowledge from other workspaces won't be assumed"),
+        "{rev}"
+    );
+    let after_events = store
+        .events_for_concepts(&["electric-field".to_string()])
+        .unwrap();
+    assert_eq!(after_events.len(), before_events.len() + 1);
+    assert_eq!(after_events.last().unwrap().kind, EventKind::Revisit);
+
+    // Prior is now suppressed in Workspace B.
+    let sb = rt.load_session("sb").unwrap().unwrap();
+    let views = rt
+        .concept_views(&sb, &["electric-field".to_string()])
+        .unwrap();
+    assert_eq!(views.get("electric-field").unwrap().prior, None);
+    let why_after = say_b("/why").await.unwrap().reply;
+    assert!(
+        !why_after.contains(&format!("solid in {name_a}")),
+        "{why_after}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+}
+
+#[tokio::test]
+async fn a7_vouched_and_handoff_remain_strictly_local_only() {
+    let dir_a = std::env::temp_dir().join(format!("pf-a7-a-{}", uuid::Uuid::new_v4().simple()));
+    let dir_b = std::env::temp_dir().join(format!("pf-a7-b-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir_a).unwrap();
+    std::fs::create_dir_all(&dir_b).unwrap();
+
+    // Init a git repo in dir_b so provenance ledger & coverage run.
+    let git = |args: &[&str]| {
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&dir_b)
+            .args(["-c", "user.email=t@t", "-c", "user.name=t"])
+            .args(args)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git {args:?}");
+    };
+    git(&["init", "-q"]);
+    std::fs::write(dir_b.join("app.py"), "def main():\n    pass\n").unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "init"]);
+
+    struct TagDispatch;
+    impl crate::decide::Decide for TagDispatch {
+        fn decide<'a>(
+            &'a self,
+            _input: &'a str,
+            questions: &'a [crate::decide::Question],
+            _prefer: Option<&'a str>,
+        ) -> BoxFuture<'a, Result<Option<crate::decide::Decision>>> {
+            let answers = questions
+                .iter()
+                .map(|q| {
+                    let choice = if q.name == "else" { "no" } else { "yes" };
+                    (
+                        q.name.clone(),
+                        crate::decide::Answer {
+                            choice: choice.into(),
+                            probability: 0.95,
+                            ..Default::default()
+                        },
+                    )
+                })
+                .collect();
+            Box::pin(async move {
+                Ok(Some(crate::decide::Decision {
+                    by: "TagDispatch".into(),
+                    answers,
+                }))
+            })
+        }
+    }
+
+    let store = Arc::new(Store::open_in_memory().unwrap());
+    let mut rt = Runtime::new(store.clone(), Arc::new(FakeEngine::new(vec![])))
+        .with_decider(Arc::new(TagDispatch));
+    rt.config = test_config;
+
+    // Workspace A has Solid evidence on `dispatch`.
+    let sa = rt.create_session("sa".into(), dir_a.clone()).unwrap();
+    let ws_a = crate::understanding::workspace_key(&sa.cwd);
+    store
+        .upsert_workspace_concept(
+            &ws_a,
+            &crate::understanding::Concept {
+                id: "dispatch".into(),
+                label: "Dispatch".into(),
+                aliases: vec![],
+                domain: "cli".into(),
+                created_by: "map".into(),
+            },
+        )
+        .unwrap();
+    rt.append_events(
+        &sa,
+        vec![
+            crate::understanding::NewEvent::new("dispatch", EventKind::Pass)
+                .detail(serde_json::json!({"flawed": false})),
+            crate::understanding::NewEvent::new("dispatch", EventKind::Pass)
+                .detail(serde_json::json!({"flawed": true})),
+        ],
+    );
+
+    // Workspace B has NO local pass on `dispatch`, only `SolidElsewhere`.
+    let mut sb = rt.create_session("sb".into(), dir_b.clone()).unwrap();
+    let mut part = Part::new("route".into(), "Routing".into(), String::new(), vec![]);
+    part.concepts = vec!["dispatch".into()];
+    sb.map = Map {
+        parts: vec![part.clone()],
+    };
+    sb.active = Some("route".into());
+    sb.mode = SessionMode::Working;
+
+    // Confirm `prior` is SolidElsewhere while local `state` is Unknown.
+    let views = rt.concept_views(&sb, &["dispatch".to_string()]).unwrap();
+    let v = views.get("dispatch").unwrap();
+    assert_eq!(v.state, crate::understanding::ConceptState::Unknown);
+    assert!(!v.state.has_evidence());
+    assert!(matches!(
+        v.prior,
+        Some(crate::understanding::PriorState::SolidElsewhere { .. })
+    ));
+
+    // Provenance ledger must label the hunk `delegated` (NOT `reviewable`), and vouched = 0!
+    let before = rt.snapshot_before(&sb);
+    std::fs::write(
+        dir_b.join("app.py"),
+        "def main():\n    pass\n\ndef route(cmd):\n    return cmd\n",
+    )
+    .unwrap();
+    let changes = rt.record_changes(&sb, &part, before, false, "").await;
+    assert_eq!(changes.len(), 1);
+    rt.record_review(&sb, "route", &changes, "approved", None);
+
+    let root = crate::ledger::repo_root(&dir_b).unwrap();
+    let entries = store.ledger(&root.to_string_lossy()).unwrap();
+    let change_entry = entries.iter().find(|e| e.kind == "change").unwrap();
+    assert_eq!(change_entry.label, "delegated");
+    let cov = crate::ledger::coverage(&root, &entries);
+    assert_eq!(
+        cov.total
+            .get(&crate::ledger::Bucket::Vouched)
+            .copied()
+            .unwrap_or(0),
+        0,
+        "cross-workspace prior must never count as local A7 vouched"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
 }

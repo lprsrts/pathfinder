@@ -872,6 +872,9 @@ pub struct ProposedConcept {
     pub id: String,
     #[serde(default)]
     pub label: String,
+    /// Short topic/domain tag (e.g. `"electromagnetism"`, `"rust-async"`), never a path.
+    #[serde(default)]
+    pub domain: String,
     #[serde(default)]
     pub needs: Vec<String>,
 }

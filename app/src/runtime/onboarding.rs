@@ -186,7 +186,24 @@ impl Runtime {
         {
             tracing::warn!("registering the map's concepts: {e:#}");
         }
+        let mut carried_over = Vec::new();
+        if !quick {
+            for i in 0..session.map.parts.len() {
+                let part_id = session.map.parts[i].id.clone();
+                if session.map.parts[i].status == PartStatus::Open
+                    && self.understanding_status(session, &part_id)
+                        == Some(crate::understanding::UnderstandingStatus::Understood)
+                {
+                    session.map.parts[i].status = PartStatus::Understood;
+                    carried_over.push(session.map.parts[i].title.clone());
+                }
+            }
+        }
         session.advance();
+        if !quick && session.active.is_none() && !session.map.parts.is_empty() {
+            session.active = Some(session.map.parts[0].id.clone());
+            session.mode = SessionMode::Working;
+        }
 
         if quick && let Some(part_id) = session.active.clone() {
             // The lead goes with the candidate's header, after any files
@@ -207,7 +224,22 @@ impl Runtime {
         }
 
         // The map itself shows in the TUI's side panel (and on `/map`).
-        let rest = self.enter_part(session, true);
+        let mut rest = self.enter_part(session, true);
+        if !carried_over.is_empty() {
+            let titles: Vec<String> = carried_over.iter().map(|t| format!("**{t}**")).collect();
+            let note = if session
+                .active_part()
+                .is_some_and(|p| p.status == PartStatus::Open)
+            {
+                format!(
+                    "Already shown in this workspace: {} — moving on to the next open part.",
+                    titles.join(", ")
+                )
+            } else {
+                format!("Already shown in this workspace: {}.", titles.join(", "))
+            };
+            rest = format!("{note}\n\n{rest}");
+        }
         session.push_turn("assistant", format!("{}\n\n{rest}", proposal.brief));
         Ok(TurnOutput::text(format!("\n\n{rest}")))
     }

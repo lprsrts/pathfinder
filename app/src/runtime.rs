@@ -90,7 +90,7 @@ impl TurnOutput {
     }
 }
 
-pub const COMMANDS_HELP: &str = "Commands: `/find <terms>`, `/open <file> [page|line]`, `/web <terms>`, `/tell <question>`, `/check <your work>`, `/plan`, `/summary <text>`, `/handoff [notes]`, `/approve`, `/object <reason>`, `/known`, `/delegate [notes]`, `/accept`, `/reject`, `/replan [what changed]`, `/next`, `/focus <id|number|prefix>`, `/map`, `/why`, `/coverage`.";
+pub const COMMANDS_HELP: &str = "Commands: `/find <terms>`, `/open <file> [page|line]`, `/web <terms>`, `/tell <question>`, `/check <your work>`, `/plan`, `/summary <text>`, `/handoff [notes]`, `/approve`, `/object <reason>`, `/known`, `/delegate [notes]`, `/accept`, `/reject`, `/replan [what changed]`, `/next`, `/focus <id|number|prefix>`, `/map`, `/why [--all]`, `/revisit <concept>`, `/coverage`.";
 
 /// No decision model: the LLM decides each message's step itself.
 struct NoDecider;
@@ -689,7 +689,8 @@ impl Runtime {
                 self.handle_delegate(session, arg, files, sink).await
             }
             "/accept" => self.handle_accept(session).await,
-            "/why" => Ok(TurnOutput::text(self.why(session))),
+            "/why" => Ok(TurnOutput::text(self.why(session, arg))),
+            "/revisit" => Ok(self.handle_revisit(session, arg)),
             "/coverage" => Ok(TurnOutput::text(self.coverage_report(session))),
             "/reject" => Ok(match session.pending_change.take() {
                 Some(_) => TurnOutput::text(i18n::line(
@@ -1064,15 +1065,15 @@ const MAP_SYSTEM: &str = r#"You sketch the map for Pathfinder: what the task dep
 - `note`: where to read for this part: a workspace file and page or line (e.g. `slides-4.pdf p. 12`, `notes.md:40`), or "" if the workspace has nothing for it. Never an explanation or a hint about the content. `brief`: what the map covers, in one or two sentences. In the brief, titles and labels, write math as plain text or Unicode (x², √, ≤, μᵢ), never LaTeX.
 - A goal that is a check of a topic just explained in the conversation ("Check ...", "Prüfen, ...") gets one part for that topic, two at most: the user explains it and judges a candidate.
 - Never give results away: no answers, computed values or intermediate results (a cutoff frequency, a derivative, "≈ 0.157") in the brief, notes or titles. The user works them out; for an exercise, say what each part is about, not what it comes to.
-- `concepts`: the ideas the parts rest on, the record Pathfinder keeps of what the user has shown they understand. Each has an `id` (a lowercase hyphenated slug naming the idea itself, e.g. `d-separation`, `chain-rule`), a short `label`, and `needs`: the concept ids it builds on. Include a concept the task needs even if no part covers it (a prerequisite the user may lack). When the prompt lists concepts already recorded in this folder, a part that rests on one of those ideas lists that id exactly (and you don't redeclare it), even if you'd word it differently: the user's checks count only under the same id. Declare new concepts only for ideas none of them is.
+- `concepts`: the ideas the parts rest on, the record Pathfinder keeps of what the user has shown they understand. Each has an `id` (a lowercase hyphenated slug naming the idea itself, e.g. `d-separation`, `chain-rule`), a short `label`, a short topic `domain` tag (e.g. `electromagnetism`, `rust-async`, `probability` — never a file path or repo name) to keep homonyms in different fields apart, and `needs`: the concept ids it builds on. Include a concept the task needs even if no part covers it (a prerequisite the user may lack). When the prompt lists concepts already recorded, a part that rests on one of those ideas lists that id exactly (and you don't redeclare it), even if you'd word it differently: the user's checks count only under the same id. Only reuse an id when it is the same idea in the same domain; declare a new concept for an idea none of them is.
 - Each part lists its 1–4 core `concepts` (ids from `concepts`): what someone must understand to judge an agent's work on that part. Usually one or two.
 
 Return ONLY a JSON object:
-{"brief": "...", "concepts": [{"id": "weighted-sum", "label": "Weighted sum of inputs", "needs": []}], "parts": [{"id": "weights", "title": "...", "note": "...", "depends_on": [], "concepts": ["weighted-sum"]}]}"#;
+{"brief": "...", "concepts": [{"id": "weighted-sum", "label": "Weighted sum of inputs", "domain": "neural-networks", "needs": []}], "parts": [{"id": "weights", "title": "...", "note": "...", "depends_on": [], "concepts": ["weighted-sum"]}]}"#;
 
 const CHANGE_SYSTEM: &str = r#"You propose a change to Pathfinder's map of what the task depends on, because something changed. The user accepts or rejects it.
 
-- `parts`: parts to add, or existing parts to update (same id), each with id, title, note, depends_on and its 1–4 core `concepts` (concept ids). New concepts go in `concepts` (id, label, needs), as in the map. Reuse the id of a concept on the map or recorded in this folder (listed in the prompt) when a part rests on that idea; declare a new one only for an idea none of them is. New ids: `id`: a short descriptive slug the user types in commands: lowercase words joined by hyphens, at most 12 characters (e.g. `weights`, `fwd-pass`, `loss`). Unique.
+- `parts`: parts to add, or existing parts to update (same id), each with id, title, note, depends_on and its 1–4 core `concepts` (concept ids). New concepts go in `concepts` (id, label, domain, needs), as in the map. Reuse the id of a concept on the map or already recorded (listed in the prompt) when a part rests on that same idea in the same domain; declare a new one only for an idea none of them is. New ids: `id`: a short descriptive slug the user types in commands: lowercase words joined by hyphens, at most 12 characters (e.g. `weights`, `fwd-pass`, `loss`). Unique.
 - `remove`: ids of parts to drop. Only parts with no work or outcome can be removed.
 - No size limit. No cycles.
 

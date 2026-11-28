@@ -89,7 +89,7 @@ impl Group {
     fn of(name: &str) -> Self {
         match name {
             "/open" | "/find" | "/web" | "/attach" => Self::Read,
-            "/tell" | "/check" | "/summary" | "/why" => Self::Ask,
+            "/tell" | "/check" | "/summary" | "/why" | "/revisit" => Self::Ask,
             "/plan" | "/map" | "/next" | "/focus" | "/known" | "/replan" | "/accept"
             | "/reject" | "/confirm" | "/cancel" | "/undo" => Self::Plan,
             "/handoff" | "/delegate" | "/approve" | "/object" | "/coverage" => Self::Agent,
@@ -101,7 +101,7 @@ impl Group {
 
 /// Every command in the palette's order: by section, the loop's steps
 /// first within each.
-const ORDER: [&str; 40] = [
+const ORDER: [&str; 41] = [
     "/open",
     "/find",
     "/web",
@@ -110,6 +110,7 @@ const ORDER: [&str; 40] = [
     "/check",
     "/summary",
     "/why",
+    "/revisit",
     "/plan",
     "/map",
     "/next",
@@ -293,13 +294,20 @@ pub const LOCAL: [(Local, &str, &[&str], &str); 17] = [
 ];
 
 /// The task commands, run by the runtime: (name, what it does).
-pub const TASK: [(&str, &str); 23] = [
+pub const TASK: [(&str, &str); 24] = [
     ("/find", "search files: /find <terms>"),
     ("/open", "show a file: /open <file> [page or line]"),
     ("/web", "search online: /web <terms>"),
     ("/tell", "get an answer, recorded as told: /tell <question>"),
     ("/check", "first wrong step: /check <work, file or photo>"),
-    ("/why", "your record, or what the current part rests on"),
+    (
+        "/why",
+        "your record (--all for all workspaces), or what the current part rests on",
+    ),
+    (
+        "/revisit",
+        "ignore prior from other workspaces: /revisit <concept>",
+    ),
     ("/map", "the plan as a diagram"),
     ("/plan", "build the plan now"),
     ("/summary", "explain the current part; a candidate follows"),
@@ -342,13 +350,22 @@ const LOCAL_ARGS: [(&str, &str, &str); 5] = [
     ),
 ];
 
-const TASK_META: [(&str, &str, &str); 23] = [
+const TASK_META: [(&str, &str, &str); 24] = [
     ("/find", "<terms>", "search files"),
     ("/open", "<file> [page or line]", "show a file"),
     ("/web", "<terms>", "search online"),
     ("/tell", "<question>", "get an answer, recorded as told"),
     ("/check", "<work, file or photo>", "first wrong step"),
-    ("/why", "", "your record, or what the current part rests on"),
+    (
+        "/why",
+        "[--all]",
+        "your record, or what the current part rests on",
+    ),
+    (
+        "/revisit",
+        "<concept>",
+        "ignore prior from other workspaces",
+    ),
     ("/map", "", "the plan as a diagram"),
     ("/plan", "[goal]", "build the plan now"),
     (
@@ -1191,7 +1208,9 @@ mod tests {
             Parsed::Local(Local::Bug, "it broke")
         );
         assert_eq!(parse("/why"), Parsed::Task);
+        assert_eq!(parse("/why --all"), Parsed::Task);
         assert_eq!(parse("/WHY"), Parsed::Task);
+        assert_eq!(parse("/revisit electric-field"), Parsed::Task);
         assert_eq!(parse("/focus 3"), Parsed::Task);
         assert_eq!(parse("/frobnicate"), Parsed::Unknown("/frobnicate"));
     }
@@ -1230,6 +1249,7 @@ mod tests {
         // /resume, /replan, /reject: nothing to add beyond what's typed.
         assert_eq!(complete("/re"), None);
         assert_eq!(complete("/repl").as_deref(), Some("/replan "));
+        assert_eq!(complete("/rev").as_deref(), Some("/revisit "));
         assert_eq!(complete("/res").as_deref(), Some("/resume "));
         assert_eq!(complete("/zz"), None);
         assert_eq!(complete("/clear").as_deref(), Some("/new "));

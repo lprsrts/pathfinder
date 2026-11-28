@@ -69,9 +69,13 @@ impl Runtime {
             return part_step(session);
         };
         let ws = Self::workspace(session);
-        let concepts = self.store.concepts(&ws).unwrap_or_default();
-        let ids: Vec<String> = concepts.iter().map(|c| c.id.clone()).collect();
-        let stats = understanding::step_stats(&self.store.events(&ws, &ids).unwrap_or_default());
+        let concepts = self.store.all_concepts().unwrap_or_default();
+        let mut ids: Vec<String> = concepts.iter().map(|c| c.id.clone()).collect();
+        if !ids.contains(&target) {
+            ids.push(target.clone());
+        }
+        let ws_events = self.store.events(&ws, &ids).unwrap_or_default();
+        let stats = understanding::step_stats(&ws_events);
         let view = views
             .get(&target)
             .cloned()
@@ -79,6 +83,18 @@ impl Runtime {
         let Some(mut kind) = understanding::choose_step(&view, steer, &stats) else {
             return part_step(session);
         };
+        let has_prior = view.prior.is_some()
+            && !view.state.has_evidence()
+            && view.open_misconceptions.is_empty()
+            && view.state != understanding::ConceptState::Shaky;
+        if has_prior {
+            // Skip wide intro/purpose prompts and open directly at a narrow,
+            // applied/transfer step for this workspace.
+            kind.scope = Scope::Narrow;
+            if steer.is_none() && kind.angle == Angle::Purpose {
+                kind.angle = Angle::Mechanism;
+            }
+        }
         let concept = concepts
             .iter()
             .find(|c| c.id == target)
@@ -92,19 +108,35 @@ impl Runtime {
             });
         // Avoid repeating the exact same fixed `Next:` question verbatim
         // once the user has already seen or answered a step on this
-        // concept/kind without advancing.
-        let fixed_for =
-            |k: StepKind| i18n::line(lang, step_question(k)).replace("{concept}", &concept.label);
-        if steer.is_none()
-            && question.is_none()
-            && let Some(prev) = session
+        // concept/kind without advancing (within a session or across sessions).
+        let fixed_for = |k: StepKind| {
+            if has_prior && steer.is_none() {
+                prior_transfer_question(k.angle, &concept.label, &part.title)
+            } else {
+                i18n::line(lang, step_question(k)).replace("{concept}", &concept.label)
+            }
+        };
+        if steer.is_none() && question.is_none() {
+            if let Some(prev) = session
                 .last_step
                 .as_ref()
                 .filter(|l| l.concept == target && l.kind == kind.as_str())
-        {
-            let fixed = fixed_for(kind);
-            if prev.repeats >= 1 || (!prev.question.is_empty() && prev.question != fixed) {
-                kind.angle = next_angle(kind.angle);
+            {
+                let fixed = fixed_for(kind);
+                if prev.repeats >= 1 || (!prev.question.is_empty() && prev.question != fixed) {
+                    kind.angle = next_angle(kind.angle);
+                }
+            } else if session.last_step.is_none()
+                && view.passes == 0
+                && let Some(prev_kind) = ws_events
+                    .iter()
+                    .rev()
+                    .find(|e| e.concept == target && e.kind == EventKind::Step)
+                    .and_then(|e| e.detail["kind"].as_str())
+                    .and_then(StepKind::parse)
+                && prev_kind.angle == kind.angle
+            {
+                kind.angle = next_angle(prev_kind.angle);
             }
         }
         let model_question = question.is_some();
@@ -151,6 +183,22 @@ impl Runtime {
             repeats: if fresh || !repeated { 0 } else { prev_repeats },
         });
         Some(line)
+    }
+}
+
+/// Applied/transfer prompt for a concept already demonstrated in another
+/// workspace (`prior`), never mentioning raw paths or repo names.
+fn prior_transfer_question(angle: Angle, concept: &str, part_title: &str) -> String {
+    match angle {
+        Angle::Mechanism => format!(
+            "You've shown {concept} before — how does it apply specifically to {part_title} here?"
+        ),
+        Angle::Example => format!(
+            "You've shown {concept} before — point to a concrete instance of it in {part_title} here."
+        ),
+        Angle::Purpose => {
+            format!("You've shown {concept} before — what role does it play in {part_title} here?")
+        }
     }
 }
 

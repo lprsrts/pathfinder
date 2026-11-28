@@ -6,12 +6,12 @@ use std::collections::{HashMap, HashSet};
 use anyhow::Result;
 use serde_json::json;
 
-use super::{Runtime, render_change, render_part};
+use super::{Runtime, TurnOutput, render_change, render_part};
 use crate::decide::Question;
 use crate::domain::{MapChange, PartStatus, ProposedConcept, ProposedPart, Session};
 use crate::understanding::{
-    self, Concept, ConceptState, ConceptView, EventKind, Misconception, NewEvent, Targets,
-    exact_match, lexical_candidates, slugify, workspace_key,
+    self, Concept, ConceptState, ConceptView, EventKind, Misconception, NewEvent, PriorState,
+    Targets, exact_match, lexical_candidates, slugify, workspace_key,
 };
 
 /// A proposed concept is the same as an existing one at this probability (A5).
@@ -20,6 +20,14 @@ const SAME_CONCEPT: f64 = 0.7;
 const STATES_BELIEF: f64 = 0.8;
 /// At most this many gaps are proposed as parts at once.
 const MAX_GAP_PARTS: usize = 2;
+/// Maximum concepts listed in the Mapper prompt.
+const MAX_KNOWN_CONCEPTS: usize = 80;
+/// Slots reserved for top goal-relevant global concepts when the workspace is large.
+const MAX_GLOBAL_RESERVE: usize = 20;
+/// Maximum recent same-workspace `Touched` notes passed to the Tutor.
+const MAX_TOUCHED_NOTES: usize = 5;
+/// Maximum characters stored per `Touched` note snippet.
+const MAX_NOTE_CHARS: usize = 200;
 
 impl Runtime {
     pub(super) fn workspace(session: &Session) -> String {
@@ -31,8 +39,13 @@ impl Runtime {
         session: &Session,
         concepts: &[String],
     ) -> Result<HashMap<String, ConceptView>> {
-        let events = self.store.events(&Self::workspace(session), concepts)?;
-        Ok(understanding::views(&events, understanding::now()))
+        let ws = Self::workspace(session);
+        let events = self.store.events_for_concepts(concepts)?;
+        Ok(understanding::views_in_workspace(
+            &events,
+            &ws,
+            understanding::now(),
+        ))
     }
 
     /// Appends events and returns their ids (empty if recording failed).
@@ -54,9 +67,9 @@ impl Runtime {
         }
     }
 
-    pub(super) fn labels(&self, session: &Session) -> HashMap<String, String> {
+    pub(super) fn labels(&self, _session: &Session) -> HashMap<String, String> {
         self.store
-            .concepts(&Self::workspace(session))
+            .all_concepts()
             .unwrap_or_default()
             .into_iter()
             .map(|c| (c.id, c.label))
@@ -64,11 +77,18 @@ impl Runtime {
     }
 
     /// The part's concepts and their states, for the Tutor's view (A2).
+    /// Surfaces cross-workspace `prior` with domain tags only (never raw paths
+    /// or repo names) and includes a concise digest of recent same-workspace
+    /// `Touched` notes from earlier sessions.
     pub(super) fn concepts_prompt(&self, session: &Session, part: &crate::domain::Part) -> String {
         if part.concepts.is_empty() {
             return String::new();
         }
-        let labels = self.labels(session);
+        let all_concepts = self.store.all_concepts().unwrap_or_default();
+        let meta: HashMap<&str, (&str, &str)> = all_concepts
+            .iter()
+            .map(|c| (c.id.as_str(), (c.label.as_str(), c.domain.as_str())))
+            .collect();
         let mut all: Vec<String> = part.concepts.clone();
         for p in &session.map.parts {
             for c in &p.concepts {
@@ -79,11 +99,13 @@ impl Runtime {
         }
         let views = self.concept_views(session, &all).unwrap_or_default();
         let line = |c: &String| {
-            format!(
-                "- `{c}`: {} ({})",
-                labels.get(c).map(String::as_str).unwrap_or(c),
-                understanding::state_of(&views, c).label()
-            )
+            let (label, domain) = meta.get(c.as_str()).copied().unwrap_or((c.as_str(), ""));
+            let dom = if domain.is_empty() {
+                String::new()
+            } else {
+                format!(" [{domain}]")
+            };
+            format!("- `{c}`: {label}{dom} ({})", prompt_state(&views, c))
         };
         let own: Vec<String> = part.concepts.iter().map(line).collect();
         let other: Vec<String> = all[part.concepts.len()..].iter().map(line).collect();
@@ -91,59 +113,158 @@ impl Runtime {
             "\nConcept ids this part rests on (the user's state):\n{}",
             own.join("\n")
         );
+        let has_prior = part.concepts.iter().any(|c| {
+            views
+                .get(c)
+                .is_some_and(|v| !v.state.has_evidence() && v.prior.is_some())
+        });
+        if has_prior {
+            out.push_str(
+                "\nConcepts marked `prior` were already demonstrated in another workspace; skip basic definitions and focus on how they apply in this workspace.",
+            );
+        }
         if !other.is_empty() {
             out.push_str(&format!(
                 "\nOther concept ids on the map:\n{}",
                 other.join("\n")
             ));
         }
+        let ws = Self::workspace(session);
+        let ws_events = self.store.events(&ws, &part.concepts).unwrap_or_default();
+        let mut notes: Vec<(String, String)> = Vec::new();
+        let mut seen_notes: HashSet<String> = HashSet::new();
+        for e in ws_events.iter().rev() {
+            if e.kind != EventKind::Touched {
+                continue;
+            }
+            let Some(note) = e.detail["note"]
+                .as_str()
+                .map(str::trim)
+                .filter(|n| !n.is_empty())
+            else {
+                continue;
+            };
+            if part
+                .log
+                .iter()
+                .any(|l| l.trim() == note || l.contains(note))
+            {
+                continue;
+            }
+            let key = format!("{}:{note}", e.concept);
+            if seen_notes.insert(key) {
+                notes.push((e.concept.clone(), note.to_string()));
+                if notes.len() >= MAX_TOUCHED_NOTES {
+                    break;
+                }
+            }
+        }
+        notes.reverse();
+        if !notes.is_empty() {
+            out.push_str("\nRecent notes from earlier sessions in this workspace:");
+            for (c, note) in notes {
+                out.push_str(&format!("\n- `{c}`: {note}"));
+            }
+        }
         out
     }
 
-    /// This folder's recorded concepts, with the user's state on each, for
-    /// the Mapper: it must reuse their ids where a part rests on the same
-    /// idea, or a check passed in another thread of the folder never
-    /// counts here. Concepts with a record come first; another folder's
-    /// concepts are never listed (they are keyed by workspace).
+    /// Current-workspace concepts plus top goal-relevant global concepts
+    /// (capped at ~80 total), showing state (`shown`, `solid`, `prior`, …) and
+    /// short `domain` tag. Never includes raw filesystem paths or repo names
+    /// from other workspaces.
     pub(super) fn known_concepts_prompt(&self, session: &Session) -> String {
-        let concepts = self
-            .store
-            .concepts(&Self::workspace(session))
-            .unwrap_or_default();
-        if concepts.is_empty() {
+        let ws = Self::workspace(session);
+        let all_concepts = self.store.all_concepts().unwrap_or_default();
+        if all_concepts.is_empty() {
             return String::new();
         }
-        let ids: Vec<String> = concepts.iter().map(|c| c.id.clone()).collect();
+        let ws_ids: HashSet<String> = self
+            .store
+            .workspace_concepts(&ws)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|c| c.id)
+            .collect();
+        let ids: Vec<String> = all_concepts.iter().map(|c| c.id.clone()).collect();
         let views = self.concept_views(session, &ids).unwrap_or_default();
-        let rank = |c: &Concept| match understanding::state_of(&views, &c.id) {
-            ConceptState::Solid | ConceptState::Shown => 0,
-            ConceptState::Shaky => 1,
-            ConceptState::Claimed | ConceptState::Delegated => 2,
-            ConceptState::Unknown => 3,
+        let state_rank = |c: &Concept| match views.get(&c.id) {
+            Some(v) if v.state.has_evidence() => 0u8,
+            Some(v) if v.prior.is_some() => 1,
+            Some(v) if v.state == ConceptState::Shaky => 2,
+            Some(v) if matches!(v.state, ConceptState::Claimed | ConceptState::Delegated) => 3,
+            _ => 4,
         };
-        let mut ordered: Vec<&Concept> = concepts.iter().collect();
-        ordered.sort_by_key(|c| rank(c));
-        let list: Vec<String> = ordered
+
+        let mut ws_ordered: Vec<&Concept> = all_concepts
             .iter()
-            .take(80)
+            .filter(|c| ws_ids.contains(&c.id))
+            .collect();
+        ws_ordered.sort_by(|a, b| {
+            state_rank(a)
+                .cmp(&state_rank(b))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+
+        let query_tokens = goal_query_tokens(session);
+        let mut global_scored: Vec<(usize, u8, &Concept)> = all_concepts
+            .iter()
+            .filter(|c| !ws_ids.contains(&c.id))
+            .filter_map(|c| {
+                let score = relevance_score(c, &query_tokens);
+                (score > 0).then_some((score, state_rank(c), c))
+            })
+            .collect();
+        global_scored.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| a.1.cmp(&b.1))
+                .then_with(|| a.2.id.cmp(&b.2.id))
+        });
+
+        let global_reserve = global_scored.len().min(MAX_GLOBAL_RESERVE);
+        let ws_take = ws_ordered
+            .len()
+            .min(MAX_KNOWN_CONCEPTS.saturating_sub(global_reserve));
+        let global_take = MAX_KNOWN_CONCEPTS.saturating_sub(ws_take);
+
+        let mut selected: Vec<&Concept> = Vec::with_capacity(MAX_KNOWN_CONCEPTS);
+        selected.extend(ws_ordered.into_iter().take(ws_take));
+        selected.extend(
+            global_scored
+                .into_iter()
+                .take(global_take)
+                .map(|(_, _, c)| c),
+        );
+        if selected.is_empty() {
+            return String::new();
+        }
+        let list: Vec<String> = selected
+            .into_iter()
             .map(|c| {
+                let dom = if c.domain.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{}]", c.domain)
+                };
                 format!(
-                    "- `{}`: {} ({})",
+                    "- `{}`: {}{dom} ({})",
                     c.id,
                     c.label,
-                    understanding::state_of(&views, &c.id).label()
+                    prompt_state(&views, &c.id)
                 )
             })
             .collect();
         format!(
-            "\n\nConcepts already recorded in this folder, from any thread in it, with the user's state on each (shown and solid mean they passed a check on it):\n{}\nWhen a part rests on one of these ideas, list its id exactly, even if you would word or scope it a little differently; don't declare a new concept for it under another name. The user's checks count only under the same id. Declare a new concept only for an idea none of these is.",
+            "\n\nConcepts already recorded, with the user's state on each (shown and solid mean passed locally; prior means passed in another workspace):\n{}\nWhen a part rests on one of these ideas in the same domain, list its id exactly, even if you would word or scope it a little differently; don't declare a new concept for it under another name. The user's checks count only under the same id. Only reuse an id when it is the same idea in the same domain; declare a new concept for an idea none of them is.",
             list.join("\n")
         )
     }
 
-    /// Maps each proposed name to a concept id: an exact match on id, label or
-    /// alias; else a decision model picks among lexical candidates (same at
-    /// p ≥ 0.7); else a new concept. One decision request covers them all.
+    /// Maps each proposed name to a global concept id: an exact/same-name match
+    /// (respecting domain compatibility so homonyms across domains don't merge);
+    /// else a decision model picks among lexical candidates (with domain tags,
+    /// same at p ≥ 0.7); else a new concept. Links matched/new concepts to the
+    /// current workspace via `upsert_workspace_concept`.
     pub(super) async fn resolve_concepts(
         &self,
         session: &Session,
@@ -151,7 +272,18 @@ impl Runtime {
         created_by: &str,
     ) -> Result<HashMap<String, String>> {
         let ws = Self::workspace(session);
-        let existing = self.store.concepts(&ws)?;
+        let existing = self.store.all_concepts()?;
+        let ws_ids: HashSet<String> = self
+            .store
+            .workspace_concepts(&ws)?
+            .into_iter()
+            .map(|c| c.id)
+            .collect();
+        let ws_existing: Vec<Concept> = existing
+            .iter()
+            .filter(|c| ws_ids.contains(&c.id))
+            .cloned()
+            .collect();
         let mut out = HashMap::new();
         let mut ask: Vec<(usize, Vec<String>)> = Vec::new();
         let mut questions = Vec::new();
@@ -161,38 +293,52 @@ impl Runtime {
             } else {
                 p.label.clone()
             };
-            // The same concept in other words, in this folder's record
-            // from any thread ("GMMs" for "Gaussian mixtures"): one idea,
-            // so a check passed anywhere in the folder counts here.
-            if let Some(c) = exact_match(&p.id, &existing)
-                .or_else(|| exact_match(&label, &existing))
-                .or_else(|| understanding::same_named(&label, &existing))
+            // Prefer current-workspace matches first, then global matches,
+            // never auto-merging across conflicting domains (homonym safety).
+            if let Some(c) = compatible_match(&p.id, &label, &p.domain, &ws_existing)
+                .or_else(|| compatible_match(&p.id, &label, &p.domain, &existing))
             {
                 out.insert(p.id.clone(), c.id.clone());
                 continue;
             }
             let mut lex = lexical_candidates(&label, &existing);
-            // An id that names a recorded concept under a label that
-            // doesn't (`products-of-gaussians`, "Gaussian fusion") may be a
-            // narrower or broader idea: the decision model is asked, and
-            // nothing is merged on the id's words alone.
-            if let Some(c) = understanding::same_named(&p.id, &existing)
-                && !lex.iter().any(|l| l.id == c.id)
+            for extra in [
+                exact_match(&p.id, &existing),
+                exact_match(&label, &existing),
+                understanding::same_named(&p.id, &existing),
+                understanding::same_named(&label, &existing),
+            ]
+            .into_iter()
+            .flatten()
             {
-                lex.insert(0, c);
+                if !lex.iter().any(|l| l.id == extra.id) {
+                    lex.insert(0, extra);
+                }
             }
             if lex.is_empty() {
                 continue;
             }
             let mut options: Vec<(String, String)> = lex
                 .iter()
-                .map(|c| (c.id.clone(), c.label.clone()))
+                .map(|c| {
+                    let desc = if c.domain.is_empty() {
+                        c.label.clone()
+                    } else {
+                        format!("{} [domain: {}]", c.label, c.domain)
+                    };
+                    (c.id.clone(), desc)
+                })
                 .collect();
             options.push(("new".into(), "None of these: a different concept".into()));
+            let proposed_desc = if p.domain.trim().is_empty() {
+                format!("\"{label}\"")
+            } else {
+                format!("\"{label}\" (domain: {})", p.domain.trim())
+            };
             questions.push(Question {
                 name: format!("c{i}"),
                 instructions: format!(
-                    "Is the concept \"{label}\" the same idea as one of these recorded concepts? The same idea in other words or with an abbreviation counts (\"GMM\" and \"Gaussian mixture model\"); a related, broader or narrower idea doesn't."
+                    "Is the concept {proposed_desc} the same idea as one of these recorded concepts? The same idea in other words or with an abbreviation counts (\"GMM\" and \"Gaussian mixture model\"); a related, broader or narrower idea, or a homonym from a different domain (e.g. physics \"field\" vs struct \"field\"), doesn't."
                 ),
                 options,
             });
@@ -231,6 +377,7 @@ impl Runtime {
             } else {
                 p.label.clone()
             };
+            let domain = p.domain.trim().to_string();
             match out.get(&p.id) {
                 Some(id) => {
                     let aliases = [p.id.clone(), label]
@@ -243,7 +390,7 @@ impl Runtime {
                             id: id.clone(),
                             label: String::new(),
                             aliases,
-                            domain: String::new(),
+                            domain,
                             created_by: created_by.into(),
                         },
                     )?;
@@ -270,7 +417,7 @@ impl Runtime {
                             id: id.clone(),
                             label,
                             aliases: vec![],
-                            domain: String::new(),
+                            domain,
                             created_by: created_by.into(),
                         },
                     )?;
@@ -306,6 +453,7 @@ impl Runtime {
                     all.push(ProposedConcept {
                         id: c.clone(),
                         label: c.replace('-', " "),
+                        domain: String::new(),
                         needs: vec![],
                     });
                 }
@@ -345,6 +493,7 @@ impl Runtime {
             .map(|t| ProposedConcept {
                 id: t.clone(),
                 label: t.clone(),
+                domain: String::new(),
                 needs: vec![],
             })
             .collect();
@@ -354,6 +503,7 @@ impl Runtime {
             names.push(ProposedConcept {
                 id: m.concept.clone(),
                 label: m.concept.clone(),
+                domain: String::new(),
                 needs: vec![],
             });
         }
@@ -363,11 +513,16 @@ impl Runtime {
         let resolved = self.resolve_concepts(session, &names, "extractor").await?;
         let mut events: Vec<NewEvent> = Vec::new();
         let mut seen = HashSet::new();
+        let note = truncate_note(text, MAX_NOTE_CHARS);
         for t in touched {
             if let Some(id) = resolved.get(t)
                 && seen.insert(id.clone())
             {
-                events.push(NewEvent::new(id, EventKind::Touched));
+                let mut ev = NewEvent::new(id, EventKind::Touched);
+                if !note.is_empty() {
+                    ev = ev.detail(json!({"note": note}));
+                }
+                events.push(ev);
             }
         }
         if let Some(m) = misconception
@@ -729,8 +884,11 @@ impl Runtime {
         out
     }
 
-    /// `/why`: what the active part's status rests on.
-    pub(super) fn why(&self, session: &Session) -> String {
+    /// `/why` (local + elsewhere/prior) or `/why --all` (global knowledge graph).
+    pub(super) fn why(&self, session: &Session, arg: &str) -> String {
+        if arg.split_whitespace().any(|w| w == "--all") {
+            return self.global_record(session);
+        }
         let Some(part) = session.active_part() else {
             return self.folder_record(session);
         };
@@ -772,6 +930,7 @@ impl Runtime {
             mermaid_text(part_status(lang, part.status)),
         );
         let mut notes = Vec::new();
+        let mut priors = Vec::new();
         for c in &ids {
             let detail = match views.get(c) {
                 Some(v) if v.passes + v.fails > 0 => format!(
@@ -781,7 +940,10 @@ impl Runtime {
                         .replace("{passed}", &v.passes.to_string())
                         .replace("{failed}", &v.fails.to_string())
                 ),
-                Some(v) => state(lang, v.state).to_string(),
+                Some(v) => match &v.prior {
+                    Some(p) => format!("{} · {}", state(lang, v.state), prior_display(p)),
+                    None => state(lang, v.state).to_string(),
+                },
                 None => state(lang, ConceptState::Unknown).to_string(),
             };
             out.push_str(&format!(
@@ -791,6 +953,9 @@ impl Runtime {
                 mermaid_text(&detail),
             ));
             if let Some(v) = views.get(c) {
+                if let Some(p) = &v.prior {
+                    priors.push(format!("**{}** ({})", name(c), prior_display(p)));
+                }
                 for m in &v.open_misconceptions {
                     if let Ok(Some(found)) = self.store.misconception(m) {
                         notes.push(
@@ -809,6 +974,12 @@ impl Runtime {
             }
         }
         out.push_str("```");
+        if !priors.is_empty() {
+            out.push_str(&format!(
+                "\n\nPrior from another workspace: {}. Use `/revisit <concept>` to ignore prior here.",
+                priors.join(", ")
+            ));
+        }
         for n in notes {
             out.push_str(&format!("\n\n{n}"));
         }
@@ -829,6 +1000,104 @@ impl Runtime {
             out.push_str(&format!("\n\n{h}"));
         }
         out
+    }
+
+    /// `/revisit <concept>`: appends `EventKind::Revisit` for the matched
+    /// concept in the current workspace (strictly append-only) so prior
+    /// knowledge from other workspaces won't be assumed for it here.
+    pub(super) fn handle_revisit(&self, session: &mut Session, query: &str) -> TurnOutput {
+        let query = query
+            .trim()
+            .trim_start_matches('`')
+            .trim_end_matches('`')
+            .trim();
+        if query.is_empty() {
+            return TurnOutput::notice(
+                "Usage: `/revisit <concept>` — ignore prior knowledge from other workspaces for that concept here.",
+            );
+        }
+        let ws = Self::workspace(session);
+        let all = self.store.all_concepts().unwrap_or_default();
+        if all.is_empty() {
+            return TurnOutput::notice("No concepts are recorded yet.");
+        }
+        let ws_ids: HashSet<String> = self
+            .store
+            .workspace_concepts(&ws)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|c| c.id)
+            .collect();
+        let ws_concepts: Vec<Concept> = all
+            .iter()
+            .filter(|c| ws_ids.contains(&c.id))
+            .cloned()
+            .collect();
+
+        let matched = exact_match(query, &ws_concepts)
+            .or_else(|| understanding::same_named(query, &ws_concepts))
+            .or_else(|| exact_match(query, &all))
+            .or_else(|| understanding::same_named(query, &all))
+            .cloned();
+
+        let concept = match matched {
+            Some(c) => c,
+            None => {
+                let low = query.to_lowercase();
+                let slug = slugify(query);
+                let mut prefix: Vec<&Concept> = all
+                    .iter()
+                    .filter(|c| {
+                        (!slug.is_empty() && c.id.starts_with(&slug))
+                            || c.label.to_lowercase().starts_with(&low)
+                    })
+                    .collect();
+                // Prefer workspace-local matches if there is a unique one.
+                let ws_prefix: Vec<&Concept> = prefix
+                    .iter()
+                    .copied()
+                    .filter(|c| ws_ids.contains(&c.id))
+                    .collect();
+                if ws_prefix.len() == 1 {
+                    prefix = ws_prefix;
+                }
+                match prefix.as_slice() {
+                    [one] => (*one).clone(),
+                    [] => {
+                        return TurnOutput::notice(format!(
+                            "No concept matches `{query}`. `/why` or `/why --all` shows recorded concepts."
+                        ));
+                    }
+                    many => {
+                        let list = many
+                            .iter()
+                            .take(6)
+                            .map(|c| format!("`{}`", c.id))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        return TurnOutput::notice(format!(
+                            "`{query}` matches {list}. Type more of the concept name or id."
+                        ));
+                    }
+                }
+            }
+        };
+
+        self.append_events(
+            session,
+            vec![NewEvent::new(&concept.id, EventKind::Revisit)],
+        );
+        if session
+            .last_step
+            .as_ref()
+            .is_some_and(|s| s.concept == concept.id)
+        {
+            session.last_step = None;
+        }
+        TurnOutput::text(format!(
+            "Marked **{}** (`{}`) for revisit here. Prior knowledge from other workspaces won't be assumed for it in this workspace.",
+            concept.label, concept.id
+        ))
     }
 
     /// §16: what Pathfinder keeps about how you learn, all of it: which
@@ -898,7 +1167,8 @@ impl Runtime {
         let ids: Vec<String> = concepts.iter().map(|c| c.id.clone()).collect();
         let events = self.store.events(&ws, &ids).unwrap_or_default();
         let views = self.concept_views(session, &ids).unwrap_or_default();
-        // Ideas with any event, most recently active first.
+        // Ideas with any local event, or workspace-linked with cross-workspace prior,
+        // most recently active first.
         let mut active: Vec<(&Concept, i64, Option<Line>)> = concepts
             .iter()
             .filter_map(|c| {
@@ -907,18 +1177,23 @@ impl Runtime {
                     .iter()
                     .filter(|e| e.concept == c.id && e.kind != EventKind::Step)
                     .collect();
-                let last = mine.iter().map(|e| e.id).max()?;
-                let told = if mine.iter().any(|e| e.kind == EventKind::Told) {
-                    Some(Line::ToldOnly)
-                } else if mine
-                    .iter()
-                    .all(|e| matches!(e.kind, EventKind::Read | EventKind::Searched))
-                {
-                    Some(Line::ReadOnly)
+                if let Some(last) = mine.iter().map(|e| e.id).max() {
+                    let told = if mine.iter().any(|e| e.kind == EventKind::Told) {
+                        Some(Line::ToldOnly)
+                    } else if mine
+                        .iter()
+                        .all(|e| matches!(e.kind, EventKind::Read | EventKind::Searched))
+                    {
+                        Some(Line::ReadOnly)
+                    } else {
+                        None
+                    };
+                    Some((c, last, told))
+                } else if views.get(&c.id).is_some_and(|v| v.prior.is_some()) {
+                    Some((c, 0, None))
                 } else {
                     None
-                };
-                Some((c, last, told))
+                }
             })
             .collect();
         if active.is_empty() {
@@ -938,7 +1213,12 @@ impl Runtime {
         );
         for (c, _, told) in &active {
             let st = understanding::state_of(&views, &c.id);
+            let prior = views.get(&c.id).and_then(|v| v.prior.as_ref());
             let name = if st == ConceptState::Unknown
+                && let Some(p) = prior
+            {
+                format!("{} · {}", state(lang, st), prior_display(p))
+            } else if st == ConceptState::Unknown
                 && let Some(mark) = told
             {
                 if *mark == Line::ToldOnly {
@@ -1001,6 +1281,223 @@ impl Runtime {
             out.push_str(&format!("\n\n{h}"));
         }
         out
+    }
+
+    /// `/why --all`: the user's global knowledge graph across all workspaces.
+    pub(super) fn global_record(&self, session: &Session) -> String {
+        use crate::i18n::{Line, line, state};
+        let lang = session.language.as_deref();
+        let ws = Self::workspace(session);
+        let concepts = self.store.all_concepts().unwrap_or_default();
+        if concepts.is_empty() {
+            return line(lang, Line::NoRecord).to_string();
+        }
+        let ids: Vec<String> = concepts.iter().map(|c| c.id.clone()).collect();
+        let events = self.store.events_for_concepts(&ids).unwrap_or_default();
+        let now = understanding::now();
+        let views = understanding::views_in_workspace(&events, &ws, now);
+
+        let mut by_concept: HashMap<&str, Vec<&understanding::Event>> = HashMap::new();
+        let mut all_workspaces: HashSet<&str> = HashSet::new();
+        for e in &events {
+            if e.kind != EventKind::Step {
+                by_concept.entry(e.concept.as_str()).or_default().push(e);
+                all_workspaces.insert(e.workspace.as_str());
+            }
+        }
+
+        let mut active: Vec<(&Concept, i64)> = concepts
+            .iter()
+            .filter_map(|c| {
+                let last = by_concept
+                    .get(c.id.as_str())
+                    .and_then(|es| es.iter().map(|e| e.id).max())?;
+                Some((c, last))
+            })
+            .collect();
+        if active.is_empty() {
+            return line(lang, Line::NoRecord).to_string();
+        }
+        active.sort_by_key(|a| std::cmp::Reverse(a.1));
+        active.truncate(Self::RECORD_MAX);
+        let shown_ids: HashSet<&str> = active.iter().map(|(c, _)| c.id.as_str()).collect();
+
+        let (mut local_shown, mut elsewhere_shown) = (0usize, 0usize);
+        let mut out =
+            String::from("Global knowledge record (all workspaces)\n\n```mermaid\nflowchart LR\n");
+        for (c, _) in &active {
+            let v = views.get(&c.id);
+            let local_st = v.map(|v| v.state).unwrap_or(ConceptState::Unknown);
+            let status = if local_st.has_evidence() {
+                local_shown += 1;
+                format!("{} (here)", state(lang, local_st))
+            } else if let Some(p) = v.and_then(|v| v.prior.as_ref()) {
+                elsewhere_shown += 1;
+                prior_display(p)
+            } else if local_st != ConceptState::Unknown {
+                format!("{} (here)", state(lang, local_st))
+            } else if let Some(es) = by_concept.get(c.id.as_str())
+                && let Some(last_ev) = es.last()
+            {
+                let other_ws = last_ev.workspace.as_str();
+                let other_events: Vec<understanding::Event> = es
+                    .iter()
+                    .filter(|e| e.workspace == other_ws)
+                    .map(|e| (*e).clone())
+                    .collect();
+                let other_st = understanding::concept_view(&other_events, now).state;
+                format!("{} in {}", state(lang, other_st), workspace_name(other_ws))
+            } else {
+                state(lang, ConceptState::Unknown).to_string()
+            };
+            let detail = if c.domain.is_empty() {
+                status
+            } else {
+                format!("{} · {status}", c.domain)
+            };
+            out.push_str(&format!(
+                "    {}[\"{}<br/><small>{}</small>\"]\n",
+                crate::domain::mermaid_id(&c.id),
+                crate::domain::mermaid_text(&c.label),
+                crate::domain::mermaid_text(&detail),
+            ));
+        }
+        for (concept, needs) in self.store.prerequisites().unwrap_or_default() {
+            for n in needs {
+                if shown_ids.contains(concept.as_str()) && shown_ids.contains(n.as_str()) {
+                    out.push_str(&format!(
+                        "    {} --> {}\n",
+                        crate::domain::mermaid_id(&n),
+                        crate::domain::mermaid_id(&concept)
+                    ));
+                }
+            }
+        }
+        out.push_str(&format!(
+            "```\n\n{} concepts across {} workspaces: {local_shown} shown here, {elsewhere_shown} shown elsewhere.",
+            active.len(),
+            all_workspaces.len().max(1)
+        ));
+        out
+    }
+}
+
+/// Concept state string for LLM prompts: never includes raw workspace paths or
+/// repo names from other workspaces.
+fn prompt_state(views: &HashMap<String, ConceptView>, concept: &str) -> &'static str {
+    match views.get(concept) {
+        Some(v) if v.state != ConceptState::Unknown => v.state.label(),
+        Some(v) => match &v.prior {
+            Some(PriorState::SolidElsewhere { .. }) => "prior: solid",
+            Some(PriorState::ShownElsewhere { .. }) => "prior: shown",
+            None => ConceptState::Unknown.label(),
+        },
+        None => ConceptState::Unknown.label(),
+    }
+}
+
+/// Short display name of a workspace path for local user-facing inspection
+/// (`/why`, `/why --all`). Never used in LLM prompts.
+fn workspace_name(ws: &str) -> String {
+    std::path::Path::new(ws)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| !n.is_empty())
+        .unwrap_or(ws)
+        .to_string()
+}
+
+fn prior_display(prior: &PriorState) -> String {
+    match prior {
+        PriorState::SolidElsewhere { workspace } => {
+            format!("solid in {}", workspace_name(workspace))
+        }
+        PriorState::ShownElsewhere { workspace } => {
+            format!("shown in {}", workspace_name(workspace))
+        }
+    }
+}
+
+/// Whether two topic/domain tags clearly belong to different domains.
+/// Empty domains never conflict (legacy concepts or untagged extractor items).
+fn domains_conflict(a: &str, b: &str) -> bool {
+    let na = slugify(a);
+    let nb = slugify(b);
+    if na.is_empty() || nb.is_empty() || na == nb {
+        return false;
+    }
+    let ta: HashSet<&str> = na.split('-').filter(|w| w.len() >= 2).collect();
+    let tb: HashSet<&str> = nb.split('-').filter(|w| w.len() >= 2).collect();
+    ta.is_disjoint(&tb)
+}
+
+fn compatible_match<'a>(
+    id: &str,
+    label: &str,
+    domain: &str,
+    concepts: &'a [Concept],
+) -> Option<&'a Concept> {
+    exact_match(id, concepts)
+        .or_else(|| exact_match(label, concepts))
+        .or_else(|| understanding::same_named(label, concepts))
+        .filter(|c| !domains_conflict(domain, &c.domain))
+}
+
+fn query_words(text: &str) -> HashSet<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.chars().count() >= 3)
+        .map(|w| {
+            let low = w.to_lowercase();
+            if low.chars().count() > 3 && low.ends_with('s') && !low.ends_with("ss") {
+                low[..low.len() - 1].to_string()
+            } else {
+                low
+            }
+        })
+        .collect()
+}
+
+fn goal_query_tokens(session: &Session) -> HashSet<String> {
+    let mut out = HashSet::new();
+    if let Some(goal) = &session.goal {
+        out.extend(query_words(goal));
+    }
+    for part in &session.map.parts {
+        out.extend(query_words(&part.title));
+    }
+    for turn in session
+        .history
+        .iter()
+        .rev()
+        .filter(|t| t.role == "user")
+        .take(6)
+    {
+        out.extend(query_words(&turn.content));
+    }
+    out
+}
+
+fn relevance_score(concept: &Concept, query: &HashSet<String>) -> usize {
+    if query.is_empty() {
+        return 0;
+    }
+    let mut have = query_words(&concept.id);
+    have.extend(query_words(&concept.label));
+    have.extend(query_words(&concept.domain));
+    for a in &concept.aliases {
+        have.extend(query_words(a));
+    }
+    query.intersection(&have).count()
+}
+
+fn truncate_note(text: &str, max_chars: usize) -> String {
+    let cleaned = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if cleaned.chars().count() <= max_chars {
+        cleaned
+    } else {
+        let mut s: String = cleaned.chars().take(max_chars).collect();
+        s.push('…');
+        s
     }
 }
 
