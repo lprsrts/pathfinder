@@ -179,6 +179,7 @@ impl Store {
                     workspace TEXT NOT NULL,
                     legacy_id TEXT NOT NULL,
                     concept_id TEXT NOT NULL,
+                    max_event_id INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (workspace, legacy_id)
                 );
                 CREATE INDEX IF NOT EXISTS idx_concept_id_map_concept
@@ -191,6 +192,17 @@ impl Store {
             if !has_domain {
                 conn.execute(
                     "ALTER TABLE concepts ADD COLUMN domain TEXT NOT NULL DEFAULT ''",
+                    [],
+                )?;
+            }
+            let has_max_event_id: bool = conn
+                .prepare(
+                    "SELECT 1 FROM pragma_table_info('concept_id_map') WHERE name = 'max_event_id'",
+                )?
+                .exists([])?;
+            if !has_max_event_id {
+                conn.execute(
+                    "ALTER TABLE concept_id_map ADD COLUMN max_event_id INTEGER NOT NULL DEFAULT 0",
                     [],
                 )?;
             }
@@ -336,12 +348,16 @@ impl Store {
                 workspace TEXT NOT NULL,
                 legacy_id TEXT NOT NULL,
                 concept_id TEXT NOT NULL,
+                max_event_id INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (workspace, legacy_id)
             );
             CREATE INDEX IF NOT EXISTS idx_concept_id_map_concept
                 ON concept_id_map(concept_id);
             "#,
         )?;
+
+        let max_event_id: i64 =
+            tx.query_row("SELECT COALESCE(MAX(id), 0) FROM events", [], |r| r.get(0))?;
 
         let mut sorted_concepts: Vec<Concept> = global_concepts.into_values().collect();
         sorted_concepts.sort_by(|a, b| a.id.cmp(&b.id));
@@ -368,8 +384,9 @@ impl Store {
 
         for ((workspace, legacy_id), concept_id) in &remaps {
             tx.execute(
-                "INSERT INTO concept_id_map (workspace, legacy_id, concept_id) VALUES (?1, ?2, ?3)",
-                params![workspace, legacy_id, concept_id],
+                "INSERT INTO concept_id_map (workspace, legacy_id, concept_id, max_event_id) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![workspace, legacy_id, concept_id, max_event_id],
             )?;
             tx.execute(
                 "UPDATE misconceptions SET concept = ?3 WHERE workspace = ?1 AND concept = ?2",
@@ -534,12 +551,14 @@ impl Store {
                            SELECT 1 FROM concept_id_map m \
                            WHERE m.workspace = e.workspace \
                              AND m.legacy_id = e.concept \
+                             AND e.id <= m.max_event_id \
                              AND m.concept_id != c.id \
                        )) \
                        OR EXISTS ( \
                            SELECT 1 FROM concept_id_map m \
                            WHERE m.workspace = e.workspace \
                              AND m.legacy_id = e.concept \
+                             AND e.id <= m.max_event_id \
                              AND m.concept_id = c.id \
                        ) \
                    ) \
@@ -716,12 +735,14 @@ impl Store {
                      SELECT 1 FROM concept_id_map m \
                      WHERE m.workspace = e.workspace \
                        AND m.legacy_id = e.concept \
+                       AND e.id <= m.max_event_id \
                        AND m.concept_id != ?1 \
                  ) \
              ) OR EXISTS ( \
                  SELECT 1 FROM concept_id_map m \
                  WHERE m.workspace = e.workspace \
                    AND m.legacy_id = e.concept \
+                   AND e.id <= m.max_event_id \
                    AND m.concept_id = ?1 \
              ) \
              ORDER BY e.id",
@@ -775,12 +796,14 @@ impl Store {
                        SELECT 1 FROM concept_id_map m \
                        WHERE m.workspace = e.workspace \
                          AND m.legacy_id = e.concept \
+                         AND e.id <= m.max_event_id \
                          AND m.concept_id != ?2 \
                    )) \
                    OR EXISTS ( \
                        SELECT 1 FROM concept_id_map m \
                        WHERE m.workspace = e.workspace \
                          AND m.legacy_id = e.concept \
+                         AND e.id <= m.max_event_id \
                          AND m.concept_id = ?2 \
                    ) \
                ) \
@@ -1362,6 +1385,31 @@ mod understanding_tests {
         assert_eq!(lin_w2.len(), 2);
         assert_eq!(lin_w2[0].kind, EventKind::Pass);
         assert_eq!(lin_w2[1].kind, EventKind::ReviewOk);
+
+        // Appending a post-migration event in `/w2` for canonical `kernel`
+        // (Linux Kernel) must stay on `kernel` and NOT be remapped to `kernel-3`.
+        store
+            .append_events(
+                "/w2",
+                "s3",
+                &[NewEvent::new("kernel", EventKind::Claim)],
+                400,
+            )
+            .unwrap();
+        let os_after = store.events_for_concepts(&["kernel".into()]).unwrap();
+        assert_eq!(os_after.len(), 2);
+        assert_eq!(os_after[0].workspace, "/w1");
+        assert_eq!(os_after[0].kind, EventKind::Pass);
+        assert_eq!(os_after[1].workspace, "/w2");
+        assert_eq!(os_after[1].concept, "kernel");
+        assert_eq!(os_after[1].kind, EventKind::Claim);
+        let os_w2 = store.events("/w2", &["kernel".into()]).unwrap();
+        assert_eq!(os_w2.len(), 1);
+        assert_eq!(os_w2[0].kind, EventKind::Claim);
+        // `kernel-3` still has only its 2 events (legacy remapped Pass + post-migration ReviewOk).
+        let lin_after = store.events_for_concepts(&["kernel-3".into()]).unwrap();
+        assert_eq!(lin_after.len(), 2);
+        assert!(lin_after.iter().all(|e| e.concept == "kernel-3"));
 
         // Prerequisites and misconceptions were remapped to `kernel-3`.
         let prereqs = store.prerequisites().unwrap();
