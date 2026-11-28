@@ -55,6 +55,7 @@ impl Runtime {
             prev_mode,
             prev_change: session.pending_change.clone(),
             prev_gaps: session.gaps_raised.clone(),
+            also: Vec::new(),
         };
         let (out, events) = self.record_known(session, then, i18n::Line::ShowKnown)?;
         let claimed = session
@@ -65,6 +66,124 @@ impl Runtime {
             session.last_commitment = Some(Undoable { events, ..snapshot });
         }
         Ok(out)
+    }
+
+    /// Claims on several parts your words named at once ("I already know
+    /// parts 1 and 2"): recorded together, shown back in one line, and
+    /// undone together in the next turn. Parts that aren't open are left
+    /// as they are; you move on only when the part you're on was claimed.
+    pub(super) fn claim_many(&self, session: &mut Session, ids: &[String]) -> Result<TurnOutput> {
+        let open: Vec<String> = ids
+            .iter()
+            .filter(|id| {
+                session
+                    .map
+                    .get(id)
+                    .is_some_and(|p| p.status == PartStatus::Open)
+            })
+            .cloned()
+            .collect();
+        let Some((first, rest)) = open.split_first() else {
+            let titles: Vec<String> = ids
+                .iter()
+                .filter_map(|id| session.map.get(id))
+                .map(|p| format!("**{}** is already {}.", p.title, p.status.label()))
+                .collect();
+            return Ok(notice(session, titles.join(" ")));
+        };
+        let snapshot = Undoable {
+            part: first.clone(),
+            events: Vec::new(),
+            turn: session.turn,
+            prev_active: session.active.clone(),
+            prev_mode: session.mode,
+            prev_change: session.pending_change.clone(),
+            prev_gaps: session.gaps_raised.clone(),
+            also: rest.to_vec(),
+        };
+        let mut events = Vec::new();
+        for id in &open {
+            if session
+                .pending_candidate
+                .as_ref()
+                .is_some_and(|c| c.part_id == *id)
+            {
+                session.pending_candidate = None;
+            }
+            self.set_status(session, id, PartStatus::Known, "claimed by the user")?;
+            events.extend(self.record_skip(session, id, EventKind::Claim));
+        }
+        let lang = session.language.clone();
+        let titles: Vec<String> = open
+            .iter()
+            .filter_map(|id| session.map.get(id).map(|p| p.title.clone()))
+            .collect();
+        let joined = titles.join(&format!(
+            "**{}**",
+            i18n::line(lang.as_deref(), i18n::Line::And)
+        ));
+        let mut concepts: Vec<String> = Vec::new();
+        for id in &open {
+            for c in session
+                .map
+                .get(id)
+                .map(|p| p.concepts.clone())
+                .unwrap_or_default()
+            {
+                if !concepts.contains(&c) {
+                    concepts.push(c);
+                }
+            }
+        }
+        let lead = self.known_lead(session, &concepts, &joined);
+        let moved = session.active.as_ref().is_some_and(|a| open.contains(a));
+        let out = if moved {
+            self.after_resolution(session, lead)
+        } else {
+            session.push_turn("assistant", &lead);
+            TurnOutput::text(lead)
+        };
+        session.last_commitment = Some(Undoable { events, ..snapshot });
+        Ok(out)
+    }
+
+    /// The line a claim is shown back with, worded by what the part
+    /// already rests on: a claim adds no evidence, but a concept you had
+    /// already shown keeps its evidence, so "a claim, not evidence" is
+    /// said only of the concepts that rest on your word alone.
+    pub(super) fn known_lead(&self, session: &Session, concepts: &[String], title: &str) -> String {
+        let lang = session.language.as_deref();
+        let views = if concepts.is_empty() {
+            None
+        } else {
+            self.concept_views(session, concepts).ok()
+        };
+        let Some(views) = views else {
+            return i18n::line(lang, i18n::Line::ShowKnown).replace("{title}", title);
+        };
+        let labels = self.labels(session);
+        let unshown: Vec<String> = concepts
+            .iter()
+            .filter(|c| !crate::understanding::state_of(&views, c).has_evidence())
+            .map(|c| {
+                format!(
+                    "**{}**",
+                    labels.get(c).cloned().unwrap_or_else(|| c.clone())
+                )
+            })
+            .collect();
+        if unshown.len() == concepts.len() {
+            i18n::line(lang, i18n::Line::ShowKnown).replace("{title}", title)
+        } else if unshown.is_empty() {
+            i18n::line(lang, i18n::Line::ShowKnownShown).replace("{title}", title)
+        } else {
+            i18n::line(lang, i18n::Line::ShowKnownSome)
+                .replace("{title}", title)
+                .replace(
+                    "{concepts}",
+                    &unshown.join(i18n::line(lang, i18n::Line::And)),
+                )
+        }
     }
 
     /// `/undo`: takes back a claim from your last step. A verdict, a
@@ -92,21 +211,29 @@ impl Runtime {
             })
             .collect();
         self.append_events(session, events);
-        let mut title = claim.part.clone();
-        if let Some(part) = session.map.get_mut(&claim.part)
-            && part.status == PartStatus::Known
-        {
-            part.status = PartStatus::Open;
-            title = part.title.clone();
-            self.store.record_outcome(
-                &session.id,
-                &claim.part,
-                &title,
-                "claim_withdrawn",
-                PartStatus::Open.label(),
-                Some("claim withdrawn"),
-            )?;
+        let mut titles = Vec::new();
+        for id in std::iter::once(&claim.part).chain(&claim.also) {
+            let mut title = id.clone();
+            if let Some(part) = session.map.get_mut(id)
+                && part.status == PartStatus::Known
+            {
+                part.status = PartStatus::Open;
+                title = part.title.clone();
+                self.store.record_outcome(
+                    &session.id,
+                    id,
+                    &title,
+                    "claim_withdrawn",
+                    PartStatus::Open.label(),
+                    Some("claim withdrawn"),
+                )?;
+            }
+            titles.push(title);
         }
+        let title = titles.join(&format!(
+            "**{}**",
+            i18n::line(lang.as_deref(), i18n::Line::And)
+        ));
         session.active = claim.prev_active;
         session.mode = claim.prev_mode;
         session.pending_change = claim.prev_change;
@@ -117,19 +244,305 @@ impl Runtime {
         ))
     }
 
-    /// "Let the agent do it": a handoff for an understood part, a
-    /// delegation for an open one, decided by code from its status.
-    pub(super) fn propose_agent(
+    /// "Let the agent do it" on the part your words name ("let the agent
+    /// write the letter"), not just the one you're on: asks which part
+    /// when they could mean several. `routed`: the part the Router read,
+    /// used when the words name none.
+    pub(super) fn agent_step(
         &self,
         session: &mut Session,
         text: &str,
         files: &[PathBuf],
+        routed: Option<&str>,
     ) -> TurnOutput {
-        let kind = match session.active_part().map(|p| p.status) {
-            Some(PartStatus::Understood) => CommitKind::Handoff,
-            _ => CommitKind::Delegate,
+        let Some(active) = session.active.clone() else {
+            return notice(session, "No part is active.".into());
         };
-        self.propose(session, kind, text, files)
+        // "Do the rest", "X and Y": every part named, run one after
+        // another on one Enter.
+        let many = self.agent_parts(session, text);
+        if many.len() > 1 {
+            return self.propose_agents(session, &many, text, files);
+        }
+        let clause = refer::agent_clause(text);
+        let target = match self.part_named(session, &clause) {
+            refer::PartRef::Active => match routed.filter(|r| session.map.get(r).is_some()) {
+                Some(id) => refer::PartRef::One(id.to_string()),
+                None => refer::PartRef::Active,
+            },
+            other => other,
+        };
+        match target {
+            // "Parts 1 and 2": both, in order.
+            refer::PartRef::All(ids) => self.propose_agents(session, &ids, text, files),
+            refer::PartRef::Many(ids) => {
+                let ask = PendingAsk {
+                    text: text.to_string(),
+                    files: files.to_vec(),
+                    part: active,
+                    choices: ids.into_iter().map(AskChoice::Part).collect(),
+                    then: vec![AskChoice::Agent],
+                };
+                let line = ask_line(session, &ask);
+                session.pending_ask = Some(ask);
+                notice(session, line)
+            }
+            refer::PartRef::One(id) => self.propose_agent(session, &id, text, files),
+            refer::PartRef::Active => self.propose_agent(session, &active, text, files),
+        }
+    }
+
+    /// The parts one request for the agent names, in map order, when it
+    /// names more than one the agent can take: "let the agent do the rest",
+    /// "all remaining parts in one go", "…: the quadrature check and the
+    /// L2 distance". Empty otherwise. Code alone.
+    pub(super) fn agent_parts(&self, session: &Session, text: &str) -> Vec<String> {
+        let takes = |id: &str| {
+            session
+                .map
+                .get(id)
+                .is_some_and(|p| matches!(p.status, PartStatus::Open | PartStatus::Understood))
+        };
+        let at = refer::pointers(&session.map, &session.cwd);
+        let labels = self.labels(session);
+        let one = |item: &str| match refer::resolve_part(&session.map, None, &at, &labels, item) {
+            refer::PartRef::One(id) => vec![id],
+            refer::PartRef::All(ids) => ids,
+            _ => Vec::new(),
+        };
+        let mut named: Vec<String> = Vec::new();
+        for item in refer::agent_items(text) {
+            let mut found = one(&item);
+            // "the component count and the L2 distance": each on its own.
+            if found.is_empty() && item.contains(" and ") {
+                found = item.split(" and ").flat_map(|p| one(p.trim())).collect();
+            }
+            for id in found {
+                if !named.contains(&id) {
+                    named.push(id);
+                }
+            }
+        }
+        // "…, but not the letter", "the rest except the letter".
+        let left_out: Vec<String> = refer::agent_exclusions(text)
+            .iter()
+            .flat_map(|item| one(item))
+            .collect();
+        named.retain(|id| takes(id) && !left_out.contains(id));
+        if named.len() < 2 && refer::asks_rest(text) {
+            named = session
+                .map
+                .parts
+                .iter()
+                .filter(|p| takes(&p.id) && !left_out.contains(&p.id))
+                .map(|p| p.id.clone())
+                .collect();
+        }
+        if named.len() < 2 {
+            return Vec::new();
+        }
+        session
+            .map
+            .parts
+            .iter()
+            .filter(|p| named.contains(&p.id))
+            .map(|p| p.id.clone())
+            .collect()
+    }
+
+    /// Several parts for the agent in one request, shown back together:
+    /// each with what it will be (a handoff you review, or a delegation
+    /// and why), and one Enter runs them in order (§12, §15).
+    pub(super) fn propose_agents(
+        &self,
+        session: &mut Session,
+        ids: &[String],
+        text: &str,
+        files: &[PathBuf],
+    ) -> TurnOutput {
+        use i18n::Line;
+        let lang = session.language.clone();
+        let lang = lang.as_deref();
+        let mut queue: Vec<crate::domain::QueuedAgent> = Vec::new();
+        let mut shown: Vec<String> = Vec::new();
+        for id in ids {
+            let Some(part) = session.map.get(id).cloned() else {
+                continue;
+            };
+            let (reviewable, missing) = self.reviewable(session, &part);
+            let unchecked = refer::wants_no_review(text) && part.status == PartStatus::Open;
+            let kind = if reviewable && !unchecked {
+                CommitKind::Handoff
+            } else {
+                CommitKind::Delegate
+            };
+            if refusal(&part, kind, reviewable).is_some() {
+                continue;
+            }
+            shown.push(match kind {
+                CommitKind::Handoff => {
+                    i18n::line(lang, Line::AgentPartHandoff).replace("{title}", &part.title)
+                }
+                _ if !unchecked && !missing.is_empty() => {
+                    i18n::line(lang, Line::AgentPartDelegateWhy)
+                        .replace("{title}", &part.title)
+                        .replace("{concepts}", &missing.join(", "))
+                }
+                _ => i18n::line(lang, Line::AgentPartDelegate).replace("{title}", &part.title),
+            });
+            queue.push(crate::domain::QueuedAgent {
+                part: part.id.clone(),
+                kind,
+            });
+        }
+        match queue.len() {
+            0 => return self.propose_agent(session, &ids[0], text, files),
+            1 => return self.propose_agent(session, &queue[0].part, text, files),
+            _ => {}
+        }
+        let first = queue.remove(0);
+        let line = i18n::line(lang, Line::ShowAgentParts).replace("{parts}", &shown.join("; "));
+        session.pending_commitment = Some(PendingCommitment {
+            kind: first.kind,
+            part: first.part,
+            text: text.to_string(),
+            files: files.to_vec(),
+            candidate: None,
+            then: queue,
+        });
+        notice(session, line)
+    }
+
+    /// Forgets the parts still queued from an earlier request for the agent.
+    pub(super) fn drop_queue(session: &mut Session) {
+        session.agent_queue.clear();
+        session.agent_text.clear();
+        session.agent_files.clear();
+    }
+
+    /// Runs the parts still queued from one request for the agent, in
+    /// order, after `out` (the run before). Stops while a result waits for
+    /// your review: the next part starts after your verdict on it.
+    pub(super) async fn run_queue(
+        &self,
+        session: &mut Session,
+        mut out: TurnOutput,
+        sink: StreamSink,
+    ) -> Result<TurnOutput> {
+        while !session.agent_queue.is_empty()
+            && !session
+                .map
+                .parts
+                .iter()
+                .any(|p| p.status == PartStatus::InReview)
+        {
+            let next = session.agent_queue.remove(0);
+            let Some(part) = session.map.get(&next.part) else {
+                continue;
+            };
+            let runs = match next.kind {
+                CommitKind::Handoff => {
+                    matches!(part.status, PartStatus::Open | PartStatus::Understood)
+                }
+                _ => part.status == PartStatus::Open,
+            };
+            if !runs {
+                continue;
+            }
+            // What the run before said stays in view above the next one.
+            if !out.reply.trim().is_empty() {
+                sink(StreamEvent::TextDelta(format!(
+                    "{}\n\n",
+                    out.reply.trim_end()
+                )));
+            }
+            let text = queued_instructions(&session.agent_text);
+            let files = session.agent_files.clone();
+            go_to(session, &next.part);
+            out = match next.kind {
+                CommitKind::Handoff => {
+                    self.handle_handoff(session, &text, &files, sink.clone())
+                        .await?
+                }
+                _ => {
+                    self.handle_delegate(session, &text, &files, sink.clone())
+                        .await?
+                }
+            };
+        }
+        if session.agent_queue.is_empty() {
+            session.agent_text.clear();
+            session.agent_files.clear();
+        }
+        Ok(out)
+    }
+
+    /// "Let the agent do it": a handoff with your review when the part is
+    /// reviewable (§12: understood, or every concept it rests on shown or
+    /// solid), else a delegation that says in one line why. "Without me
+    /// checking" asks for a delegation outright. Decided by code, never a
+    /// model.
+    pub(super) fn propose_agent(
+        &self,
+        session: &mut Session,
+        part: &str,
+        text: &str,
+        files: &[PathBuf],
+    ) -> TurnOutput {
+        let Some(found) = session.map.get(part).cloned() else {
+            return notice(session, "No part is active.".into());
+        };
+        let (reviewable, missing) = self.reviewable(session, &found);
+        let unchecked = refer::wants_no_review(text) && found.status == PartStatus::Open;
+        let kind = if reviewable && !unchecked {
+            CommitKind::Handoff
+        } else {
+            CommitKind::Delegate
+        };
+        let out = self.propose_on(session, kind, &found, text, files);
+        if kind == CommitKind::Delegate
+            && !unchecked
+            && !missing.is_empty()
+            && session.pending_commitment.is_some()
+        {
+            // Why it isn't a handoff, in one line: what you haven't shown.
+            let why = i18n::line(session.language.as_deref(), i18n::Line::DelegateWhy)
+                .replace("{concepts}", &missing.join(", "));
+            let line = format!("{}\n{why}", out.reply);
+            if let Some(last) = session.history.last_mut()
+                && last.role == "assistant"
+            {
+                last.content = line.clone();
+            }
+            return TurnOutput::notice(line);
+        }
+        out
+    }
+
+    /// Whether your review of `part` would count (§12): it is understood,
+    /// or it is open and every concept it rests on is shown or solid. Also
+    /// the concepts not shown yet, by label.
+    pub(super) fn reviewable(
+        &self,
+        session: &Session,
+        part: &crate::domain::Part,
+    ) -> (bool, Vec<String>) {
+        match part.status {
+            PartStatus::Understood => return (true, Vec::new()),
+            PartStatus::Open if !part.concepts.is_empty() => {}
+            _ => return (false, Vec::new()),
+        }
+        let Ok(views) = self.concept_views(session, &part.concepts) else {
+            return (false, Vec::new());
+        };
+        let labels = self.labels(session);
+        let missing: Vec<String> = part
+            .concepts
+            .iter()
+            .filter(|c| !crate::understanding::state_of(&views, c).has_evidence())
+            .map(|c| labels.get(c).cloned().unwrap_or_else(|| c.clone()))
+            .collect();
+        (missing.is_empty(), missing)
     }
 
     /// Holds a commitment with side effects and shows it back: Enter runs
@@ -142,11 +555,26 @@ impl Runtime {
         text: &str,
         files: &[PathBuf],
     ) -> TurnOutput {
-        let lang = session.language.clone();
-        let lang = lang.as_deref();
         let Some(part) = session.active_part().cloned() else {
             return notice(session, "No part is active.".into());
         };
+        self.propose_on(session, kind, &part, text, files)
+    }
+
+    /// `propose` on `part`, which need not be the one you're on: a handoff
+    /// or delegation of another part moves you there only once you
+    /// confirm it.
+    fn propose_on(
+        &self,
+        session: &mut Session,
+        kind: CommitKind,
+        part: &crate::domain::Part,
+        text: &str,
+        files: &[PathBuf],
+    ) -> TurnOutput {
+        let lang = session.language.clone();
+        let lang = lang.as_deref();
+        let part = part.clone();
         let line = match kind {
             CommitKind::Verdict => {
                 if session.pending_candidate.is_none() {
@@ -158,7 +586,8 @@ impl Runtime {
                 i18n::line(lang, i18n::Line::ShowVerdict).replace("{words}", &cut(text, WORDS_MAX))
             }
             CommitKind::Handoff => {
-                if let Some(refused) = refusal(&part, kind) {
+                let reviewable = self.reviewable(session, &part).0;
+                if let Some(refused) = refusal(&part, kind, reviewable) {
                     return notice(session, refused);
                 }
                 let which = if crate::ledger::repo_root(&session.cwd).is_some() {
@@ -169,15 +598,33 @@ impl Runtime {
                 i18n::line(lang, which).replace("{title}", &part.title)
             }
             CommitKind::Delegate => {
-                if let Some(refused) = refusal(&part, kind) {
+                if let Some(refused) = refusal(&part, kind, false) {
                     return notice(session, refused);
                 }
                 i18n::line(lang, i18n::Line::ShowDelegate).replace("{title}", &part.title)
             }
+            // Your verdict on the agent's result, as `/approve` and
+            // `/object` give it: only on a result waiting for review.
+            CommitKind::Approve | CommitKind::Object => {
+                if part.status != PartStatus::InReview {
+                    return notice(
+                        session,
+                        "Nothing is waiting for your review on this part.".into(),
+                    );
+                }
+                let which = if kind == CommitKind::Approve {
+                    i18n::Line::ShowApprove
+                } else {
+                    i18n::Line::ShowObject
+                };
+                i18n::line(lang, which)
+                    .replace("{title}", &part.title)
+                    .replace("{words}", &cut(text, WORDS_MAX))
+            }
         };
         let candidate = match kind {
             CommitKind::Verdict => session.pending_candidate.as_ref().map(|c| c.id.clone()),
-            CommitKind::Handoff | CommitKind::Delegate => None,
+            _ => None,
         };
         session.pending_commitment = Some(PendingCommitment {
             kind,
@@ -185,6 +632,7 @@ impl Runtime {
             text: text.to_string(),
             files: files.to_vec(),
             candidate,
+            then: Vec::new(),
         });
         notice(session, line)
     }
@@ -203,17 +651,25 @@ impl Runtime {
                 i18n::line(lang.as_deref(), i18n::Line::NothingWaiting).to_string(),
             ));
         };
-        let applies = session.active.as_deref() == Some(p.part.as_str())
-            && match p.kind {
-                // The very candidate your words were shown back for: a
-                // newer one on the same part was never judged by them.
-                CommitKind::Verdict => session
-                    .pending_candidate
-                    .as_ref()
-                    .is_some_and(|c| c.part_id == p.part && Some(&c.id) == p.candidate.as_ref()),
-                // Their commands check the part's status again.
-                CommitKind::Handoff | CommitKind::Delegate => true,
-            };
+        let applies = match p.kind {
+            // The very candidate your words were shown back for: a newer
+            // one on the same part was never judged by them.
+            CommitKind::Verdict => {
+                session.active.as_deref() == Some(p.part.as_str())
+                    && session
+                        .pending_candidate
+                        .as_ref()
+                        .is_some_and(|c| c.part_id == p.part && Some(&c.id) == p.candidate.as_ref())
+            }
+            // The part your words named, which you go to now; their
+            // commands check its status again.
+            CommitKind::Handoff | CommitKind::Delegate => session.map.get(&p.part).is_some(),
+            // Still the result you were shown back: in review on that part.
+            CommitKind::Approve | CommitKind::Object => session
+                .map
+                .get(&p.part)
+                .is_some_and(|part| part.status == PartStatus::InReview),
+        };
         if !applies {
             return Ok(notice(
                 session,
@@ -221,14 +677,47 @@ impl Runtime {
             ));
         }
         session.ran_commitment = Some(p.kind);
-        match p.kind {
+        // One request for several parts: the rest wait their turn.
+        let text = if p.then.is_empty() {
+            // A new request for one part replaces what an older one left
+            // queued: that queue never runs on a later, unrelated OK.
+            if matches!(p.kind, CommitKind::Handoff | CommitKind::Delegate) {
+                Self::drop_queue(session);
+            }
+            p.text.clone()
+        } else {
+            session.agent_queue = p.then.clone();
+            session.agent_text = p.text.clone();
+            session.agent_files = p.files.clone();
+            queued_instructions(&p.text)
+        };
+        let out = match p.kind {
             CommitKind::Verdict => {
                 forget_show_back(session, &p.text);
-                self.handle_judgment(session, &p.text, &p.files, sink).await
+                return self.handle_judgment(session, &p.text, &p.files, sink).await;
             }
-            CommitKind::Handoff => self.handle_handoff(session, &p.text, &p.files, sink).await,
-            CommitKind::Delegate => self.handle_delegate(session, &p.text, &p.files, sink).await,
-        }
+            CommitKind::Handoff => {
+                go_to(session, &p.part);
+                self.handle_handoff(session, &text, &p.files, sink.clone())
+                    .await?
+            }
+            CommitKind::Delegate => {
+                go_to(session, &p.part);
+                self.handle_delegate(session, &text, &p.files, sink.clone())
+                    .await?
+            }
+            CommitKind::Approve => {
+                go_to(session, &p.part);
+                self.handle_approve(session).await?
+            }
+            // Catching a planted check finishes the part: the queue goes on.
+            CommitKind::Object => {
+                go_to(session, &p.part);
+                self.handle_object(session, &p.text, &p.files, sink.clone())
+                    .await?
+            }
+        };
+        self.run_queue(session, out, sink).await
     }
 
     /// `/cancel` (Esc): drops what waits for your OK. A verdict you didn't
@@ -314,8 +803,15 @@ impl Runtime {
     ) -> Option<TurnOutput> {
         let active = session.active.clone()?;
         let wanted = wanted_choices(top);
-        let (part, choices, then) = match self.part_named(session, text) {
-            refer::PartRef::Many(ids) => {
+        // Asking only about the agent: the part is read from the words
+        // that ask for it ("… let the agent write the letter").
+        let named = if top == [AGENT] {
+            refer::agent_clause(text)
+        } else {
+            text.to_string()
+        };
+        let (part, choices, then) = match self.part_named(session, &named) {
+            refer::PartRef::Many(ids) | refer::PartRef::All(ids) => {
                 let choices = ids.into_iter().map(AskChoice::Part).collect();
                 (active, choices, wanted)
             }
@@ -367,6 +863,10 @@ impl Runtime {
                 let line = ask_line(session, &ask);
                 session.pending_ask = Some(ask);
                 Some(notice(session, line))
+            }
+            refer::PartRef::All(ids) => {
+                session.push_turn("user", text);
+                Some(self.claim_many(session, &ids)?)
             }
             refer::PartRef::One(id) if session.active.as_deref() == Some(id.as_str()) => None,
             refer::PartRef::One(id) => {
@@ -459,7 +959,7 @@ impl Runtime {
             }
             AskChoice::Agent => {
                 session.push_turn("user", text);
-                self.propose_agent(session, &ask.text, &files)
+                self.propose_agent(session, &part, &ask.text, &files)
             }
             AskChoice::Part(_) => unreachable!("a part was resolved above"),
         }))
@@ -549,6 +1049,8 @@ fn not_run(session: &Session, p: &PendingCommitment) -> String {
         CommitKind::Verdict => i18n::Line::NotRunVerdict,
         CommitKind::Handoff => i18n::Line::NotRunHandoff,
         CommitKind::Delegate => i18n::Line::NotRunDelegate,
+        CommitKind::Approve => i18n::Line::NotRunApprove,
+        CommitKind::Object => i18n::Line::NotRunObject,
     };
     i18n::line(session.language.as_deref(), which).replace("{title}", &title)
 }
@@ -617,6 +1119,11 @@ fn ask_line(session: &Session, ask: &PendingAsk) -> String {
                 AskChoice::Check => i18n::line(lang, Line::AskCheck).replace("{title}", &here),
                 AskChoice::Note => i18n::line(lang, Line::AskNote).to_string(),
                 AskChoice::Tell => i18n::line(lang, Line::AskTell).to_string(),
+                // Another part than the one you're on is named, so you know
+                // which one the agent would do.
+                AskChoice::Agent if session.active.as_deref() != Some(ask.part.as_str()) => {
+                    i18n::line(lang, Line::AskAgentPart).replace("{title}", &here)
+                }
                 AskChoice::Agent => i18n::line(lang, Line::AskAgent).to_string(),
                 AskChoice::Part(id) => format!("**{}**", title(id)),
             };
@@ -637,6 +1144,14 @@ fn ask_line(session: &Session, ask: &PendingAsk) -> String {
     i18n::line(lang, which).replace("{choices}", &joined)
 }
 
+/// Your request for the agent, as each of the parts it named gets it: the
+/// agent does one part per run, and the others follow.
+fn queued_instructions(text: &str) -> String {
+    format!(
+        "{text}\n\n(This request hands several parts to the agent, one run each, in order. Do only this part now; the others follow in their own runs.)"
+    )
+}
+
 /// Makes `id` the part you're on, as `/focus` would, without a reply.
 fn go_to(session: &mut Session, id: &str) {
     if session.active.as_deref() != Some(id) && session.map.get(id).is_some() {
@@ -647,9 +1162,12 @@ fn go_to(session: &mut Session, id: &str) {
 }
 
 /// Why `/handoff` or `/delegate` would refuse this part, in its words.
-fn refusal(part: &crate::domain::Part, kind: CommitKind) -> Option<String> {
+/// `reviewable`: an open part whose every concept is shown or solid can be
+/// handed off as if understood (§12).
+fn refusal(part: &crate::domain::Part, kind: CommitKind, reviewable: bool) -> Option<String> {
     match (kind, part.status) {
         (CommitKind::Handoff, PartStatus::Understood) => None,
+        (CommitKind::Handoff, PartStatus::Open) if reviewable => None,
         (CommitKind::Delegate, PartStatus::Open) => None,
         (CommitKind::Handoff, PartStatus::Open) => Some(
             "Handoff comes after understanding: log, `/summary`, then judge the candidate. To hand it off without understanding, `/delegate`.".into(),

@@ -149,6 +149,15 @@ pub struct ModelChoices {
 
 pub const CHECKS: [&str; 3] = ["off", "light", "normal"];
 
+/// What a review-checks level is called on screen. `normal` is the highest
+/// level, so it reads as `full`; the stored id stays `normal`.
+pub fn checks_label(id: &str) -> &str {
+    match id {
+        "normal" => "full",
+        other => other,
+    }
+}
+
 /// Main model effort levels offered in the picker.
 pub const EFFORTS: [&str; 4] = ["default", "low", "medium", "high"];
 
@@ -561,6 +570,7 @@ impl Runtime {
         files: &[PathBuf],
         sink: StreamSink,
     ) -> Result<TurnOutput> {
+        follow_language(session, text);
         // A question back to you lasts one message: this one may answer
         // it; otherwise it is dropped and nothing was recorded (§15).
         let ask = session.pending_ask.take();
@@ -572,6 +582,15 @@ impl Runtime {
                 .await?
         {
             return Ok(out);
+        }
+        // "What do I actually understand now?" asks about your record: the
+        // whole folder's, every idea you have shown so far, not only the
+        // part you're on; never sources or a model (§8, A10).
+        if !text.starts_with('/') && refer::asks_record(text) {
+            session.push_turn("user", text);
+            let why = self.folder_record(session);
+            session.push_turn("assistant", &why);
+            return Ok(TurnOutput::text(why));
         }
         let output = if text.starts_with('/') {
             self.handle_command(session, text, files, sink).await?
@@ -648,11 +667,27 @@ impl Runtime {
                 self.build_map(session, files, sink).await
             }
             "/summary" => self.handle_summary(session, arg, files, sink).await,
-            "/handoff" => self.handle_handoff(session, arg, files, sink).await,
-            "/object" => self.handle_object(session, arg, files, sink).await,
-            "/approve" => self.handle_approve(session).await,
+            // A part you hand over yourself replaces an older queued request.
+            "/handoff" => {
+                Self::drop_queue(session);
+                self.handle_handoff(session, arg, files, sink).await
+            }
+            // Catching a planted check finishes the part: the queue goes on.
+            "/object" => {
+                let out = self
+                    .handle_object(session, arg, files, sink.clone())
+                    .await?;
+                self.run_queue(session, out, sink).await
+            }
+            "/approve" => {
+                let out = self.handle_approve(session).await?;
+                self.run_queue(session, out, sink).await
+            }
             "/known" => self.handle_known(session, Some(arg)),
-            "/delegate" => self.handle_delegate(session, arg, files, sink).await,
+            "/delegate" => {
+                Self::drop_queue(session);
+                self.handle_delegate(session, arg, files, sink).await
+            }
             "/accept" => self.handle_accept(session).await,
             "/why" => Ok(TurnOutput::text(self.why(session))),
             "/coverage" => Ok(TurnOutput::text(self.coverage_report(session))),
@@ -705,9 +740,17 @@ fn exam_questions_asked(session: &Session) -> Vec<String> {
                 .history
                 .iter()
                 .filter(|t| t.role == "assistant")
-                .filter(|t| i18n::opens_with(&t.content, i18n::Line::ExamQuestionFor))
-                .filter_map(|t| {
-                    let (_, q) = t.content.split_once("\n\n")?;
+                // The first question carries the exam's lead before its
+                // header.
+                .map(|t| {
+                    let lead = i18n::line(session.language.as_deref(), i18n::Line::ExamLead);
+                    t.content
+                        .strip_prefix(lead)
+                        .map_or(t.content.as_str(), str::trim_start)
+                })
+                .filter(|c| i18n::opens_with(c, i18n::Line::ExamQuestionFor))
+                .filter_map(|c| {
+                    let (_, q) = c.split_once("\n\n")?;
                     let q = q.rsplit_once("\n\n").map_or(q, |(q, _)| q);
                     Some(q.trim().to_string())
                 }),
@@ -718,8 +761,9 @@ fn exam_questions_asked(session: &Session) -> Vec<String> {
 /// The decision model's step for a verdict on a waiting candidate.
 const VERDICT: &str = "verdict";
 
-/// The Router's step for "let the agent do it" (§15): code picks a handoff
-/// or a delegation from the part's status, never a model.
+/// The Router's step for "let the agent do it" (§15): code picks the part
+/// named, and a handoff or a delegation from whether your review of it
+/// would count (§12), never a model.
 const AGENT: &str = "agent";
 
 /// The Router's step for "just tell me" (§11, §15).
@@ -730,6 +774,11 @@ const UNDO: &str = "undo";
 
 /// The Router's step for agreeing to what waits for your OK (§15).
 const CONFIRM: &str = "confirm";
+
+/// The Router's steps for your verdict on the agent's result in plain
+/// words (§7): shown back for Enter, then run as `/approve` or `/object`.
+const APPROVE: &str = "approve";
+const OBJECT: &str = "object";
 
 /// The steps that change what the record says about you (§15).
 const COMMITMENTS: [&str; 4] = [VERDICT, "known", AGENT, TELL];
@@ -750,9 +799,9 @@ const CONFIDENT_STEP: f64 = 0.9;
 const DECISION_THRESHOLD: f64 = 0.6;
 
 const CANDIDATE_HIDDEN: &str = "(candidate hidden while the user judges it)";
+const REVIEW_HIDDEN: &str = "(the agent's changes, hidden while the user reviews them)";
 
-pub(crate) const REVIEW_PROMPT: &str =
-    "\n\nReview the result: `/approve`, or `/object <what's wrong and why>` to send it back.";
+pub(crate) const REVIEW_PROMPT: &str = "\n\nReview the result: say it looks good (`/approve`), or what's wrong and why to send it back (`/object <what's wrong and why>`).";
 
 /// Keeps a turn's steps with the first reply it added to the history.
 fn keep_steps(session: &mut Session, turns_before: usize, steps: Vec<crate::domain::Step>) {
@@ -864,9 +913,70 @@ fn render_map_and_pending(session: &Session) -> String {
     out
 }
 
-fn format_history(session: &Session) -> String {
+/// The conversation's language follows your own messages: a message
+/// whose language is clear sets it (a command's argument counts, the
+/// command doesn't); a short or mixed one leaves it as it was. Never the
+/// system locale, and never a model's guess once it is set.
+fn follow_language(session: &mut Session, text: &str) {
+    let own = match text.strip_prefix('/') {
+        Some(rest) => rest.split_once(char::is_whitespace).map_or("", |(_, a)| a),
+        None => text,
+    };
+    if let Some(lang) = i18n::detect(own) {
+        session.language = Some(lang);
+    }
+}
+
+/// A system prompt for a model that writes text you read, with the
+/// conversation's language spelled out.
+fn in_language(system: &str, session: &Session) -> String {
+    format!("{system}\n\n{}", i18n::rule(session.language.as_deref()))
+}
+
+impl Runtime {
+    /// The recent conversation for a model's prompt, with a candidate waiting
+    /// for your verdict hidden: it may be flawed on purpose, and a model that
+    /// can see it tends to vouch for it (A2). A review still waiting for your
+    /// verdict is hidden too, checked or not, so its planted hunk (if any)
+    /// never reaches a model that may not see it (A2, §13). The one helper for
+    /// every prompt but the Judge's, which is given the candidate on purpose.
+    fn format_history(&self, session: &Session) -> String {
+        mask_history(session, &self.waiting_reviews(session))
+    }
+
+    /// The turns that show a review still waiting for your verdict. Every
+    /// review gets a secret, so this reads the same whether a review is
+    /// checked or not.
+    fn waiting_reviews(&self, session: &Session) -> Vec<usize> {
+        self.store
+            .active_secrets(&session.id)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|s| s.kind == "planted_flaw" || s.kind == "review")
+            .map(|s| s.opened_at_turn)
+            .collect()
+    }
+}
+
+/// `format_history`, given the turns that show a review still waiting.
+fn mask_history(session: &Session, reviews: &[usize]) -> String {
     let start = session.history.len().saturating_sub(12);
-    format_turns(&session.history[start..])
+    let turns: Vec<crate::domain::TurnRecord> = session.history[start..]
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            let mut t = t.clone();
+            if t.role == "assistant" && reviews.contains(&(start + i)) {
+                t.content = REVIEW_HIDDEN.to_string();
+            }
+            t
+        })
+        .collect();
+    let turns = format_turns(&turns);
+    match &session.pending_candidate {
+        Some(p) if !p.candidate.trim().is_empty() => turns.replace(&p.candidate, CANDIDATE_HIDDEN),
+        _ => turns,
+    }
 }
 
 fn format_turns(turns: &[crate::domain::TurnRecord]) -> String {
@@ -888,7 +998,7 @@ First decide what kind of message this is, by what the user means, in any wordin
 - A question or request (set `question` true, `ready_to_map` false, `goal` null, `reply` ""): anything they want answered, explained, summarised or looked up ("what is a phasor?", "explain this slide", "how do I derive this?", "what do I need to know from slide set 4?", "give me the solution to exercise 1a", "what's the capital of Peru?"). Also their own work shown for review ("I solved exercise 2, is this right?", a photo of their solution). Asking for a solution is a question, not a task: the user decides. Set `offer_check` to true when it's about understanding something, false for lookups and chit-chat.
 - A quick check (`check` and `ready_to_map` true): the user signals, however they put it, that they now understand what was just explained (e.g. "ah, now it clicks"). That claim is the moment to check it. The goal starts with "Check" (in their language: "Prüfen, ...") and names the topic just explained, narrowly. Thanks or an acknowledgement without any claim of understanding is chit-chat: a question with `offer_check` false.
 - An exam (`exam` and `ready_to_map` true): they want to be tested or examined on a topic, in any form (e.g. practising for an oral exam, being quizzed on a chapter). The goal starts with "Examine" (in their language: "Abfragen, ...") and names the topic: the one they name, else the one just discussed.
-- A task (`ready_to_map` true, `check` and `exam` false): only when they want to work through something themselves ("I want to solve exercise 1 myself, help me without giving it away", "ich will das Kapitel richtig lernen") or want work done in the workspace (build, fix, change something). Not for questions about a topic, however big.
+- A task (`ready_to_map` true, `check` and `exam` false): only when they want to work through something themselves ("I want to solve exercise 1 myself, help me without giving it away", "ich will das Kapitel richtig lernen") or want work done in the workspace (build, fix, change something). Not for questions about a topic, however big. Writing or saving something in the workspace (a letter, a file) is a task: never reply that you can't write or that access is read-only.
 
 Always set `language` to the two-letter code of the language the user writes in (e.g. "de", "en"), and write `goal` and `reply` in that language.
 
@@ -897,7 +1007,7 @@ Otherwise it's onboarding for a task. Aim to finish in this turn:
 - Ask one short question only when you can't tell what the task is at all (e.g. "orient yourself", "help me with my thesis"). If the workspace has content, ground it: say in one sentence what the workspace is (from the snapshot and any files worth reading, such as a README), then ask what they want to do there. If it's empty, just ask. Never ask the user to confirm, choose a scope, or say what they want to be able to explain.
 - If the user says what they already know or don't ("I'm new to this", "I know the basics"), keep it in `goal` (e.g. "... starting from the basics").
 
-`reply`: when ready, just the goal in one sentence (the map is shown right after it; don't announce it). When asking, at most two sentences.
+`reply`: when ready, just the goal in one sentence (the map is shown right after it; don't announce it). When asking, at most two sentences. Write math as plain text or Unicode (x², √, ≤, μᵢ), never LaTeX.
 
 You get a workspace snapshot. If a file could answer something, read it before writing your JSON, since `reply` ends your turn. Don't read files when the snapshot and the user's words already settle it.
 
@@ -911,10 +1021,10 @@ const MAP_SYSTEM: &str = r#"You sketch the map for Pathfinder: what the task dep
 - `depends_on` lists parts that must be understood or done before this one makes sense. No cycles.
 - `id`: a short descriptive slug the user types in commands: lowercase words joined by hyphens, at most 12 characters (e.g. `weights`, `fwd-pass`, `loss`). Unique. It names what the part is actually about, not a broad field: `colliders`, not `probability`. Users skip parts by their names.
 - Start where the user is: if the goal or conversation says what they already know or don't, shape the parts for that (e.g. include the basics for a newcomer). Keep parts they say they know on the map; they can mark them known themselves.
-- `note`: where to read for this part: a workspace file and page or line (e.g. `slides-4.pdf p. 12`, `notes.md:40`), or "" if the workspace has nothing for it. Never an explanation or a hint about the content. `brief`: what the map covers, in one or two sentences.
+- `note`: where to read for this part: a workspace file and page or line (e.g. `slides-4.pdf p. 12`, `notes.md:40`), or "" if the workspace has nothing for it. Never an explanation or a hint about the content. `brief`: what the map covers, in one or two sentences. In the brief, titles and labels, write math as plain text or Unicode (x², √, ≤, μᵢ), never LaTeX.
 - A goal that is a check of a topic just explained in the conversation ("Check ...", "Prüfen, ...") gets one part for that topic, two at most: the user explains it and judges a candidate.
 - Never give results away: no answers, computed values or intermediate results (a cutoff frequency, a derivative, "≈ 0.157") in the brief, notes or titles. The user works them out; for an exercise, say what each part is about, not what it comes to.
-- `concepts`: the ideas the parts rest on, the record Pathfinder keeps of what the user has shown they understand. Each has an `id` (a lowercase hyphenated slug naming the idea itself, e.g. `d-separation`, `chain-rule`), a short `label`, and `needs`: the concept ids it builds on. Include a concept the task needs even if no part covers it (a prerequisite the user may lack). Reuse ids of concepts already recorded in this workspace when it's the same idea.
+- `concepts`: the ideas the parts rest on, the record Pathfinder keeps of what the user has shown they understand. Each has an `id` (a lowercase hyphenated slug naming the idea itself, e.g. `d-separation`, `chain-rule`), a short `label`, and `needs`: the concept ids it builds on. Include a concept the task needs even if no part covers it (a prerequisite the user may lack). When the prompt lists concepts already recorded in this folder, a part that rests on one of those ideas lists that id exactly (and you don't redeclare it), even if you'd word it differently: the user's checks count only under the same id. Declare new concepts only for ideas none of them is.
 - Each part lists its 1–4 core `concepts` (ids from `concepts`): what someone must understand to judge an agent's work on that part. Usually one or two.
 
 Return ONLY a JSON object:
@@ -922,12 +1032,12 @@ Return ONLY a JSON object:
 
 const CHANGE_SYSTEM: &str = r#"You propose a change to Pathfinder's map of what the task depends on, because something changed. The user accepts or rejects it.
 
-- `parts`: parts to add, or existing parts to update (same id), each with id, title, note, depends_on and its 1–4 core `concepts` (concept ids). New concepts go in `concepts` (id, label, needs), as in the map. New ids: `id`: a short descriptive slug the user types in commands: lowercase words joined by hyphens, at most 12 characters (e.g. `weights`, `fwd-pass`, `loss`). Unique.
+- `parts`: parts to add, or existing parts to update (same id), each with id, title, note, depends_on and its 1–4 core `concepts` (concept ids). New concepts go in `concepts` (id, label, needs), as in the map. Reuse the id of a concept on the map or recorded in this folder (listed in the prompt) when a part rests on that idea; declare a new one only for an idea none of them is. New ids: `id`: a short descriptive slug the user types in commands: lowercase words joined by hyphens, at most 12 characters (e.g. `weights`, `fwd-pass`, `loss`). Unique.
 - `remove`: ids of parts to drop. Only parts with no work or outcome can be removed.
 - No size limit. No cycles.
 
 - `goal`: only when what changed alters what the task is (a new purpose or scope): the new goal as one sentence starting with a verb, not in first person. Otherwise null.
-`brief`: one sentence to the user, saying "you", on what changes and why.
+`brief`: one sentence to the user, saying "you", on what changes and why. In the brief and titles, write math as plain text or Unicode (x², √, ≤, μᵢ), never LaTeX.
 
 Return ONLY a JSON object:
 {"brief": "...", "goal": null, "parts": [], "remove": [], "concepts": []}"#;
@@ -941,13 +1051,14 @@ First decide what the latest message is (`intent`):
 - `move`: they want to go on to the next part, or to a named one (put its id in `part`). For `known`, also put a part they name to go to in `part`.
 - `accept` / `reject`: they answer a waiting map change ("yes, add it", "no, keep the map").
 - `replan`: they ask to change the plan, or say something that changes the whole task's scope or purpose (a new constraint or aim).
-- `agent`: they ask for the agent to do this part (do it for them, hand it off, delegate it).
+- `agent`: they ask for the agent to do this part or another one (put its id in `part`), or for something to be written, saved or changed in their files ("do it for me", "hand it off", "write the letter"). You can't write files and the agent can, so such a request is always `agent`, never `log` or `tell`.
 - `tell`: they ask to be told the answer or an explanation outright, rather than pointed to sources.
 For anything but `log`, set `reply` to "" and `map_change` to null: Pathfinder takes the step.
 
 For `log`, set `reply` to "ok". Pathfinder never answers in its own words: a question gets pointers into the sources, found separately. For `log`, also write, in the user's language:
 - `ack`: for a log entry (not a question), one short sentence, at most 20 words, saying "you", that names what they just did in their own terms ("You linked Maxwell's equations to the Helmholtz equation."). It adds nothing: no fact, no explanation, no correction, no praise, no judgment of whether they are right, no hint. "" for a question.
 - `question`: one open question for their next step, at most 25 words, written from this part and the place in its sources they should look next (the part's note, the file and page you read). It makes them think further about what they wrote, never contains or hints at the answer, and reads as a natural, grammatical sentence (don't paste a long name into a template). "" if you can't write one.
+- In `ack` and `question`, write math as plain text or Unicode (x², √, ≤, μᵢ), never LaTeX.
 
 If a `log` message reveals the map is wrong (a missing dependency, a part that doesn't belong, a wrong edge, or a new constraint that changes the task's scope), propose a change in `map_change`; the user accepts or rejects it. Otherwise set it to null. A change has `brief` (one sentence to the user, saying "you"), `goal` (only when the message changes what the task is, e.g. a new purpose or scope: the new goal as one sentence starting with a verb, not in first person; otherwise null), `parts` (to add, or update by id: id, title, note, depends_on; new ids are short hyphenated slugs of at most 12 characters) and `remove` (ids of parts with no work yet).
 
@@ -1002,7 +1113,7 @@ You have the candidate, the hidden key (correct or flawed, and why) and the user
 
 `pass` is true only if their verdict matches the key and their reason does too: for a flawed candidate they name the actual flaw, not a different one; for a correct one they say why it holds, not just that it looks fine.
 
-`feedback`: reveal the key and say what their judgment got right or missed, in the language the user writes in.
+`feedback`: reveal the key and say what their judgment got right or missed, in the language the user writes in. Write math as plain text or Unicode (x², √, ≤, μᵢ), never LaTeX.
 
 `misconception`: when they fail because they hold a wrong belief (not just a slip or "don't know"), state that belief in one sentence; otherwise null.
 
@@ -1015,7 +1126,7 @@ const AGENT_SYSTEM: &str = r#"You do the work for one part of a task in the user
 
 Work in the open: before each step, say in one short sentence what you're about to do and why, then do it. Read and search before changing files; change them with `edit` (or `write` for new files); run builds, tests, installs and git with `bash`. The user approves each command and watches it run. If they decline one, find another way or explain what's blocked.
 
-Stay within this part. End with a report of what you changed or found, concrete enough for the user to review."#;
+Stay within this part. End with a report of what you changed or found, concrete enough for the user to review. In what you say and in the report, write math as plain text or Unicode (x², √, ≤, μᵢ), never LaTeX. Files you write keep the notation they already use."#;
 
 /// The usage-event kind of a tool call.
 fn tool_kind(kind: crate::stream::ToolKind) -> pathfinder_schema::Tool {
@@ -1047,6 +1158,7 @@ fn turn_step(
         Some(CommitKind::Verdict) => return Step::Verdict,
         Some(CommitKind::Handoff) => return Step::Handoff,
         Some(CommitKind::Delegate) => return Step::Delegate,
+        Some(CommitKind::Approve | CommitKind::Object) => return Step::Other,
         None => {}
     }
     if let Some(cmd) = text.strip_prefix('/') {

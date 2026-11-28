@@ -18,7 +18,7 @@ pub const BLOCK_FROM: f64 = 0.5;
 /// toward the true answer as the secret's stakes allow. b bits let a guesser
 /// who follows the hint be right with probability 0.5 · 2^b.
 ///
-/// A learning candidate: 0.2 bits, a guesser's best odds 57.5%.
+/// A learning candidate: 0.2 bits, a guesser's best odds 57.4%.
 pub const BITS_LIMIT: f64 = 0.2;
 /// A review check, whose verdict vouches for the agent's work in the ledger
 /// or marks it shaky: 0.14 bits, a guesser's best odds 55%. It blocks about
@@ -127,27 +127,45 @@ fn windows(words: &[String], n: usize) -> HashSet<String> {
     words.windows(n).map(|w| w.join(" ")).collect()
 }
 
+/// A text as written and as the user is shown it: math in LaTeX is drawn
+/// as Unicode (`crate::mathtext`), so the pre-check reads both.
+fn forms(text: &str) -> Vec<String> {
+    let shown = crate::mathtext::prose(text).into_owned();
+    if shown == text {
+        vec![shown]
+    } else {
+        vec![text.to_string(), shown]
+    }
+}
+
 /// The deterministic pre-check (A6): the draft repeats the hidden key,
 /// as six words in a row from it that the candidate itself doesn't
-/// contain, or a long line of code from it.
+/// contain, or a long line of code from it. The key, the candidate and the
+/// draft are each read as written and as displayed, so a key written in
+/// Unicode is caught in a draft written in LaTeX, and the other way round.
 pub fn precheck_hit(secret: &Secret, draft: &str) -> bool {
     const N: usize = 6;
-    let reason = secret.reason();
-    let shown = windows(&words(secret.candidate()), N);
-    let key: HashSet<String> = windows(&words(reason), N)
-        .difference(&shown)
-        .cloned()
+    let reasons = forms(secret.reason());
+    let candidates = forms(secret.candidate());
+    let drafts = forms(draft);
+    let shown: HashSet<String> = candidates
+        .iter()
+        .flat_map(|c| windows(&words(c), N))
         .collect();
-    let drafted = windows(&words(draft), N);
-    if key.iter().any(|w| drafted.contains(w)) {
+    let drafted: HashSet<String> = drafts.iter().flat_map(|d| windows(&words(d), N)).collect();
+    let echoed = reasons
+        .iter()
+        .flat_map(|r| windows(&words(r), N))
+        .any(|w| !shown.contains(&w) && drafted.contains(&w));
+    if echoed {
         return true;
     }
-    let candidate = secret.candidate();
-    reason
-        .lines()
+    reasons
+        .iter()
+        .flat_map(|r| r.lines())
         .map(str::trim)
-        .filter(|l| l.len() >= 16 && !candidate.contains(*l))
-        .any(|l| draft.contains(l))
+        .filter(|l| l.len() >= 16 && !candidates.iter().any(|c| c.contains(*l)))
+        .any(|l| drafts.iter().any(|d| d.contains(l)))
 }
 
 #[cfg(test)]
@@ -200,5 +218,35 @@ mod tests {
             &s,
             "Independence tests decide which edges go."
         ));
+    }
+
+    #[test]
+    fn precheck_reads_the_draft_as_it_is_shown() {
+        // The key in Unicode, the draft in LaTeX: the user sees the key.
+        let s = Secret::candidate_key(
+            "fuse(a, b) multiplies the two densities.",
+            false,
+            "Uses μᵢ + σᵢ² instead of μᵢ + σᵢ",
+            0,
+        );
+        let draft = r"Hint: it uses \(\mu_i + \sigma_i^2\) instead of \(\mu_i + \sigma_i\).";
+        assert!(crate::mathtext::prose(draft).contains("uses μᵢ + σᵢ² instead of μᵢ + σᵢ"));
+        assert!(precheck_hit(&s, draft));
+        // The other way round: the key in LaTeX, the draft in Unicode.
+        let s = Secret::candidate_key(
+            "fuse(a, b) multiplies the two densities.",
+            false,
+            r"Uses \(\mu_i + \sigma_i^2\) instead of \(\mu_i + \sigma_i\)",
+            0,
+        );
+        assert!(precheck_hit(&s, "Hint: it uses μᵢ + σᵢ² instead of μᵢ + σᵢ."));
+        // Math the candidate already shows is still fine to repeat.
+        let s = Secret::candidate_key(
+            r"It returns \(\mu_a + \mu_b\) over \(\sigma_a + \sigma_b\) here.",
+            false,
+            "It returns μₐ + μ_b over σₐ + σ_b here, which is wrong.",
+            0,
+        );
+        assert!(!precheck_hit(&s, "The candidate returns μₐ + μ_b over σₐ + σ_b here, hmm."));
     }
 }

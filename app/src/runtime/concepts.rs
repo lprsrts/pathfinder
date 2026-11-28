@@ -100,7 +100,11 @@ impl Runtime {
         out
     }
 
-    /// Existing concepts for the Mapper, so it reuses their ids.
+    /// This folder's recorded concepts, with the user's state on each, for
+    /// the Mapper: it must reuse their ids where a part rests on the same
+    /// idea, or a check passed in another thread of the folder never
+    /// counts here. Concepts with a record come first; another folder's
+    /// concepts are never listed (they are keyed by workspace).
     pub(super) fn known_concepts_prompt(&self, session: &Session) -> String {
         let concepts = self
             .store
@@ -109,13 +113,30 @@ impl Runtime {
         if concepts.is_empty() {
             return String::new();
         }
-        let list: Vec<String> = concepts
+        let ids: Vec<String> = concepts.iter().map(|c| c.id.clone()).collect();
+        let views = self.concept_views(session, &ids).unwrap_or_default();
+        let rank = |c: &Concept| match understanding::state_of(&views, &c.id) {
+            ConceptState::Solid | ConceptState::Shown => 0,
+            ConceptState::Shaky => 1,
+            ConceptState::Claimed | ConceptState::Delegated => 2,
+            ConceptState::Unknown => 3,
+        };
+        let mut ordered: Vec<&Concept> = concepts.iter().collect();
+        ordered.sort_by_key(|c| rank(c));
+        let list: Vec<String> = ordered
             .iter()
             .take(80)
-            .map(|c| format!("- `{}`: {}", c.id, c.label))
+            .map(|c| {
+                format!(
+                    "- `{}`: {} ({})",
+                    c.id,
+                    c.label,
+                    understanding::state_of(&views, &c.id).label()
+                )
+            })
             .collect();
         format!(
-            "\n\nConcepts already recorded in this workspace (reuse these ids when a part rests on one):\n{}",
+            "\n\nConcepts already recorded in this folder, from any thread in it, with the user's state on each (shown and solid mean they passed a check on it):\n{}\nWhen a part rests on one of these ideas, list its id exactly, even if you would word or scope it a little differently; don't declare a new concept for it under another name. The user's checks count only under the same id. Declare a new concept only for an idea none of these is.",
             list.join("\n")
         )
     }
@@ -140,13 +161,26 @@ impl Runtime {
             } else {
                 p.label.clone()
             };
-            if let Some(c) =
-                exact_match(&p.id, &existing).or_else(|| exact_match(&label, &existing))
+            // The same concept in other words, in this folder's record
+            // from any thread ("GMMs" for "Gaussian mixtures"): one idea,
+            // so a check passed anywhere in the folder counts here.
+            if let Some(c) = exact_match(&p.id, &existing)
+                .or_else(|| exact_match(&label, &existing))
+                .or_else(|| understanding::same_named(&label, &existing))
             {
                 out.insert(p.id.clone(), c.id.clone());
                 continue;
             }
-            let lex = lexical_candidates(&label, &existing);
+            let mut lex = lexical_candidates(&label, &existing);
+            // An id that names a recorded concept under a label that
+            // doesn't (`products-of-gaussians`, "Gaussian fusion") may be a
+            // narrower or broader idea: the decision model is asked, and
+            // nothing is merged on the id's words alone.
+            if let Some(c) = understanding::same_named(&p.id, &existing)
+                && !lex.iter().any(|l| l.id == c.id)
+            {
+                lex.insert(0, c);
+            }
             if lex.is_empty() {
                 continue;
             }
@@ -158,7 +192,7 @@ impl Runtime {
             questions.push(Question {
                 name: format!("c{i}"),
                 instructions: format!(
-                    "Is the concept \"{label}\" the same idea as one of these recorded concepts? Only the same idea counts, not a related one."
+                    "Is the concept \"{label}\" the same idea as one of these recorded concepts? The same idea in other words or with an abbreviation counts (\"GMM\" and \"Gaussian mixture model\"); a related, broader or narrower idea doesn't."
                 ),
                 options,
             });
@@ -439,7 +473,11 @@ impl Runtime {
         let mut events = Vec::new();
         let flawed = !pending.key_correct;
         if pass {
-            if let Some(m) = &pending.misconception
+            // A misconception closes only by passing a flawed candidate built
+            // to embody it (§10, A5): a correct candidate or an exam answer
+            // passes its concepts but leaves the belief open.
+            if flawed
+                && let Some(m) = &pending.misconception
                 && let Ok(Some(found)) = self.store.misconception(m)
             {
                 events.push(
@@ -485,8 +523,13 @@ impl Runtime {
         self.append_events(session, events);
     }
 
-    /// `claim` or `delegated` on every core concept of a part (§6). Returns
+    /// `claim` or `delegated` on the core concepts of a part (§6). Returns
     /// (event id, concept) for each, so a claim can be undone (§15).
+    ///
+    /// A claim is your word on every concept the part rests on. Handing a
+    /// part off says nothing about a concept another open part still rests
+    /// on: you may yet show it there, so it keeps the state it earned
+    /// rather than turning `delegated` by association.
     pub(super) fn record_skip(
         &self,
         session: &Session,
@@ -496,7 +539,17 @@ impl Runtime {
         let Some(part) = session.map.get(part_id) else {
             return Vec::new();
         };
-        let concepts = part.concepts.clone();
+        let concepts: Vec<String> = part
+            .concepts
+            .iter()
+            .filter(|c| {
+                kind != EventKind::Delegated
+                    || !session.map.parts.iter().any(|p| {
+                        p.id != part.id && p.status == PartStatus::Open && p.concepts.contains(c)
+                    })
+            })
+            .cloned()
+            .collect();
         let events = concepts
             .iter()
             .map(|c| NewEvent::new(c, kind).reference(part_id.to_string()))
@@ -512,11 +565,24 @@ impl Runtime {
     /// One pointer only: the next step's place, or the card's "Read:" when
     /// there's no next step.
     pub(super) fn enter_part(&self, session: &mut Session, hint: bool) -> String {
+        self.enter_part_after(session, hint, None)
+    }
+
+    /// `enter_part`, right after the agent did a part (`ran`: the concepts
+    /// it rests on): only gaps the run opened are raised now (a concept of
+    /// that part the next one needs). Any other gap waits for the next part
+    /// you enter, so an agent run never ends in an unrelated map change.
+    pub(super) fn enter_part_after(
+        &self,
+        session: &mut Session,
+        hint: bool,
+        ran: Option<&[String]>,
+    ) -> String {
         if session.quick_check || session.exam {
-            return self.part_card(session, hint, true);
+            return self.part_card(session, hint, true, ran);
         }
         let next = self.next_step(session, None, None, true);
-        let mut out = self.part_card(session, hint, next.is_none());
+        let mut out = self.part_card(session, hint, next.is_none(), ran);
         if let Some(part) = session.active_part().cloned()
             && let Some(h) = super::path::horizon(session, &part)
         {
@@ -530,7 +596,13 @@ impl Runtime {
 
     /// The part's card, what it rests on, and any gaps underneath it (A5),
     /// each raised once, proposed as small parts.
-    fn part_card(&self, session: &mut Session, hint: bool, read_at: bool) -> String {
+    fn part_card(
+        &self,
+        session: &mut Session,
+        hint: bool,
+        read_at: bool,
+        ran: Option<&[String]>,
+    ) -> String {
         let Some(part) = session.active_part().cloned() else {
             return String::new();
         };
@@ -587,6 +659,7 @@ impl Runtime {
             understanding::gaps(&part.concepts, &prerequisites, &views, &covered)
                 .into_iter()
                 .filter(|g| !session.gaps_raised.contains(&g.concept))
+                .filter(|g| ran.is_none_or(|r| r.contains(&g.concept)))
                 .collect();
         if gaps.is_empty() {
             return out;
@@ -661,11 +734,15 @@ impl Runtime {
             return self.folder_record(session);
         };
         if part.concepts.is_empty() {
-            return format!(
+            let out = format!(
                 "**{}** has no concepts recorded (the map predates them); its status is {}.",
                 part.title,
                 part.status.label()
             );
+            return match agent_work(session) {
+                Some(w) => format!("{out}\n\n{w}"),
+                None => out,
+            };
         }
         use crate::domain::{mermaid_id, mermaid_text};
         use crate::i18n::{Line, line, part_status, state};
@@ -735,28 +812,17 @@ impl Runtime {
             out.push_str(&format!("\n\n{n}"));
         }
         out.push_str(&format!("\n\n{}", line(lang, Line::EvidenceNote)));
-        // A10: passes against claims; a withdrawn claim no longer counts
-        // but stays visible as withdrawn (§15).
-        let events = self.store.events(&ws, &part.concepts).unwrap_or_default();
-        let withdrawn = understanding::retracted_claims(&events);
-        let claims = events
-            .iter()
-            .filter(|e| e.kind == EventKind::Claim && !withdrawn.contains(&e.id))
-            .count();
-        let passes: usize = part
-            .concepts
-            .iter()
-            .filter_map(|c| views.get(c))
-            .map(|v| v.passes)
-            .sum();
-        out.push_str(&format!(
-            "\n\n{}",
-            line(lang, Line::EvidenceRatio)
-                .replace("{passes}", &passes.to_string())
-                .replace("{claims}", &claims.to_string())
-        ));
+        // A10: of the ideas drawn above, how many passed a check and how
+        // many rest on your claim alone, so the line matches the drawing.
+        // A withdrawn claim no longer counts but stays visible as
+        // withdrawn (§15).
+        out.push_str(&format!("\n\n{}", evidence_ratio(&ids, &views, lang)));
+        let events = self.store.events(&ws, &ids).unwrap_or_default();
         for w in withdrawn_lines(&events, lang, &name) {
             out.push_str(&format!("\n{w}"));
+        }
+        if let Some(w) = agent_work(session) {
+            out.push_str(&format!("\n\n{w}"));
         }
         if let Some(h) = self.step_history(session) {
             out.push_str(&format!("\n\n{h}"));
@@ -778,15 +844,28 @@ impl Runtime {
             .map(|c| c.id)
             .collect();
         let events = self.store.events(&ws, &ids).unwrap_or_default();
-        let stats = understanding::step_stats(&events);
-        if stats.is_empty() {
-            return None;
+        // Per angle, in plain words, and only angles a verdict followed:
+        // a step nobody was judged after says nothing yet.
+        let mut by_angle: Vec<(understanding::Angle, u32, u32)> = Vec::new();
+        for (kind, (passes, judged)) in understanding::step_stats(&events) {
+            let Some(k) = understanding::StepKind::parse(&kind) else {
+                continue;
+            };
+            match by_angle.iter_mut().find(|(a, ..)| *a == k.angle) {
+                Some((_, p, j)) => {
+                    *p += passes;
+                    *j += judged;
+                }
+                None => by_angle.push((k.angle, passes, judged)),
+            }
         }
-        let mut kinds: Vec<String> = stats
-            .iter()
-            .map(|(kind, (passes, judged))| {
+        let mut kinds: Vec<String> = understanding::Angle::ALL
+            .into_iter()
+            .filter_map(|a| by_angle.iter().find(|(b, ..)| *b == a))
+            .filter(|(_, _, judged)| *judged > 0)
+            .map(|(angle, passes, judged)| {
                 line(lang, Line::StepKindRate)
-                    .replace("{kind}", &kind.replace('-', "·"))
+                    .replace("{kind}", line(lang, angle_line(*angle)))
                     .replace("{passes}", &passes.to_string())
                     .replace("{judged}", &judged.to_string())
             })
@@ -794,6 +873,9 @@ impl Runtime {
         let steered = understanding::steered_steps(&events);
         if steered > 0 {
             kinds.push(line(lang, Line::SteeredTimes).replace("{n}", &steered.to_string()));
+        }
+        if kinds.is_empty() {
+            return None;
         }
         Some(format!(
             "{}\n{}",
@@ -839,7 +921,11 @@ impl Runtime {
             })
             .collect();
         if active.is_empty() {
-            return line(lang, Line::NoRecord).to_string();
+            let none = line(lang, Line::NoRecord).to_string();
+            return match agent_work(session) {
+                Some(w) => format!("{none}\n\n{w}"),
+                None => none,
+            };
         }
         active.sort_by_key(|a| std::cmp::Reverse(a.1));
         active.truncate(Self::RECORD_MAX);
@@ -892,18 +978,8 @@ impl Runtime {
                 .replace("{told}", &told_only.to_string())
                 .replace("{shaky}", &shaky.to_string()),
         );
-        let withdrawn = understanding::retracted_claims(&events);
-        let claims = events
-            .iter()
-            .filter(|e| e.kind == EventKind::Claim && !withdrawn.contains(&e.id))
-            .count();
-        let passes = events.iter().filter(|e| e.kind == EventKind::Pass).count();
-        out.push_str(&format!(
-            "\n\n{}",
-            line(lang, Line::EvidenceRatio)
-                .replace("{passes}", &passes.to_string())
-                .replace("{claims}", &claims.to_string())
-        ));
+        let drawn: Vec<String> = active.iter().map(|(c, ..)| c.id.clone()).collect();
+        out.push_str(&format!("\n\n{}", evidence_ratio(&drawn, &views, lang)));
         let labels: HashMap<&str, &str> = concepts
             .iter()
             .map(|c| (c.id.as_str(), c.label.as_str()))
@@ -917,10 +993,80 @@ impl Runtime {
         for w in withdrawn_lines(&events, lang, &name) {
             out.push_str(&format!("\n{w}"));
         }
+        if let Some(w) = agent_work(session) {
+            out.push_str(&format!("\n\n{w}"));
+        }
         if let Some(h) = self.step_history(session) {
             out.push_str(&format!("\n\n{h}"));
         }
         out
+    }
+}
+
+/// A10's evidence ratio over exactly the ideas a record draws: those with
+/// a passed check, and those resting on your claim alone (a claimed idea
+/// you later passed counts as passed, as it is drawn).
+fn evidence_ratio(
+    ids: &[String],
+    views: &HashMap<String, understanding::ConceptView>,
+    lang: Option<&str>,
+) -> String {
+    use crate::i18n::{Line, line};
+    let passed = ids
+        .iter()
+        .filter(|c| views.get(*c).is_some_and(|v| v.passes > 0))
+        .count();
+    let claimed = ids
+        .iter()
+        .filter(|c| understanding::state_of(views, c) == ConceptState::Claimed)
+        .count();
+    line(lang, Line::EvidenceRatio)
+        .replace("{passes}", &passed.to_string())
+        .replace("{claims}", &claimed.to_string())
+}
+
+/// §12 labels for the work handed to the agent, so a part handed off or
+/// delegated stays in the record after you move on: reviewable when you
+/// had shown what it rests on, delegated when you hadn't.
+fn agent_work(session: &Session) -> Option<String> {
+    use crate::i18n::{Line, line};
+    let lang = session.language.as_deref();
+    let rows: Vec<String> = session
+        .map
+        .parts
+        .iter()
+        .filter_map(|p| {
+            let which = match p.status {
+                PartStatus::InReview => Line::AgentInReview,
+                PartStatus::Done if p.review_missed => Line::AgentMissedCheck,
+                PartStatus::Done if p.review_caught => Line::AgentCaughtCheck,
+                PartStatus::Done => Line::AgentApproved,
+                PartStatus::Delegated => Line::AgentDelegated,
+                _ => return None,
+            };
+            Some(format!(
+                "- {}",
+                line(lang, which).replace("{title}", &p.title)
+            ))
+        })
+        .collect();
+    if rows.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{}\n{}",
+        line(lang, Line::AgentWork),
+        rows.join("\n")
+    ))
+}
+
+/// The step history's plain words for an angle.
+fn angle_line(a: understanding::Angle) -> crate::i18n::Line {
+    use crate::i18n::Line;
+    match a {
+        understanding::Angle::Example => Line::AngleExample,
+        understanding::Angle::Purpose => Line::AnglePurpose,
+        understanding::Angle::Mechanism => Line::AngleMechanism,
     }
 }
 

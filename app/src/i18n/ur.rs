@@ -90,16 +90,26 @@ fn line(l: Line) -> &'static str {
         ShowDelegate => {
             "**{title}** سمجھے بغیر سونپیں؟ اسے سونپا گیا درج کیا جائے گا: نتیجے کی ضمانت آپ نہیں دیں گے۔ Enter چلائے · Esc منسوخ کرے۔"
         }
+        DelegateWhy => "آپ کے جائزے والی حوالگی نہیں: آپ نے ابھی {concepts} نہیں دکھایا۔",
         ShowVerdict => {
             "اسے امیدوار پر آپ کا فیصلہ مان کر جانچیں؟ “{words}” Enter جانچے · Esc نوٹ کے طور پر رکھے۔"
+        }
+        ShowApprove => {
+            "**{title}** کے لیے ایجنٹ کا نتیجہ منظور کریں؟ Enter منظور کرتا ہے · Esc منسوخ کرتا ہے۔"
+        }
+        ShowObject => {
+            "اپنے اعتراض کے ساتھ **{title}** ایجنٹ کو واپس بھیجیں؟ “{words}” Enter بھیجتا ہے · Esc منسوخ کرتا ہے۔"
         }
         NotRunVerdict => "فیصلے کے طور پر نہیں جانچا گیا: نوٹ کے طور پر رکھا۔",
         NotRunHandoff => "نہیں چلا: **{title}** ایجنٹ کو نہیں سونپا گیا۔",
         NotRunDelegate => "نہیں چلا: **{title}** نہیں سونپا گیا۔",
+        NotRunApprove => "نہیں چلا: **{title}** منظور نہیں ہوا۔",
+        NotRunObject => "نہیں چلا: **{title}** پر آپ کا اعتراض نہیں بھیجا گیا۔",
         NotRunStale => "نہیں چلا: جو آپ کی منظوری کا منتظر تھا وہ اب لاگو نہیں۔",
         AskWhich => {
             "آپ کا مطلب کیا تھا: {choices}؟ آپ کے کہنے تک کچھ درج نہیں ہوگا؛ ایک نمبر یا چند الفاظ کافی ہیں۔"
         }
+        AskAgentPart => "**{title}** ایجنٹ سے کروائیں",
         AskKnown => "درج کریں کہ میں **{title}** پہلے سے جانتا ہوں (بغیر جانچ)",
         AskTell => "بس مجھے بتا دیں",
         AskAgent => "یہ حصہ ایجنٹ کو کرنے دیں",
@@ -126,11 +136,50 @@ fn line(l: Line) -> &'static str {
         Horizon => "افق: {what}۔",
         HorizonNeeds => "ضرورت {parts}",
         HorizonLeads => "آگے {parts}",
-        EvidenceRatio => "پاس: {passes} · دعوے: {claims}۔",
+        EvidenceRatio => {
+            "اوپر کے خیالات میں سے {passes} نے جانچ پاس کی اور {claims} صرف آپ کی بات پر ٹکے ہیں۔"
+        }
         ClaimWithdrawn => "**{concept}** پر دعویٰ ہٹا دیا گیا ({date})۔",
-        StepHistory => "آپ یہاں کیسے پہنچے: {kinds}۔",
-        StepKindRate => "{kind} {judged} میں سے {passes} پاس تک لے گئے",
+        StepHistory => "اب تک پاس تک کیا لے گیا: {kinds}۔",
+        StepKindRate => "{kind}، {judged} میں سے {passes} بار",
         SteeredTimes => "آپ نے {n} بار سمت دی",
+        AngleExample => "ایک مثال سے شروع کرنا",
+        AnglePurpose => "یہ کس لیے ہے پوچھنا",
+        AngleMechanism => "یہ کیسے کام کرتا ہے دیکھنا",
+        AgentWork => "**ایجنٹ کو سونپا گیا**",
+        AgentInReview => {
+            "**{title}**: قابلِ جائزہ، یہ دکھانے کے بعد سونپا کہ یہ کس پر ٹکا ہے؛ آپ کے جائزے کا منتظر۔"
+        }
+        AgentApproved => {
+            "**{title}**: قابلِ جائزہ، یہ دکھانے کے بعد سونپا کہ یہ کس پر ٹکا ہے؛ آپ نے منظور کیا۔"
+        }
+        AgentMissedCheck => {
+            "**{title}**: جانچ پکڑے بغیر منظور کیا؛ جائزہ شمار نہیں ہوا، آپ اس کی ضمانت نہیں دیتے۔"
+        }
+        AgentDelegated => {
+            "**{title}**: تفویض کیا گیا، آپ کی سمجھ کے بغیر کیا گیا؛ آپ اس کی ضمانت نہیں دیتے۔"
+        }
+        AgentCaughtCheck => {
+            "**{title}**: قابلِ جائزہ؛ اس کے جائزے میں آپ نے رکھی گئی جانچ پکڑی اور اعتراض کیا، اس لیے ایجنٹ کا اصل نتیجہ لکھا گیا۔"
+        }
+        ShowAgentParts => {
+            "یہ حصے ایک کے بعد ایک ایجنٹ سے کروائیں؟ {parts}۔ Enter سب چلائے · Esc منسوخ کرے۔"
+        }
+        AgentPartHandoff => "**{title}** (حوالگی: نتیجے کا جائزہ آپ لیں گے)",
+        AgentPartDelegate => "**{title}** (سونپا گیا: آپ ضمانت نہیں دیں گے)",
+        AgentPartDelegateWhy => "**{title}** (سونپا گیا: آپ نے ابھی {concepts} نہیں دکھایا)",
+        ConfirmHandoff => "ہاں، سونپ دو",
+        ConfirmDelegate => "ہاں، بغیر سمجھے سونپ دو",
+        ConfirmVerdict => "ہاں، جانچو",
+        ConfirmApprove => "ہاں، منظور کرو",
+        ConfirmObject => "ہاں، واپس بھیجو",
+        CancelShown => "نہیں",
+        ShowKnownShown => {
+            "درج: آپ **{title}** پہلے سے جانتے ہیں۔ جن خیالات پر یہ ٹکا ہے وہ سب آپ پہلے دکھا چکے ہیں، اس لیے یہ صرف آپ کی بات پر نہیں، آپ کی جانچوں پر ٹکا ہے۔ واپس لینے کے لیے \"undo\" کہیں یا Esc دبائیں۔"
+        }
+        ShowKnownSome => {
+            "درج: آپ **{title}** پہلے سے جانتے ہیں۔ {concepts} کے لیے صرف آپ کی بات ہے؛ باقی آپ دکھا چکے ہیں۔ واپس لینے کے لیے \"undo\" کہیں یا Esc دبائیں۔"
+        }
         StepHistoryNote => {
             "آپ کیسے سیکھتے ہیں، اس بارے میں Pathfinder بس اتنا ہی رکھتا ہے، اس فولڈر کے مقامی ریکارڈ میں۔"
         }

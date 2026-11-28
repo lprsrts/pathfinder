@@ -19,7 +19,7 @@ Use your read-only tools (list, grep, read; PDFs are read by page) to search the
 - `search_terms`: up to 5 short keyword phrases the user could search for next (no sentences).
 - Never use knowledge that is not in the workspace."#;
 
-const TELL_SYSTEM: &str = r#"The user typed /tell: they explicitly asked to be told the answer, and it is recorded as told (not understood). Answer what they asked, correctly and briefly, like a strong tutor. Where the workspace has a source for it, name the file and page. Write math as plain text or Unicode, never LaTeX. Reply in the user's language."#;
+pub(super) const TELL_SYSTEM: &str = r#"The user typed /tell: they explicitly asked to be told the answer, and it is recorded as told (not understood). Answer what they asked, correctly and briefly, like a strong tutor. Where the workspace has a source for it, name the file and page. Write math as plain text or Unicode, never LaTeX. Reply in the user's language. You can't write or save files, and never say so or mention read-only access: if they ask for something to be written into their files, answer what you can and add, in one sentence, that the agent can write it if they say "let the agent do it"."#;
 
 const CHECK_SYSTEM: &str = r#"The user shows their own work (a derivation, calculation, proof or code) and wants to know where it first goes wrong. You never explain why a step is wrong, never give the fix, the right result or a hint.
 
@@ -204,16 +204,13 @@ impl Runtime {
         // and while any secret is active (a candidate's key, a review's
         // planted hunk, an exam key) the answer is held for the gate
         // before you see it (A6).
-        let mut history = format_history(session);
+        let history = self.format_history(session);
         let held = plain || !matches!(self.gate_mode(session), gate::GateMode::Open);
-        if let Some(pending) = &session.pending_candidate {
-            history = history.replace(&pending.candidate, CANDIDATE_HIDDEN);
-        }
         let req = EngineRequest {
             tier: EngineTier::System2,
             tools: ToolAccess::ReadOnly,
             cwd: session.cwd.clone(),
-            system_prompt: TELL_SYSTEM.to_string(),
+            system_prompt: in_language(TELL_SYSTEM, session),
             prompt: format!("Conversation so far:\n{history}\n\nAnswer: {arg}"),
             files: files.to_vec(),
             stream_text: !held,
@@ -713,7 +710,10 @@ pub(crate) fn cited_hits(
                 match sources::verify_local(cwd, p) {
                     Ok(h) if !hits.contains(&h) => hits.push(h),
                     Ok(_) => {}
-                    Err(why) => tracing::info!("dropped a cited hit: {why:?}"),
+                    Err(why) => tracing::info!(
+                        "dropped a cited hit: {why:?} (quote: {:?})",
+                        p.quote.chars().take(120).collect::<String>()
+                    ),
                 }
             }
             // A suggested term is shown and searched only if your folder has

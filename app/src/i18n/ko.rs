@@ -92,16 +92,24 @@ fn line(l: Line) -> &'static str {
         ShowDelegate => {
             "**{title}**을(를) 이해하지 않고 넘길까요? 넘김으로 기록되고, 결과를 보증하지 않게 돼요. Enter 실행 · Esc 취소."
         }
+        DelegateWhy => "검토가 있는 넘김이 아니에요: 아직 {concepts}을(를) 보여 주지 않았어요.",
         ShowVerdict => {
             "이것을 후보에 대한 판정으로 채점할까요? “{words}” Enter 채점 · Esc 메모로 남기기."
+        }
+        ShowApprove => "**{title}**에 대한 에이전트의 결과를 승인할까요? Enter 승인 · Esc 취소.",
+        ShowObject => {
+            "이의와 함께 **{title}**을(를) 에이전트에게 돌려보낼까요? “{words}” Enter 전송 · Esc 취소."
         }
         NotRunVerdict => "판정으로 채점하지 않고 메모로 남겼어요.",
         NotRunHandoff => "실행 안 됨: **{title}**을(를) 에이전트에게 넘기지 않았어요.",
         NotRunDelegate => "실행 안 됨: **{title}**을(를) 넘기지 않았어요.",
+        NotRunApprove => "실행 안 됨: **{title}**은(는) 승인되지 않았어요.",
+        NotRunObject => "실행 안 됨: **{title}**에 대한 이의는 보내지 않았어요.",
         NotRunStale => "실행 안 됨: 승인을 기다리던 일이 더 이상 해당되지 않아요.",
         AskWhich => {
             "어느 쪽이었나요: {choices}? 말해 주기 전까지는 아무것도 기록하지 않아요. 번호나 몇 마디면 돼요."
         }
+        AskAgentPart => "**{title}**을(를) 에이전트에게 맡기기",
         AskKnown => "**{title}**을(를) 이미 안다고 기록 (확인 없음)",
         AskTell => "그냥 알려 줘",
         AskAgent => "이 파트는 에이전트가 하게 해 줘",
@@ -132,11 +140,46 @@ fn line(l: Line) -> &'static str {
         Horizon => "전망: {what}.",
         HorizonNeeds => "필요: {parts}",
         HorizonLeads => "이어짐: {parts}",
-        EvidenceRatio => "통과: {passes} · 주장: {claims}.",
+        EvidenceRatio => {
+            "위 개념 중 {passes}개는 확인을 통과했고, {claims}개는 당신의 말에만 기대고 있어요."
+        }
         ClaimWithdrawn => "**{concept}**에 대한 주장 철회 ({date}).",
-        StepHistory => "여기까지 온 길: {kinds}.",
-        StepKindRate => "{kind} {judged}번 중 {passes}번 통과로 이어짐",
+        StepHistory => "지금까지 통과로 이어진 것: {kinds}.",
+        StepKindRate => "{kind}, {judged}번 중 {passes}번",
         SteeredTimes => "직접 방향을 정한 횟수 {n}",
+        AngleExample => "예시부터 시작하기",
+        AnglePurpose => "무엇을 위한 건지 묻기",
+        AngleMechanism => "어떻게 작동하는지 따라가기",
+        AgentWork => "**에이전트에게 넘긴 일**",
+        AgentInReview => {
+            "**{title}**: 검토 가능, 근거를 보여 준 뒤 넘겼어요. 검토를 기다리고 있어요."
+        }
+        AgentApproved => "**{title}**: 검토 가능, 근거를 보여 준 뒤 넘겼어요. 승인했어요.",
+        AgentMissedCheck => {
+            "**{title}**: 점검을 알아채지 못하고 승인했어요. 검토로 기록되지 않으며 보증하지 않아요."
+        }
+        AgentDelegated => "**{title}**: 위임됨, 이해 없이 처리됐어요. 보증하지 않아요.",
+        AgentCaughtCheck => {
+            "**{title}**: 검토 가능. 검토에서 심어 둔 확인을 잡아내고 이의를 제기해서, 에이전트의 실제 결과가 기록됐어요."
+        }
+        ShowAgentParts => {
+            "이 부분들을 차례로 에이전트에게 맡길까요? {parts}. Enter 모두 실행 · Esc 취소."
+        }
+        AgentPartHandoff => "**{title}** (넘김: 결과를 직접 검토)",
+        AgentPartDelegate => "**{title}** (위임: 보증하지 않음)",
+        AgentPartDelegateWhy => "**{title}** (위임: 아직 {concepts}을(를) 보여 주지 않음)",
+        ConfirmHandoff => "네, 넘겨 줘",
+        ConfirmDelegate => "네, 위임해 줘",
+        ConfirmVerdict => "네, 판정해 줘",
+        ConfirmApprove => "네, 승인해 줘",
+        ConfirmObject => "네, 돌려보내 줘",
+        CancelShown => "아니요",
+        ShowKnownShown => {
+            "기록했어요: **{title}**을(를) 이미 안다고요. 기대는 개념을 모두 이미 보여 줬으니 말만이 아니라 확인에 기대고 있어요. \"되돌려\"라고 하거나 Esc를 누르면 되돌릴 수 있어요."
+        }
+        ShowKnownSome => {
+            "기록했어요: **{title}**을(를) 이미 안다고요. {concepts}은(는) 말뿐이고, 나머지는 이미 보여 줬어요. \"되돌려\"라고 하거나 Esc를 누르면 되돌릴 수 있어요."
+        }
         StepHistoryNote => {
             "Pathfinder가 학습 방식에 대해 남기는 건 이것뿐이며, 이 폴더의 로컬 기록에 있어요."
         }

@@ -141,6 +141,10 @@ pub struct PageFonts {
     /// Some text on the page is set in Cambria Math (see
     /// [`FontClass::OfficeMath`]).
     pub office_math: bool,
+    /// The page's text from runs without wrong letters, in poppler's
+    /// order; a run with wrong letters ends a segment, so no segment joins
+    /// the words on either side of one.
+    pub trusted: Vec<String>,
 }
 
 /// How far a page's text can be trusted as the source's own words.
@@ -151,8 +155,12 @@ pub enum PageTrust {
     Clean,
     /// Some math is garbled: only plain prose lines can be quoted.
     Shaky,
-    /// A math font's glyphs came out as ordinary letters (`m` for μ): any
-    /// line can hold one, so none can be quoted.
+    /// A math font's glyphs came out as ordinary letters (`X` for ∑, `m`
+    /// for μ), and poppler said which runs they are in: only plain prose
+    /// whose letters all come from the other runs can be quoted.
+    Lettered,
+    /// A math font's glyphs came out as ordinary letters and nothing else
+    /// on the page can be told apart from them: no line can be quoted.
     Unquotable,
 }
 
@@ -200,6 +208,15 @@ pub fn parse_xml(xml: &str) -> HashMap<usize, PageFonts> {
             }
             if wrong_letters(class, &text) {
                 facts.wrong_letters = true;
+                facts.trusted.push(String::new());
+            } else {
+                match facts.trusted.last_mut() {
+                    Some(seg) => {
+                        seg.push_str(&text);
+                        seg.push('\n');
+                    }
+                    None => facts.trusted.push(format!("{text}\n")),
+                }
             }
         }
     }
@@ -325,12 +342,42 @@ pub fn repair(pages: &mut [String], fonts: Option<&HashMap<usize, PageFonts>>) -
                     .collect();
             }
             if facts.wrong_letters {
-                PageTrust::Unquotable
+                if facts
+                    .trusted
+                    .iter()
+                    .any(|s| s.chars().any(char::is_alphanumeric))
+                {
+                    PageTrust::Lettered
+                } else {
+                    PageTrust::Unquotable
+                }
             } else if unreliable(page) {
                 PageTrust::Shaky
             } else {
                 PageTrust::Clean
             }
+        })
+        .collect()
+}
+
+/// A [`PageTrust::Lettered`] page's trusted segments (see
+/// [`PageFonts::trusted`]), with symbol codes and Cambria Math's misplaced
+/// characters mapped as [`repair`] maps the page.
+pub fn trusted_text(facts: &PageFonts) -> Vec<String> {
+    facts
+        .trusted
+        .iter()
+        .map(|seg| {
+            seg.chars()
+                .map(|c| mapped(c, facts).unwrap_or(c))
+                .map(|c| {
+                    if facts.office_math {
+                        office_math_char(c).unwrap_or(c)
+                    } else {
+                        c
+                    }
+                })
+                .collect()
         })
         .collect()
 }
@@ -444,12 +491,14 @@ fn is_math_symbol(c: char) -> bool {
 /// poppler or the Symbol table, so it is right), digits and plain
 /// punctuation only, so no symbol in it can be a wrong one.
 pub fn plain_prose(line: &str) -> bool {
-    line.chars().any(char::is_alphabetic)
-        && line.chars().all(|c| {
-            c.is_alphanumeric() && !is_private(c) && !is_misplaced_script(c) && !is_math_alnum(c)
-                || c.is_whitespace()
-                || ".,;:!?'\"()-–—„“”‘’«»/%&".contains(c)
-        })
+    line.chars().any(char::is_alphabetic) && line.chars().all(prose_char)
+}
+
+/// A character [`plain_prose`] allows.
+pub fn prose_char(c: char) -> bool {
+    c.is_alphanumeric() && !is_private(c) && !is_misplaced_script(c) && !is_math_alnum(c)
+        || c.is_whitespace()
+        || ".,;:!?'\"()[]-–—„“”‘’«»/%&§".contains(c)
 }
 
 /// Small one-page PDFs for tests: Helvetica text with a second font `F1`.
@@ -570,6 +619,42 @@ mod tests {
 </pdf2xml>"##;
 
     #[test]
+    fn runs_with_wrong_letters_split_the_trusted_text() {
+        // LaTeX's CMEX draws ∑ with the code of `X`; the prose around it is
+        // in a text font.
+        let xml = r##"<page number="1">
+	<fontspec id="0" size="16" family="ABCDEF+SFRM1095" color="#000000"/>
+	<fontspec id="1" size="16" family="ABCDEF+CMEX10" color="#000000"/>
+<text top="10" left="10" width="90" height="16" font="0">sources for</text>
+<text top="10" left="100" width="9" height="16" font="1">P</text>
+<text top="10" left="110" width="90" height="16" font="0">one and the same</text>
+<text top="30" left="10" width="90" height="16" font="0">Proposition 3 (Sum).</text>
+</page>
+<page number="2">
+<text top="10" left="10" width="9" height="16" font="1">X</text>
+</page>"##;
+        let facts = parse_xml(xml);
+        assert!(facts[&1].wrong_letters);
+        assert_eq!(
+            trusted_text(&facts[&1]),
+            vec![
+                "sources for\n".to_string(),
+                "one and the same\nProposition 3 (Sum).\n".to_string()
+            ]
+        );
+        let mut pages = vec![
+            "sources forP one and the same\nProposition 3 (Sum).\n".to_string(),
+            "X\n".to_string(),
+        ];
+        // Nothing on page 2 but the wrong letter: nothing to tell apart.
+        assert_eq!(
+            repair(&mut pages, Some(&facts)),
+            vec![PageTrust::Lettered, PageTrust::Unquotable]
+        );
+        assert!(PageTrust::Lettered.marked());
+    }
+
+    #[test]
     fn xml_says_which_font_drew_each_private_char() {
         let facts = parse_xml(XML);
         let p1 = &facts[&1];
@@ -671,6 +756,10 @@ mod tests {
         assert!(!plain_prose("∂B elektrischer Flussdichte"));
         assert!(!plain_prose("x \u{F072}"));
         assert!(!plain_prose("12 34"));
+        // A reference and a section sign are prose; an equals sign isn't.
+        assert!(plain_prose("admits a closed-form expression [18], because"));
+        assert!(plain_prose("§ 6.8 Reduction of mixtures"));
+        assert!(!plain_prose("with M = K L components"));
     }
 
     #[test]

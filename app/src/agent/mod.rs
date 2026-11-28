@@ -486,6 +486,17 @@ impl ApiEngine {
     }
 }
 
+/// Why a tool call failed, for its row: the error's first line, at most
+/// 160 characters (anything after it, such as nearby lines, stays with the
+/// model).
+fn why_failed(err: &str) -> String {
+    let first = err.lines().next().unwrap_or("").trim();
+    match first.char_indices().nth(160) {
+        Some((at, _)) => format!("{}…", &first[..at]),
+        None => first.to_string(),
+    }
+}
+
 /// Runs one tool call, showing it in the thread: diffs for file changes, a
 /// live terminal (after the user allows it) for commands.
 async fn run_call(
@@ -522,7 +533,7 @@ async fn run_call(
             sink(StreamEvent::ToolUpdate {
                 id: id.clone(),
                 content: ToolContent::Diff {
-                    path: c.path,
+                    path: crate::stream::shown_path(&c.path, root),
                     old: c.old,
                     new: c.new,
                 },
@@ -562,6 +573,17 @@ async fn run_call(
             }
         }
     };
+    // A failed call says why on its row, in one line (the model gets it
+    // all): a wrong path or a bad pattern, not just a red mark.
+    // A command shows its own output instead.
+    if let Err(err) = &outcome
+        && call.name != "bash"
+    {
+        sink(StreamEvent::ToolUpdate {
+            id: id.clone(),
+            content: ToolContent::Text(why_failed(err)),
+        });
+    }
     sink(StreamEvent::ToolEnd {
         id,
         ok: outcome.is_ok(),
@@ -974,6 +996,10 @@ mod tests {
                 StreamEvent::Thought(_) => return,
                 StreamEvent::TextDelta(t) => format!("text {t}"),
                 StreamEvent::ToolStart(t) => format!("start {}", t.title),
+                StreamEvent::ToolUpdate {
+                    content: ToolContent::Text(t),
+                    ..
+                } => format!("why {t}"),
                 StreamEvent::ToolUpdate { .. } => "update".into(),
                 StreamEvent::ToolEnd { ok, .. } => format!("end {ok}"),
             };
@@ -988,6 +1014,34 @@ mod tests {
             name: name.into(),
             args,
         })
+    }
+
+    #[tokio::test]
+    async fn a_file_change_row_names_the_file_relative_to_the_workspace() {
+        let ws = workspace();
+        let (engine, _llm) = scripted(vec![
+            Ok(vec![call(
+                "1",
+                "write",
+                json!({"path": "letter.txt", "content": "Dear sir,\nthe bill.\n"}),
+            )]),
+            Ok(vec![Part::Text("Wrote it.".into())]),
+        ]);
+        let rows = Arc::new(Mutex::new(Vec::new()));
+        let sink: StreamSink = {
+            let rows = rows.clone();
+            Arc::new(move |ev| {
+                if let StreamEvent::ToolUpdate { content, .. } = ev {
+                    rows.lock().unwrap().push(content.summary());
+                }
+            })
+        };
+        engine
+            .run_text(&request(ws.clone(), ToolAccess::Full), sink)
+            .await
+            .unwrap();
+        assert_eq!(*rows.lock().unwrap(), vec!["letter.txt: 2 lines, was 0"]);
+        assert!(ws.join("letter.txt").exists());
     }
 
     #[tokio::test]
@@ -1013,6 +1067,13 @@ mod tests {
         assert!(log.contains(&"start Read Cargo.toml".to_string()));
         assert!(log.contains(&"end true".to_string()));
         assert!(log.contains(&"end false".to_string()));
+        // The failed one says why on its row, in one line.
+        let why = log.iter().find(|l| l.starts_with("why ")).unwrap();
+        assert!(
+            why.contains("`../escape` is outside the workspace"),
+            "{why}"
+        );
+        assert!(!why.contains('\n'), "{why}");
 
         let seen = llm.seen.lock().unwrap();
         assert_eq!(seen.len(), 2);

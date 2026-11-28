@@ -32,6 +32,16 @@ fn plain() -> bool {
     PLAIN.with(|p| p.get())
 }
 
+thread_local! {
+    /// Inside a blockquote: quotes from sources stay verbatim, so their
+    /// LaTeX is not rendered as math.
+    static VERBATIM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn verbatim() -> bool {
+    VERBATIM.with(|v| v.get())
+}
+
 fn render_lines(raw: &[&str], width: u16, base: Style) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     let mut i = 0;
@@ -66,6 +76,25 @@ fn render_lines(raw: &[&str], width: u16, base: Style) -> Vec<Line<'static>> {
                 render_code_block(&block, lang, width, base, &mut out);
             }
             continue;
+        }
+
+        // Display math: `$$` or `\[` opening a line, closed on a later one,
+        // as one indented line of Unicode math.
+        if !verbatim()
+            && let Some(close) = display_math_open(trimmed)
+            && let Some(end) = (i + 1..raw.len()).find(|&j| raw[j].contains(close))
+        {
+            let joined = raw[i..=end].join(" ");
+            let body = joined.trim();
+            let math = crate::mathtext::delimited(body)
+                .filter(|(_, used)| body[*used..].trim().is_empty())
+                .map(|(m, _)| m);
+            if let Some(math) = math {
+                let spans = vec![Span::styled(format!("  {math}"), base)];
+                out.extend(wrap_hanging(&spans, width, 2));
+                i = end + 1;
+                continue;
+            }
         }
 
         // Blockquotes: consecutive `> ...` lines rendered with a `│ ` bar.
@@ -155,6 +184,19 @@ fn render_lines(raw: &[&str], width: u16, base: Style) -> Vec<Line<'static>> {
         i += 1;
     }
     out
+}
+
+/// The closing delimiter of display math opened at the start of `trimmed`
+/// and not closed on the same line.
+fn display_math_open(trimmed: &str) -> Option<&'static str> {
+    let (open, close) = if trimmed.starts_with("$$") {
+        ("$$", "$$")
+    } else if trimmed.starts_with("\\[") {
+        ("\\[", "\\]")
+    } else {
+        return None;
+    };
+    (!trimmed[open.len()..].contains(close)).then_some(close)
 }
 
 fn parse_fence_open(trimmed: &str) -> Option<(char, usize, &str)> {
@@ -468,7 +510,9 @@ fn render_blockquote(
         return;
     }
     let inner_w = width.saturating_sub(prefix_w).max(1);
+    let was = VERBATIM.with(|v| v.replace(true));
     let inner = render_lines(quote_lines, inner_w, base);
+    VERBATIM.with(|v| v.set(was));
     if inner.is_empty() {
         out.push(Line::from(Span::styled(prefix, bar_style)));
     } else {
@@ -746,7 +790,8 @@ fn truncate_to_width(s: &str, max_w: usize) -> String {
 }
 
 /// Inline formatting: `` `code` ``, `***bold italic***`, `**bold**`,
-/// `*italic*`, `_italic_` (preserving `snake_case`), and `[label](url)`.
+/// `*italic*`, `_italic_` (preserving `snake_case`), `[label](url)`, and
+/// LaTeX math (`\(…\)`, `$…$`) shown as Unicode outside blockquotes.
 pub fn inline(text: &str, base: Style) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     let mut rest = text;
@@ -789,6 +834,17 @@ pub fn inline(text: &str, base: Style) -> Vec<Span<'static>> {
             }
             prev_char = Some(')');
             rest = &rest[consumed..];
+            continue;
+        }
+
+        // LaTeX math, shown as Unicode (never in a quote from a source).
+        if rest.starts_with(['\\', '$'])
+            && !verbatim()
+            && let Some((math, used)) = crate::mathtext::delimited(rest)
+        {
+            buf.push_str(&math);
+            prev_char = math.chars().last();
+            rest = &rest[used..];
             continue;
         }
 
@@ -1725,5 +1781,50 @@ mod tests {
         for l in &lines {
             assert!(l.width() <= 5, "{l:?}");
         }
+    }
+
+    #[test]
+    fn latex_in_replies_reads_as_unicode_but_code_and_quotes_stay_verbatim() {
+        let reply = concat!(
+            r"The overlap is \(c_{ij}=\mathcal N(\mu_{a_i};\mu_{b_j},v_{a_i}+v_{b_j})\)",
+            "\n",
+            r"- weight \(w_{a_i}w_{b_j}c_{ij}\), error below \(2.22\times10^{-16}\)",
+            "\n",
+            r"Inline code `\(x_1\)` stays.",
+            "\n\n```python\n",
+            r"s = '\(a_i\)'",
+            "\n```\n\n",
+            r"  > from the paper: \(\mu_{a_i}\) and $x^2$",
+            "\n\n$$\n",
+            r"\frac{a+b}{2}",
+            "\n$$\nafter",
+        );
+        let text = plain(&render(reply, 200, Style::default())).join("\n");
+        assert!(
+            text.contains("The overlap is cᵢⱼ = 𝒩(μ_(aᵢ); μ_(bⱼ), v_(aᵢ) + v_(bⱼ))"),
+            "{text}"
+        );
+        assert!(
+            text.contains("• weight w_(aᵢ)w_(bⱼ)cᵢⱼ, error below 2.22×10⁻¹⁶"),
+            "{text}"
+        );
+        // Code, inline and fenced, and a quote from a source: verbatim.
+        assert!(text.contains(r"Inline code \(x_1\) stays."), "{text}");
+        assert!(text.contains(r"s = '\(a_i\)'"), "{text}");
+        assert!(
+            text.contains(r"from the paper: \(\mu_{a_i}\) and $x^2$"),
+            "{text}"
+        );
+        // Display math across lines: one indented line.
+        assert!(text.contains("\n  (a + b)/2\nafter"), "{text}");
+        assert!(!text.contains("$$"), "{text}");
+        // A Markdown-escaped citation and shell variables keep their marks.
+        let text = plain(&render(
+            r"See \[1\] and copy it to $HOME/$USER now.",
+            200,
+            Style::default(),
+        ))
+        .join("\n");
+        assert!(text.contains("See [1] and copy it to $HOME/$USER now."), "{text}");
     }
 }

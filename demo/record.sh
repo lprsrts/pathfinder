@@ -1,10 +1,15 @@
 #!/bin/sh
-# Record the Pathfinder demo (the electricity bill scenario).
+# Record a Pathfinder demo.
 #
-#   PATHFINDER_DEMO_CREDENTIALS=/path/to/a/pathfinder/home demo/record.sh
+#   PATHFINDER_DEMO_CREDENTIALS=/path/to/a/pathfinder/home demo/record.sh [energy-bill|research]
+#
+# energy-bill (the default): someone works out their electricity bill in
+# ~/Documents/Electricity bill. research: a scientist works through a public
+# preprint in ~/Research/mixture-uncertainty, a git repository, so the
+# agent's work is staged for review (the paper is downloaded from arXiv).
 #
 # Sets up a throwaway home, starts a shell in a private tmux server and
-# starts VHS (demo/energy-bill.tape), which records that tmux session. You
+# starts VHS (demo/<scenario>.tape), which records that tmux session. You
 # then play the person with demo/say.sh, reading each reply before you
 # answer: the candidate you judge is right or flawed at random, so the
 # lines can't all be scripted ahead. `demo/say.sh --end` stops the
@@ -13,9 +18,15 @@
 # PATHFINDER_DEMO_CREDENTIALS is a folder holding an auth.json (and
 # optionally config.json and cache/models.json), e.g. a PATHFINDER_HOME
 # where you've run /login. The files are copied into the throwaway home
-# under $DEMO_ROOT (default /tmp/pathfinder-demo), never into the repo.
+# under $DEMO_ROOT (default /tmp/pathfinder-demo), never into the repo, and
+# a refreshed sign-in is copied back so the source stays signed in.
 set -eu
 
+SCENARIO=${1:-energy-bill}
+case "$SCENARIO" in
+  energy-bill|research) ;;
+  *) echo "usage: demo/record.sh [energy-bill|research]" >&2; exit 2 ;;
+esac
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 DEMO="$REPO/demo"
 ROOT=${DEMO_ROOT:-/tmp/pathfinder-demo}
@@ -35,7 +46,7 @@ The files are copied into a throwaway home under $ROOT, not into the repo.
 EOF
   exit 1
 fi
-for tool in vhs tmux pdftotext jq ffmpeg python3; do
+for tool in vhs tmux pdftotext jq ffmpeg python3 git curl; do
   command -v $tool >/dev/null || { echo "$tool is not installed (pdftotext comes with poppler)" >&2; exit 1; }
 done
 
@@ -45,16 +56,33 @@ echo "Building the release binary..."
 now() { python3 -c 'import time; print(f"{time.time():.2f}")'; }
 
 # A throwaway home, outside any git repository, so the screen shows
-# ~/Documents/... and the agent's work is a plain edit in that folder.
+# ~/Documents/... (or ~/Research/...).
 tmux -L $SOCK kill-server 2>/dev/null || true
 rm -rf "$ROOT"
 mkdir -p "$ROOT"
 ROOT=$(cd "$ROOT" && pwd -P) # the real path (/tmp is a link on macOS)
 HOME_DIR="$ROOT/home"
-FOLDER="$HOME_DIR/Documents/Electricity bill"
 PF_HOME="$ROOT/pathfinder-home"
-mkdir -p "$FOLDER" "$PF_HOME" "$ROOT/bin"
-cp "$DEMO/energy-bill/bill-october-2026.pdf" "$DEMO/energy-bill/tariff-sheet.pdf" "$FOLDER/"
+case "$SCENARIO" in
+  energy-bill)
+    # Not a git repository: the agent's work is a plain edit in the folder.
+    FOLDER="$HOME_DIR/Documents/Electricity bill"
+    mkdir -p "$FOLDER"
+    cp "$DEMO/energy-bill/bill-october-2026.pdf" "$DEMO/energy-bill/tariff-sheet.pdf" "$FOLDER/" ;;
+  research)
+    # A git repository holding the public preprint (Darijani et al. 2026,
+    # arXiv:2603.20365), fetched from arXiv here and never kept in this repo.
+    # In a repository a handoff runs in a staged copy and its review may be
+    # checked.
+    FOLDER="$HOME_DIR/Research/mixture-uncertainty"
+    mkdir -p "$FOLDER"
+    echo "Downloading arXiv:2603.20365..."
+    curl -fsSL -A "pathfinder-demo" -o "$FOLDER/darijani2026-gmm-uncertainty.pdf" https://arxiv.org/pdf/2603.20365v1
+    (cd "$FOLDER" && git init -q -b main \
+      && git add . \
+      && git -c user.name=Researcher -c user.email=researcher@example.invalid -c commit.gpgsign=false commit -q -m "Add the preprint") ;;
+esac
+mkdir -p "$PF_HOME" "$ROOT/bin"
 
 (umask 077
  cp "$CREDS/auth.json" "$PF_HOME/auth.json"
@@ -95,18 +123,29 @@ env -i \
     "bash --noprofile --rcfile '$ROOT/bashrc' -i"
 
 : > "$ROOT/timeline.log"
+# A sign-in's refresh token is replaced each time it is used, so a refresh
+# in the throwaway copy would leave the source signed out. Copy a refreshed
+# auth.json back to the source as soon as it changes, and once more at the
+# end, so both stay on the same sign-in.
+sync_auth() {
+  if [ -f "$PF_HOME/auth.json" ] && ! cmp -s "$PF_HOME/auth.json" "$CREDS/auth.json"; then
+    (umask 077; cp "$PF_HOME/auth.json" "$CREDS/auth.json.demo-tmp" && mv "$CREDS/auth.json.demo-tmp" "$CREDS/auth.json")
+  fi
+}
 # Logs when each reply starts and ends, for cut.py.
 (
   prev=idle
   while tmux -L $SOCK has-session -t demo 2>/dev/null; do
     if tmux -L $SOCK capture-pane -p -t demo 2>/dev/null | grep -Eq 'Working [0-9]+s|Esc stops'; then cur=busy; else cur=idle; fi
     if [ "$cur" != "$prev" ]; then echo "$(now) $cur" >> "$ROOT/timeline.log"; prev=$cur; fi
+    sync_auth
     sleep 0.2
   done
+  sync_auth
 ) > /dev/null 2>&1 &
 
 cd "$ROOT"
-nohup vhs "$DEMO/energy-bill.tape" > "$ROOT/vhs.log" 2>&1 &
+nohup vhs "$DEMO/$SCENARIO.tape" > "$ROOT/vhs.log" 2>&1 &
 
 # Wait for VHS to attach.
 i=0

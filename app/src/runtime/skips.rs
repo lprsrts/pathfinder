@@ -40,7 +40,11 @@ impl Runtime {
         session.pending_candidate = None;
         self.set_status(session, &part.id, PartStatus::Known, "claimed by the user")?;
         let events = self.record_skip(session, &part.id, EventKind::Claim);
-        let lead = i18n::line(session.language.as_deref(), lead).replace("{title}", &part.title);
+        let lead = if lead == i18n::Line::ShowKnown {
+            self.known_lead(session, &part.concepts, &part.title)
+        } else {
+            i18n::line(session.language.as_deref(), lead).replace("{title}", &part.title)
+        };
         let target = then
             .filter(|q| !q.is_empty() && *q != "next")
             .and_then(|q| session.map.resolve(q).ok())
@@ -92,13 +96,14 @@ impl Runtime {
         }
         self.set_status(session, &part.id, PartStatus::Delegated, &result)?;
         self.record_skip(session, &part.id, EventKind::Delegated);
-        Ok(self.after_resolution(
+        Ok(self.after_agent_run(
             session,
             format!(
                 "\n\n{}",
                 i18n::line(session.language.as_deref(), i18n::Line::Delegated)
                     .replace("{title}", &part.title)
             ),
+            &part.concepts,
         ))
     }
 }

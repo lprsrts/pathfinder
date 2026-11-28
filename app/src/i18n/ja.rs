@@ -92,16 +92,28 @@ fn line(l: Line) -> &'static str {
         ShowDelegate => {
             "**{title}** を理解しないまま任せますか？委任として記録され、結果を保証することにはなりません。Enter で実行 · Esc で取消。"
         }
+        DelegateWhy => {
+            "あなたのレビュー付きの引き渡しではありません：{concepts} はまだ示されていません。"
+        }
         ShowVerdict => {
             "これを候補への判定として採点しますか？「{words}」 Enter で採点 · Esc でメモとして残す。"
+        }
+        ShowApprove => {
+            "**{title}** のエージェントの結果を承認しますか？Enter で承認 · Esc で取消。"
+        }
+        ShowObject => {
+            "異議を添えて **{title}** をエージェントに差し戻しますか？「{words}」Enter で送信 · Esc で取消。"
         }
         NotRunVerdict => "判定としては採点せず、メモとして残しました。",
         NotRunHandoff => "未実行: **{title}** はエージェントに渡していません。",
         NotRunDelegate => "未実行: **{title}** は委任していません。",
+        NotRunApprove => "未実行: **{title}** は承認していません。",
+        NotRunObject => "未実行: **{title}** への異議は送っていません。",
         NotRunStale => "未実行: 承認を待っていた内容はもう当てはまりません。",
         AskWhich => {
             "どれのことですか：{choices}？ はっきりするまで何も記録しません。番号か一言で答えてください。"
         }
+        AskAgentPart => "**{title}** をエージェントに任せる",
         AskKnown => "**{title}** はもう知っていると記録する（確認なし）",
         AskTell => "答えを教えてほしい",
         AskAgent => "このパートをエージェントに任せる",
@@ -136,11 +148,48 @@ fn line(l: Line) -> &'static str {
         Horizon => "見通し: {what}。",
         HorizonNeeds => "前提: {parts}",
         HorizonLeads => "次へ: {parts}",
-        EvidenceRatio => "合格: {passes} · 申告: {claims}。",
+        EvidenceRatio => {
+            "上のうち、{passes} 個は確認に合格し、{claims} 個はあなたの申告だけに基づいています。"
+        }
         ClaimWithdrawn => "**{concept}** の申告を撤回 ({date})。",
-        StepHistory => "ここまでの道のり: {kinds}。",
-        StepKindRate => "{kind} {judged} 回中 {passes} 回が合格につながった",
+        StepHistory => "これまで合格につながったもの: {kinds}。",
+        StepKindRate => "{kind}、{judged} 回中 {passes} 回",
         SteeredTimes => "あなたが {n} 回方向を指定",
+        AngleExample => "例から始める",
+        AnglePurpose => "何のためにあるかを問う",
+        AngleMechanism => "どう動くかをたどる",
+        AgentWork => "**エージェントに任せたもの**",
+        AgentInReview => {
+            "**{title}**: 確認可能。拠り所を示したあとで任せました。あなたの確認待ちです。"
+        }
+        AgentApproved => {
+            "**{title}**: 確認可能。拠り所を示したあとで任せました。あなたが承認しました。"
+        }
+        AgentMissedCheck => {
+            "**{title}**: チェックに気づかずに承認しました。確認としては記録されず、あなたは保証しません。"
+        }
+        AgentDelegated => "**{title}**: 委任。理解しないまま行われました。あなたは保証しません。",
+        AgentCaughtCheck => {
+            "**{title}**: 確認可能。レビューで仕込まれたチェックに気づいて異議を出したので、エージェントの本当の結果が書き込まれました。"
+        }
+        ShowAgentParts => {
+            "これらのパートを順番にエージェントに任せますか？{parts}。Enter ですべて実行 · Esc で取消。"
+        }
+        AgentPartHandoff => "**{title}**（引き渡し：結果をあなたが確認）",
+        AgentPartDelegate => "**{title}**（委任：あなたは保証しません）",
+        AgentPartDelegateWhy => "**{title}**（委任：まだ {concepts} を示していません）",
+        ConfirmHandoff => "はい、任せる",
+        ConfirmDelegate => "はい、委任する",
+        ConfirmVerdict => "はい、判定する",
+        ConfirmApprove => "はい、承認する",
+        ConfirmObject => "はい、差し戻す",
+        CancelShown => "いいえ",
+        ShowKnownShown => {
+            "記録しました: **{title}** はもう知っている、と。拠り所となる考えはすべて示し済みなので、申告だけでなく確認に基づいています。「取り消して」と言うか Esc で取り消せます。"
+        }
+        ShowKnownSome => {
+            "記録しました: **{title}** はもう知っている、と。{concepts} は申告のみで、残りは示し済みです。「取り消して」と言うか Esc で取り消せます。"
+        }
         StepHistoryNote => {
             "Pathfinder があなたの学び方について記録するのはこれだけで、このフォルダーのローカル記録に残ります。"
         }

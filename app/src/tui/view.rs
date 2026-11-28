@@ -388,6 +388,9 @@ fn tool_groups(app: &App) -> Vec<(usize, Vec<usize>)> {
 }
 
 /// One line for a run of reads and searches: "Read 3 files, 2 searches".
+/// A probe that failed (a wrong path, a bad pattern) is the agent's own
+/// business: it read why and went on, so the line counts only what worked.
+/// When nothing in the run worked, it says so, and Tab→Enter shows why.
 fn group_line(app: &App, members: &[usize], width: u16) -> Vec<Line<'static>> {
     let mut files = std::collections::BTreeSet::new();
     let (mut searches, mut lists, mut failed) = (0, 0, 0);
@@ -396,6 +399,14 @@ fn group_line(app: &App, members: &[usize], width: u16) -> Vec<Line<'static>> {
         let Entry::Tool { title, ok, .. } = &app.entries[i] else {
             continue;
         };
+        match ok {
+            None => running = Some(title.clone()),
+            Some(false) => {
+                failed += 1;
+                continue;
+            }
+            Some(true) => {}
+        }
         if let Some(rest) = title
             .strip_prefix("Read ")
             .or_else(|| title.strip_prefix("View "))
@@ -405,11 +416,6 @@ fn group_line(app: &App, members: &[usize], width: u16) -> Vec<Line<'static>> {
             lists += 1;
         } else {
             searches += 1;
-        }
-        match ok {
-            None => running = Some(title.clone()),
-            Some(false) => failed += 1,
-            Some(true) => {}
         }
     }
     let plural =
@@ -424,12 +430,22 @@ fn group_line(app: &App, members: &[usize], width: u16) -> Vec<Line<'static>> {
     if lists > 0 {
         parts.push(format!("listed {}", plural(lists, "folder", "folders")));
     }
-    let mut text = parts.join(", ");
+    let none_worked = parts.is_empty();
+    let mut text = if none_worked {
+        format!(
+            "{} didn't work (a wrong path or pattern)",
+            plural(failed, "lookup", "lookups")
+        )
+    } else {
+        parts.join(", ")
+    };
     if let Some(first) = text.get(..1) {
         text = first.to_uppercase() + &text[1..];
     }
     let (mark, color) = if running.is_some() {
         ("●", Color::Cyan)
+    } else if none_worked {
+        ("✗", Color::Red)
     } else {
         ("✓", Color::Green)
     };
@@ -437,11 +453,10 @@ fn group_line(app: &App, members: &[usize], width: u16) -> Vec<Line<'static>> {
         Span::styled(format!("{mark} "), Style::default().fg(color)),
         Span::styled(text, dim()),
     ];
-    if failed > 0 {
-        spans.push(Span::styled(format!(" ({failed} failed)"), dim()));
-    }
     if let Some(now) = running {
         spans.push(Span::styled(format!(" · {now}"), dim()));
+    } else if none_worked {
+        spans.push(Span::styled(" · Tab→Enter shows why · ^G all", dim()));
     } else {
         spans.push(Span::styled(" · Tab→Enter expands · ^G all", dim()));
     }
@@ -976,21 +991,32 @@ fn has_waiting_state(app: &App) -> bool {
 
 /// What Enter does to what waits for your OK (§15), from the part's title
 /// only: never the candidate or anything the gate holds (A6).
-fn ok_what(kind: crate::domain::CommitKind, title: &str) -> String {
+fn ok_what(kind: crate::domain::CommitKind, title: &str, more: usize) -> String {
     use crate::domain::CommitKind;
+    let then = match more {
+        0 => String::new(),
+        1 => ", then 1 more part".into(),
+        n => format!(", then {n} more parts"),
+    };
     match kind {
         CommitKind::Verdict => "judge your message as your verdict".into(),
-        CommitKind::Handoff => format!("hand {title} to the agent"),
-        CommitKind::Delegate => format!("delegate {title}"),
+        CommitKind::Handoff => format!("hand {title} to the agent{then}"),
+        CommitKind::Delegate => format!("delegate {title}{then}"),
+        CommitKind::Approve => format!("approve the agent's result for {title}"),
+        CommitKind::Object => format!("send {title} back to the agent with your objection"),
     }
 }
 
 /// What waits on you, in a few words, for the rule when the panel isn't
 /// docked.
+/// Your OK isn't asked while a reply runs: Enter and Esc then answer the
+/// reply, and what waited may be what is running now.
 fn waiting_text(app: &App) -> Option<&'static str> {
     let s = &app.session;
     if s.pending_commitment.is_some() {
-        Some("⧗ your OK (Enter runs · Esc cancels)")
+        app.running
+            .is_none()
+            .then_some("⧗ your OK (Enter runs · Esc cancels)")
     } else if s.pending_change.is_some() {
         Some("⧗ map change (/accept · /reject)")
     } else if s.pending_candidate.is_some() && s.exam {
@@ -1004,7 +1030,11 @@ fn waiting_text(app: &App) -> Option<&'static str> {
     }
 }
 
-/// Parts done of all, and the active one: `Parts 2/5 » Verdict prompt`.
+/// Parts understood of all, and the active one: `Understood 2/5 »
+/// Verdict prompt`. A part in review was understood before it was handed
+/// off, so it counts; parts claimed or handed off without understanding are
+/// resolved but not understood, so they don't; an exam counts questions
+/// passed.
 fn parts_text(app: &App) -> Option<String> {
     let s = &app.session;
     if s.map.parts.is_empty() {
@@ -1014,15 +1044,15 @@ fn parts_text(app: &App) -> Option<String> {
         .map
         .parts
         .iter()
-        .filter(|p| matches!(p.status, PartStatus::Understood | PartStatus::Done))
+        .filter(|p| p.status.counts_as_understood())
         .count();
     let active = s
         .active
         .as_deref()
         .and_then(|id| s.map.parts.iter().find(|p| p.id == id))
-        .map(|p| format!(" » {}", p.title))
+        .map(|p| format!(" » {}", crate::mathtext::prose(&p.title)))
         .unwrap_or_default();
-    let what = if s.exam { "Exam" } else { "Parts" };
+    let what = if s.exam { "Exam" } else { "Understood" };
     Some(format!("{what} {done}/{}{active}", s.map.parts.len()))
 }
 
@@ -1236,7 +1266,10 @@ pub fn side_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     }
     if let Some(goal) = &s.goal {
         lines.push(Line::from(Span::styled("Goal", bold)));
-        lines.extend(markdown::wrap(&[Span::raw(goal.clone())], width));
+        lines.extend(markdown::wrap(
+            &[Span::raw(crate::mathtext::prose(goal).into_owned())],
+            width,
+        ));
     }
 
     // What waits on you, with the commands and keys that answer it.
@@ -1246,7 +1279,7 @@ pub fn side_lines(app: &App, width: u16) -> Vec<Line<'static>> {
             &[Span::styled("⧗ Waiting for your OK", yellow_bold)],
             width,
         ));
-        let what = ok_what(kind, title);
+        let what = ok_what(kind, title, s.waiting_more());
         let mut what = what[..1].to_uppercase() + &what[1..];
         what.push('?');
         lines.extend(markdown::wrap(&[Span::raw(what)], width));
@@ -1255,15 +1288,18 @@ pub fn side_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         } else {
             " cancels"
         };
-        lines.extend(markdown::wrap(
-            &[
-                Span::styled("Enter", cyan),
-                Span::styled(" runs · ", dim()),
-                Span::styled("Esc", cyan),
-                Span::styled(cancel, dim()),
-            ],
-            width,
-        ));
+        // Its keys only while they answer it: during a reply they stop it.
+        if app.running.is_none() {
+            lines.extend(markdown::wrap(
+                &[
+                    Span::styled("Enter", cyan),
+                    Span::styled(" runs · ", dim()),
+                    Span::styled("Esc", cyan),
+                    Span::styled(cancel, dim()),
+                ],
+                width,
+            ));
+        }
     } else if s.undoable()
         && let Some(title) = s
             .last_commitment
@@ -1275,7 +1311,7 @@ pub fn side_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         lines.extend(markdown::wrap(
             &[
                 Span::styled("↶ ", cyan),
-                Span::raw(format!("You claimed {title}")),
+                Span::raw(format!("You claimed {}", crate::mathtext::prose(&title))),
             ],
             width,
         ));
@@ -1297,7 +1333,10 @@ pub fn side_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         ));
         if !change.brief.is_empty() {
             lines.extend(markdown::wrap(
-                &[Span::styled(change.brief.clone(), dim())],
+                &[Span::styled(
+                    crate::mathtext::prose(&change.brief).into_owned(),
+                    dim(),
+                )],
                 width,
             ));
         }
@@ -1358,11 +1397,15 @@ pub fn side_lines(app: &App, width: u16) -> Vec<Line<'static>> {
             .map
             .parts
             .iter()
-            .filter(|p| matches!(p.status, PartStatus::Understood | PartStatus::Done))
+            .filter(|p| p.status.counts_as_understood())
             .count();
         gap(&mut lines);
-        let count = format!("{done}/{}", s.map.parts.len());
-        let head = if s.exam { "Exam" } else { "Parts" };
+        let (head, how) = if s.exam {
+            ("Exam", "")
+        } else {
+            ("Parts", " understood")
+        };
+        let count = format!("{done}/{}{how}", s.map.parts.len());
         let pad = w.saturating_sub(head.width() + count.width()).max(1);
         lines.push(Line::from(vec![
             Span::styled(head, bold),
@@ -1384,7 +1427,7 @@ pub fn side_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                 Span::styled(format!("{mark} "), Style::default().fg(color)),
                 Span::styled(num.clone(), dim()),
                 Span::styled(
-                    part.title.clone(),
+                    crate::mathtext::prose(&part.title).into_owned(),
                     if active { bold } else { Style::default() },
                 ),
             ];
@@ -1519,7 +1562,10 @@ fn placeholder(app: &App) -> String {
         } else {
             "cancels"
         };
-        format!("Enter: {} · Esc {esc}", ok_what(kind, title))
+        format!(
+            "Enter: {} · Esc {esc}",
+            ok_what(kind, title, app.session.waiting_more())
+        )
     } else if app.session.undoable() {
         "Esc takes back your claim, or go on".into()
     } else if app.session.pending_change.is_some() {
@@ -1742,7 +1788,7 @@ fn footer_line(app: &App, width: u16, palette: Option<&PaletteKind>) -> Line<'st
     } else {
         "off".into()
     };
-    let checks = app.current(CHECKS);
+    let checks = crate::runtime::checks_label(&app.current(CHECKS)).to_string();
     let (fast_a, main_a) = (
         app.footer_model(FAST_MODEL, true),
         app.footer_model(MAIN_MODEL, true),
@@ -2143,7 +2189,7 @@ pub fn settings_row(app: &App, option: &str, name: &str) -> Line<'static> {
             });
         }
     } else {
-        spans.push(Span::raw(app.current_setting(option)));
+        spans.push(Span::raw(app.current_label(option)));
     }
     Line::from(spans)
 }
@@ -3592,10 +3638,11 @@ mod tests {
             misconception: None,
             id: "c1".into(),
         });
-        let line = rule_line(&app, 160, false);
+        // The count says what it counts: parts understood.
+        let line = rule_line(&app, 170, false);
         let text = line_text(&line);
         assert!(
-            text.contains("Parts 1/2 » The verdict prompt · ^B"),
+            text.contains("Understood 1/2 » The verdict prompt · ^B"),
             "{text}"
         );
         let wait = line
@@ -3604,9 +3651,19 @@ mod tests {
             .find(|s| s.content.contains("your verdict"))
             .unwrap();
         assert_eq!(wait.style.fg, Some(Color::Yellow));
+        // A part in review was understood before it was handed off.
+        app.session.map.parts[0].status = PartStatus::InReview;
+        let text = line_text(&rule_line(&app, 170, false));
+        assert!(text.contains("Understood 1/2 » The verdict prompt"), "{text}");
+        app.session.map.parts[0].status = PartStatus::Understood;
+        // A LaTeX title reads as Unicode on the rule, as in the panel.
+        app.session.map.parts[1].title = r"The weight \(w_{ij}\)".into();
+        let text = line_text(&rule_line(&app, 170, false));
+        assert!(text.contains("» The weight wᵢⱼ"), "{text}");
+        app.session.map.parts[1].title = "The verdict prompt".into();
         // Docked, the panel shows them instead.
         let docked = line_text(&rule_line(&app, 160, true));
-        assert!(!docked.contains("Parts"), "{docked}");
+        assert!(!docked.contains("Understood"), "{docked}");
         assert!(!docked.contains("verdict"), "{docked}");
 
         // Narrow: the parts and the scroll chip go first; what runs and what
@@ -3625,7 +3682,7 @@ mod tests {
         let text = line_text(&rule_line(&app, 80, false));
         assert!(text.contains("⧗ your verdict"), "{text}");
         assert!(text.contains("Working"), "{text}");
-        assert!(!text.contains("Parts"), "{text}");
+        assert!(!text.contains("Understood"), "{text}");
     }
 
     #[test]
@@ -3777,6 +3834,12 @@ mod tests {
             "{wide}"
         );
         assert!(wide.contains("fast ") && wide.contains("checks "), "{wide}");
+        // The highest checks level reads `full` here too, as in Settings.
+        app.session.checks = Some("normal".into());
+        assert_eq!(app.current(crate::options::CHECKS), "normal");
+        let wide = line_text(&footer_line(&app, 200, None));
+        assert!(wide.contains("checks full"), "{wide}");
+        assert!(!wide.contains("checks normal"), "{wide}");
         let narrow = line_text(&footer_line(&app, 40, None));
         assert!(narrow.contains("Enter send · F1 keys"), "{narrow}");
 
@@ -3891,7 +3954,10 @@ mod tests {
         assert_eq!(t[0], "Goal");
         assert!(t.iter().all(|l| !l.starts_with("Thread")), "{t:?}");
         let parts = t.iter().position(|l| l.starts_with("Parts")).unwrap();
-        assert_eq!(t[parts], format!("Parts{}1/2", " ".repeat(31 - 8)));
+        assert_eq!(
+            t[parts],
+            format!("Parts{}1/2 understood", " ".repeat(31 - 19))
+        );
         assert_eq!(t[parts + 1], "✓ 1 Candidate checks");
         assert_eq!(t[parts + 2], "▶ 2 The verdict prompt");
         let next = t.iter().position(|l| l == "Next").unwrap();
@@ -3927,6 +3993,7 @@ mod tests {
             text: "please do it".into(),
             files: vec![],
             candidate: None,
+            then: Vec::new(),
         });
         let t = texts(&side_lines(&app, 31));
         let at = t.iter().position(|l| l == "⧗ Waiting for your OK").unwrap();
@@ -3960,6 +4027,7 @@ mod tests {
             text: "it is right".into(),
             files: vec![],
             candidate: None,
+            then: Vec::new(),
         });
         assert_eq!(
             placeholder(&app),
@@ -3988,6 +4056,7 @@ mod tests {
             prev_mode: SessionMode::Working,
             prev_change: None,
             prev_gaps: vec![],
+            also: vec![],
         });
         assert_eq!(placeholder(&app), "Esc takes back your claim, or go on");
         let t = texts(&side_lines(&app, 40));
@@ -4017,6 +4086,7 @@ mod tests {
             text: "let the agent do it".into(),
             files: vec![],
             candidate: None,
+            then: Vec::new(),
         });
         app.entries.push(Entry::User("let the agent do it".into()));
         app.entries.push(Entry::Note(
@@ -4038,6 +4108,69 @@ mod tests {
             screen.contains("⧗ your OK (Enter runs · Esc cancels)"),
             "{screen}"
         );
+    }
+
+    #[test]
+    fn a_run_of_lookups_counts_only_what_worked() {
+        let mut app = test_app();
+        let tool = |id: &str, title: &str, ok: bool| Entry::Tool {
+            id: id.into(),
+            title: title.into(),
+            ok: Some(ok),
+            detail: if ok {
+                String::new()
+            } else {
+                "`notes/` is outside the workspace".into()
+            },
+        };
+        app.entries.push(tool("t1", "Grep `GMM`", true));
+        app.entries.push(tool("t2", "Grep `(fusion`", false));
+        app.entries.push(tool("t3", "List notes", false));
+        app.entries.push(tool("t4", "List .", true));
+        app.entries.push(tool("t5", "Read paper.pdf (p.29)", false));
+        let line = texts(&group_line(&app, &[0, 1, 2, 3, 4], 200)).join(" ");
+        assert!(
+            line.starts_with("✓ 1 search, listed 1 folder · Tab→Enter expands"),
+            "{line}"
+        );
+        assert!(!line.contains("failed") && !line.contains("read"), "{line}");
+
+        // Nothing worked: it says so in plain words, and where to see why.
+        app.entries.clear();
+        app.entries.push(tool("t1", "Grep `(fusion`", false));
+        app.entries.push(tool("t2", "List notes", false));
+        let line = texts(&group_line(&app, &[0, 1], 200)).join(" ");
+        assert!(
+            line.starts_with(
+                "✗ 2 lookups didn't work (a wrong path or pattern) · Tab→Enter shows why"
+            ),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn your_ok_leaves_the_rule_and_its_keys_the_panel_while_a_reply_runs() {
+        use crate::domain::{CommitKind, PendingCommitment};
+        let mut app = test_app();
+        with_parts(&mut app, true);
+        app.session.pending_commitment = Some(PendingCommitment {
+            kind: CommitKind::Handoff,
+            part: "p2".into(),
+            text: "let the agent do it".into(),
+            files: vec![],
+            candidate: None,
+            then: Vec::new(),
+        });
+        assert!(waiting_text(&app).is_some());
+        app.running = Some(tokio_util::sync::CancellationToken::new());
+        app.started = Some(std::time::Instant::now());
+        assert_eq!(waiting_text(&app), None);
+        let rule = line_text(&rule_line(&app, 160, false));
+        assert!(!rule.contains("your OK"), "{rule}");
+        assert!(!rule.contains("Enter runs"), "{rule}");
+        let t = texts(&side_lines(&app, 40));
+        assert!(t.iter().all(|l| !l.contains("Enter runs")), "{t:?}");
+        assert_eq!(placeholder(&app), "Esc stops the reply");
     }
 
     #[test]
@@ -4218,10 +4351,11 @@ mod tests {
         let app = test_app();
         let line = settings_row(&app, crate::options::CHECKS, "Review checks");
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(text.ends_with("off · light · normal"), "{text}");
-        let current = app.current(crate::options::CHECKS);
+        // The highest level reads as `full`; it is still stored as `normal`.
+        assert!(text.ends_with("off · light · full"), "{text}");
+        let current = app.current_label(crate::options::CHECKS);
         for s in &line.spans {
-            if ["off", "light", "normal"].contains(&s.content.as_ref()) {
+            if ["off", "light", "full"].contains(&s.content.as_ref()) {
                 assert_eq!(
                     s.style.add_modifier.contains(Modifier::DIM),
                     s.content != current.as_str(),

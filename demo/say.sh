@@ -9,7 +9,8 @@
 # Each action waits for Pathfinder to finish replying, then prints the
 # screen. --hold S is how many seconds the video keeps the screen before
 # this action (time to read the last reply; default 3); cut.py drops the
-# rest of the time you spent deciding.
+# rest of the time you spent deciding. DEMO_TYPE_DELAY sets the seconds per
+# character (default 0.03; 0.018 suits long messages).
 set -eu
 ROOT=${DEMO_ROOT:-/tmp/pathfinder-demo}
 ROOT=$(cd "$ROOT" && pwd -P)
@@ -43,12 +44,13 @@ case "${1:-}" in
     msg=$1
     echo "$(now) type hold=$hold" >> "$LOG"
     # One character at a time, at a steady typing pace.
-    printf '%s' "$msg" | python3 -c '
-import subprocess, sys, time
+    printf '%s' "$msg" | DELAY=${DEMO_TYPE_DELAY:-0.03} python3 -c '
+import os, subprocess, sys, time
 text = sys.stdin.read()
+d = float(os.environ["DELAY"])
 for ch in text:
     subprocess.run(["tmux", "-L", "pathfinder-demo", "send-keys", "-t", "demo", "-l", "\\;" if ch == ";" else ch])
-    time.sleep(0.03 if ch != " " else 0.05)
+    time.sleep(d if ch != " " else d * 5 / 3)
 '
     sleep 0.5
     echo "$(now) send" >> "$LOG"

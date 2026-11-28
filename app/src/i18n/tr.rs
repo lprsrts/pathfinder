@@ -88,16 +88,26 @@ fn line(l: Line) -> &'static str {
         ShowDelegate => {
             "**{title}** anlamadan devredilsin mi? Devredildi olarak kaydedilir: sonuca kefil olmazsın. Enter çalıştırır · Esc iptal eder."
         }
+        DelegateWhy => "İncelemeli bir devir değil: {concepts} henüz göstermedin.",
         ShowVerdict => {
             "Bu, aday hakkındaki kararın olarak değerlendirilsin mi? “{words}” Enter değerlendirir · Esc not olarak tutar."
+        }
+        ShowApprove => {
+            "Ajanın **{title}** için sonucunu onaylıyor musun? Enter onaylar · Esc iptal eder."
+        }
+        ShowObject => {
+            "**{title}** itirazınla ajana geri gönderilsin mi? “{words}” Enter gönderir · Esc iptal eder."
         }
         NotRunVerdict => "Karar olarak değerlendirilmedi: not olarak tutuldu.",
         NotRunHandoff => "Çalıştırılmadı: **{title}** ajana verilmedi.",
         NotRunDelegate => "Çalıştırılmadı: **{title}** devredilmedi.",
+        NotRunApprove => "Çalıştırılmadı: **{title}** onaylanmadı.",
+        NotRunObject => "Çalıştırılmadı: **{title}** için itirazın gönderilmedi.",
         NotRunStale => "Çalıştırılmadı: onayını bekleyen şey artık geçerli değil.",
         AskWhich => {
             "Hangisini demek istedin: {choices}? Sen söyleyene kadar hiçbir şey kaydedilmez; bir numara ya da birkaç kelime yeter."
         }
+        AskAgentPart => "**{title}** işini ajana bırak",
         AskKnown => "**{title}** konusunu zaten bildiğimi kaydet (kontrolsüz)",
         AskTell => "bana söyleyiver",
         AskAgent => "bu bölümü ajan yapsın",
@@ -130,11 +140,48 @@ fn line(l: Line) -> &'static str {
         Horizon => "Ufuk: {what}.",
         HorizonNeeds => "gerekenler: {parts}",
         HorizonLeads => "şuna götürür: {parts}",
-        EvidenceRatio => "Geçilen: {passes} · iddia: {claims}.",
+        EvidenceRatio => {
+            "Yukarıdaki fikirlerden {passes} tanesi bir kontrolü geçti, {claims} tanesi yalnızca senin sözüne dayanıyor."
+        }
         ClaimWithdrawn => "**{concept}** hakkındaki iddia çekildi ({date}).",
-        StepHistory => "Buraya nasıl geldin: {kinds}.",
-        StepKindRate => "{kind}: {judged} adımdan {passes} tanesi geçişe götürdü",
+        StepHistory => "Şimdiye kadar geçişe götüren: {kinds}.",
+        StepKindRate => "{kind}, {judged} kezde {passes}",
         SteeredTimes => "{n} kez sen yönlendirdin",
+        AngleExample => "bir örnekle başlamak",
+        AnglePurpose => "ne işe yaradığını sormak",
+        AngleMechanism => "nasıl çalıştığını izlemek",
+        AgentWork => "**Ajana devredilenler**",
+        AgentInReview => {
+            "**{title}**: incelenebilir, neye dayandığını gösterdikten sonra devredildi; incelemeni bekliyor."
+        }
+        AgentApproved => {
+            "**{title}**: incelenebilir, neye dayandığını gösterdikten sonra devredildi; onayladın."
+        }
+        AgentMissedCheck => {
+            "**{title}**: kontrol fark edilmeden onaylandı; inceleme sayılmaz, ona kefil olmuyorsun."
+        }
+        AgentDelegated => "**{title}**: devredildi, sen anlamadan yapıldı; ona kefil olmuyorsun.",
+        AgentCaughtCheck => {
+            "**{title}**: incelenebilir; incelemesinde yerleştirilen kontrolü yakaladın ve itiraz ettin, bu yüzden ajanın gerçek sonucu yazıldı."
+        }
+        ShowAgentParts => {
+            "Ajan bu parçaları sırayla yapsın mı? {parts}. Enter hepsini çalıştırır · Esc iptal eder."
+        }
+        AgentPartHandoff => "**{title}** (devir: sonucu sen incelersin)",
+        AgentPartDelegate => "**{title}** (devredildi: kefil olmazsın)",
+        AgentPartDelegateWhy => "**{title}** (devredildi: {concepts} henüz göstermedin)",
+        ConfirmHandoff => "evet, devret",
+        ConfirmDelegate => "evet, anlamadan devret",
+        ConfirmVerdict => "evet, değerlendir",
+        ConfirmApprove => "evet, onayla",
+        ConfirmObject => "evet, geri gönder",
+        CancelShown => "hayır",
+        ShowKnownShown => {
+            "Kaydedildi: **{title}** konusunu zaten biliyorsun. Dayandığı her fikri zaten gösterdin; yalnızca sözüne değil, kontrollerine dayanıyor. Geri almak için \"geri al\" de ya da Esc'ye bas."
+        }
+        ShowKnownSome => {
+            "Kaydedildi: **{title}** konusunu zaten biliyorsun. {concepts} için yalnızca senin sözün var; gerisini zaten gösterdin. Geri almak için \"geri al\" de ya da Esc'ye bas."
+        }
         StepHistoryNote => {
             "Pathfinder'ın nasıl öğrendiğine dair tuttuğu her şey bu, bu klasörün yerel kaydında."
         }

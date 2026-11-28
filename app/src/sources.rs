@@ -476,16 +476,87 @@ pub fn unclean_pages(full: &Path, rel: &str) -> Vec<crate::pdftext::PageTrust> {
         .unwrap_or_default()
 }
 
-/// Whether a line of page `i` (0-based) can stand as the source's own words:
-/// on a page whose math didn't extract cleanly, only plain prose can, and on
-/// one whose math font came out as ordinary letters (`m` for μ), none can.
-fn quotable(unclean: &[crate::pdftext::PageTrust], i: usize, line: &str) -> bool {
-    use crate::pdftext::PageTrust;
-    match unclean.get(i).copied().unwrap_or_default() {
-        PageTrust::Clean => true,
-        PageTrust::Shaky => crate::pdftext::plain_prose(line),
-        PageTrust::Unquotable => false,
+/// How far each page of a source can be trusted, with what quoting from
+/// a [`crate::pdftext::PageTrust::Lettered`] page is checked against.
+#[derive(Debug, Default)]
+pub struct PageChecks {
+    trust: Vec<crate::pdftext::PageTrust>,
+    /// Per page: the [`loose`] forms of its trusted segments.
+    trusted: Vec<Vec<String>>,
+    /// Per page, once needed: its whole text in [`loose`] form.
+    folded: Vec<std::sync::OnceLock<String>>,
+}
+
+impl PageChecks {
+    /// The checks for a source's pages (all clean for anything but a PDF).
+    pub fn of(full: &Path, rel: &str) -> Self {
+        if !is_pdf(full) {
+            return Self::default();
+        }
+        let Ok(t) = crate::agent::tools::pdf_text(full, rel) else {
+            return Self::default();
+        };
+        Self {
+            trust: t.unclean.clone(),
+            trusted: t
+                .trusted
+                .iter()
+                .map(|segs| segs.iter().map(|s| loose(s).0).collect())
+                .collect(),
+            folded: (0..t.unclean.len()).map(|_| Default::default()).collect(),
+        }
     }
+
+    fn trust(&self, i: usize) -> crate::pdftext::PageTrust {
+        self.trust.get(i).copied().unwrap_or_default()
+    }
+
+    /// Whether `span`, text of page `i` (0-based) whose full text is
+    /// `page`, can stand as the source's own words: on a page whose math
+    /// didn't extract cleanly, only plain prose can; on one whose math font
+    /// came out as ordinary letters (`X` for ∑, `m` for μ), only plain prose
+    /// none of whose letters came from that font, and on one where those
+    /// letters can't be told apart, nothing.
+    fn quotable(&self, i: usize, page: &str, span: &str) -> bool {
+        use crate::pdftext::{PageTrust, plain_prose};
+        match self.trust(i) {
+            PageTrust::Clean => true,
+            PageTrust::Shaky => plain_prose(span),
+            PageTrust::Lettered => plain_prose(span) && self.untouched(i, page, span),
+            PageTrust::Unquotable => false,
+        }
+    }
+
+    /// Whether every place `span` occurs on page `i` is in its trusted
+    /// text: a span with a wrong letter in it, or the same words elsewhere
+    /// next to one, is not.
+    fn untouched(&self, i: usize, page: &str, span: &str) -> bool {
+        let want = loose(&normalise(span)).0;
+        if want.is_empty() {
+            return false;
+        }
+        let Some(cell) = self.folded.get(i) else {
+            return false;
+        };
+        let folded = cell.get_or_init(|| loose(&normalise(page)).0);
+        let on_page = occurrences(folded, &want);
+        let trusted: usize = self
+            .trusted
+            .get(i)
+            .map_or(0, |segs| segs.iter().map(|s| occurrences(s, &want)).sum());
+        trusted > 0 && on_page <= trusted
+    }
+}
+
+/// How many times `want` occurs in `hay`, overlaps included.
+fn occurrences(hay: &str, want: &str) -> usize {
+    let mut n = 0;
+    let mut from = 0;
+    while let Some(at) = hay[from..].find(want) {
+        n += 1;
+        from += at + hay[from + at..].chars().next().map_or(1, char::len_utf8);
+    }
+    n
 }
 
 // ------------------------------------------------------------ verification
@@ -551,34 +622,341 @@ pub fn verify_local(cwd: &Path, p: &ProposedHit) -> Result<Hit, Rejected> {
         .unwrap_or_else(|_| raw.to_string());
     let pages = pages(&full, &file).map_err(Rejected::Unreadable)?;
     let pdf = is_pdf(&full);
-    let unclean = unclean_pages(&full, &file);
+    let checks = PageChecks::of(&full, &file);
     // The cited page first, then the rest: a wrong page number is corrected,
     // a quote that isn't in the file at all is dropped.
-    let order: Vec<usize> = p
+    let cited = p
         .page
         .filter(|n| pdf && *n >= 1 && *n <= pages.len())
-        .map(|n| n - 1)
-        .into_iter()
-        .chain(0..pages.len())
-        .collect();
-    for i in order {
+        .map(|n| n - 1);
+    let mut order: Vec<usize> = cited.into_iter().chain(0..pages.len()).collect();
+    let mut seen = std::collections::HashSet::new();
+    order.retain(|i| seen.insert(*i));
+    let hit = |i: usize, line: usize, own: &str| Hit {
+        at: Locator::Local {
+            file: file.clone(),
+            page: pdf.then_some(i + 1),
+            line,
+        },
+        quote: cap(own),
+    };
+    // The quote as it stands. Garbled math is never shown as what the
+    // source says.
+    for &i in &order {
         let lines: Vec<&str> = pages[i].lines().collect();
-        if let Some((line, own)) = locate(&lines, &p.quote) {
-            // Garbled math is never shown as what the source says.
-            if !quotable(&unclean, i, &own) {
-                continue;
-            }
-            return Ok(Hit {
-                at: Locator::Local {
-                    file,
-                    page: pdf.then_some(i + 1),
-                    line,
-                },
-                quote: cap(&own),
+        if let Some((line, own)) = locate(&lines, &p.quote)
+            && checks.quotable(i, &pages[i], &own)
+        {
+            return Ok(hit(i, line, &own));
+        }
+    }
+    // A quote that runs into math the page can't vouch for: its own prose,
+    // or, for the math itself, the clean line that introduces it (the
+    // equation's lead-in, its proposition's title, its section heading).
+    for &i in &order {
+        let lines: Vec<&str> = pages[i].lines().collect();
+        if let Some((line, own)) =
+            prose_part(&lines, &p.quote, |own| checks.quotable(i, &pages[i], own))
+        {
+            return Ok(hit(i, line, &own));
+        }
+        let at = locate(&lines, &p.quote)
+            .map(|(line, _)| line - 1)
+            .or_else(|| {
+                (Some(i) == cited)
+                    .then(|| locate_math(&lines, &p.quote))
+                    .flatten()
             });
+        if let Some(at) = at
+            && let Some((line, own)) = lead_in(&lines, at, |own| checks.quotable(i, &pages[i], own))
+        {
+            return Ok(hit(i, line, &own));
         }
     }
     Err(Rejected::NotInSource { file, page: p.page })
+}
+
+/// Fewest words, and characters, a part of a quote must have to stand
+/// for it.
+const PART_WORDS: usize = 3;
+const PART_CHARS: usize = 15;
+
+/// The longest run of plain words in `quote` (cut at math symbols and
+/// sentence ends) that is in `lines` and passes `ok`, with its line.
+fn prose_part(lines: &[&str], quote: &str, ok: impl Fn(&str) -> bool) -> Option<(usize, String)> {
+    let q = normalise(quote);
+    let mut parts: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let chars: Vec<char> = q.chars().collect();
+    for (k, &c) in chars.iter().enumerate() {
+        let sentence_end = matches!(c, '.' | ':' | ';' | '?' | '!')
+            && chars.get(k + 1).is_none_or(|n| n.is_whitespace());
+        if crate::pdftext::prose_char(c) {
+            cur.push(c);
+            if sentence_end {
+                parts.push(std::mem::take(&mut cur));
+            }
+        } else {
+            parts.push(std::mem::take(&mut cur));
+        }
+    }
+    parts.push(cur);
+    let mut parts: Vec<String> = parts
+        .into_iter()
+        .map(|p| p.trim().to_string())
+        .filter(|p| {
+            p.split_whitespace()
+                .filter(|w| w.chars().any(char::is_alphabetic))
+                .count()
+                >= PART_WORDS
+                && p.chars().count() >= PART_CHARS
+        })
+        .collect();
+    // The whole quote was already tried. A part stands for the quote only
+    // when it holds most of its words: a real phrase never vouches for
+    // words around it the source doesn't have ("we prove = the L2
+    // distance between mixtures = is always zero").
+    let words = |t: &str| {
+        t.split(|c: char| !c.is_alphanumeric())
+            .filter(|w| w.chars().count() >= 2 && w.chars().any(char::is_alphabetic))
+            .count()
+    };
+    let all = words(&q);
+    parts.retain(|p| *p != q && words(p) * 2 > all);
+    parts.sort_by_key(|p| std::cmp::Reverse(p.chars().count()));
+    parts
+        .into_iter()
+        .find_map(|part| locate(lines, &part).filter(|(_, own)| ok(own)))
+}
+
+/// Most lines above a piece of math its lead-in, and the title of the
+/// statement it belongs to, are looked for in.
+const LEAD_IN_LINES: usize = 12;
+const TITLE_LINES: usize = 24;
+
+/// The clean line introducing the math at line `at` (0-based), looked for
+/// from there upwards: the title of the proposition, theorem or definition
+/// it is part of (`Proposition B.3 (Bayesian Fusion for GMMs).`), else the
+/// nearest line, or its first sentences, of at least [`PART_WORDS`] words
+/// that pass `ok`. A line that only finishes a word broken off the line
+/// before it (`sity of X, then:`) is skipped. Returns its 1-based line and
+/// text.
+fn lead_in(lines: &[&str], at: usize, ok: impl Fn(&str) -> bool) -> Option<(usize, String)> {
+    static TITLE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r"^(Proposition|Theorem|Lemma|Corollary|Definition|Remark|Example|Assumption|Satz|Beispiel|Bemerkung)\s+([A-Z]\.?)?[0-9]+(\.[0-9]+)*\b",
+        )
+        .unwrap()
+    });
+    let last = at.min(lines.len().saturating_sub(1));
+    let title = (at.saturating_sub(TITLE_LINES)..=last)
+        .rev()
+        .filter(|k| TITLE.is_match(lines[*k].trim_start()))
+        .find_map(|k| first_sentences(lines, k, true, &ok));
+    if title.is_some() {
+        return title;
+    }
+    (at.saturating_sub(LEAD_IN_LINES)..=last)
+        .rev()
+        .find_map(|k| first_sentences(lines, k, false, &ok))
+}
+
+/// Line `k` (0-based), or its longest run of whole first sentences (the
+/// shortest, for a title), if it is at least [`PART_WORDS`] words that pass
+/// `ok` and doesn't just finish a word broken off the line before it. Its
+/// 1-based line and text.
+fn first_sentences(
+    lines: &[&str],
+    k: usize,
+    shortest: bool,
+    ok: impl Fn(&str) -> bool,
+) -> Option<(usize, String)> {
+    let broken = k > 0 && {
+        let prev: Vec<char> = lines[k - 1].trim_end().chars().collect();
+        prev.len() >= 2 && prev[prev.len() - 1] == '-' && prev[prev.len() - 2].is_alphabetic()
+    };
+    if broken {
+        return None;
+    }
+    let text = normalise(lines[k]);
+    // The whole line, else its longest run of whole sentences.
+    let chars: Vec<char> = text.chars().collect();
+    let mut ends: Vec<usize> = chars
+        .iter()
+        .enumerate()
+        .filter(|(j, c)| {
+            matches!(c, '.' | ':' | ';' | '?' | '!')
+                && chars.get(j + 1).is_none_or(|n| n.is_whitespace())
+        })
+        .map(|(j, _)| j + 1)
+        .collect();
+    ends.push(chars.len());
+    ends.sort_unstable();
+    ends.dedup();
+    if !shortest {
+        ends.reverse();
+    }
+    for end in ends {
+        let cand: String = chars[..end].iter().collect();
+        let cand = cand.trim();
+        let words = cand
+            .split_whitespace()
+            .filter(|w| w.chars().any(char::is_alphabetic))
+            .count();
+        if words >= PART_WORDS && ok(cand) {
+            return Some((k + 1, cand.to_string()));
+        }
+    }
+    None
+}
+
+/// Where a piece of math quoted from a rendered page (`c_{ab} = …`, with
+/// sub- and superscripts the text layout puts on lines of their own) most
+/// likely is in `lines`: the 0-based first line of the smallest window of
+/// up to [`MAX_SPAN`] lines, one of them math, holding at least 80% of its
+/// letters and digits. Only a quote that is math itself (an `=`, a sub- or
+/// superscript, a LaTeX command or a relation) is looked for so: prose
+/// that isn't in the source is still not found.
+fn locate_math(lines: &[&str], quote: &str) -> Option<usize> {
+    let math = quote.chars().any(|c| {
+        matches!(
+            c,
+            '=' | '_' | '^' | '\\' | '≤' | '≥' | '≈' | '∝' | '≠' | '⁻' | 'ᵀ'
+        ) || ('₀'..='₉').contains(&c)
+    });
+    let want = math_letters(quote);
+    if !math || loose(&want).0.chars().count() < 8 {
+        return None;
+    }
+    let bag = |s: &str| {
+        let mut m: std::collections::HashMap<char, usize> = std::collections::HashMap::new();
+        for c in loose(&normalise(s)).0.chars() {
+            *m.entry(c).or_default() += 1;
+        }
+        m
+    };
+    let need = bag(&want);
+    let total: usize = need.values().sum();
+    // The quote's words (three letters or more, no function name): a
+    // formula is never placed by letters its words only share.
+    const FUNCTIONS: &[&str] = &[
+        "exp", "det", "log", "sin", "cos", "tan", "max", "min", "arg", "sup", "inf", "lim", "var",
+        "cov", "diag", "sqrt", "frac",
+    ];
+    let words: Vec<String> = want
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.chars().count() >= 3 && w.chars().all(char::is_alphabetic))
+        .map(|w| loose(w).0)
+        .filter(|w| !FUNCTIONS.contains(&w.as_str()))
+        .collect();
+    let mut best: Option<(usize, usize, usize)> = None; // (covered, -span, start)
+    for start in 0..lines.len() {
+        for span in 1..=MAX_SPAN.min(lines.len() - start) {
+            let window = &lines[start..start + span];
+            if window
+                .iter()
+                .all(|l| l.trim().is_empty() || crate::pdftext::plain_prose(l))
+            {
+                continue;
+            }
+            let text = window.join("\n");
+            let have = bag(&text);
+            let covered: usize = need
+                .iter()
+                .map(|(c, n)| (*n).min(have.get(c).copied().unwrap_or(0)))
+                .sum();
+            if covered * 5 < total * 4 {
+                continue;
+            }
+            // Most of what the window holds is the quote's too: letters a
+            // long stretch of other text happens to have don't place it.
+            let held: usize = have.values().sum();
+            let flat = loose(&normalise(&text)).0;
+            if covered * 5 < held * 3 || !words.iter().all(|w| flat.contains(w.as_str())) {
+                continue;
+            }
+            let better = match best {
+                None => true,
+                Some((bc, bs, _)) => covered > bc || (covered == bc && span < bs),
+            };
+            if better {
+                best = Some((covered, span, start));
+            }
+            break;
+        }
+    }
+    best.map(|(_, _, start)| start)
+}
+
+/// A math quote's letters and digits as the text layout has them: LaTeX
+/// commands as their Greek letter or function name (others dropped), and
+/// Unicode sub- and superscript digits as digits.
+fn math_letters(quote: &str) -> String {
+    const GREEK: &[(&str, &str)] = &[
+        ("alpha", "α"),
+        ("beta", "β"),
+        ("gamma", "γ"),
+        ("delta", "δ"),
+        ("epsilon", "ε"),
+        ("varepsilon", "ε"),
+        ("zeta", "ζ"),
+        ("eta", "η"),
+        ("theta", "θ"),
+        ("kappa", "κ"),
+        ("lambda", "λ"),
+        ("mu", "μ"),
+        ("nu", "ν"),
+        ("xi", "ξ"),
+        ("pi", "π"),
+        ("rho", "ρ"),
+        ("sigma", "σ"),
+        ("tau", "τ"),
+        ("phi", "φ"),
+        ("varphi", "φ"),
+        ("chi", "χ"),
+        ("psi", "ψ"),
+        ("omega", "ω"),
+        ("Gamma", "Γ"),
+        ("Delta", "Δ"),
+        ("Theta", "Θ"),
+        ("Lambda", "Λ"),
+        ("Xi", "Ξ"),
+        ("Pi", "Π"),
+        ("Sigma", "Σ"),
+        ("Phi", "Φ"),
+        ("Psi", "Ψ"),
+        ("Omega", "Ω"),
+        ("det", "det"),
+        ("exp", "exp"),
+        ("log", "log"),
+        ("ln", "ln"),
+        ("sin", "sin"),
+        ("cos", "cos"),
+        ("tan", "tan"),
+        ("max", "max"),
+        ("min", "min"),
+        ("tr", "tr"),
+    ];
+    static CMD: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"\\([A-Za-z]+)").unwrap());
+    let text = CMD.replace_all(quote, |c: &regex::Captures| {
+        GREEK
+            .iter()
+            .find(|(k, _)| *k == &c[1])
+            .map_or(" ", |(_, v)| v)
+            .to_string()
+    });
+    text.chars()
+        .map(|c| match c {
+            '₀'..='₉' => char::from_u32(u32::from(c) - 0x2080 + 0x30).unwrap_or(c),
+            '⁰' => '0',
+            '¹' => '1',
+            '²' => '2',
+            '³' => '3',
+            '⁴'..='⁹' => char::from_u32(u32::from(c) - 0x2070 + 0x30).unwrap_or(c),
+            _ => c,
+        })
+        .collect()
 }
 
 /// Checks a web hit against the page text that was actually fetched.
@@ -664,13 +1042,13 @@ pub fn source_files(cwd: &Path) -> Vec<(PathBuf, String)> {
     let Ok(root) = dunce::canonicalize(cwd) else {
         return out;
     };
-    for entry in ignore::WalkBuilder::new(cwd).build().flatten() {
+    // A linked file counts only if it really is inside the folder, and
+    // Pathfinder's private files (a database or staging copy kept in the
+    // workspace) never do.
+    let visible = crate::agent::confine::Visible::new(&root);
+    for entry in visible.walk(cwd).build().flatten() {
         let p = entry.path();
         if !p.is_file() {
-            continue;
-        }
-        // A linked file counts only if it really is inside the folder.
-        if entry.path_is_symlink() && !dunce::canonicalize(p).is_ok_and(|r| r.starts_with(&root)) {
             continue;
         }
         let ok = p
@@ -692,26 +1070,53 @@ pub fn source_files(cwd: &Path) -> Vec<(PathBuf, String)> {
 /// Most files one search reads.
 const MAX_FIND_FILES: usize = 5000;
 
-/// `/find`: lines in the workspace's sources that contain the terms, most
-/// terms first. Raw lines, nothing else.
+/// Lines in the workspace's sources that contain the terms: the ones
+/// holding them as one phrase first, then the most terms, then the
+/// earliest. Raw lines, nothing else.
 pub fn find(cwd: &Path, terms: &[String], limit: usize) -> Vec<Hit> {
-    find_counted(cwd, terms, limit).0
+    search(cwd, terms, limit, false).0
 }
 
-/// [`find`], plus how many lines matched in all (searched files only).
+/// `/find`: [`find`], plus how many lines matched in all (searched files
+/// only). When some lines hold every term, only those count: a line with
+/// one word of `Bayesian Fusion for GMMs` isn't a match for it.
 pub fn find_counted(cwd: &Path, terms: &[String], limit: usize) -> (Vec<Hit>, usize) {
-    let terms: Vec<String> = terms
-        .iter()
-        .map(|t| term_form(t))
-        .filter(|t| !t.is_empty())
-        .collect();
-    if terms.is_empty() {
+    search(cwd, terms, limit, true)
+}
+
+fn search(cwd: &Path, terms: &[String], limit: usize, strict: bool) -> (Vec<Hit>, usize) {
+    let words: Vec<&String> = terms.iter().filter(|t| !term_form(t).is_empty()).collect();
+    if words.is_empty() {
         return (Vec::new(), 0);
     }
+    // Several words: also looked for as the phrase they make.
+    let phrase = (words.len() >= 2).then(|| {
+        term_form(
+            &words
+                .iter()
+                .map(|w| w.as_str())
+                .collect::<Vec<_>>()
+                .join(" "),
+        )
+    });
+    // "for", "of", "the" count toward the phrase, not as terms of their
+    // own: "for" is in "information".
+    let mut counted: Vec<String> = words
+        .iter()
+        .filter(|w| !keywords(w).is_empty())
+        .map(|w| term_form(w))
+        .collect();
+    if counted.is_empty() {
+        counted = words.iter().map(|w| term_form(w)).collect();
+    }
+    let all = counted.len() + 1;
     let mut total = 0usize;
+    let mut total_all = 0usize;
+    // (rank, seq, hit): the phrase ranks above every term, every term
+    // above some.
     let mut scored: Vec<(usize, usize, Hit)> = Vec::new();
     let mut seq = 0;
-    // Most terms first, then the earliest; only the best `limit` are kept.
+    // Best rank first, then the earliest; only the best `limit` are kept.
     let best = |scored: &mut Vec<(usize, usize, Hit)>| {
         scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
         scored.truncate(limit);
@@ -722,21 +1127,29 @@ pub fn find_counted(cwd: &Path, terms: &[String], limit: usize) -> (Vec<Hit>, us
             continue;
         };
         let pdf = is_pdf(&full);
-        let unclean = unclean_pages(&full, &rel);
+        let checks = PageChecks::of(&full, &rel);
         for (pi, page) in pages.iter().enumerate() {
             for (li, line) in page.lines().enumerate() {
                 let low = loose(line).0;
-                let n = terms.iter().filter(|t| low.contains(t.as_str())).count();
-                if n == 0 || !quotable(&unclean, pi, line) {
+                let n = counted.iter().filter(|t| low.contains(t.as_str())).count();
+                if n == 0 || !checks.quotable(pi, page, line) {
                     continue;
                 }
+                let rank = if phrase.as_ref().is_some_and(|p| low.contains(p.as_str())) {
+                    all
+                } else {
+                    n
+                };
                 total += 1;
+                if rank >= counted.len() {
+                    total_all += 1;
+                }
                 seq += 1;
                 if scored.len() >= limit.max(64) * 4 {
                     best(&mut scored);
                 }
                 scored.push((
-                    n,
+                    rank,
                     seq,
                     Hit {
                         at: Locator::Local {
@@ -750,8 +1163,11 @@ pub fn find_counted(cwd: &Path, terms: &[String], limit: usize) -> (Vec<Hit>, us
             }
         }
     }
-    // Need every term when there are enough such lines; else the best.
     best(&mut scored);
+    if strict && total_all > 0 {
+        scored.retain(|(rank, _, _)| *rank >= counted.len());
+        total = total_all;
+    }
     (scored.into_iter().map(|(_, _, h)| h).collect(), total)
 }
 
@@ -1387,13 +1803,84 @@ pub struct WebResult {
     pub quote: String,
 }
 
-/// Web results that pass verification against their fetched text.
+/// What makes two web addresses the same source: one arXiv paper's
+/// `abs/`, `html/` and `pdf/` pages and its versions are one paper (and so is
+/// its `10.48550/arXiv.` DOI), a DOI is one work whichever resolver serves
+/// it, and other pages compare without scheme, `www.`, fragment or trailing
+/// slash.
+pub fn source_key(url: &str) -> String {
+    let lower = url.trim().to_ascii_lowercase();
+    let rest = lower
+        .split_once("://")
+        .map_or(lower.as_str(), |(_, r)| r)
+        .split('#')
+        .next()
+        .unwrap_or_default();
+    let rest = rest.strip_prefix("www.").unwrap_or(rest);
+    // arXiv by its id, without a version or `.pdf`.
+    let arxiv_id = |id: &str| -> Option<String> {
+        let id = id.split(['?', '#']).next()?.trim_end_matches('/');
+        let id = id.strip_suffix(".pdf").unwrap_or(id);
+        let id = match id.rfind('v') {
+            Some(i)
+                if i + 1 < id.len()
+                    && id[i + 1..].bytes().all(|b| b.is_ascii_digit())
+                    && id[..i].ends_with(|c: char| c.is_ascii_digit()) =>
+            {
+                &id[..i]
+            }
+            _ => id,
+        };
+        (!id.is_empty() && id.contains(|c: char| c.is_ascii_digit())).then(|| format!("arxiv:{id}"))
+    };
+    for host in ["arxiv.org/", "export.arxiv.org/"] {
+        if let Some(path) = rest.strip_prefix(host) {
+            for kind in ["abs/", "html/", "pdf/"] {
+                if let Some(key) = path.strip_prefix(kind).and_then(arxiv_id) {
+                    return key;
+                }
+            }
+        }
+    }
+    // A DOI wherever it is served from; an arXiv DOI is the arXiv paper.
+    if let Some(at) = rest.find("10.").filter(|&i| {
+        let tail = &rest[i + 3..];
+        let digits = tail.bytes().take_while(u8::is_ascii_digit).count();
+        digits >= 4
+            && tail[digits..].starts_with('/')
+            && (i == 0 || rest[..i].ends_with('/') || rest[..i].ends_with(':'))
+    }) {
+        let doi = rest[at..].split(['?', '#']).next().unwrap_or_default();
+        let doi = doi.trim_end_matches('/');
+        if let Some(key) = doi.strip_prefix("10.48550/arxiv.").and_then(arxiv_id) {
+            return key;
+        }
+        return format!("doi:{doi}");
+    }
+    rest.trim_end_matches('/').to_string()
+}
+
+/// Web results that pass verification against their fetched text, one per
+/// source: a paper's title and a line of its abstract are one entry, the
+/// abstract's line (it says more), in the place the first of them had. One
+/// paper's addresses are one source (`source_key`).
 pub fn web_hits(results: &[WebResult]) -> Vec<Hit> {
+    let url_of = |h: &Hit| match &h.at {
+        Locator::Web { url, .. } => source_key(url),
+        Locator::Local { file, .. } => file.clone(),
+    };
+    let is_title = |h: &Hit| matches!(&h.at, Locator::Web { section: Some(s), .. } if s == "Title");
     let mut hits: Vec<Hit> = Vec::new();
     for h in results
         .iter()
         .filter_map(|r| verify_web(&r.url, r.section.as_deref(), &r.page_text, &r.quote))
     {
+        if let Some(o) = hits.iter_mut().find(|o| url_of(o) == url_of(&h)) {
+            if is_title(o) && !is_title(&h) {
+                *o = h;
+            }
+            continue;
+        }
         // The same abstract from two catalogues is one hit.
         if !hits.iter().any(|o| loose(&o.quote).0 == loose(&h.quote).0) {
             hits.push(h);
@@ -1717,21 +2204,24 @@ mod tests {
             )),
             "{body}"
         );
-        // Garbled math isn't the source's words, and since a wrong letter
-        // reads like any other, no line on the page is.
+        // Garbled math isn't the source's words. Poppler says which runs
+        // the wrong letters are in, so prose set apart from them is.
+        assert_eq!(
+            unclean_pages(&d.path().join("slides.pdf"), "slides.pdf"),
+            vec![crate::pdftext::PageTrust::Lettered]
+        );
         assert!(matches!(
             verify_local(d.path(), &hit("slides.pdf", Some(1), "div D = r")),
             Err(Rejected::NotInSource { .. })
         ));
-        assert!(matches!(
-            verify_local(
-                d.path(),
-                &hit("slides.pdf", Some(1), "Maxwell equations describe")
-            ),
-            Err(Rejected::NotInSource { .. })
-        ));
+        let h = verify_local(
+            d.path(),
+            &hit("slides.pdf", Some(1), "Maxwell equations describe"),
+        )
+        .unwrap();
+        assert_eq!(h.quote, "Maxwell equations describe");
         assert!(find(d.path(), &["div".to_string()], 5).is_empty());
-        assert!(find(d.path(), &["Maxwell".to_string()], 5).is_empty());
+        assert_eq!(find(d.path(), &["Maxwell".to_string()], 5).len(), 1);
     }
 
     #[test]
@@ -1817,6 +2307,230 @@ mod tests {
             page,
             quote: quote.into(),
         }
+    }
+
+    /// The checks for one page of the given trust, with these trusted
+    /// segments.
+    fn checks(trust: crate::pdftext::PageTrust, trusted: &[&str]) -> PageChecks {
+        PageChecks {
+            trust: vec![trust],
+            trusted: vec![trusted.iter().map(|t| loose(t).0).collect()],
+            folded: vec![Default::default()],
+        }
+    }
+
+    #[test]
+    fn a_lettered_page_quotes_only_prose_clear_of_its_wrong_letters() {
+        use crate::pdftext::PageTrust;
+        let page =
+            "Take sources forP one and the same value.\nThe sum is finite here.\nX = a + b\n";
+        let c = checks(
+            PageTrust::Lettered,
+            &[
+                "Take sources for",
+                "one and the same value.\nThe sum is finite here.\n= a + b",
+            ],
+        );
+        assert!(c.quotable(0, page, "The sum is finite here."));
+        assert!(c.quotable(0, page, "one and the same value."));
+        // The CMEX `P` (∑) inside prose, and math, are never quoted.
+        assert!(!c.quotable(0, page, "sources forP one"));
+        assert!(!c.quotable(0, page, "X = a + b"));
+        // Words a wrong letter makes elsewhere on the page aren't vouched
+        // for by the same words where they are clean.
+        let page = "25 mm thick\nIt is 25 mm thick\n";
+        let c = checks(
+            PageTrust::Lettered,
+            &["25 m", "m thick\nIt is 25 mm thick\n"],
+        );
+        assert!(!c.quotable(0, page, "25 mm thick"));
+        assert!(c.quotable(0, page, "It is 25 mm thick"));
+        // Shaky: prose only; unquotable: nothing.
+        let c = checks(PageTrust::Shaky, &[]);
+        assert!(c.quotable(0, page, "It is 25 mm thick"));
+        assert!(!checks(PageTrust::Unquotable, &[]).quotable(0, page, "It is 25 mm thick"));
+    }
+
+    #[test]
+    fn math_is_cited_by_its_prose_or_the_line_that_introduces_it() {
+        let lines = [
+            "Theorem 2.1 (Product rule). Let f and g be",
+            "smooth, then:",
+            "",
+            "        d",
+            "  h =     (f g) = f′ g + f g′          (7)",
+            "       dx",
+            "where the prime marks a derivative in x.",
+        ];
+        let prose = |l: &str| crate::pdftext::plain_prose(l);
+        // The prose part of a quote that runs into the formula.
+        assert_eq!(
+            prose_part(
+                &lines,
+                "where the prime marks a derivative in x. h = f′ g",
+                prose
+            ),
+            Some((7, "where the prime marks a derivative in x.".to_string()))
+        );
+        // The formula itself, as the text has it or as LaTeX: the title of
+        // the statement it is part of.
+        let at = locate(&lines, "h = (f g) = f′ g + f g′").unwrap().0 - 1;
+        assert_eq!(at, 4);
+        assert_eq!(
+            lead_in(&lines, at, prose),
+            Some((1, "Theorem 2.1 (Product rule).".to_string()))
+        );
+        assert_eq!(
+            locate_math(&lines, r"h = \frac{d}{dx}(fg) = f'g + fg'"),
+            Some(4)
+        );
+        // Without a title, the nearest lead-in of a few words; a line that
+        // only finishes a broken word isn't one.
+        let lines = [
+            "The distance between the two densi-",
+            "ties is:",
+            "  d = ∥f − g∥2",
+        ];
+        assert_eq!(
+            lead_in(&lines, 2, prose),
+            Some((1, "The distance between the two densi-".to_string()))
+        );
+        // Prose that isn't in the source is never placed by its letters.
+        let lines = [
+            "The algorithm assigns every point to its nearest centre.",
+            "x = 1",
+        ];
+        assert_eq!(
+            locate_math(&lines, "Every point is assigned to the nearest centre"),
+            None
+        );
+        // Nor is a made-up formula, by letters it shares with the math.
+        let lines = [
+            "Theorem 2.1 (Product rule). Let f and g be",
+            "smooth, then:",
+            "        d",
+            "  h =     (f g) = f′ g + f g′          (7)",
+            "       dx",
+            "where the prime marks a derivative in x.",
+            "  a = b + c + d + e + f + g + h          (8)",
+        ];
+        assert_eq!(locate_math(&lines, "price = cost + margin"), None);
+        assert_eq!(
+            locate_math(&lines, "a = b + c + d + e + f + g + h"),
+            Some(6)
+        );
+        assert_eq!(
+            locate_math(&lines[..6], "a = b + c + d + e + f + g + h"),
+            None
+        );
+        assert_eq!(locate_math(&lines[..6], "x = d f / d h + g g"), None);
+        // A real phrase doesn't vouch for made-up words around it.
+        let prose = |l: &str| crate::pdftext::plain_prose(l);
+        assert_eq!(
+            prose_part(
+                &lines,
+                "we prove = the prime marks a derivative = is always zero for every curve",
+                prose
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_garbled_formula_on_a_pdf_page_is_cited_by_its_theorem() {
+        if !have_poppler() {
+            return;
+        }
+        use crate::pdftext::fixture;
+        // ∑ from a symbol font, alone on its line: the page's math is
+        // garbled, so only its prose can be quoted.
+        let pdf = fixture::pdf(
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+            Some(&[(0x53, 0x2211)]),
+            "BT /F2 14 Tf 50 340 Td (Theorem 4 \\(Geometric series\\). For every q:) Tj ET \
+BT /F1 20 Tf 60 300 Td (S) Tj ET \
+BT /F2 14 Tf 50 270 Td (s = a + a q + a q q = a / \\(1 - q\\)) Tj ET \
+BT /F2 14 Tf 50 200 Td (The proof is a telescoping sum over the terms.) Tj ET",
+        );
+        let d = pdf_ws(&pdf);
+        assert_eq!(
+            unclean_pages(&d.path().join("slides.pdf"), "slides.pdf"),
+            vec![crate::pdftext::PageTrust::Shaky]
+        );
+        let h = verify_local(
+            d.path(),
+            &hit("slides.pdf", Some(1), "s = a + a q + a q q = a / (1 - q)"),
+        )
+        .unwrap();
+        assert_eq!(h.quote, "Theorem 4 (Geometric series).");
+        assert_eq!(h.at.to_string(), "slides.pdf p.1 l.1");
+        let h = verify_local(
+            d.path(),
+            &hit("slides.pdf", Some(1), "The proof is a telescoping sum"),
+        )
+        .unwrap();
+        assert_eq!(h.quote, "The proof is a telescoping sum");
+        // Prose the page doesn't have is still dropped.
+        assert!(matches!(
+            verify_local(
+                d.path(),
+                &hit(
+                    "slides.pdf",
+                    Some(1),
+                    "The series converges for every ratio"
+                )
+            ),
+            Err(Rejected::NotInSource { .. })
+        ));
+    }
+
+    #[test]
+    fn find_puts_the_exact_phrase_first_and_counts_lines_with_every_term() {
+        let d = ws(&[(
+            "paper.md",
+            "Using Bayesian fusion of GMMs is easy.\nBayesian ideas.\nMore information on fusion.\nProposition 3 (Bayesian Fusion for GMMs).\nGMMs again.\n",
+        )]);
+        let terms: Vec<String> = ["Bayesian", "Fusion", "for", "GMMs"]
+            .iter()
+            .map(|t| t.to_string())
+            .collect();
+        let (hits, total) = find_counted(d.path(), &terms, 12);
+        assert_eq!(
+            hits.iter().map(|h| h.at.to_string()).collect::<Vec<_>>(),
+            vec!["paper.md:4", "paper.md:1"]
+        );
+        assert_eq!(total, 2);
+        // `find`, for code's own searches, still ranks the rest after them.
+        assert_eq!(find(d.path(), &terms, 12).len(), 5);
+    }
+
+    #[test]
+    fn a_paper_s_title_and_abstract_are_one_web_hit() {
+        let text = "\u{1}Title\nFusing Gaussian mixtures in closed form\n\u{1}Abstract\nWe fuse Gaussian mixtures exactly.\n";
+        let at = |section: &str, quote: &str| WebResult {
+            url: "https://arxiv.org/abs/1".into(),
+            section: Some(section.into()),
+            page_text: text.into(),
+            quote: quote.into(),
+        };
+        let hits = web_hits(&[
+            at("Title", "Fusing Gaussian mixtures in closed form"),
+            WebResult {
+                url: "https://example.org/b".into(),
+                section: None,
+                page_text: "Mixtures are fused here too.".into(),
+                quote: "Mixtures are fused here too.".into(),
+            },
+            at("Abstract", "We fuse Gaussian mixtures exactly."),
+        ]);
+        assert_eq!(
+            hits.iter().map(|h| h.at.to_string()).collect::<Vec<_>>(),
+            vec![
+                "https://arxiv.org/abs/1 § Abstract",
+                "https://example.org/b"
+            ]
+        );
+        assert_eq!(hits[0].quote, "We fuse Gaussian mixtures exactly.");
     }
 
     #[test]
@@ -2155,6 +2869,61 @@ mod tests {
     }
 
     #[test]
+    fn one_paper_s_addresses_are_one_source() {
+        let key = source_key("https://arxiv.org/abs/2306.07309v1");
+        assert_eq!(key, "arxiv:2306.07309");
+        for same in [
+            "https://arxiv.org/html/2306.07309",
+            "https://arxiv.org/html/2306.07309v2/",
+            "http://arxiv.org/pdf/2306.07309v1.pdf",
+            "https://www.arxiv.org/abs/2306.07309#S2",
+            "https://doi.org/10.48550/arXiv.2306.07309",
+        ] {
+            assert_eq!(source_key(same), key, "{same}");
+        }
+        assert_ne!(source_key("https://arxiv.org/abs/2306.07310"), key);
+        assert_eq!(
+            source_key("http://arxiv.org/abs/hep-th/9901001v3"),
+            "arxiv:hep-th/9901001"
+        );
+        assert_eq!(
+            source_key("https://doi.org/10.1109/TSP.2006.1"),
+            source_key("https://dx.doi.org/10.1109/tsp.2006.1/")
+        );
+        assert_eq!(
+            source_key("https://example.org/a/"),
+            source_key("http://www.example.org/a")
+        );
+        assert_ne!(
+            source_key("https://example.org/a"),
+            source_key("https://example.org/b")
+        );
+    }
+
+    #[test]
+    fn an_arxiv_paper_s_abs_and_html_pages_are_one_web_hit() {
+        let hits = web_hits(&[
+            WebResult {
+                url: "http://arxiv.org/abs/2306.07309v1".into(),
+                section: Some("Abstract".into()),
+                page_text: "We fuse Gaussian mixtures exactly.".into(),
+                quote: "We fuse Gaussian mixtures exactly.".into(),
+            },
+            WebResult {
+                url: "https://arxiv.org/html/2306.07309".into(),
+                section: Some("Method".into()),
+                page_text: "Each pair of components is multiplied.".into(),
+                quote: "Each pair of components is multiplied.".into(),
+            },
+        ]);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(
+            hits[0].at.to_string(),
+            "http://arxiv.org/abs/2306.07309v1 § Abstract"
+        );
+    }
+
+    #[test]
     fn web_hits_are_checked_against_the_fetched_page() {
         let results = vec![
             WebResult {
@@ -2330,5 +3099,127 @@ mod tests {
         // Missing file suggests near match.
         let err = open_spec(d.path(), &parse_open_spec("notes.md")).unwrap_err();
         assert!(err.contains("Did you mean `sub/notes.md`?"), "{err}");
+    }
+
+    /// A LaTeX preprint whose big operators come out as letters (CMEX's
+    /// `X` for ∑), from outside the repo:
+    /// `PATHFINDER_GMM_PDF=/path/to/2603.20365v1.pdf cargo test -- --ignored gmm_preprint`.
+    #[test]
+    #[ignore]
+    fn gmm_preprint_cites_survive_on_its_math_pages() {
+        let Some(path) = std::env::var_os("PATHFINDER_GMM_PDF") else {
+            return;
+        };
+        let path = std::path::PathBuf::from(path);
+        let dir = path.parent().unwrap();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let unclean = unclean_pages(&path, &name);
+        for p in [18, 27, 29] {
+            assert_eq!(unclean[p - 1], crate::pdftext::PageTrust::Lettered, "p.{p}");
+        }
+        let cite = |page: usize, quote: &str| {
+            let h = verify_local(dir, &hit(&name, Some(page), quote))
+                .unwrap_or_else(|e| panic!("p.{page} {quote:?}: {e:?}"));
+            let Locator::Local { page: at, .. } = &h.at else {
+                unreachable!()
+            };
+            assert_eq!(*at, Some(page), "{quote:?} -> {h:?}");
+            assert!(crate::pdftext::plain_prose(&h.quote), "{h:?}");
+            println!("p.{page} {quote:?} -> {} {:?}", h.at, h.quote);
+            h.quote
+        };
+        // Proposition B.3, p.29: its title, and its equation (44).
+        let b3 = "Proposition B.3 (Bayesian Fusion for GMMs).";
+        assert_eq!(cite(29, b3), b3);
+        assert_eq!(
+            cite(
+                29,
+                "Proposition B.3 (Bayesian Fusion for GMMs). G_X(x|g_a) = Σ π_ai N_X(x|m_ai, Σ_ai)"
+            ),
+            b3
+        );
+        assert_eq!(
+            cite(
+                29,
+                "G_X(x|g_a) · G_X(x|g_b) = Σ_{i=1}^{K_a} Σ_{j=1}^{K_b} c_{a_i b_j} π_{a_i} π_{b_j} N_X(x|m_{a_i b_j}, Σ_{a_i b_j})",
+            ),
+            b3
+        );
+        // Section 6.8, p.18: its heading, a sentence with a reference, and
+        // the L2 distance formula (21).
+        let s68 = "6.8 Reduction of Gaussian Mixture Models";
+        assert_eq!(cite(18, s68), s68);
+        assert!(
+            cite(
+                18,
+                "the L2 distance between mixtures admits a closed-form expression [18]"
+            )
+            .contains("[18]")
+        );
+        assert!(cite(18, "∥GX (x|ga ) − GX (x|gb )∥L2 (Rd ) =").contains("L2 distance"));
+        // Equation (39), p.27, as the text has it, in LaTeX and in Unicode:
+        // shown by the proposition it belongs to.
+        let a6 = "Proposition A.6 (Bayesian Fusion of Gaussians).";
+        for q in [
+            "mab = (Σ−1",
+            r"c_{ab} = \frac{\exp\left(-\frac{1}{2}(m_a - m_b)^\top (\Sigma_a + \Sigma_b)^{-1} (m_a - m_b)\right)}{\sqrt{\det(2\pi(\Sigma_a+\Sigma_b))}}",
+            "c_ab = exp(−½(m_a − m_b)ᵀ(Σ_a + Σ_b)⁻¹(m_a − m_b)) / √det(2π(Σ_a + Σ_b))",
+            "Σ_ab = (Σ_a⁻¹ + Σ_b⁻¹)⁻¹",
+        ] {
+            assert_eq!(cite(27, q), a6);
+        }
+        // A made-up formula is never placed on a page by the letters it
+        // shares with the math there.
+        for (page, q) in [
+            (1, "price = cost + margin"),
+            (9, "price = cost + margin"),
+            (18, "price = cost + margin"),
+            (18, "total = mass + energy"),
+            (27, "kinetic_energy = half m v^2"),
+            (29, "a = b + c + d + e + f + g + h"),
+            (18, "D = w^T A w - 2 w^T B v + v^T C v"),
+            (
+                18,
+                "we prove = the L2 distance between mixtures = is always zero",
+            ),
+        ] {
+            let got = verify_local(dir, &hit(&name, Some(page), q));
+            assert!(
+                matches!(got, Err(Rejected::NotInSource { .. })),
+                "p.{page} {q:?} -> {got:?}"
+            );
+        }
+        // A wrong letter (CMEX's `P` for ∑ inline) is never quoted, and
+        // words the paper doesn't have are still not found.
+        assert!(
+            !cite(
+                29,
+                "random generators (sources) forP one and the same quantity"
+            )
+            .contains("forP")
+        );
+        assert!(matches!(
+            verify_local(
+                dir,
+                &hit(
+                    &name,
+                    Some(29),
+                    "Mixtures make fusion cheap and exact for every sensor"
+                )
+            ),
+            Err(Rejected::NotInSource { .. })
+        ));
+        // `/find` puts the exact heading first and counts lines with every word.
+        let terms: Vec<String> = "Bayesian Fusion for GMMs"
+            .split(' ')
+            .map(String::from)
+            .collect();
+        let (hits, total) = find_counted(dir, &terms, 12);
+        println!(
+            "{total} lines: {:?}",
+            hits.iter().map(|h| h.at.to_string()).collect::<Vec<_>>()
+        );
+        assert!(hits[0].quote.contains(b3), "{:?}", hits[0]);
+        assert!(total < 20, "{total}");
     }
 }

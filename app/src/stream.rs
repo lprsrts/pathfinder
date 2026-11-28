@@ -48,6 +48,23 @@ impl ToolContent {
     }
 }
 
+/// `path` as a tool row shows it: relative to the workspace `root` the
+/// agent works in (a staging copy's own root included), as the row's title
+/// names it; absolute only when it lies outside.
+pub fn shown_path(path: &Path, root: &Path) -> PathBuf {
+    if let Ok(rel) = path.strip_prefix(root) {
+        return rel.to_path_buf();
+    }
+    // `/tmp` and `/private/tmp` on macOS: compare the real paths too.
+    match (path.canonicalize(), root.canonicalize()) {
+        (Ok(p), Ok(r)) => p
+            .strip_prefix(&r)
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|_| path.to_path_buf()),
+        _ => path.to_path_buf(),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolStart {
     pub id: String,
@@ -398,6 +415,27 @@ fn decode_unicode(s: &str) -> Option<(char, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tool_row_shows_paths_relative_to_the_workspace() {
+        let root = Path::new("/private/tmp/ws");
+        assert_eq!(
+            shown_path(Path::new("/private/tmp/ws/out/letter.txt"), root),
+            PathBuf::from("out/letter.txt")
+        );
+        // Outside the workspace it stays whole.
+        assert_eq!(
+            shown_path(Path::new("/elsewhere/x.txt"), root),
+            PathBuf::from("/elsewhere/x.txt")
+        );
+        // A real path under a linked root (`/tmp` on macOS) still shortens.
+        let dir = std::env::temp_dir().join(format!("pf-shown-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "").unwrap();
+        let real = dir.canonicalize().unwrap().join("a.txt");
+        assert_eq!(shown_path(&real, &dir), PathBuf::from("a.txt"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn latex_in_a_json_string_streams_as_latex() {

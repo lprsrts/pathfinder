@@ -84,14 +84,20 @@ fn line(l: Line) -> &'static str {
         ShowDelegate => {
             "在未理解的情况下交出 **{title}**？会记为已交出：你不为结果担保。Enter 执行 · Esc 取消。"
         }
+        DelegateWhy => "不是带你审阅的交接：你还没有展示 {concepts}。",
         ShowVerdict => "把这句作为你对候选的判断来评判？“{words}” Enter 评判 · Esc 保留为笔记。",
+        ShowApprove => "批准代理在 **{title}** 上的结果？Enter 批准 · Esc 取消。",
+        ShowObject => "带着你的异议把 **{title}** 退回给代理？“{words}” Enter 发送 · Esc 取消。",
         NotRunVerdict => "未作为判断评判：已保留为笔记。",
         NotRunHandoff => "未执行：**{title}** 没有交给智能体。",
         NotRunDelegate => "未执行：**{title}** 没有交出。",
+        NotRunApprove => "未执行：**{title}** 没有被批准。",
+        NotRunObject => "未执行：你对 **{title}** 的异议没有发送。",
         NotRunStale => "未执行：等待你确认的事项已不再适用。",
         AskWhich => {
             "你指的是哪一个：{choices}？在你说之前不会记录任何内容；回一个数字或几个字就行。"
         }
+        AskAgentPart => "让代理做 **{title}**",
         AskKnown => "记下我已掌握 **{title}**（不检查）",
         AskTell => "直接告诉我",
         AskAgent => "让智能体做这一部分",
@@ -118,11 +124,38 @@ fn line(l: Line) -> &'static str {
         Horizon => "前景：{what}。",
         HorizonNeeds => "依赖 {parts}",
         HorizonLeads => "通向 {parts}",
-        EvidenceRatio => "通过：{passes} · 声明：{claims}。",
+        EvidenceRatio => "上面的概念中，{passes} 个通过了检查，{claims} 个只凭你的说法。",
         ClaimWithdrawn => "对 **{concept}** 的声明已撤回（{date}）。",
-        StepHistory => "你是怎么走到这里的：{kinds}。",
-        StepKindRate => "{kind} {judged} 次中有 {passes} 次带来通过",
+        StepHistory => "到目前为止带来通过的：{kinds}。",
+        StepKindRate => "{kind}，{judged} 次中 {passes} 次",
         SteeredTimes => "由你引导 {n} 次",
+        AngleExample => "从例子入手",
+        AnglePurpose => "问它有什么用",
+        AngleMechanism => "追踪它如何运作",
+        AgentWork => "**交给智能体的工作**",
+        AgentInReview => "**{title}**：可审查，在你展示了它所依据的内容后交出；等待你审查。",
+        AgentApproved => "**{title}**：可审查，在你展示了它所依据的内容后交出；你已批准。",
+        AgentMissedCheck => "**{title}**：批准时没有发现检查；不算作审查，你不为它担保。",
+        AgentDelegated => "**{title}**：已委托，在你未理解的情况下完成；你不为它担保。",
+        AgentCaughtCheck => {
+            "**{title}**：可审查；审查时你发现了植入的检查并提出反对，因此写入的是代理的真实结果。"
+        }
+        ShowAgentParts => "让代理依次完成这些部分？{parts}。Enter 全部执行 · Esc 取消。",
+        AgentPartHandoff => "**{title}**（交接：你审阅结果）",
+        AgentPartDelegate => "**{title}**（委托：你不为它担保）",
+        AgentPartDelegateWhy => "**{title}**（委托：你还没有展示 {concepts}）",
+        ConfirmHandoff => "是，交出去",
+        ConfirmDelegate => "是，委托出去",
+        ConfirmVerdict => "是，评判它",
+        ConfirmApprove => "是，批准",
+        ConfirmObject => "是，退回",
+        CancelShown => "不",
+        ShowKnownShown => {
+            "已记录：你已经掌握 **{title}**。它所依据的每个概念你都已展示过，所以它依靠的是你的检查，而不只是你的说法。说“撤回”或按 Esc 即可撤回。"
+        }
+        ShowKnownSome => {
+            "已记录：你已经掌握 **{title}**。{concepts} 只凭你的说法；其余你已展示过。说“撤回”或按 Esc 即可撤回。"
+        }
         StepHistoryNote => {
             "这就是 Pathfinder 关于你学习方式所保存的全部内容，存在此文件夹的本地记录中。"
         }

@@ -90,16 +90,26 @@ fn line(l: Line) -> &'static str {
         ShowDelegate => {
             "¿Delegar **{title}** sin entenderlo? Queda anotado como delegado: no respondes por el resultado. Enter ejecuta · Esc cancela."
         }
+        DelegateWhy => "No es un traspaso con tu revisión: aún no has demostrado {concepts}.",
         ShowVerdict => {
             "¿Juzgar esto como tu veredicto sobre el candidato? «{words}» Enter juzga · Esc lo guarda como nota."
+        }
+        ShowApprove => {
+            "¿Aprobar el resultado del agente para **{title}**? Enter aprueba · Esc cancela."
+        }
+        ShowObject => {
+            "¿Devolver **{title}** al agente con tu objeción? “{words}” Enter la envía · Esc cancela."
         }
         NotRunVerdict => "No juzgado como veredicto: guardado como nota.",
         NotRunHandoff => "No ejecutado: **{title}** no se pasó al agente.",
         NotRunDelegate => "No ejecutado: **{title}** no se delegó.",
+        NotRunApprove => "No ejecutado: **{title}** no se aprobó.",
+        NotRunObject => "No ejecutado: tu objeción sobre **{title}** no se envió.",
         NotRunStale => "No ejecutado: lo que esperaba tu OK ya no aplica.",
         AskWhich => {
             "¿Qué quisiste decir: {choices}? No se anota nada hasta que lo digas; basta un número o unas palabras."
         }
+        AskAgentPart => "dejar que el agente haga **{title}**",
         AskKnown => "anotar que ya conozco **{title}** (sin comprobación)",
         AskTell => "dímelo sin más",
         AskAgent => "que el agente haga esta parte",
@@ -130,11 +140,50 @@ fn line(l: Line) -> &'static str {
         Horizon => "Horizonte: {what}.",
         HorizonNeeds => "necesita {parts}",
         HorizonLeads => "lleva a {parts}",
-        EvidenceRatio => "Aprobados: {passes} · afirmaciones: {claims}.",
+        EvidenceRatio => {
+            "De las ideas de arriba, {passes} aprobaron una comprobación y {claims} se apoyan solo en tu palabra."
+        }
         ClaimWithdrawn => "Afirmación sobre **{concept}** retirada ({date}).",
-        StepHistory => "Cómo llegaste aquí: {kinds}.",
-        StepKindRate => "{kind} {passes} de {judged} llevaron a un aprobado",
+        StepHistory => "Lo que ha llevado a un aprobado hasta ahora: {kinds}.",
+        StepKindRate => "{kind}, {passes} de {judged} veces",
         SteeredTimes => "guiado por ti {n} veces",
+        AngleExample => "empezar por un ejemplo",
+        AnglePurpose => "preguntar para qué sirve",
+        AngleMechanism => "seguir cómo funciona",
+        AgentWork => "**Entregado al agente**",
+        AgentInReview => {
+            "**{title}**: revisable, entregado después de que mostraras en qué se apoya; espera tu revisión."
+        }
+        AgentApproved => {
+            "**{title}**: revisable, entregado después de que mostraras en qué se apoya; lo aprobaste."
+        }
+        AgentMissedCheck => {
+            "**{title}**: aprobado sin detectar la comprobación; no cuenta como revisión, no respondes por él."
+        }
+        AgentDelegated => {
+            "**{title}**: delegado, hecho sin que lo entendieras; no respondes por ello."
+        }
+        AgentCaughtCheck => {
+            "**{title}**: revisable; en su revisión detectaste la comprobación sembrada y objetaste, así que se escribió el resultado real del agente."
+        }
+        ShowAgentParts => {
+            "¿Que el agente haga estas partes, una tras otra? {parts}. Enter las ejecuta todas · Esc cancela."
+        }
+        AgentPartHandoff => "**{title}** (traspaso: tú revisas el resultado)",
+        AgentPartDelegate => "**{title}** (delegado: no respondes por él)",
+        AgentPartDelegateWhy => "**{title}** (delegado: aún no has demostrado {concepts})",
+        ConfirmHandoff => "sí, entrégalo",
+        ConfirmDelegate => "sí, delégalo",
+        ConfirmVerdict => "sí, júzgalo",
+        ConfirmApprove => "sí, apruébalo",
+        ConfirmObject => "sí, devuélvelo",
+        CancelShown => "no",
+        ShowKnownShown => {
+            "Anotado: ya conoces **{title}**. Ya mostraste cada idea en la que se apoya, así que se sostiene en tus comprobaciones, no solo en tu palabra. Di «deshacer» o pulsa Esc para retirarlo."
+        }
+        ShowKnownSome => {
+            "Anotado: ya conoces **{title}**. Solo tu palabra para {concepts}; el resto ya lo mostraste. Di «deshacer» o pulsa Esc para retirarlo."
+        }
         StepHistoryNote => {
             "Es todo lo que Pathfinder guarda sobre cómo aprendes, en el registro local de esta carpeta."
         }

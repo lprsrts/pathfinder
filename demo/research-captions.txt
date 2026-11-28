@@ -1,0 +1,27 @@
+# Captions for the research demo (DEMO_CAPTIONS=demo/research-captions.txt).
+# `STEP text` from when step STEP starts, `STEP+ text` from when its reply
+# has arrived. Tied to the steps of the current recording (see README.md);
+# renumber them for a new take.
+0 Pathfinder: the reasoning stays with you, the labour goes to the agent
+1 A scientist works through a public preprint on Gaussian mixtures
+2 For this demo, review checks were set to the maximum: normal is the highest setting
+5 They ask where the paper derives fusion, the component growth and the L2 distance
+5+ Pathfinder points to the pages, each quote checked against the PDF
+6+ Related work online, each quote taken from the source it links
+7 Their own argument: fusion multiplies components, the L2 distance stays cheap to score
+7+ Pathfinder writes an explanation that is right or has one real mistake. They must say which
+9+ It was right, and they said why: that counts as shown
+10 The experiment is labour for the agent. Pathfinder splits it into parts
+10+ A part resting on what they haven't shown goes on trust: they delegate the random inputs
+13 Before the fusion code, they explain the Gaussian product in their own words
+13+ This candidate is code. They check it against their formulas
+15+ Shown, so the agent can take it, and they will review its work
+17+ The agent works in a staged copy. Nothing reaches the folder until they decide
+18 They read the diff: the overlap scales by √ of the fused variance, not √(va + vb)
+20 They object with the precise reason
+20+ Last paragraph: it was a planted check. Caught, so the agent's real result is written
+21+ The rest: a part they have shown goes for review, the others on trust
+22+ The five-fusion code: each result is the next prior, nothing merged. They approve it
+23+ The agent ran the rest: quadrature check, component counts, L2 distance
+24+ Their record: two parts they understood and reviewed (Parts 2/7), the rest done on trust
+27+ The experiment runs: 6, 18, 54, 162, 486 components; eq. 44 matches quadrature

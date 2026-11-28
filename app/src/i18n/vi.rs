@@ -90,16 +90,24 @@ fn line(l: Line) -> &'static str {
         ShowDelegate => {
             "Giao **{title}** đi mà chưa hiểu? Sẽ ghi là đã giao: bạn không bảo đảm cho kết quả. Enter chạy · Esc hủy."
         }
+        DelegateWhy => "Không phải giao kèm xem xét của bạn: bạn chưa thể hiện {concepts}.",
         ShowVerdict => {
             "Xem đây là phán quyết của bạn về ứng viên? “{words}” Enter chấm · Esc giữ làm ghi chú."
+        }
+        ShowApprove => "Chấp thuận kết quả của tác tử cho **{title}**? Enter chấp thuận · Esc hủy.",
+        ShowObject => {
+            "Gửi **{title}** lại cho tác tử kèm phản đối của bạn? “{words}” Enter gửi · Esc hủy."
         }
         NotRunVerdict => "Không chấm như phán quyết: giữ làm ghi chú.",
         NotRunHandoff => "Chưa chạy: **{title}** chưa được giao cho tác tử.",
         NotRunDelegate => "Chưa chạy: **{title}** chưa được giao đi.",
+        NotRunApprove => "Chưa chạy: **{title}** chưa được chấp thuận.",
+        NotRunObject => "Chưa chạy: phản đối của bạn về **{title}** chưa được gửi.",
         NotRunStale => "Chưa chạy: điều đang chờ bạn đồng ý không còn áp dụng.",
         AskWhich => {
             "Ý bạn là gì: {choices}? Chưa ghi gì cho đến khi bạn nói; một con số hoặc vài từ là đủ."
         }
+        AskAgentPart => "để tác tử làm **{title}**",
         AskKnown => "ghi nhận rằng tôi đã biết **{title}** (không kiểm tra)",
         AskTell => "cứ nói cho tôi biết",
         AskAgent => "để tác tử làm phần này",
@@ -128,11 +136,50 @@ fn line(l: Line) -> &'static str {
         Horizon => "Chân trời: {what}.",
         HorizonNeeds => "cần {parts}",
         HorizonLeads => "dẫn tới {parts}",
-        EvidenceRatio => "Đạt: {passes} · tự nhận: {claims}.",
+        EvidenceRatio => {
+            "Trong các ý ở trên, {passes} đã qua một lần kiểm tra và {claims} chỉ dựa vào lời bạn."
+        }
         ClaimWithdrawn => "Lời tự nhận về **{concept}** đã rút ({date}).",
-        StepHistory => "Bạn đến đây thế nào: {kinds}.",
-        StepKindRate => "{kind} {passes} trên {judged} dẫn tới đạt",
+        StepHistory => "Điều đã dẫn tới đạt cho đến nay: {kinds}.",
+        StepKindRate => "{kind}, {passes} trên {judged} lần",
         SteeredTimes => "bạn tự định hướng {n} lần",
+        AngleExample => "bắt đầu từ một ví dụ",
+        AnglePurpose => "hỏi nó để làm gì",
+        AngleMechanism => "lần theo cách nó hoạt động",
+        AgentWork => "**Đã giao cho tác tử**",
+        AgentInReview => {
+            "**{title}**: xem xét được, giao đi sau khi bạn cho thấy nó dựa trên gì; đang chờ bạn xem xét."
+        }
+        AgentApproved => {
+            "**{title}**: xem xét được, giao đi sau khi bạn cho thấy nó dựa trên gì; bạn đã chấp thuận."
+        }
+        AgentMissedCheck => {
+            "**{title}**: đã chấp thuận mà không phát hiện phần kiểm tra; không tính là xem xét, bạn không bảo đảm cho nó."
+        }
+        AgentDelegated => {
+            "**{title}**: đã ủy thác, làm mà bạn chưa hiểu; bạn không bảo đảm cho nó."
+        }
+        AgentCaughtCheck => {
+            "**{title}**: xem xét được; khi xem xét bạn đã bắt được lỗi cài sẵn và phản đối, nên kết quả thật của tác tử đã được ghi."
+        }
+        ShowAgentParts => {
+            "Để tác tử làm lần lượt các phần này? {parts}. Enter chạy tất cả · Esc hủy."
+        }
+        AgentPartHandoff => "**{title}** (giao kèm xem xét: bạn xem xét kết quả)",
+        AgentPartDelegate => "**{title}** (đã giao: bạn không bảo đảm cho nó)",
+        AgentPartDelegateWhy => "**{title}** (đã giao: bạn chưa thể hiện {concepts})",
+        ConfirmHandoff => "có, giao đi",
+        ConfirmDelegate => "có, ủy thác",
+        ConfirmVerdict => "có, chấm nó",
+        ConfirmApprove => "có, chấp thuận",
+        ConfirmObject => "có, gửi lại",
+        CancelShown => "không",
+        ShowKnownShown => {
+            "Đã ghi: bạn đã biết **{title}**. Bạn đã cho thấy mọi ý mà nó dựa vào, nên nó đứng trên các lần kiểm tra của bạn, không chỉ lời bạn. Nói \"hoàn tác\" hoặc nhấn Esc để rút lại."
+        }
+        ShowKnownSome => {
+            "Đã ghi: bạn đã biết **{title}**. Chỉ có lời bạn cho {concepts}; phần còn lại bạn đã cho thấy. Nói \"hoàn tác\" hoặc nhấn Esc để rút lại."
+        }
         StepHistoryNote => {
             "Đó là tất cả những gì Pathfinder giữ về cách bạn học, trong hồ sơ cục bộ của thư mục này."
         }

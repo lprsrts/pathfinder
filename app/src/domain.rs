@@ -33,6 +33,13 @@ pub enum PartStatus {
 }
 
 impl PartStatus {
+    /// Whether the part counts as understood in the parts counter and the
+    /// all-resolved line: understood, in review (understood, then handed
+    /// off) or done.
+    pub fn counts_as_understood(self) -> bool {
+        matches!(self, Self::Understood | Self::InReview | Self::Done)
+    }
+
     pub fn is_resolved(self) -> bool {
         matches!(
             self,
@@ -104,6 +111,14 @@ pub struct Part {
     /// A handoff's isolated copy, held until your verdict (§13, A8).
     #[serde(default)]
     pub staging: Option<Staging>,
+    /// Approved without catching a planted check: the review didn't
+    /// happen and isn't recorded as one (§13).
+    #[serde(default)]
+    pub review_missed: bool,
+    /// You caught the planted check in its review and objected (§13): the
+    /// record says so, never that you approved it.
+    #[serde(default)]
+    pub review_caught: bool,
 }
 
 /// Where a handoff runs until your verdict. Whether the review is checked
@@ -142,6 +157,8 @@ impl Part {
             concepts: Vec::new(),
             unreviewed: Vec::new(),
             staging: None,
+            review_missed: false,
+            review_caught: false,
         }
     }
 }
@@ -565,6 +582,17 @@ pub struct Session {
     /// Nothing runs until you confirm it.
     #[serde(default)]
     pub pending_commitment: Option<PendingCommitment>,
+    /// Parts you handed to the agent in one request, still to run: the
+    /// next starts once the one before is done or you gave your verdict
+    /// on its review.
+    #[serde(default)]
+    pub agent_queue: Vec<QueuedAgent>,
+    /// The request the queued parts came from, and its files: each run
+    /// gets it as its instructions.
+    #[serde(default)]
+    pub agent_text: String,
+    #[serde(default)]
+    pub agent_files: Vec<PathBuf>,
     /// The last claim read from plain words, undoable for one turn (§15).
     #[serde(default)]
     pub last_commitment: Option<Undoable>,
@@ -593,6 +621,10 @@ pub enum CommitKind {
     Handoff,
     /// Hand the part off without understanding it (§6).
     Delegate,
+    /// Accept the agent's result waiting for your review (§7).
+    Approve,
+    /// Send the result back to the agent with your words as the reason.
+    Object,
 }
 
 /// A commitment shown back and waiting for Enter (run) or Esc (cancel).
@@ -601,7 +633,8 @@ pub struct PendingCommitment {
     pub kind: CommitKind,
     /// The part it applies to; confirming checks it is still active.
     pub part: String,
-    /// Your message: the verdict, or the agent's instructions.
+    /// Your message: the verdict, the agent's instructions, or your
+    /// objection.
     pub text: String,
     #[serde(default)]
     pub files: Vec<PathBuf>,
@@ -609,6 +642,19 @@ pub struct PendingCommitment {
     /// Confirming judges it only against that same candidate.
     #[serde(default)]
     pub candidate: Option<String>,
+    /// More parts the same request hands to the agent ("do the rest"),
+    /// in order: one Enter runs them all, one after another.
+    #[serde(default)]
+    pub then: Vec<QueuedAgent>,
+}
+
+/// A part waiting its turn with the agent, from one request that handed
+/// over several (§15: you saw and confirmed each in one show-back).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueuedAgent {
+    pub part: String,
+    /// A handoff (you review the result) or a delegation, as shown back.
+    pub kind: CommitKind,
 }
 
 /// One answer to a question back to you (§15).
@@ -659,6 +705,9 @@ pub struct Undoable {
     pub prev_mode: SessionMode,
     pub prev_change: Option<MapChange>,
     pub prev_gaps: Vec<String>,
+    /// Other parts claimed in the same step ("I know parts 1 and 2").
+    #[serde(default)]
+    pub also: Vec<String>,
 }
 
 /// A next step that was shown (§16).
@@ -694,6 +743,9 @@ impl Session {
             checks: None,
             turn: 0,
             pending_commitment: None,
+            agent_queue: Vec::new(),
+            agent_text: String::new(),
+            agent_files: Vec::new(),
             last_commitment: None,
             last_step: None,
             pending_ask: None,
@@ -711,6 +763,11 @@ impl Session {
             .map(|part| part.title.as_str())
             .unwrap_or(p.part.as_str());
         Some((p.kind, title))
+    }
+
+    /// How many more parts what waits for your OK hands to the agent.
+    pub fn waiting_more(&self) -> usize {
+        self.pending_commitment.as_ref().map_or(0, |p| p.then.len())
     }
 
     /// Whether `/undo` (or Esc) can take back the last claim now: only in

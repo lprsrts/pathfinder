@@ -15,6 +15,7 @@ pub mod envvar;
 pub mod i18n;
 pub mod ledger;
 pub mod llm;
+pub mod mathtext;
 pub mod operator;
 pub mod options;
 pub mod paths;

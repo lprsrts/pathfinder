@@ -75,11 +75,9 @@ impl Runtime {
                 render_change(change, &session.map, session.language.as_deref())
             ));
         }
-        // The waiting candidate is hidden from this call: it may be flawed on
-        // purpose, and a model that can see it tends to vouch for it.
-        let mut history = format_history(session);
-        if let Some(pending) = &session.pending_candidate {
-            history = history.replace(&pending.candidate, CANDIDATE_HIDDEN);
+        // The waiting candidate is hidden from this call (`format_history`).
+        let history = self.format_history(session);
+        if session.pending_candidate.is_some() {
             waiting.push_str(
                 "\n\nA candidate for this part is waiting for the user's verdict; it's hidden from you, so you don't know whether it's right. A message that asks about the candidate is `log`, even if they add that they want to move on; `move` or `known` only when they ask to leave it unjudged and ask nothing about it.",
             );
@@ -90,7 +88,7 @@ impl Runtime {
             tier: EngineTier::System1,
             tools: ToolAccess::ReadOnly,
             cwd: session.cwd.clone(),
-            system_prompt: LOG_SYSTEM.to_string(),
+            system_prompt: in_language(LOG_SYSTEM, session),
             prompt: format!(
                 "Goal: {}\n\n{}{}\n\nMap:\n{}{waiting}\n\nRecent conversation:\n{}\n\nLatest message: {text}\n\nRead any files you need first, then respond with JSON only.",
                 session.goal.as_deref().unwrap_or("(session goal)"),
@@ -155,8 +153,24 @@ impl Runtime {
         } else {
             i18n::line(session.language.as_deref(), i18n::Line::Logged).to_string()
         };
+        // A map change is the Tutor's words too (its brief and part titles):
+        // while a secret is active it passes the Gate with the reply, or is
+        // dropped with it (A6).
+        let mut map_change = decision.map_change.take();
         if let gate::GateMode::Checked(secrets) = &gate {
-            decision.reply = self.gate_reply(session, secrets, decision.reply).await;
+            let draft = match &map_change {
+                Some(change) => format!(
+                    "{}\n\n{}",
+                    decision.reply,
+                    render_change(change, &session.map, session.language.as_deref())
+                ),
+                None => decision.reply.clone(),
+            };
+            let shown = self.gate_reply(session, secrets, draft.clone()).await;
+            if shown != draft {
+                decision.reply = shown;
+                map_change = None;
+            }
         }
         sink(StreamEvent::TextDelta(decision.reply.clone()));
 
@@ -181,7 +195,7 @@ impl Runtime {
             sink(StreamEvent::TextDelta(next.clone()));
             full.push_str(&next);
         }
-        if let Some(change) = decision.map_change {
+        if let Some(change) = map_change {
             let rendered = format!(
                 "\n\n{}",
                 render_change(&change, &session.map, session.language.as_deref())
@@ -231,6 +245,15 @@ impl Runtime {
         }
         let before = session.history.len();
         let out = self.route_chat(session, routed, text, files, sink).await?;
+        // A reply no step kept (a move's part card, a refusal) is kept
+        // here, so the thread never holds a message left unanswered.
+        if !out.reply.trim().is_empty()
+            && !session.history[before.min(session.history.len())..]
+                .iter()
+                .any(|t| t.role == "assistant")
+        {
+            session.push_turn("assistant", out.reply.trim_start());
+        }
         if let Some(line) = dropped
             && let Some(reply) = session
                 .history
@@ -253,18 +276,66 @@ impl Runtime {
         sink: StreamSink,
     ) -> Result<TurnOutput> {
         let checking = (session.quick_check || session.exam) && session.pending_candidate.is_some();
+        // "… I think I understand it now, check me": a check on what you
+        // just explained, whatever step the Router read in the words before
+        // it (a long explanation reads like a question or a note). Asking
+        // to be checked records nothing: the verdict is shown back.
+        let other_step = matches!(&routed, Some(Routed::Step { step, .. })
+            if !matches!(step.as_str(), "log" | "summary" | "known"));
+        if !other_step
+            && session.pending_candidate.is_none()
+            && let Some(explained) = super::refer::asks_check(text)
+            && let Some(part) = session
+                .active_part()
+                .filter(|p| p.status == PartStatus::Open)
+                .cloned()
+        {
+            session.push_turn("user", text);
+            if let Some(p) = session.active_part_mut() {
+                if explained || p.log.is_empty() {
+                    p.log.push(text.to_string());
+                }
+                if explained && !part.log.is_empty() {
+                    p.summary = Some(text.to_string());
+                }
+            }
+            let visible = self.write_candidate(session, &part.id, files, sink).await?;
+            return Ok(TurnOutput::text(visible));
+        }
         match routed {
             Some(Routed::Unsure { top }) => match self.ask_which(session, text, files, &top) {
                 Some(out) => Ok(out),
                 None => self.handle_log(session, text, files, sink, None).await,
             },
-            // A quick check or an exam question you chose to be asked: the
-            // judge decides whether it is an answer, and drops the check if
-            // not (the one place a verdict isn't shown back first).
-            Some(_) | None if checking => self.handle_judgment(session, text, files, sink).await,
+            // An exam question you chose to be asked: your answer goes to
+            // the judge, which decides whether it is one and drops the exam
+            // if not. An answer isn't a verdict on a candidate.
+            Some(_) | None if checking && session.exam => {
+                self.handle_judgment(session, text, files, sink).await
+            }
+            // A quick check's candidate: a verdict read from plain words is
+            // shown back for one Enter, as on any candidate (§15). Only a
+            // sure question about it is answered as one, the check still
+            // waiting.
+            Some(Routed::Step { step, by, .. }) if checking && step == "log" => {
+                self.handle_log(session, text, files, sink, Some(&by)).await
+            }
+            Some(_) | None if checking => {
+                session.push_turn("user", text);
+                Ok(self.propose(session, CommitKind::Verdict, text, files))
+            }
             Some(Routed::Step { step, .. }) if step == VERDICT => {
                 session.push_turn("user", text);
                 Ok(self.propose(session, CommitKind::Verdict, text, files))
+            }
+            Some(Routed::Step { step, .. }) if step == APPROVE || step == OBJECT => {
+                session.push_turn("user", text);
+                let kind = if step == APPROVE {
+                    CommitKind::Approve
+                } else {
+                    CommitKind::Object
+                };
+                Ok(self.propose(session, kind, text, files))
             }
             Some(Routed::Step {
                 step,
@@ -337,7 +408,7 @@ impl Runtime {
             ("known".into(), "They clearly say they already know this whole part and want to skip it.".into()),
             ("move".into(), "They want to go on to the next part, or to another named part.".into()),
             ("replan".into(), "They ask to change the plan, or say something that changes the whole task's scope or purpose (a new constraint, requirement or aim).".into()),
-            (AGENT.into(), "They ask for the agent to do this part (do it for them, hand it off, delegate it).".into()),
+            (AGENT.into(), "They ask for the agent to do this part or another one they name, or for something to be written, saved or changed in their files (do it for them, hand it off, delegate it, write the letter).".into()),
             (TELL.into(), "They ask to be told the answer or an explanation outright, rather than pointed to sources.".into()),
         ];
         if session.pending_change.is_some() {
@@ -348,6 +419,18 @@ impl Runtime {
             steps.push((
                 "reject".into(),
                 "They turn down the waiting map change.".into(),
+            ));
+        }
+        // The agent's result waits for your review: accepting it or saying
+        // what's wrong is your verdict on it, shown back first (§7, §15).
+        if part.status == PartStatus::InReview {
+            steps.push((
+                APPROVE.into(),
+                "They accept the agent's result waiting for their review (it looks good, approve it).".into(),
+            ));
+            steps.push((
+                OBJECT.into(),
+                "They say what's wrong with the agent's result and why, to send it back.".into(),
             ));
         }
         if session.undoable() {
@@ -365,6 +448,10 @@ impl Runtime {
                 }
                 CommitKind::Handoff => "hand off to the agent",
                 CommitKind::Delegate => "delegate to the agent without understanding it",
+                CommitKind::Approve => "approve the agent's result for",
+                CommitKind::Object => {
+                    "send back to the agent, with their message as the objection,"
+                }
             };
             steps.push((
                 CONFIRM.into(),
@@ -436,6 +523,9 @@ impl Runtime {
             part.note,
             part.log.len()
         );
+        if part.status == PartStatus::InReview {
+            input.push_str("The agent's result on this part is waiting for the user's review.\n");
+        }
         match &session.pending_change {
             Some(change) => input.push_str(&format!(
                 "Map change waiting for the user's OK:\n{}\n",
@@ -452,8 +542,16 @@ impl Runtime {
         }
         let start = session.history.len().saturating_sub(6);
         input.push_str("\nRecent conversation:\n");
-        for t in &session.history[start..] {
-            input.push_str(&format!("{}: {}\n", t.role, t.content));
+        // A review waiting for your verdict is hidden: the Router may not
+        // see a planted hunk (A2).
+        let reviews = self.waiting_reviews(session);
+        for (i, t) in session.history[start..].iter().enumerate() {
+            let content = if t.role == "assistant" && reviews.contains(&(start + i)) {
+                REVIEW_HIDDEN
+            } else {
+                t.content.as_str()
+            };
+            input.push_str(&format!("{}: {content}\n", t.role));
         }
         input.push_str(&format!("\nLatest message: {text}"));
 
@@ -561,7 +659,12 @@ impl Runtime {
                 Ok(TurnOutput::text(reply))
             }
             Intent::Known => self.claim_shown_back(session, part, None),
-            Intent::Agent => Ok(self.propose_agent(session, text, files)),
+            Intent::Agent => Ok(self.agent_step(session, text, files, part)),
+            // Something to write into your files is work for the agent: a
+            // told answer can't save anything (§11).
+            Intent::Tell if super::refer::wants_writing(text) => {
+                Ok(self.agent_step(session, text, files, part))
+            }
             Intent::Tell => self.tell(session, text, files, sink, true).await,
             Intent::Move => Ok(match part.filter(|p| !p.is_empty() && *p != "next") {
                 Some(id) => self.handle_focus(session, id),
@@ -630,6 +733,21 @@ impl Runtime {
         files: &[PathBuf],
         sink: StreamSink,
     ) -> Result<String> {
+        self.write_candidate_led(session, part_id, files, sink, None)
+            .await
+    }
+
+    /// [`Self::write_candidate`] with a `lead` line ("Quick check:") shown
+    /// with the candidate's header, after any files the model reads, so it
+    /// never stands alone as an empty heading.
+    pub(super) async fn write_candidate_led(
+        &self,
+        session: &mut Session,
+        part_id: &str,
+        files: &[PathBuf],
+        sink: StreamSink,
+        lead: Option<&str>,
+    ) -> Result<String> {
         let part = session
             .map
             .get(part_id)
@@ -649,6 +767,9 @@ impl Runtime {
                 "\n\nThis candidate checks: {}. Build it around these concepts.",
                 names.join(", ")
             );
+            // An exam question has no flaw to embody a belief, so it never
+            // aims at (or closes) a misconception (A5 T1).
+            let m = m.filter(|_| !session.exam);
             if let Some(m) = &m {
                 flawed = true;
                 checks.push_str(&format!(
@@ -682,12 +803,14 @@ impl Runtime {
             tier: EngineTier::System2,
             tools: ToolAccess::ReadOnly,
             cwd: session.cwd.clone(),
-            system_prompt: if exam {
-                EXAM_QUESTION_SYSTEM
-            } else {
-                CANDIDATE_SYSTEM
-            }
-            .to_string(),
+            system_prompt: in_language(
+                if exam {
+                    EXAM_QUESTION_SYSTEM
+                } else {
+                    CANDIDATE_SYSTEM
+                },
+                session,
+            ),
             prompt: format!(
                 "Goal: {}\n\nMap (`▶` is this part; parts after it in `needs` order may be new to the user):\n{}\n\n{}{checks}\n\n{what}\n\nRead any files you need first, then respond with JSON only.",
                 session.goal.as_deref().unwrap_or("(session goal)"),
@@ -701,7 +824,8 @@ impl Runtime {
         };
         let lang = session.language.as_deref();
         let header = format!(
-            "{}\n\n",
+            "{}{}\n\n",
+            lead.map(|l| format!("{l}\n\n")).unwrap_or_default(),
             i18n::line(
                 lang,
                 if exam {
@@ -837,12 +961,14 @@ impl Runtime {
             tier: EngineTier::System2,
             tools: ToolAccess::None,
             cwd: session.cwd.clone(),
-            system_prompt: if session.exam {
-                EXAM_JUDGE_SYSTEM
-            } else {
-                JUDGE_SYSTEM
-            }
-            .to_string(),
+            system_prompt: in_language(
+                if session.exam {
+                    EXAM_JUDGE_SYSTEM
+                } else {
+                    JUDGE_SYSTEM
+                },
+                session,
+            ),
             prompt,
             files: files.to_vec(),
             stream_text: false,
@@ -906,9 +1032,12 @@ impl Runtime {
             Some(s) => s == crate::understanding::UnderstandingStatus::Understood,
             None => verdict.pass,
         };
+        // A verdict never moves a part that has gone on (in review, done,
+        // delegated, skipped): the evidence is recorded, the status stays.
+        let movable = matches!(part.status, PartStatus::Open | PartStatus::Understood);
         // An exam goes on: the next question, on the next part.
         if session.exam {
-            if understood {
+            if understood && movable {
                 self.set_status(session, &part.id, PartStatus::Understood, &verdict.feedback)?;
             }
             session.push_turn("assistant", &verdict.feedback);
@@ -926,7 +1055,7 @@ impl Runtime {
         }
         // A quick check is one candidate: record it and go back to chat.
         if session.quick_check {
-            if understood {
+            if understood && movable {
                 self.set_status(session, &part.id, PartStatus::Understood, &verdict.feedback)?;
             }
             session.push_turn("assistant", &verdict.feedback);
@@ -946,7 +1075,9 @@ impl Runtime {
             return Ok(TurnOutput::text(ask));
         }
         let next = if understood {
-            self.set_status(session, &part.id, PartStatus::Understood, &verdict.feedback)?;
+            if movable {
+                self.set_status(session, &part.id, PartStatus::Understood, &verdict.feedback)?;
+            }
             format!(
                 "\n\n{}",
                 i18n::line(session.language.as_deref(), i18n::Line::Understood)
@@ -973,8 +1104,51 @@ fn second_look(session: &Session, text: &str, routed: Option<Routed>) -> Option<
     if session.pending_candidate.is_some() || session.quick_check || session.exam {
         return routed;
     }
+    // "Looks good, approve it" on a result waiting for your review: your
+    // approval, shown back for Enter, whatever the Router read (or if it
+    // wasn't asked). Code alone, as for a request for the agent.
+    let in_review = session
+        .active_part()
+        .is_some_and(|p| p.status == PartStatus::InReview);
+    let decided = matches!(&routed, Some(Routed::Step { step, .. })
+        if step == APPROVE || step == OBJECT || step == CONFIRM);
+    if in_review && !decided && super::refer::asks_approve(text) {
+        return Some(Routed::Step {
+            step: APPROVE.into(),
+            part: None,
+            by: "code".into(),
+            steer: None,
+        });
+    }
     let read_as_log = matches!(&routed, Some(Routed::Step { step, .. }) if step == "log");
-    match super::refer::plain_commitment(text) {
+    let commitment = super::refer::plain_commitment(text);
+    // "I get the bill now. Let the agent write the letter": a claim the
+    // Router read in words that ask for the agent. The agent's step waits
+    // for your OK; a claim would be recorded at once, on the wrong part.
+    if let Some(Routed::Step {
+        step,
+        part,
+        by,
+        steer,
+    }) = routed
+    {
+        let step = if step == "known" && commitment == Some(AGENT) {
+            AGENT.to_string()
+        } else {
+            step
+        };
+        let routed = Some(Routed::Step {
+            step,
+            part,
+            by,
+            steer,
+        });
+        return match commitment {
+            Some(c) if read_as_log => Some(Routed::Unsure { top: vec![c] }),
+            _ => routed,
+        };
+    }
+    match commitment {
         // A claim the Router read as a log entry or wasn't sure about: the
         // Tutor would log it silently. Asking to be told or for the agent,
         // when unsure, the Tutor still reads and shows back itself.

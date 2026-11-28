@@ -15,6 +15,16 @@ impl Runtime {
         };
         match part.status {
             PartStatus::Understood => {}
+            // Every concept it rests on is shown or solid: your review
+            // counts (§12), so it is understood (A5).
+            PartStatus::Open if self.reviewable(session, &part).0 => {
+                self.set_status(
+                    session,
+                    &part.id,
+                    PartStatus::Understood,
+                    "every concept it rests on is shown",
+                )?;
+            }
             PartStatus::Open => {
                 return Ok(TurnOutput::text(
                     "Handoff comes after understanding: log, `/summary`, then judge the candidate. To hand it off without understanding, `/delegate`.",
@@ -27,6 +37,17 @@ impl Runtime {
                     other.label()
                 )));
             }
+        }
+        let part = session.map.get(&part.id).cloned().unwrap_or(part);
+        // A candidate waiting on this part is stale once it goes to the
+        // agent: dropped, and its secret retired at the end of the turn,
+        // as `/delegate` does. A later verdict can't undo the review.
+        if session
+            .pending_candidate
+            .as_ref()
+            .is_some_and(|p| p.part_id == part.id)
+        {
+            session.pending_candidate = None;
         }
         // §13: in a git repository the agent works in a staging copy and
         // nothing reaches your files until your verdict.
@@ -112,7 +133,7 @@ impl Runtime {
             p.unreviewed.clear();
         }
         self.set_status(session, &part.id, PartStatus::Done, "result approved")?;
-        Ok(self.after_resolution(session, format!("**{}** done.", part.title)))
+        Ok(self.after_agent_run(session, format!("**{}** done.", part.title), &part.concepts))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -154,7 +175,12 @@ impl Runtime {
             tier: EngineTier::System2,
             tools: ToolAccess::Full,
             cwd: staging.map_or_else(|| session.cwd.clone(), std::path::Path::to_path_buf),
-            system_prompt: AGENT_SYSTEM.to_string(),
+            // Your language is for what it says to you; what it writes into
+            // files follows the task (a letter to a German supplier).
+            system_prompt: format!(
+                "{} It is the language of what you say to the user, not of the files you write: those follow the task and the files around them.",
+                in_language(AGENT_SYSTEM, session)
+            ),
             prompt,
             files: files.to_vec(),
             stream_text: true,

@@ -92,16 +92,24 @@ fn line(l: Line) -> &'static str {
         ShowDelegate => {
             "Serahkan **{title}** tanpa memahaminya? Dicatat sebagai diserahkan: kamu tidak menjamin hasilnya. Enter jalankan · Esc batal."
         }
+        DelegateWhy => "Bukan serah terima dengan tinjauanmu: kamu belum menunjukkan {concepts}.",
         ShowVerdict => {
             "Nilai ini sebagai putusanmu atas kandidat? “{words}” Enter menilai · Esc menyimpannya sebagai catatan."
+        }
+        ShowApprove => "Setujui hasil agen untuk **{title}**? Enter menyetujui · Esc membatalkan.",
+        ShowObject => {
+            "Kembalikan **{title}** ke agen dengan keberatanmu? “{words}” Enter mengirimnya · Esc membatalkan."
         }
         NotRunVerdict => "Tidak dinilai sebagai putusan: disimpan sebagai catatan.",
         NotRunHandoff => "Tidak dijalankan: **{title}** tidak diserahkan ke agen.",
         NotRunDelegate => "Tidak dijalankan: **{title}** tidak diserahkan.",
+        NotRunApprove => "Tidak dijalankan: **{title}** tidak disetujui.",
+        NotRunObject => "Tidak dijalankan: keberatanmu tentang **{title}** tidak dikirim.",
         NotRunStale => "Tidak dijalankan: yang menunggu OK-mu sudah tidak berlaku.",
         AskWhich => {
             "Maksudmu yang mana: {choices}? Tidak ada yang dicatat sampai kamu bilang; cukup nomor atau beberapa kata."
         }
+        AskAgentPart => "biarkan agen mengerjakan **{title}**",
         AskKnown => "catat bahwa saya sudah tahu **{title}** (tanpa pengecekan)",
         AskTell => "langsung beri tahu saya",
         AskAgent => "biar agen yang mengerjakan bagian ini",
@@ -138,11 +146,50 @@ fn line(l: Line) -> &'static str {
         Horizon => "Cakrawala: {what}.",
         HorizonNeeds => "perlu {parts}",
         HorizonLeads => "menuju {parts}",
-        EvidenceRatio => "Lulus: {passes} · klaim: {claims}.",
+        EvidenceRatio => {
+            "Dari ide di atas, {passes} lulus pemeriksaan dan {claims} hanya bersandar pada kata-katamu."
+        }
         ClaimWithdrawn => "Klaim atas **{concept}** ditarik ({date}).",
-        StepHistory => "Bagaimana kamu sampai di sini: {kinds}.",
-        StepKindRate => "{kind} {passes} dari {judged} berujung lulus",
+        StepHistory => "Yang sejauh ini berujung lulus: {kinds}.",
+        StepKindRate => "{kind}, {passes} dari {judged} kali",
         SteeredTimes => "diarahkan olehmu {n} kali",
+        AngleExample => "mulai dari contoh",
+        AnglePurpose => "bertanya untuk apa",
+        AngleMechanism => "menelusuri cara kerjanya",
+        AgentWork => "**Diserahkan ke agen**",
+        AgentInReview => {
+            "**{title}**: dapat ditinjau, diserahkan setelah kamu menunjukkan dasarnya; menunggu tinjauanmu."
+        }
+        AgentApproved => {
+            "**{title}**: dapat ditinjau, diserahkan setelah kamu menunjukkan dasarnya; kamu menyetujuinya."
+        }
+        AgentMissedCheck => {
+            "**{title}**: disetujui tanpa menangkap pemeriksaannya; tidak dicatat sebagai tinjauan, kamu tidak menjaminnya."
+        }
+        AgentDelegated => {
+            "**{title}**: didelegasikan, dikerjakan tanpa kamu pahami; kamu tidak menjaminnya."
+        }
+        AgentCaughtCheck => {
+            "**{title}**: dapat ditinjau; dalam tinjauannya kamu menangkap pemeriksaan yang disisipkan dan berkeberatan, jadi hasil asli agen yang ditulis."
+        }
+        ShowAgentParts => {
+            "Biarkan agen mengerjakan bagian-bagian ini satu per satu? {parts}. Enter jalankan semua · Esc batal."
+        }
+        AgentPartHandoff => "**{title}** (serah terima: kamu meninjau hasilnya)",
+        AgentPartDelegate => "**{title}** (diserahkan: kamu tidak menjaminnya)",
+        AgentPartDelegateWhy => "**{title}** (diserahkan: kamu belum menunjukkan {concepts})",
+        ConfirmHandoff => "ya, serahkan",
+        ConfirmDelegate => "ya, delegasikan",
+        ConfirmVerdict => "ya, nilai",
+        ConfirmApprove => "ya, setujui",
+        ConfirmObject => "ya, kembalikan",
+        CancelShown => "tidak",
+        ShowKnownShown => {
+            "Dicatat: kamu sudah tahu **{title}**. Kamu sudah menunjukkan setiap ide yang menjadi dasarnya, jadi ia berdiri di atas pemeriksaanmu, bukan hanya kata-katamu. Bilang \"batalkan\" atau tekan Esc untuk menariknya kembali."
+        }
+        ShowKnownSome => {
+            "Dicatat: kamu sudah tahu **{title}**. Hanya kata-katamu untuk {concepts}; sisanya sudah kamu tunjukkan. Bilang \"batalkan\" atau tekan Esc untuk menariknya kembali."
+        }
         StepHistoryNote => {
             "Hanya itu yang disimpan Pathfinder tentang caramu belajar, di catatan lokal folder ini."
         }

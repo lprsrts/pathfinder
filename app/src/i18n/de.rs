@@ -92,16 +92,26 @@ fn line(l: Line) -> &'static str {
         ShowDelegate => {
             "**{title}** abgeben, ohne es zu verstehen? Es wird als abgegeben vermerkt: Für das Ergebnis bürgst du nicht. Enter startet · Esc bricht ab."
         }
+        DelegateWhy => "Keine Übergabe mit deiner Prüfung: Du hast {concepts} noch nicht gezeigt.",
         ShowVerdict => {
             "Das als dein Urteil über den Kandidaten werten? „{words}“ Enter wertet · Esc behält es als Notiz."
+        }
+        ShowApprove => {
+            "Das Ergebnis des Agenten für **{title}** annehmen? Enter nimmt an · Esc bricht ab."
+        }
+        ShowObject => {
+            "**{title}** mit deinem Einwand an den Agenten zurückgeben? „{words}“ Enter sendet · Esc bricht ab."
         }
         NotRunVerdict => "Nicht als Urteil gewertet: als Notiz behalten.",
         NotRunHandoff => "Nicht ausgeführt: **{title}** ging nicht an den Agenten.",
         NotRunDelegate => "Nicht ausgeführt: **{title}** wurde nicht abgegeben.",
+        NotRunApprove => "Nicht ausgeführt: **{title}** wurde nicht angenommen.",
+        NotRunObject => "Nicht ausgeführt: Dein Einwand zu **{title}** wurde nicht gesendet.",
         NotRunStale => "Nicht ausgeführt: Was auf dein OK wartete, gilt nicht mehr.",
         AskWhich => {
             "Was meintest du: {choices}? Nichts wird vermerkt, bis du es sagst; eine Zahl oder ein paar Worte reichen."
         }
+        AskAgentPart => "den Agenten **{title}** machen lassen",
         AskKnown => "vermerken, dass ich **{title}** schon kenne (ohne Prüfung)",
         AskTell => "sag es mir einfach",
         AskAgent => "lass den Agenten diesen Teil machen",
@@ -134,11 +144,50 @@ fn line(l: Line) -> &'static str {
         Horizon => "Horizont: {what}.",
         HorizonNeeds => "braucht {parts}",
         HorizonLeads => "führt zu {parts}",
-        EvidenceRatio => "Bestanden: {passes} · Behauptungen: {claims}.",
+        EvidenceRatio => {
+            "Von den Ideen oben: {passes} in einer Prüfung bestanden, {claims} stützen sich nur auf dein Wort."
+        }
         ClaimWithdrawn => "Behauptung zu **{concept}** zurückgezogen ({date}).",
-        StepHistory => "Wie du hierher kamst: {kinds}.",
-        StepKindRate => "{kind} {passes} von {judged} führten zum Bestehen",
+        StepHistory => "Was bisher zum Bestehen führte: {kinds}.",
+        StepKindRate => "{kind}, {passes} von {judged} Mal",
         SteeredTimes => "{n}-mal von dir gelenkt",
+        AngleExample => "mit einem Beispiel anfangen",
+        AnglePurpose => "fragen, wofür es da ist",
+        AngleMechanism => "nachvollziehen, wie es funktioniert",
+        AgentWork => "**An den Agenten übergeben**",
+        AgentInReview => {
+            "**{title}**: prüfbar, übergeben, nachdem du gezeigt hast, worauf es beruht; wartet auf deine Prüfung."
+        }
+        AgentApproved => {
+            "**{title}**: prüfbar, übergeben, nachdem du gezeigt hast, worauf es beruht; du hast es angenommen."
+        }
+        AgentMissedCheck => {
+            "**{title}**: angenommen, ohne die Prüfung zu bemerken; zählt nicht als Prüfung, du bürgst nicht dafür."
+        }
+        AgentDelegated => {
+            "**{title}**: delegiert, ohne dein Verständnis erledigt; du bürgst nicht dafür."
+        }
+        AgentCaughtCheck => {
+            "**{title}**: prüfbar; in der Prüfung hast du den eingebauten Fehler bemerkt und widersprochen, also wurde das echte Ergebnis des Agenten geschrieben."
+        }
+        ShowAgentParts => {
+            "Soll der Agent diese Teile nacheinander machen? {parts}. Enter startet alle · Esc bricht ab."
+        }
+        AgentPartHandoff => "**{title}** (Übergabe: du prüfst das Ergebnis)",
+        AgentPartDelegate => "**{title}** (abgegeben: du bürgst nicht dafür)",
+        AgentPartDelegateWhy => "**{title}** (abgegeben: du hast {concepts} noch nicht gezeigt)",
+        ConfirmHandoff => "ja, übergib es",
+        ConfirmDelegate => "ja, delegiere es",
+        ConfirmVerdict => "ja, werte es",
+        ConfirmApprove => "ja, nimm es an",
+        ConfirmObject => "ja, gib es zurück",
+        CancelShown => "nein",
+        ShowKnownShown => {
+            "Vermerkt: Du kennst **{title}** schon. Jede Idee, auf der es beruht, hast du schon gezeigt: Es stützt sich auf deine Prüfungen, nicht nur auf dein Wort. Sag „rückgängig“ oder drück Esc, um es zurückzunehmen."
+        }
+        ShowKnownSome => {
+            "Vermerkt: Du kennst **{title}** schon. Nur dein Wort für {concepts}; den Rest hast du schon gezeigt. Sag „rückgängig“ oder drück Esc, um es zurückzunehmen."
+        }
         StepHistoryNote => {
             "Mehr hält Pathfinder nicht darüber fest, wie du lernst; es bleibt im lokalen Verlauf dieses Ordners."
         }

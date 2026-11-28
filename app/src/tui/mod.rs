@@ -2199,7 +2199,30 @@ impl App {
         self.input = cmd.to_string();
         self.cursor = self.input.len();
         self.cmd_sel = 0;
-        self.submit();
+        let shown = self.shortcut_shown(cmd);
+        self.submit_shown(shown);
+    }
+
+    /// What the thread shows as your message for a key that answers what
+    /// waits for your OK (§15): your intent ("yes, hand it off"), not the
+    /// command the key sends.
+    fn shortcut_shown(&self, cmd: &str) -> Option<String> {
+        use crate::domain::CommitKind;
+        use crate::i18n::{Line, line};
+        let lang = self.session.language.as_deref();
+        let kind = self.session.pending_commitment.as_ref()?.kind;
+        let which = match cmd {
+            "/confirm" => match kind {
+                CommitKind::Handoff => Line::ConfirmHandoff,
+                CommitKind::Delegate => Line::ConfirmDelegate,
+                CommitKind::Verdict => Line::ConfirmVerdict,
+                CommitKind::Approve => Line::ConfirmApprove,
+                CommitKind::Object => Line::ConfirmObject,
+            },
+            "/cancel" => Line::CancelShown,
+            _ => return None,
+        };
+        Some(line(lang, which).to_string())
     }
 
     /// Usage events: the thread on screen closes…
@@ -2343,6 +2366,11 @@ impl App {
     }
 
     fn submit(&mut self) {
+        self.submit_shown(None);
+    }
+
+    /// Sends the input; the thread shows `shown` for it when given.
+    fn submit_shown(&mut self, shown: Option<String>) {
         let text = self.input.trim().to_string();
         if text.is_empty() {
             return;
@@ -2396,7 +2424,9 @@ impl App {
                 files.push(f);
             }
         }
-        let shown = if files.is_empty() {
+        let shown = if let Some(shown) = shown {
+            shown
+        } else if files.is_empty() {
             text.clone()
         } else {
             let names: Vec<String> = files
@@ -2410,6 +2440,13 @@ impl App {
             format!("{text}\n📎 {}", names.join(", "))
         };
         self.entries.push(Entry::User(shown));
+        // What this answers no longer waits: the rule and the panel drop
+        // it now, not when the reply ends (the reload then has the truth).
+        match text.trim() {
+            "/confirm" | "/cancel" => self.session.pending_commitment = None,
+            "/accept" | "/reject" => self.session.pending_change = None,
+            _ => {}
+        }
         self.last_sent = text.clone();
         self.input.clear();
         self.cursor = 0;
@@ -2662,7 +2699,7 @@ impl App {
                 .collect(),
             crate::options::CHECKS => CHECKS
                 .iter()
-                .map(|c| (c.to_string(), c.to_string()))
+                .map(|c| (c.to_string(), crate::runtime::checks_label(c).to_string()))
                 .collect(),
             _ => Vec::new(),
         }
@@ -2827,6 +2864,16 @@ impl App {
                 .unwrap_or_else(|| "none".into()),
             crate::options::CHECKS => c.checks.clone(),
             _ => String::new(),
+        }
+    }
+
+    /// A setting's current value as the settings list names it.
+    pub fn current_label(&self, option: &str) -> String {
+        match option {
+            crate::options::CHECKS => {
+                crate::runtime::checks_label(&self.current(option)).to_string()
+            }
+            _ => self.current_setting(option),
         }
     }
 
@@ -3756,7 +3803,10 @@ impl App {
             ),
             row("Fast model", self.tier_line(&tiers[0])),
             row("Main model", self.tier_line(&tiers[1])),
-            row("Checks", self.current(options::CHECKS).to_string()),
+            row(
+                "Checks",
+                crate::runtime::checks_label(&self.current(options::CHECKS)).to_string(),
+            ),
             row("Gate", gate),
             row("Accounts", accounts.join("\n")),
             row(
@@ -4448,6 +4498,7 @@ mod tests {
             text: "do it".into(),
             files: vec![],
             candidate: None,
+            then: Vec::new(),
         }
     }
 
@@ -4466,11 +4517,40 @@ mod tests {
         assert!(app.entries.is_empty() && app.running.is_none());
         app.session.pending_commitment = Some(pending_handoff());
         app.on_key(key(KeyCode::Enter));
-        assert_eq!(last_sent(&app), Some("/confirm"));
+        // Your intent shows in the thread, not the command the key sends.
+        assert_eq!(last_sent(&app), Some("yes, hand it off"));
+        assert_eq!(app.last_sent, "/confirm");
         assert!(app.running.is_some());
+        // What it answered no longer waits on you while it runs: the rule
+        // and the panel drop "your OK" now (the reload at the end has the
+        // truth).
+        assert!(app.session.pending_commitment.is_none());
         // While it runs, Enter on nothing sends nothing more.
         app.on_key(key(KeyCode::Enter));
         assert_eq!(app.entries.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_confirming_key_shows_your_intent_per_kind() {
+        use crate::domain::CommitKind;
+        for (kind, shown) in [
+            (CommitKind::Delegate, "yes, delegate it"),
+            (CommitKind::Verdict, "yes, judge it"),
+        ] {
+            let (mut app, _rx, _) = test_app();
+            app.session.pending_commitment = Some(crate::domain::PendingCommitment {
+                kind,
+                ..pending_handoff()
+            });
+            app.on_key(key(KeyCode::Enter));
+            assert_eq!(last_sent(&app), Some(shown));
+            assert_eq!(app.last_sent, "/confirm");
+            assert!(
+                !app.entries
+                    .iter()
+                    .any(|e| matches!(e, Entry::User(t) if t.starts_with('/')))
+            );
+        }
     }
 
     #[tokio::test]
@@ -4508,7 +4588,9 @@ mod tests {
         assert!(app.entries.is_empty());
         app.running = None;
         app.on_key(key(KeyCode::Esc));
-        assert_eq!(last_sent(&app), Some("/cancel"));
+        // Your intent shows in the thread; the command is what runs.
+        assert_eq!(last_sent(&app), Some("no"));
+        assert_eq!(app.last_sent, "/cancel");
     }
 
     #[tokio::test]
@@ -4525,6 +4607,7 @@ mod tests {
             prev_mode: crate::domain::SessionMode::Working,
             prev_change: None,
             prev_gaps: vec![],
+            also: vec![],
         });
         // Too late: a step has passed since the claim.
         app.on_key(key(KeyCode::Esc));

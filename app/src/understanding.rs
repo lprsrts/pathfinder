@@ -503,6 +503,148 @@ pub fn exact_match<'a>(text: &str, concepts: &'a [Concept]) -> Option<&'a Concep
     })
 }
 
+/// Words that carry no meaning in a concept's name.
+const NAME_FILLER: &[&str] = &[
+    "a", "an", "the", "of", "for", "between", "in", "on", "to", "and", "with", "by", "two", "its",
+    "from", "via", "using", "der", "die", "das", "des", "von", "und", "zwischen", "zweier",
+];
+
+/// A concept name's meaningful words, in order: lowercased, filler left
+/// out, a plural `s` dropped ("Gaussian mixtures" is `gaussian mixture`).
+fn name_words(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_lowercase)
+        .filter(|w| !NAME_FILLER.contains(&w.as_str()))
+        .map(|w| {
+            let n = w.chars().count();
+            if n > 3 && w.ends_with('s') && !w.ends_with("ss") {
+                w[..w.len() - 1].to_string()
+            } else {
+                w
+            }
+        })
+        .collect()
+}
+
+/// `words` with each abbreviation in it spelled out as `other` spells it:
+/// "gmm" becomes `gaussian mixture model` when `other` has those words in
+/// a row, or `gaussian mixture` (a trailing "model" is often left out).
+fn spelled_out(words: &[String], other: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for w in words {
+        let short = (2..=5).contains(&w.chars().count())
+            && w.chars().all(|c| c.is_ascii_alphabetic())
+            && !other.contains(w);
+        let run = short
+            .then(|| {
+                (1..=w.len()).rev().find_map(|n| {
+                    other.windows(n).find(|run| {
+                        let initials: String =
+                            run.iter().filter_map(|r| r.chars().next()).collect();
+                        initials == *w
+                            || (n + 1 == w.len() && w.ends_with('m') && initials == w[..n])
+                    })
+                })
+            })
+            .flatten();
+        match run {
+            Some(run) => out.extend(run.iter().cloned()),
+            None => out.push(w.clone()),
+        }
+    }
+    out
+}
+
+/// Words that make a name's word order part of its meaning: "probability
+/// of X given Y" is not "probability of Y given X", "KL divergence from P
+/// to Q" is not the one from Q to P, "sum of squares" is not "square of
+/// the sum".
+const NAME_RELATIONS: &[&str] = &[
+    "of",
+    "given",
+    "from",
+    "to",
+    "into",
+    "over",
+    "under",
+    "vs",
+    "versus",
+    "per",
+    "than",
+    "by",
+    "on",
+    "against",
+    "wrt",
+    "conditioned",
+    "relative",
+    "minus",
+    "divided",
+    "times",
+    "after",
+    "before",
+    "von",
+    "nach",
+    "gegen",
+    "unter",
+    "über",
+    "pro",
+];
+
+/// Whether two names say the same concept in other words: the same
+/// meaningful words, with plurals, filler and spelled-out abbreviations
+/// evened out ("L2 distance between GMMs" and "L2 distance of Gaussian
+/// mixtures"). The words must come in the same order, unless neither name
+/// holds a word that makes order matter ([`NAME_RELATIONS`]): swapping a
+/// relation's arguments is another idea. Never a related idea: one word
+/// more or less is a different name.
+pub fn same_name(a: &str, b: &str) -> bool {
+    let (wa, wb) = (name_words(a), name_words(b));
+    if wa.is_empty() || wb.is_empty() {
+        return false;
+    }
+    let (oa, ob) = (spelled_out(&wa, &wb), spelled_out(&wb, &wa));
+    let relational = |t: &str| {
+        t.split(|c: char| !c.is_alphanumeric())
+            .any(|w| NAME_RELATIONS.contains(&w.to_lowercase().as_str()))
+    };
+    let any_order = !relational(a) && !relational(b);
+    let shape = |w: &[String]| -> Vec<String> {
+        let mut w = w.to_vec();
+        if any_order {
+            w.sort();
+            w.dedup();
+        }
+        w
+    };
+    let (sa, sb) = (shape(&oa), shape(&ob));
+    let model = |s: &[String]| {
+        s.iter()
+            .filter(|w| *w != "model")
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    sa == sb
+        || (model(&sa) == model(&sb) && !model(&sa).is_empty() && sa.len().abs_diff(sb.len()) <= 1)
+}
+
+/// The recorded concept `name` says in other words (see [`same_name`]):
+/// by its label or an alias. None when no one or more than one does.
+pub fn same_named<'a>(name: &str, concepts: &'a [Concept]) -> Option<&'a Concept> {
+    let found: Vec<&Concept> = concepts
+        .iter()
+        .filter(|c| {
+            std::iter::once(&c.label)
+                .chain(&c.aliases)
+                .any(|n| same_name(name, n))
+        })
+        .collect();
+    match found.as_slice() {
+        [one] => Some(one),
+        _ => None,
+    }
+}
+
 /// Up to 20 concepts sharing a word with `text`, most shared first.
 pub fn lexical_candidates<'a>(text: &str, concepts: &'a [Concept]) -> Vec<&'a Concept> {
     let want = tokens(text);
@@ -642,14 +784,18 @@ pub fn choose_step(
     Some(StepKind { scope, angle })
 }
 
-/// §16: which step kinds led to passes. For each `step` on a concept, the
-/// next `pass` or `fail` on that concept before the next `step` on it is
-/// the step's verdict; a later step supersedes an earlier one. Activity
-/// only: nothing here is evidence.
+/// §16: which step kinds led to passes. A `step` on a concept counts only
+/// once you took it up: you wrote about that concept in your log, or
+/// opened or searched a source on it, before the next verdict. A verdict
+/// on a candidate that merely followed a step you never took says nothing
+/// about the step. The next `pass` or `fail` on that concept, before the
+/// next `step` on it, is then the step's verdict; a later step supersedes
+/// an earlier one. Activity only: nothing here is evidence.
 pub fn step_stats(events: &[Event]) -> StepStats {
     let mut sorted: Vec<&Event> = events.iter().collect();
     sorted.sort_by_key(|e| e.id);
-    let mut open: HashMap<&str, String> = HashMap::new();
+    // Per concept: the step shown last, and whether you took it up.
+    let mut open: HashMap<&str, (String, bool)> = HashMap::new();
     let mut out = StepStats::new();
     for e in sorted {
         match e.kind {
@@ -661,10 +807,15 @@ pub fn step_stats(events: &[Event]) -> StepStats {
                     continue;
                 };
                 out.entry(kind.to_string()).or_default();
-                open.insert(e.concept.as_str(), kind.to_string());
+                open.insert(e.concept.as_str(), (kind.to_string(), false));
+            }
+            EventKind::Touched | EventKind::Read | EventKind::Searched => {
+                if let Some((_, taken)) = open.get_mut(e.concept.as_str()) {
+                    *taken = true;
+                }
             }
             EventKind::Pass | EventKind::Fail => {
-                if let Some(kind) = open.remove(e.concept.as_str()) {
+                if let Some((kind, true)) = open.remove(e.concept.as_str()) {
                     let entry = out.entry(kind).or_default();
                     entry.1 += 1;
                     if e.kind == EventKind::Pass {
@@ -966,27 +1117,100 @@ mod tests {
 
     #[test]
     fn step_stats_count_the_next_verdict() {
-        let one = step_stats(&[step(1, "a", "wide-purpose"), on("a", pass(2, false))]);
+        let took = |id| on("a", ev(id, EventKind::Touched));
+        let one = step_stats(&[
+            step(1, "a", "wide-purpose"),
+            took(2),
+            on("a", pass(3, false)),
+        ]);
         assert_eq!(one.get("wide-purpose"), Some(&(1, 1)));
 
         let superseded = step_stats(&[
             step(1, "a", "wide-example"),
-            step(2, "a", "narrow-mechanism"),
-            on("a", ev(3, EventKind::Fail)),
+            took(2),
+            step(3, "a", "narrow-mechanism"),
+            on("a", ev(4, EventKind::Read)),
+            on("a", ev(5, EventKind::Fail)),
         ]);
         assert_eq!(superseded.get("narrow-mechanism"), Some(&(0, 1)));
         assert_eq!(superseded.get("wide-example"), Some(&(0, 0)));
 
-        let unjudged = step_stats(&[step(1, "a", "wide-purpose"), on("b", pass(2, false))]);
+        let unjudged = step_stats(&[
+            step(1, "a", "wide-purpose"),
+            took(2),
+            on("b", pass(3, false)),
+        ]);
         assert_eq!(unjudged.get("wide-purpose"), Some(&(0, 0)));
 
         // Only the first verdict after a step counts.
         let twice = step_stats(&[
             step(1, "a", "wide-purpose"),
-            on("a", pass(2, false)),
+            took(2),
             on("a", pass(3, false)),
+            on("a", pass(4, false)),
         ]);
         assert_eq!(twice.get("wide-purpose"), Some(&(1, 1)));
+    }
+
+    #[test]
+    fn the_same_name_in_other_words() {
+        assert!(same_name(
+            "L2 distance between Gaussian mixtures",
+            "L2 distance of two GMMs"
+        ));
+        assert!(same_name("Gaussian mixture models", "GMM"));
+        assert!(same_name(
+            "Bayesian fusion of GMMs",
+            "Bayesian fusion of Gaussian mixtures"
+        ));
+        assert!(same_name("Command routing", "command routing"));
+        // Order is free when no word in the name makes it matter.
+        assert!(same_name(
+            "Gaussian mixture L2 distance",
+            "L2 distance between Gaussian mixtures"
+        ));
+        // A related idea is not the same one.
+        assert!(!same_name("L2 distance", "L2 distance gradient"));
+        assert!(!same_name("Bayesian fusion", "Gaussian product"));
+        assert!(!same_name("VAT", "Tariff"));
+        assert!(!same_name("the", "of"));
+    }
+
+    /// Adversarial: `same_name` compares word sets, so swapping the
+    /// arguments of a relation merges two different ideas, and a pass on
+    /// one is credited to the other without the decision model being asked.
+    #[test]
+    fn adv_swapped_words_are_not_the_same_idea() {
+        let pairs = [
+            ("probability of X given Y", "probability of Y given X"),
+            ("sum of squares", "square of the sum"),
+            ("KL divergence from P to Q", "KL divergence from Q to P"),
+            ("variance of the mean", "mean of the variance"),
+        ];
+        let merged: Vec<_> = pairs.iter().filter(|(a, b)| same_name(a, b)).collect();
+        assert!(merged.is_empty(), "different ideas merged: {merged:?}");
+    }
+
+    #[test]
+    fn a_step_you_never_took_up_led_to_nothing() {
+        // A candidate judged right after a step you didn't follow: the
+        // pass came from the check, not from the step.
+        let ignored = step_stats(&[step(1, "a", "wide-purpose"), on("a", pass(2, false))]);
+        assert_eq!(ignored.get("wide-purpose"), Some(&(0, 0)));
+        // Activity on another concept doesn't take it up either.
+        let elsewhere = step_stats(&[
+            step(1, "a", "wide-purpose"),
+            on("b", ev(2, EventKind::Touched)),
+            on("a", pass(3, false)),
+        ]);
+        assert_eq!(elsewhere.get("wide-purpose"), Some(&(0, 0)));
+        // Searching a source on it does.
+        let searched = step_stats(&[
+            step(1, "a", "wide-purpose"),
+            on("a", ev(2, EventKind::Searched)),
+            on("a", pass(3, false)),
+        ]);
+        assert_eq!(searched.get("wide-purpose"), Some(&(1, 1)));
     }
 
     #[test]

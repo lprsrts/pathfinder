@@ -5,6 +5,8 @@
 use std::fs;
 use std::path::Path;
 
+use crate::agent::confine::Visible;
+
 const MAX_DEPTH: usize = 3;
 const MAX_TREE_ENTRIES: usize = 150;
 const MAX_EXCERPT_LINES: usize = 40;
@@ -55,10 +57,17 @@ pub struct WorkspaceSnapshot {
 
 impl WorkspaceSnapshot {
     pub fn scan(root: &Path) -> Self {
+        Self::scan_with(root, &Visible::new(root))
+    }
+
+    /// `scan`, seeing only what `visible` allows.
+    fn scan_with(root: &Path, visible: &Visible) -> Self {
         let mut snap = Self::default();
         let mut manifests = Vec::new();
         let mut docs = Vec::new();
-        walk(root, root, 0, &mut snap, &mut manifests, &mut docs);
+        // What the agent's own walks may see (`ls`, `glob`, `grep`): no
+        // links out of the workspace, nothing private to Pathfinder.
+        walk(visible, root, root, 0, &mut snap, &mut manifests, &mut docs);
 
         manifests.sort_by_key(|(rel, _)| depth_of(rel));
         docs.sort_by_key(|rel| {
@@ -86,7 +95,11 @@ impl WorkspaceSnapshot {
             if snap.key_files.iter().any(|(p, _)| p == rel) {
                 continue;
             }
-            if let Some(excerpt) = excerpt(&root.join(rel)) {
+            let path = root.join(rel);
+            if !visible.allows(&path) {
+                continue;
+            }
+            if let Some(excerpt) = excerpt(&path) {
                 snap.key_files.push((rel.clone(), excerpt));
             }
         }
@@ -121,6 +134,7 @@ fn depth_of(rel: &str) -> usize {
 }
 
 fn walk(
+    visible: &Visible,
     root: &Path,
     dir: &Path,
     depth: usize,
@@ -144,6 +158,9 @@ fn walk(
             continue;
         }
         let path = entry.path();
+        if !visible.allows(&path) {
+            continue;
+        }
         // `/`-separated on every OS: `depth_of` counts them, and the model
         // sees these paths.
         let rel = path
@@ -176,7 +193,7 @@ fn walk(
         }
 
         if is_dir && depth + 1 < MAX_DEPTH {
-            walk(root, &path, depth + 1, snap, manifests, docs);
+            walk(visible, root, &path, depth + 1, snap, manifests, docs);
         }
     }
 }
@@ -345,5 +362,46 @@ mod tests {
         assert!(snap.stack.is_empty());
         assert_eq!(snap.render(), "(empty or unreadable folder)");
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Adversarial: the snapshot goes into the onboarding, Mapper and cite
+    /// prompts. A `README.md` that links out of the workspace (say to
+    /// Pathfinder's config, or a key file), as the agent's commands can make
+    /// one, must not be read into them: the agent's own tools refuse it.
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_readme_outside_the_workspace_is_not_read() {
+        let root = temp_root("linked-readme");
+        let outside = temp_root("linked-readme-outside");
+        fs::write(outside.join("config.toml"), "api_key = \"sk-SECRET-123\"\n").unwrap();
+        std::os::unix::fs::symlink(outside.join("config.toml"), root.join("README.md")).unwrap();
+        let rendered = WorkspaceSnapshot::scan(&root).render();
+        fs::remove_dir_all(&root).unwrap();
+        fs::remove_dir_all(&outside).unwrap();
+        assert!(!rendered.contains("sk-SECRET-123"), "{rendered}");
+    }
+
+    /// Pathfinder's private files inside the workspace (a database set
+    /// there, a staging copy) are neither listed nor read, as in `ls`.
+    #[test]
+    fn private_files_in_the_workspace_are_left_out() {
+        let root = temp_root("private-in-ws");
+        fs::create_dir_all(root.join("staging/s")).unwrap();
+        fs::write(root.join("staging/s/README.md"), "staged secret plan\n").unwrap();
+        fs::write(root.join("harness.sqlite"), "db").unwrap();
+        fs::write(root.join("notes.txt"), "mine").unwrap();
+        let canon = root.canonicalize().unwrap();
+        let private = crate::paths::Private {
+            dirs: vec![canon.join("staging")],
+            files: vec![canon.join("harness.sqlite")],
+            made: vec![],
+        };
+        let visible = Visible::with(&root, &private);
+        let rendered = WorkspaceSnapshot::scan_with(&root, &visible).render();
+        fs::remove_dir_all(&root).unwrap();
+        assert!(rendered.contains("notes.txt"), "{rendered}");
+        for hidden in ["staging", "harness.sqlite", "staged secret plan"] {
+            assert!(!rendered.contains(hidden), "{hidden} shown:\n{rendered}");
+        }
     }
 }

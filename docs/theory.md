@@ -131,9 +131,9 @@ Everything in sections 1–14 can be done by saying it. "Where does the gate dec
 Two kinds of message are treated differently:
 
 - **Intent**: asking, looking something up, opening a source, exploring. Pathfinder acts on it directly.
-- **A commitment**: something that changes what the record says about you. Claiming you know a part, asking to be told (section 11), handing a part off or delegating it (sections 6 and 7), giving a verdict on a candidate.
+- **A commitment**: something that changes what the record says about you. Claiming you know a part, asking to be told (section 11), handing a part off or delegating it (sections 6 and 7), giving a verdict on a candidate or on the agent's result.
 
-A commitment read from plain language is still a model's proposal (section 9). Before it counts, it is shown back to you in one line, saying what will be recorded, and it can be undone in one step. Undoing never lowers the bar: a claim can be taken back right after you make it, but a verdict that has been judged, or an answer you have seen, is evidence about you and stays. So a commitment that starts work or settles a check (handing off, delegating, a verdict) waits for your OK instead of being undone afterwards. Pathfinder never records a commitment you didn't see, so the record stays something you said, not something a model guessed about you. When a decision model is unsure whether you meant a commitment, it asks instead of guessing.
+A commitment read from plain language is still a model's proposal (section 9). Before it counts, it is shown back to you in one line, saying what will be recorded, and it can be undone in one step. Undoing never lowers the bar: a claim can be taken back right after you make it, but a verdict that has been judged, or an answer you have seen, is evidence about you and stays. So a commitment that starts work or settles a check (handing off, delegating, a verdict, approving or objecting to the agent's result) waits for your OK instead of being undone afterwards. Pathfinder never records a commitment you didn't see, so the record stays something you said, not something a model guessed about you. When a decision model is unsure whether you meant a commitment, it asks instead of guessing.
 
 ## 16. The path: an exact next step, a loose horizon
 
@@ -250,7 +250,7 @@ flowchart TD
     T -->|concepts, belief| X[Extractor]
     R -->|summary| S[choose targets · A5] --> E[Examiner] --> K[register key · A6]
     R -->|"known · tell"| SB[shown back in one line · §15<br/>claim: undo next step · tell: Esc until shown]
-    R -->|"verdict · agent: handoff or delegate by part status"| OK[shown back · waits for Enter · §15<br/>Esc cancels · a verdict stays a note]
+    R -->|"verdict · approve · object (result in review) · agent on the part named: handoff if reviewable §12, else delegate"| OK[shown back · waits for Enter · §15<br/>Esc cancels · a verdict stays a note]
     R -->|"log · move · known · agent < 0.9, or unsure, while a candidate waits"| OK
     OK -->|verdict| J[Judge, no tools] --> RT[write pass/fail · retire key]
     SB -->|known| C[claim events] --> GP[walk prerequisites · gaps]
@@ -277,7 +277,7 @@ flowchart TD
     OUT[emit to the thread] --> TX[(session saved<br/>events, secrets, ledger<br/>committed as written)]
 ```
 
-A verdict read from plain words, even at low confidence while a candidate waits (any `log`, `move`, `known` or `agent` below 0.9, or no sure step at all, is shown back as a possible verdict), goes through your OK rather than straight to the Judge, because a judged verdict can't be undone (§15 wins over speed); Esc keeps the message as a note, so a question about the candidate is still answered. Exam answers and quick checks still go straight to the Judge: you asked to be asked. Undo appends a `retracted` event that only a claim can be the target of, so no undo can drop a pass, a fail or a review.
+A verdict read from plain words, even at low confidence while a candidate waits (any `log`, `move`, `known` or `agent` below 0.9, or no sure step at all, is shown back as a possible verdict), goes through your OK rather than straight to the Judge, because a judged verdict can't be undone (§15 wins over speed); Esc keeps the message as a note, so a question about the candidate is still answered. A quick check's verdict is shown back the same way: it is a verdict on a candidate like any other. Exam answers still go straight to the Judge: you asked to be asked, and an answer to a question is not a verdict on a candidate. Undo appends a `retracted` event that only a claim can be the target of, so no undo can drop a pass, a fail or a review.
 
 ## A4. Data model
 
@@ -412,7 +412,7 @@ flowchart LR
     T1[a concept with an open misconception<br/>→ flawed candidate that embodies it] --> T2[a concept with no evidence:<br/>unknown, claimed or delegated] --> T3[a shaky concept] --> T4[the concept with<br/>the fewest passes or oldest evidence]
 ```
 
-*Gaps, checked when a part is entered (after a claim or a delegation, only when there is a next part to enter):*
+*Gaps, checked when a part is entered (after a claim or a delegation, only when there is a next part to enter; right after an agent run, only gaps on that run's concepts, the rest wait for the next part entered):*
 
 ```mermaid
 flowchart LR
@@ -599,6 +599,6 @@ Run against recorded transcripts and scripted students before each release:
 - **Leak rate**: replies a key-blind decision model (a second provider when one is configured, else the gate's own) reads as giving the key away, tested against adversarial pressure transcripts (frustrated user, paraphrasing the candidate back to Tutor, multi-turn narrowing). The grader is calibrated on labelled drafts first, and messages taken as verdicts aren't graded. Target: none sent at p ≥ 0.7; replies from 0.45 to 0.7 are listed as borderline for a person to read.
 - **Candidate discrimination**: candidates must separate students who later pass from guessing.
 - **Check stealth & fairness**: planted flaws parse where a checker exists (JSON, Python, JS), and objections to real bugs are never scored as `review_missed`. That live diffs and agent reports never contradict a plant holds by construction (the review holds them back) and is covered by unit tests, not this eval.
-- **Evidence ratio**: `pass` over `claim` events per part, shown by `/why`, not a target.
+- **Evidence ratio**: of the concepts `/why` draws for a part, those with a `pass` against those resting on a `claim` alone, so it matches the drawing; not a target.
 - **Tagging soundness**: hand-tagged sample vs the Tagger, code and non-code work; no unsafe miss (a hunk tagged with some concepts but missing one it needs, so an approval could vouch for an idea you never showed). Untagged hunks are `delegated` and extra tags only undercount, so precision is reported, not a target.
 - **Coverage soundness**: no line counted as `vouched` without ledger evidence whose chain verifies, and no `claimed` line counted as `vouched`.

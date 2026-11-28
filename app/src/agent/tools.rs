@@ -6,11 +6,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use globset::GlobBuilder;
-use ignore::WalkBuilder;
 use regex::RegexBuilder;
 use serde_json::{Value, json};
 
-use super::confine::confine;
+use super::confine::{Visible, confine};
 use crate::llm::ToolSpec;
 
 const MAX_READ_LINES: usize = 2000;
@@ -492,11 +491,16 @@ pub fn change_file(
 
 /// Runs a tool. Errors are returned as text for the model to read.
 pub fn run(name: &str, args: &Value, env: &ToolEnv<'_>) -> Result<String, String> {
+    run_with(name, args, env, &Visible::new(env.root))
+}
+
+/// [`run`], with `vis` deciding what a walk may show.
+fn run_with(name: &str, args: &Value, env: &ToolEnv<'_>, vis: &Visible) -> Result<String, String> {
     match name {
-        "read" => read(args, env),
-        "ls" => ls(args, env),
-        "glob" => glob(args, env),
-        "grep" => grep(args, env),
+        "read" => read(args, env, vis),
+        "ls" => ls(args, env, vis),
+        "glob" => glob(args, env, vis),
+        "grep" => grep(args, env, vis),
         "edit" | "write" | "bash" => Err(format!(
             "`{name}` isn't available in this step, which only reads; answer with what you found"
         )),
@@ -546,7 +550,7 @@ pub fn view(
     let path = str_arg(args, "path").ok_or("`path` is required")?;
     let file = confine(env.root, path, false, env.attached)?;
     if !file.exists() {
-        return Err(not_found(path, env));
+        return Err(not_found(path, env, &Visible::new(env.root)));
     }
     let encode = |bytes: Vec<u8>| base64::engine::general_purpose::STANDARD.encode(bytes);
     match crate::llm::attachable_type(&file) {
@@ -638,6 +642,10 @@ pub(crate) struct PdfText {
     pub pages: std::sync::Arc<Vec<String>>,
     /// One per page: how far its text can be trusted.
     pub unclean: Vec<crate::pdftext::PageTrust>,
+    /// One per page: for a [`crate::pdftext::PageTrust::Lettered`] page,
+    /// its text from runs without wrong letters (see
+    /// [`crate::pdftext::trusted_text`]); empty for any other.
+    pub trusted: Vec<Vec<String>>,
 }
 
 /// [`pdf_pages`], with each page's reliability.
@@ -671,10 +679,11 @@ pub(crate) fn pdf_text(file: &Path, path: &str) -> Result<std::sync::Arc<PdfText
     if pages.last().is_some_and(|p| p.trim().is_empty()) {
         pages.pop();
     }
-    let unclean = repair_math(file, path, &mut pages);
+    let (unclean, trusted) = repair_math(file, path, &mut pages);
     let text = Arc::new(PdfText {
         pages: Arc::new(pages),
         unclean,
+        trusted,
     });
     let mut cache = cache.lock().unwrap();
     // Bounded: past the limit, start over rather than grow.
@@ -692,9 +701,14 @@ pub(crate) fn pdf_text(file: &Path, path: &str) -> Result<std::sync::Arc<PdfText
 /// Symbol and math fonts: when the text has private-use symbol codes, or
 /// `pdffonts` lists such a font, asks `pdftohtml -xml` which font drew what,
 /// maps the codes back (see [`crate::pdftext`]) and says which pages are
-/// still unreliable. Without poppler's help nothing is mapped, and pages
-/// with leftover codes are marked.
-fn repair_math(file: &Path, path: &str, pages: &mut [String]) -> Vec<crate::pdftext::PageTrust> {
+/// still unreliable, with the trusted text of the pages whose math font
+/// came out as letters. Without poppler's help nothing is mapped, and
+/// pages with leftover codes are marked.
+fn repair_math(
+    file: &Path,
+    path: &str,
+    pages: &mut [String],
+) -> (Vec<crate::pdftext::PageTrust>, Vec<Vec<String>>) {
     use crate::pdftext;
     let wanted = pdftext::has_private(pages)
         || run_poppler("pdffonts", &[], file, &[], path)
@@ -715,7 +729,18 @@ fn repair_math(file: &Path, path: &str, pages: &mut [String]) -> Vec<crate::pdft
     } else {
         None
     };
-    pdftext::repair(pages, fonts.as_ref())
+    let trust = pdftext::repair(pages, fonts.as_ref());
+    let trusted = trust
+        .iter()
+        .enumerate()
+        .map(
+            |(i, t)| match (t, fonts.as_ref().and_then(|f| f.get(&(i + 1)))) {
+                (pdftext::PageTrust::Lettered, Some(facts)) => pdftext::trusted_text(facts),
+                _ => Vec::new(),
+            },
+        )
+        .collect();
+    (trust, trusted)
 }
 
 /// Largest PDF read, how long `pdftotext` may take, and how much text the
@@ -840,7 +865,7 @@ fn read_pdf(file: &Path, path: &str, pages: Option<&str>) -> Result<String, Stri
 }
 
 /// "No such file", with the workspace's files of a similar name.
-fn not_found(path: &str, env: &ToolEnv<'_>) -> String {
+fn not_found(path: &str, env: &ToolEnv<'_>, vis: &Visible) -> String {
     let want = Path::new(path)
         .file_name()
         .map(|n| n.to_string_lossy().to_lowercase())
@@ -850,7 +875,7 @@ fn not_found(path: &str, env: &ToolEnv<'_>) -> String {
         .map_or(want.as_str(), |(s, _)| s)
         .to_string();
     let mut near: Vec<(u8, String)> = Vec::new();
-    for entry in WalkBuilder::new(env.root).build().flatten().take(20_000) {
+    for entry in vis.walk(env.root).build().flatten().take(20_000) {
         let name = entry.file_name().to_string_lossy().to_lowercase();
         let rank = if name == want {
             0
@@ -881,11 +906,11 @@ fn not_found(path: &str, env: &ToolEnv<'_>) -> String {
     msg
 }
 
-fn read(args: &Value, env: &ToolEnv<'_>) -> Result<String, String> {
+fn read(args: &Value, env: &ToolEnv<'_>, vis: &Visible) -> Result<String, String> {
     let path = str_arg(args, "path").ok_or("`path` is required")?;
     let file = confine(env.root, path, false, env.attached)?;
     if !file.exists() {
-        return Err(not_found(path, env));
+        return Err(not_found(path, env, vis));
     }
     if file.is_dir() {
         return Err(format!("`{path}` is a folder; use `ls` to list it"));
@@ -951,7 +976,7 @@ fn read(args: &Value, env: &ToolEnv<'_>) -> Result<String, String> {
     Ok(out)
 }
 
-fn ls(args: &Value, env: &ToolEnv<'_>) -> Result<String, String> {
+fn ls(args: &Value, env: &ToolEnv<'_>, vis: &Visible) -> Result<String, String> {
     let dir = confine(env.root, str_arg(args, "path").unwrap_or("."), false, &[])?;
     if !dir.is_dir() {
         return Err("not a folder".to_string());
@@ -962,7 +987,8 @@ fn ls(args: &Value, env: &ToolEnv<'_>) -> Result<String, String> {
         .unwrap_or(2)
         .clamp(1, 3) as usize;
     let mut out = Vec::new();
-    let walk = WalkBuilder::new(&dir)
+    let walk = vis
+        .walk(&dir)
         .max_depth(Some(depth))
         .sort_by_file_name(Ord::cmp)
         .build();
@@ -981,7 +1007,7 @@ fn ls(args: &Value, env: &ToolEnv<'_>) -> Result<String, String> {
     })
 }
 
-fn glob(args: &Value, env: &ToolEnv<'_>) -> Result<String, String> {
+fn glob(args: &Value, env: &ToolEnv<'_>, vis: &Visible) -> Result<String, String> {
     let pattern = str_arg(args, "pattern").ok_or("`pattern` is required")?;
     let matcher = GlobBuilder::new(pattern)
         .literal_separator(false)
@@ -990,7 +1016,8 @@ fn glob(args: &Value, env: &ToolEnv<'_>) -> Result<String, String> {
         .compile_matcher();
     let base = confine(env.root, str_arg(args, "path").unwrap_or("."), false, &[])?;
     let mut hits = Vec::new();
-    for entry in WalkBuilder::new(&base)
+    for entry in vis
+        .walk(&base)
         .sort_by_file_name(Ord::cmp)
         .build()
         .flatten()
@@ -1014,7 +1041,7 @@ fn glob(args: &Value, env: &ToolEnv<'_>) -> Result<String, String> {
     })
 }
 
-fn grep(args: &Value, env: &ToolEnv<'_>) -> Result<String, String> {
+fn grep(args: &Value, env: &ToolEnv<'_>, vis: &Visible) -> Result<String, String> {
     let pattern = str_arg(args, "pattern").ok_or("`pattern` is required")?;
     let re = RegexBuilder::new(pattern)
         .case_insensitive(
@@ -1036,7 +1063,8 @@ fn grep(args: &Value, env: &ToolEnv<'_>) -> Result<String, String> {
     let base = confine(env.root, str_arg(args, "path").unwrap_or("."), false, &[])?;
     let mut hits = Vec::new();
     let mut skipped = 0;
-    'files: for entry in WalkBuilder::new(&base)
+    'files: for entry in vis
+        .walk(&base)
         .sort_by_file_name(Ord::cmp)
         .build()
         .flatten()
@@ -1191,6 +1219,77 @@ mod tests {
         );
         assert!(run("bash", &json!({}), &env).is_err());
         fs::remove_dir_all(ws).unwrap();
+    }
+
+    /// A database kept in the workspace, its staging copies and tui log,
+    /// a link to it and a link to a private folder elsewhere: no walk names
+    /// or reads any of them (theory §11, A2).
+    #[cfg(unix)]
+    #[test]
+    fn walks_never_show_pathfinders_private_files() {
+        use std::os::unix::fs::symlink;
+        let ws = workspace();
+        let data = ws.join("data");
+        let db = data.join("harness.sqlite");
+        fs::create_dir_all(data.join("staging/s/p1")).unwrap();
+        fs::write(&db, "SECRETDB rows").unwrap();
+        fs::write(data.join("harness.sqlite-wal"), "SECRETDB wal").unwrap();
+        fs::write(data.join("tui.log"), "SECRETDB log").unwrap();
+        fs::write(data.join("staging/s/p1/answer.rs"), "// SECRETDB copy").unwrap();
+        fs::write(data.join("notes.txt"), "mine").unwrap();
+        let home = std::env::temp_dir().join(format!("harness-home-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&home).unwrap();
+        fs::write(home.join("state.json"), "SECRETDB state").unwrap();
+        symlink(&home, ws.join("home-link")).unwrap();
+        symlink(data.join("staging"), ws.join("staging-link")).unwrap();
+        symlink(&db, ws.join("db-link.txt")).unwrap();
+        let mut private = crate::paths::private_paths_for(&db);
+        private.dirs.push(home.clone());
+        let vis = Visible::with(&ws, &private);
+        let env = ToolEnv {
+            root: &ws,
+            attached: &[],
+        };
+        let tool = |name: &str, args: Value| run_with(name, &args, &env, &vis).unwrap();
+        let outputs = [
+            tool("ls", json!({"depth": 3})),
+            tool("ls", json!({"path": "data", "depth": 3})),
+            tool("glob", json!({"pattern": "**/*"})),
+            tool("grep", json!({"pattern": "SECRETDB"})),
+            tool("grep", json!({"pattern": "SECRETDB", "path": "data"})),
+            run_with("read", &json!({"path": "harness"}), &env, &vis).unwrap_err(),
+        ];
+        for out in &outputs {
+            for name in [
+                "SECRETDB",
+                "harness.sqlite",
+                "tui.log",
+                "staging",
+                "answer.rs",
+                "home-link",
+                "db-link",
+                "state.json",
+            ] {
+                assert!(!out.contains(name), "`{name}` shown in:\n{out}");
+            }
+        }
+        // What is the user's still shows.
+        assert!(outputs[0].contains("data/notes.txt"));
+        assert!(outputs[2].contains("data/notes.txt"));
+        assert_eq!(outputs[3], "No matches.");
+        // A staging copy's own walk still sees its files.
+        let copy = dunce::canonicalize(data.join("staging/s/p1")).unwrap();
+        let inside = Visible::with(&copy, &private);
+        let copy_env = ToolEnv {
+            root: &copy,
+            attached: &[],
+        };
+        assert_eq!(
+            run_with("glob", &json!({"pattern": "*.rs"}), &copy_env, &inside).unwrap(),
+            "answer.rs"
+        );
+        fs::remove_dir_all(ws).unwrap();
+        fs::remove_dir_all(home).unwrap();
     }
 
     #[test]
@@ -1355,14 +1454,24 @@ mod tests {
             root: &ws,
             attached: &[],
         };
-        let err = read(&json!({"path": "main.rs"}), &env).unwrap_err();
+        let err = read(&json!({"path": "main.rs"}), &env, &Visible::new(&ws)).unwrap_err();
         assert!(err.contains("src/main.rs"), "{err}");
-        let err = read(&json!({"path": "Cargo.toml", "offset": 99}), &env).unwrap_err();
+        let err = read(
+            &json!({"path": "Cargo.toml", "offset": 99}),
+            &env,
+            &Visible::new(&ws),
+        )
+        .unwrap_err();
         assert!(err.contains("past the end"), "{err}");
         let err = run("edit", &json!({}), &env).unwrap_err();
         assert!(err.contains("only reads"), "{err}");
         // A relative glob filter on grep matches paths under the search root.
-        let out = grep(&json!({"pattern": "println", "glob": "src/**/*.rs"}), &env).unwrap();
+        let out = grep(
+            &json!({"pattern": "println", "glob": "src/**/*.rs"}),
+            &env,
+            &Visible::new(&ws),
+        )
+        .unwrap();
         assert!(out.contains("src/main.rs:2"), "{out}");
         fs::remove_dir_all(ws).unwrap();
     }

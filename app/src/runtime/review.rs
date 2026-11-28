@@ -83,13 +83,13 @@ struct Caught {
     caught: bool,
 }
 
-const PLANT_SYSTEM: &str = r#"You make a review check for Pathfinder. The user is about to review an agent's change. You get one hunk of it (the lines it adds) and the concepts the change relies on. Rewrite the hunk's added lines so they contain exactly one plausible conceptual flaw: a mistake someone who understands those concepts would catch when reading the diff, and that changes the behaviour the part is about.
+pub(super) const PLANT_SYSTEM: &str = r#"You make a review check for Pathfinder. The user is about to review an agent's change. You get one hunk of it (the lines it adds) and the concepts the change relies on. Rewrite the hunk's added lines so they contain exactly one plausible conceptual flaw: a mistake someone who understands those concepts would catch when reading the diff, and that changes the behaviour the part is about.
 
 - Keep it the same size and style, so it reads like the agent wrote it. It must still parse and look intentional.
 - The flaw is about the concepts, not a typo, a syntax error, a renamed variable or a removed line.
 - No comments that hint at it.
 
-`added`: the replacement added lines, exactly as they'd appear in the file (keep indentation), separated by newlines. `flaw`: what is wrong and why it matters, in one or two sentences.
+`added`: the replacement added lines, exactly as they'd appear in the file (keep indentation), separated by newlines. `flaw`: what is wrong and why it matters, in one or two sentences. In `flaw`, write math as plain text or Unicode (x², √, ≤, μᵢ), never LaTeX.
 
 Return ONLY a JSON object:
 {"added": "...", "flaw": "..."}"#;
@@ -554,6 +554,9 @@ impl Runtime {
                     .collect();
                 self.append_events(session, events);
                 self.record_review(session, &part.id, &part.unreviewed, "checked_missed", None);
+                if let Some(p) = session.map.get_mut(&part.id) {
+                    p.review_missed = true;
+                }
                 lead.push_str(&format!(
                     "This review was checked: one hunk had a planted flaw.\n\n{}\nThe flaw: {}\n\nYou approved it, so this review isn't recorded as one, and what it relied on counts as shaky again. Your files get the agent's real result.\n\n",
                     planted.candidate(),
@@ -562,6 +565,9 @@ impl Runtime {
             }
             None => {
                 self.record_review(session, &part.id, &part.unreviewed, "approved", None);
+                if let Some(p) = session.map.get_mut(&part.id) {
+                    p.review_missed = false;
+                }
             }
         }
         let applied = self.apply_staged(session, &staging).await;
@@ -578,7 +584,11 @@ impl Runtime {
         }
         std::fs::remove_dir_all(&staging.dir).ok();
         self.set_status(session, &part.id, PartStatus::Done, "result approved")?;
-        Ok(self.after_resolution(session, format!("{lead}\n\n**{}** done.", part.title)))
+        Ok(self.after_agent_run(
+            session,
+            format!("{lead}\n\n**{}** done.", part.title),
+            &part.concepts,
+        ))
     }
 
     /// `/object` on a staged review: catching the planted flaw ends the
@@ -611,6 +621,8 @@ impl Runtime {
                     "checked_caught",
                     Some(reason),
                 );
+                // What you did comes first: a long report and the next
+                // part's card would otherwise bury it.
                 let mut lead = format!(
                     "You caught it: that hunk was a planted check, never part of the agent's work. ({})\n\nYour files get the agent's real result.\n\n",
                     planted.reason()
@@ -625,12 +637,21 @@ impl Runtime {
                 if let Some(p) = session.map.get_mut(&part.id) {
                     p.unreviewed.clear();
                     p.staging = None;
+                    p.review_caught = true;
+                    p.review_missed = false;
                 }
                 std::fs::remove_dir_all(&staging.dir).ok();
-                self.set_status(session, &part.id, PartStatus::Done, "planted flaw caught")?;
-                return Ok(
-                    self.after_resolution(session, format!("{lead}\n\n**{}** done.", part.title))
-                );
+                self.set_status(
+                    session,
+                    &part.id,
+                    PartStatus::Done,
+                    "planted flaw caught, objected",
+                )?;
+                return Ok(self.after_agent_run(
+                    session,
+                    format!("{lead}\n\n**{}** done.", part.title),
+                    &part.concepts,
+                ));
             }
             // A real objection on a checked review: never a miss. The plant
             // is retired now, so it's revealed: you shouldn't go on
@@ -875,12 +896,12 @@ mod tests {
             req: &'a EngineRequest,
             _sink: StreamSink,
         ) -> BoxFuture<'a, Result<String>> {
-            let step = self
-                .0
-                .lock()
-                .unwrap()
-                .pop_front()
-                .expect("unexpected engine call");
+            let step = self.0.lock().unwrap().pop_front().unwrap_or_else(|| {
+                panic!(
+                    "unexpected engine call: {}",
+                    req.prompt.chars().take(300).collect::<String>()
+                )
+            });
             Box::pin(async move {
                 match step {
                     Step::Agent(file, content) => {
@@ -1099,11 +1120,124 @@ mod tests {
         )
         .await;
         assert!(out.contains("You caught it"), "{out}");
+        // What you did comes first, before the agent's report and any next
+        // part's card.
+        assert!(
+            out.starts_with("You caught it: that hunk was a planted check"),
+            "{out}"
+        );
+        assert!(
+            out.find("You caught it").unwrap()
+                < out.find("The agent's report").unwrap_or(usize::MAX),
+            "{out}"
+        );
+        let s = rt.store.load_session("s").unwrap().unwrap();
+        let last = s
+            .history
+            .iter()
+            .rev()
+            .find(|t| t.role == "assistant")
+            .unwrap();
+        assert!(
+            last.content.starts_with("You caught it"),
+            "the thread keeps the order"
+        );
+        // The record says you caught it and objected, never that you
+        // approved it.
+        let why = turn(&rt, "/why").await;
+        assert!(
+            why.contains("you caught the planted check and objected"),
+            "{why}"
+        );
+        assert!(!why.contains("you approved it"), "{why}");
         assert_eq!(std::fs::read_to_string(dir.join("app.py")).unwrap(), REAL);
         let root = ledger::repo_root(&dir).unwrap();
         let entries = rt.store.ledger(&root.to_string_lossy()).unwrap();
         let c = ledger::coverage(&root, &entries);
         assert_eq!(c.total.get(&ledger::Bucket::Vouched), Some(&2));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Adversarial: one Enter queued two parts for the agent; catching the
+    /// planted check on the first finishes it (Done), so the queue goes on
+    /// at once, never waiting for an unrelated later `/approve`.
+    #[tokio::test]
+    async fn adv_catching_a_plant_does_not_strand_the_agent_queue() {
+        let (rt, dir) = setup(vec![
+            Step::Agent("app.py", REAL),
+            Step::Json(PLANT),
+            Step::Json(r#"{"caught":true}"#),
+            Step::Agent("docs.md", "# Routing\n"),
+            Step::Json(r#"{"added":"","flaw":""}"#),
+            Step::Json(
+                r#"{"added":"Unknown names go to help.","flaw":"Unknown names are documented as falling back to help."}"#,
+            ),
+        ]);
+        let mut s = rt.store.load_session("s").unwrap().unwrap();
+        let mut docs = Part::new("docs".into(), "Docs".into(), String::new(), vec![]);
+        docs.concepts = vec!["dispatch".into()];
+        docs.status = PartStatus::Understood;
+        s.map.parts.push(docs);
+        s.pending_commitment = Some(crate::domain::PendingCommitment {
+            kind: crate::domain::CommitKind::Handoff,
+            part: "route".into(),
+            text: "do both".into(),
+            files: vec![],
+            candidate: None,
+            then: vec![crate::domain::QueuedAgent {
+                part: "docs".into(),
+                kind: crate::domain::CommitKind::Handoff,
+            }],
+        });
+        rt.store.save_session(&s).unwrap();
+        turn(&rt, "/confirm").await;
+        let out = turn(
+            &rt,
+            "/object unknown names fall back to help instead of failing",
+        )
+        .await;
+        assert!(
+            out.contains("You caught it")
+                || rt
+                    .store
+                    .load_session("s")
+                    .unwrap()
+                    .unwrap()
+                    .history
+                    .iter()
+                    .any(|t| t.content.contains("You caught it")),
+            "{out}"
+        );
+        let s = rt.store.load_session("s").unwrap().unwrap();
+        assert_eq!(s.map.get("route").unwrap().status, PartStatus::Done);
+        assert!(
+            s.agent_queue.is_empty(),
+            "queue stranded after a caught plant"
+        );
+        assert_ne!(
+            s.map.get("docs").unwrap().status,
+            PartStatus::Understood,
+            "the queued part never ran"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A part you hand over yourself replaces what an older request left
+    /// queued: a later `/approve` never starts it.
+    #[tokio::test]
+    async fn a_new_handoff_drops_an_older_queue() {
+        let (rt, dir) = setup(vec![Step::Agent("app.py", REAL), Step::Json(PLANT)]);
+        let mut s = rt.store.load_session("s").unwrap().unwrap();
+        s.agent_queue = vec![crate::domain::QueuedAgent {
+            part: "docs".into(),
+            kind: crate::domain::CommitKind::Handoff,
+        }];
+        s.agent_text = "old request".into();
+        rt.store.save_session(&s).unwrap();
+        turn(&rt, "/handoff").await;
+        let s = rt.store.load_session("s").unwrap().unwrap();
+        assert!(s.agent_queue.is_empty());
+        assert!(s.agent_text.is_empty());
         std::fs::remove_dir_all(&dir).ok();
     }
 }

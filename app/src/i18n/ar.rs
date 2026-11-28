@@ -88,12 +88,20 @@ fn line(l: Line) -> &'static str {
         ShowDelegate => {
             "تسليم **{title}** دون فهمه؟ سيُسجّل على أنه مُسلّم: لن تكفل النتيجة. Enter للتنفيذ · Esc للإلغاء."
         }
+        DelegateWhy => "ليس تسليمًا مع مراجعتك: لم تُظهر {concepts} بعد.",
         ShowVerdict => "أأحكم على هذا كحكمك على المرشّح؟ «{words}» Enter للحكم · Esc لإبقائه ملاحظة.",
+        ShowApprove => "هل توافق على نتيجة الوكيل لـ **{title}**؟ Enter يوافق · Esc يلغي.",
+        ShowObject => {
+            "هل تعيد **{title}** إلى الوكيل مع اعتراضك؟ “{words}” Enter يرسله · Esc يلغي."
+        }
         NotRunVerdict => "لم يُحكم عليه كحكم: أُبقي ملاحظة.",
         NotRunHandoff => "لم يُنفّذ: لم يُسلَّم **{title}** للوكيل.",
         NotRunDelegate => "لم يُنفّذ: لم يُسلَّم **{title}**.",
+        NotRunApprove => "لم يُنفَّذ: لم تتم الموافقة على **{title}**.",
+        NotRunObject => "لم يُنفَّذ: لم يُرسَل اعتراضك على **{title}**.",
         NotRunStale => "لم يُنفّذ: ما كان ينتظر موافقتك لم يعد قائمًا.",
         AskWhich => "ماذا قصدت: {choices}؟ لا يُسجّل شيء حتى تقول؛ يكفي رقم أو بضع كلمات.",
+        AskAgentPart => "دع الوكيل يقوم بـ **{title}**",
         AskKnown => "سجّل أنني أعرف **{title}** مسبقًا (دون تحقق)",
         AskTell => "أخبرني فحسب",
         AskAgent => "دع الوكيل يتولى هذا الجزء",
@@ -120,11 +128,42 @@ fn line(l: Line) -> &'static str {
         Horizon => "الأفق: {what}.",
         HorizonNeeds => "يحتاج {parts}",
         HorizonLeads => "يقود إلى {parts}",
-        EvidenceRatio => "النجاحات: {passes} · الادعاءات: {claims}.",
+        EvidenceRatio => "من الأفكار أعلاه، اجتاز {passes} فحصًا، ويستند {claims} إلى كلامك وحده.",
         ClaimWithdrawn => "سُحب الادعاء بشأن **{concept}** ({date}).",
-        StepHistory => "كيف وصلت إلى هنا: {kinds}.",
-        StepKindRate => "{kind} {passes} من {judged} قادت إلى نجاح",
+        StepHistory => "ما قاد إلى نجاح حتى الآن: {kinds}.",
+        StepKindRate => "{kind}، {passes} من {judged} مرات",
         SteeredTimes => "وجّهته أنت {n} مرات",
+        AngleExample => "البدء بمثال",
+        AnglePurpose => "السؤال عن الغرض منه",
+        AngleMechanism => "تتبّع كيف يعمل",
+        AgentWork => "**ما سُلّم إلى الوكيل**",
+        AgentInReview => {
+            "**{title}**: قابل للمراجعة، سُلّم بعد أن أظهرت ما يستند إليه؛ ينتظر مراجعتك."
+        }
+        AgentApproved => "**{title}**: قابل للمراجعة، سُلّم بعد أن أظهرت ما يستند إليه؛ وافقت عليه.",
+        AgentMissedCheck => "**{title}**: وافقت عليه دون أن تلتقط الفحص؛ لا يُحتسب مراجعة، ولا تضمنه.",
+        AgentDelegated => "**{title}**: مُفوَّض، أُنجز دون فهمك؛ لا تضمنه.",
+        AgentCaughtCheck => {
+            "**{title}**: قابل للمراجعة؛ في مراجعته التقطت الفحص المزروع واعترضت، فكُتبت النتيجة الحقيقية للوكيل."
+        }
+        ShowAgentParts => {
+            "أيقوم الوكيل بهذه الأجزاء واحدًا تلو الآخر؟ {parts}. Enter يشغّلها كلها · Esc يلغي."
+        }
+        AgentPartHandoff => "**{title}** (تسليم: تراجع النتيجة بنفسك)",
+        AgentPartDelegate => "**{title}** (مُفوَّض: لا تضمنه)",
+        AgentPartDelegateWhy => "**{title}** (مُفوَّض: لم تُظهر {concepts} بعد)",
+        ConfirmHandoff => "نعم، سلّمه",
+        ConfirmDelegate => "نعم، فوّضه",
+        ConfirmVerdict => "نعم، احكم عليه",
+        ConfirmApprove => "نعم، وافق عليه",
+        ConfirmObject => "نعم، أعده",
+        CancelShown => "لا",
+        ShowKnownShown => {
+            "سُجّل: أنت تعرف **{title}** مسبقًا. أظهرت من قبل كل فكرة يستند إليها، فهو يقوم على فحوصك لا على كلامك وحده. قل «تراجع» أو اضغط Esc لسحبه."
+        }
+        ShowKnownSome => {
+            "سُجّل: أنت تعرف **{title}** مسبقًا. كلامك وحده لـ {concepts}؛ والباقي أظهرته من قبل. قل «تراجع» أو اضغط Esc لسحبه."
+        }
         StepHistoryNote => {
             "هذا كل ما يحتفظ به Pathfinder عن طريقة تعلّمك، في السجل المحلي لهذا المجلد."
         }

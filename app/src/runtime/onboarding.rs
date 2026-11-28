@@ -30,10 +30,10 @@ impl Runtime {
             tier: EngineTier::System1,
             tools: ToolAccess::ReadOnly,
             cwd: session.cwd.clone(),
-            system_prompt: ONBOARDING_SYSTEM.to_string(),
+            system_prompt: in_language(ONBOARDING_SYSTEM, session),
             prompt: format!(
                 "Workspace snapshot:\n{snapshot}\n\nConversation so far:\n{}\n\nRead any files you need first, then respond with JSON only.",
-                format_history(session)
+                self.format_history(session)
             ),
             files: files.to_vec(),
             stream_text: false,
@@ -53,7 +53,11 @@ impl Runtime {
             Some("reply"),
         )
         .await?;
-        if let Some(lang) = decision.language.as_deref().and_then(crate::i18n::code) {
+        // The model's reading of your language only fills a gap: once your
+        // own words set it, it stays until they change it (§15).
+        if session.language.is_none()
+            && let Some(lang) = decision.language.as_deref().and_then(crate::i18n::code)
+        {
             session.language = Some(lang);
         }
         if decision.question && !decision.ready_to_map {
@@ -96,7 +100,30 @@ impl Runtime {
         }
         if decision.ready_to_map {
             sink(StreamEvent::TextDelta("\n\n".to_string()));
-            return self.build_map(session, files, sink).await;
+            let out = self.build_map(session, files, sink).await?;
+            // "Let the agent write the letter" in the message that starts
+            // the map: proposed once the map is there, for the part the
+            // words name, and run only on Enter (§15), not dropped.
+            if !session.quick_check
+                && !session.exam
+                && session.active.is_some()
+                && super::refer::plain_commitment(text) == Some(AGENT)
+            {
+                let before = session.history.len();
+                let ask = self.agent_step(session, text, files, None);
+                // One reply in the thread: the map, then the proposal.
+                if session.history.len() == before + 1
+                    && before > 0
+                    && session.history[before - 1].role == "assistant"
+                {
+                    let line = session.history.pop().unwrap().content;
+                    let map = &mut session.history[before - 1].content;
+                    map.push_str("\n\n");
+                    map.push_str(&line);
+                }
+                return Ok(TurnOutput::text(format!("{}\n\n{}", out.reply, ask.reply)));
+            }
+            return Ok(out);
         }
         Ok(TurnOutput::text(String::new()))
     }
@@ -112,7 +139,7 @@ impl Runtime {
             tier: EngineTier::System2,
             tools: ToolAccess::ReadOnly,
             cwd: session.cwd.clone(),
-            system_prompt: MAP_SYSTEM.to_string(),
+            system_prompt: in_language(MAP_SYSTEM, session),
             prompt: format!(
                 "Goal: {}\n\nWorkspace snapshot:\n{snapshot}{}\n\nOnboarding conversation:\n{}\n\nRead any files you need first, then respond with JSON only.",
                 session
@@ -120,7 +147,7 @@ impl Runtime {
                     .as_deref()
                     .unwrap_or("(infer from the conversation)"),
                 self.known_concepts_prompt(session),
-                format_history(session)
+                self.format_history(session)
             ),
             files: files.to_vec(),
             stream_text: false,
@@ -162,20 +189,20 @@ impl Runtime {
         session.advance();
 
         if quick && let Some(part_id) = session.active.clone() {
-            let lead = format!(
-                "{}\n\n",
-                i18n::line(
-                    session.language.as_deref(),
-                    if session.exam {
-                        i18n::Line::ExamLead
-                    } else {
-                        i18n::Line::QuickCheckLead
-                    }
-                )
+            // The lead goes with the candidate's header, after any files
+            // the candidate writer reads: alone it would be an empty
+            // heading above the tool lines.
+            let lead = i18n::line(
+                session.language.as_deref(),
+                if session.exam {
+                    i18n::Line::ExamLead
+                } else {
+                    i18n::Line::QuickCheckLead
+                },
             );
-            sink(StreamEvent::TextDelta(lead.clone()));
-            session.push_turn("assistant", lead.trim());
-            let ask = self.write_candidate(session, &part_id, files, sink).await?;
+            let ask = self
+                .write_candidate_led(session, &part_id, files, sink, Some(lead))
+                .await?;
             return Ok(TurnOutput::text(ask));
         }
 
@@ -200,9 +227,9 @@ impl Runtime {
             tier: EngineTier::System2,
             tools: ToolAccess::ReadOnly,
             cwd: session.cwd.clone(),
-            system_prompt: CHANGE_SYSTEM.to_string(),
+            system_prompt: in_language(CHANGE_SYSTEM, session),
             prompt: format!(
-                "Goal: {}\nWhat changed: {}\n\nCurrent map:\n{}\n\nRecent conversation:\n{}\n\nRead any files you need first, then respond with JSON only.",
+                "Goal: {}\nWhat changed: {}\n\nCurrent map:\n{}{}\n\nRecent conversation:\n{}\n\nRead any files you need first, then respond with JSON only.",
                 session.goal.as_deref().unwrap_or("(session goal)"),
                 if reason.is_empty() {
                     "(infer from the conversation)"
@@ -210,7 +237,8 @@ impl Runtime {
                     reason
                 },
                 session.map.render(session.active.as_deref()),
-                format_history(session)
+                self.known_concepts_prompt(session),
+                self.format_history(session)
             ),
             files: files.to_vec(),
             stream_text: false,
@@ -285,9 +313,9 @@ impl Runtime {
             }
             None if session.map.all_resolved() => {
                 session.advance();
-                TurnOutput::text(i18n::line(
+                TurnOutput::text(i18n::all_resolved(
                     session.language.as_deref(),
-                    i18n::Line::AllResolved,
+                    &session.map,
                 ))
             }
             None => TurnOutput::text(i18n::line(

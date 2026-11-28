@@ -206,7 +206,8 @@ pub async fn search(queries: &[String], words: &[String]) -> WebFound {
     let mut add = |r: Result<Vec<WebResult>, String>, notes: &mut Vec<String>| match r {
         Ok(rs) => {
             for r in rs {
-                if !results.iter().any(|o| o.url == r.url) {
+                let key = sources::source_key(&r.url);
+                if !results.iter().any(|o| sources::source_key(&o.url) == key) {
                     results.push(r);
                 }
             }

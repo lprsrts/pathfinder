@@ -90,16 +90,24 @@ fn line(l: Line) -> &'static str {
         ShowDelegate => {
             "Delegate **{title}** without understanding it? It's recorded as delegated: you won't vouch for the result. Enter runs · Esc cancels."
         }
+        DelegateWhy => "Not a handoff with your review: you haven't shown {concepts} yet.",
         ShowVerdict => {
             "Judge this as your verdict on the candidate? “{words}” Enter judges · Esc keeps it as a note."
+        }
+        ShowApprove => "Approve the agent's result for **{title}**? Enter approves · Esc cancels.",
+        ShowObject => {
+            "Send **{title}** back to the agent with your objection? “{words}” Enter sends it · Esc cancels."
         }
         NotRunVerdict => "Not judged as a verdict: kept as a note.",
         NotRunHandoff => "Not run: **{title}** wasn't handed to the agent.",
         NotRunDelegate => "Not run: **{title}** wasn't delegated.",
+        NotRunApprove => "Not run: **{title}** wasn't approved.",
+        NotRunObject => "Not run: your objection on **{title}** wasn't sent.",
         NotRunStale => "Not run: what waited for your OK no longer applies.",
         AskWhich => {
             "Which did you mean: {choices}? Nothing is recorded until you say; a number or a few words is enough."
         }
+        AskAgentPart => "let the agent do **{title}**",
         AskKnown => "record that I already know **{title}** (no check)",
         AskTell => "just tell me",
         AskAgent => "let the agent do this part",
@@ -132,11 +140,50 @@ fn line(l: Line) -> &'static str {
         Horizon => "Horizon: {what}.",
         HorizonNeeds => "needs {parts}",
         HorizonLeads => "leads to {parts}",
-        EvidenceRatio => "Passes: {passes} · claims: {claims}.",
+        EvidenceRatio => {
+            "Of the ideas above, {passes} passed a check and {claims} rest on your word alone."
+        }
         ClaimWithdrawn => "Claim on **{concept}** withdrawn ({date}).",
-        StepHistory => "How you got here: {kinds}.",
-        StepKindRate => "{kind} {passes} of {judged} led to a pass",
+        StepHistory => "What has led to a pass so far: {kinds}.",
+        StepKindRate => "{kind}, {passes} of {judged} times",
         SteeredTimes => "steered by you {n} times",
+        AngleExample => "starting from an example",
+        AnglePurpose => "asking what it's for",
+        AngleMechanism => "tracing how it works",
+        AgentWork => "**Handed to the agent**",
+        AgentInReview => {
+            "**{title}**: reviewable, handed off after you showed what it rests on; waiting for your review."
+        }
+        AgentApproved => {
+            "**{title}**: reviewable, handed off after you showed what it rests on; you approved it."
+        }
+        AgentMissedCheck => {
+            "**{title}**: approved without catching the check; not recorded as a review, you don't vouch for it."
+        }
+        AgentDelegated => {
+            "**{title}**: delegated, done without your understanding; you don't vouch for it."
+        }
+        AgentCaughtCheck => {
+            "**{title}**: reviewable; in its review you caught the planted check and objected, so the agent's real result was written."
+        }
+        ShowAgentParts => {
+            "Let the agent do these parts, one after another? {parts}. Enter runs them all · Esc cancels."
+        }
+        AgentPartHandoff => "**{title}** (a handoff: you review the result)",
+        AgentPartDelegate => "**{title}** (delegated: you won't vouch for it)",
+        AgentPartDelegateWhy => "**{title}** (delegated: you haven't shown {concepts} yet)",
+        ConfirmHandoff => "yes, hand it off",
+        ConfirmDelegate => "yes, delegate it",
+        ConfirmVerdict => "yes, judge it",
+        ConfirmApprove => "yes, approve it",
+        ConfirmObject => "yes, send it back",
+        CancelShown => "no",
+        ShowKnownShown => {
+            "Recorded: you already know **{title}**. You've already shown every idea it rests on, so it stands on your checks, not only your word. Say undo, or press Esc, to take it back."
+        }
+        ShowKnownSome => {
+            "Recorded: you already know **{title}**. Only your word for {concepts}; the rest you've already shown. Say undo, or press Esc, to take it back."
+        }
         StepHistoryNote => {
             "That is all Pathfinder keeps about how you learn, in this folder's local record."
         }

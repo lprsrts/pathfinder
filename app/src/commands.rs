@@ -1395,6 +1395,7 @@ mod tests {
             text: String::new(),
             files: vec![],
             candidate: None,
+            then: Vec::new(),
         });
         let first_two: Vec<&str> = contextual_actions(&s)
             .into_iter()
@@ -1413,6 +1414,7 @@ mod tests {
             prev_mode: SessionMode::Working,
             prev_change: None,
             prev_gaps: vec![],
+            also: vec![],
         });
         assert_eq!(contextual_actions(&s)[0].command, "/undo");
         assert!(runs_now("/undo", &s) && !runs_now("/cancel", &s));

@@ -60,11 +60,10 @@ fn confine_with(
             dunce::simplified(&root).display()
         ));
     }
-    let hidden = private
-        .all()
-        .filter_map(|p| resolve(p).ok())
-        .any(|p| !root.starts_with(&p) && resolved.starts_with(&p));
-    if hidden {
+    if hidden_from(&root, private)
+        .iter()
+        .any(|p| under(&resolved, p))
+    {
         return Err(format!(
             "`{requested}` is one of Pathfinder's own files (its record, settings or another review's copy), which the agent's tools can't open"
         ));
@@ -87,6 +86,79 @@ fn confine_with(
         }
     }
     Ok(plain(resolved))
+}
+
+/// Whether `path` is `prefix` or inside it. On macOS and Windows, whose
+/// disks ignore case by default, case is ignored too: a private file that
+/// doesn't exist yet (a database's `-journal`) keeps the case it was
+/// spelled in, and `HARNESS.SQLITE-JOURNAL` is the same file there. On a
+/// disk there that does tell case apart this refuses a little more than
+/// it must, never less.
+fn under(path: &Path, prefix: &Path) -> bool {
+    if path.starts_with(prefix) {
+        return true;
+    }
+    if !cfg!(any(target_os = "macos", windows)) {
+        return false;
+    }
+    let fold = |c: Component| c.as_os_str().to_string_lossy().to_lowercase();
+    let mut parts = path.components();
+    prefix
+        .components()
+        .all(|p| parts.next().is_some_and(|c| fold(c) == fold(p)))
+}
+
+/// Pathfinder's private paths as real paths, less those holding `root` (a
+/// staging copy's workspace lies inside one): what no tool may show.
+fn hidden_from(root: &Path, private: &crate::paths::Private) -> Vec<PathBuf> {
+    private
+        .all()
+        .filter_map(|p| resolve(p).ok())
+        .filter(|p| !root.starts_with(p))
+        .collect()
+}
+
+/// What a walk from the workspace (`ls`, `glob`, `grep`) may show: an entry
+/// whose real path, links followed, lies inside the workspace and outside
+/// Pathfinder's private paths, the same rule [`confine`] applies to the
+/// path a tool starts from. A database set inside the workspace, a staging
+/// copy beside it, or a link into a private folder is neither named nor
+/// read (theory §11, A2).
+#[derive(Debug, Clone)]
+pub struct Visible {
+    root: PathBuf,
+    hidden: Vec<PathBuf>,
+}
+
+impl Visible {
+    /// For `root` with the current setup's private paths.
+    pub fn new(root: &Path) -> Self {
+        Self::with(root, &crate::paths::private_paths())
+    }
+
+    /// For `root` with `private` as the private paths.
+    pub fn with(root: &Path, private: &crate::paths::Private) -> Self {
+        let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        let hidden = hidden_from(&root, private);
+        Self { root, hidden }
+    }
+
+    /// Whether a walk may name `path` and read it. A link that doesn't
+    /// resolve is left out too: its target can't be checked.
+    pub fn allows(&self, path: &Path) -> bool {
+        let Ok(real) = path.canonicalize() else {
+            return false;
+        };
+        real.starts_with(&self.root) && !self.hidden.iter().any(|h| under(&real, h))
+    }
+
+    /// A walk from `base` that never enters or yields a path this hides.
+    pub fn walk(&self, base: &Path) -> ignore::WalkBuilder {
+        let mut walk = ignore::WalkBuilder::new(base);
+        let me = self.clone();
+        walk.filter_entry(move |e| me.allows(e.path()));
+        walk
+    }
 }
 
 /// The plain form of a canonical path (`C:\...` rather than `\\?\C:\...` on
@@ -233,5 +305,29 @@ mod tests {
         );
         fs::remove_dir_all(ws).unwrap();
         fs::remove_dir_all(outside).unwrap();
+    }
+
+    /// Adversarial: on a case-insensitive disk (macOS, Windows) a private
+    /// file that doesn't exist yet (a database's `-journal` or `-wal`) is
+    /// the same file in any case. Writing `HARNESS.SQLITE-JOURNAL` plants a
+    /// hot journal SQLite rolls the record back from on its next open.
+    #[test]
+    fn refuses_pathfinders_files_in_another_case() {
+        let ws = workspace();
+        let db = ws.join("data").join("harness.sqlite");
+        fs::create_dir_all(db.parent().unwrap()).unwrap();
+        fs::write(&db, "db").unwrap();
+        // Only meaningful where the disk ignores case.
+        if !ws.join("DATA").join("HARNESS.SQLITE").exists() {
+            fs::remove_dir_all(ws).unwrap();
+            return;
+        }
+        let private = crate::paths::private_paths_for(&db);
+        let open = |p: &str, write| confine_with(&ws, p, write, &[], &private);
+        assert!(open("data/harness.sqlite-journal", true).is_err());
+        assert!(open("data/HARNESS.SQLITE-JOURNAL", true).is_err());
+        assert!(open("data/harness.sqlite-WAL", true).is_err());
+        assert!(open("data/TUI.LOG", true).is_err());
+        fs::remove_dir_all(ws).unwrap();
     }
 }
