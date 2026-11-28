@@ -590,6 +590,7 @@ impl ApiEngine {
                         let res = run_call(&calls[i], &run, &root, req, &sink).await;
                         active_reads.clear();
                         batch_reads.clear();
+                        executed_read[..i].fill(false);
                         results[i] = Some(res);
                         i += 1;
                     }
@@ -1494,6 +1495,33 @@ mod tests {
         assert_eq!(out, "done");
         let seen = llm.seen.lock().unwrap();
         let Message::ToolResults(reread) = &seen[3].messages[6] else {
+            panic!()
+        };
+        assert!(reread[0].content.contains("name = \"updated\""));
+        fs::remove_dir_all(ws).unwrap();
+    }
+
+    #[tokio::test]
+    async fn same_step_read_then_edit_invalidates_active_reads() {
+        let ws = workspace();
+        let (engine, llm) = scripted(vec![
+            Ok(vec![
+                call("1", "read", json!({"path": "Cargo.toml"})),
+                call(
+                    "2",
+                    "edit",
+                    json!({"path": "Cargo.toml", "old_string": "demo", "new_string": "updated"}),
+                ),
+            ]),
+            Ok(vec![call("3", "read", json!({"path": "Cargo.toml"}))]),
+            Ok(vec![Part::Text("done".into())]),
+        ]);
+        let mut req = request(ws.clone(), ToolAccess::Full);
+        req.ctx.host = Some(Arc::new(FakeHost(Permission::Once)));
+        let out = engine.run_text(&req, recorder().0).await.unwrap();
+        assert_eq!(out, "done");
+        let seen = llm.seen.lock().unwrap();
+        let Message::ToolResults(reread) = &seen[2].messages[4] else {
             panic!()
         };
         assert!(reread[0].content.contains("name = \"updated\""));
