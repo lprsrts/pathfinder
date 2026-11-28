@@ -226,7 +226,7 @@ Without a decision service, or with decisions off, the Gate isn't asked: a Tutor
 | Router | decision | none | goal, part, log count, recent turns | | ✓ | | | step, part, steer |
 | Tutor | language | read-only | ✓ | ✓ | masked | | | cited lines (JSON), map change |
 | Extractor | decision+language | none; its language half is the Tutor's, read-only | ✓ | ✓ | | | | concepts, misconceptions |
-| Mapper | language | read-only | ✓ | ids, labels | | | | parts, concepts, prerequisites |
+| Mapper | language | read-only | ✓ | ids, labels, domains, states | | | | parts, concepts, prerequisites |
 | Examiner | language | read-only | map outline, part's log | targets | writes it | writes it | | candidate, key |
 | Judge | language | none | part title | | ✓ | ✓ | ✓ | pass, misconception, feedback |
 | Gate | decision | none | recent turns | | | probe | probe | p per secret |
@@ -235,6 +235,8 @@ Without a decision service, or with decisions off, the Gate isn't asked: a Tutor
 | Planter | language | none | part title, concept labels, the file and its hunk | | | | writes it | flawed hunk |
 
 The Agent never sees concept states or the ledger, so it can't shape its work to look reviewable (§12). On the own-agent routes this holds on disk too: its file tools refuse, and its sandboxed commands can neither read, write nor move out of hiding, anything private to Pathfinder (the database with the ledger and secrets, its logs and caches, the config with credentials, other reviews' staging copies), apart from its own staging copy, and on Linux they can't see or signal Pathfinder's process. Where that sandbox can't be applied in full, there is none and every command is asked first. Two exceptions: a command you approve to run outside the sandbox runs without that hiding, and `pathfinder coverage --export` writes a report built from the ledger to `.pathfinder/coverage.json`, which the agent can read but not write. Judge runs with no workspace tools, so untrusted files can't inject into a secret-bearing prompt, and buffers its reply until it confirms the message is a verdict. Thinking from Examiner, Judge and Planter is dropped at the sink by role (§11). Strict secret isolation holds on API routes; external CLI routes keep their own transcripts and sandboxes (§14).
+
+Cross-workspace prompt privacy: LLM prompts (Mapper, Tutor, Examiner and concept resolution) receive only short topic/domain tags (such as `electromagnetism` or `rust-async`) and concept states (`shown`, `solid`, `prior`), never raw filesystem paths or repository names from other workspaces. Workspace provenance stays in the local SQLite database and is shown only to you locally (for example in `/why`).
 
 ## A3. A turn
 
@@ -286,6 +288,8 @@ A verdict read from plain words, even at low confidence while a candidate waits 
 ```mermaid
 erDiagram
     CONCEPT ||--o{ PREREQUISITE : needs
+    CONCEPT ||--o{ WORKSPACE_CONCEPT : "used in"
+    CONCEPT ||--o{ CONCEPT_ID_MAP : "remaps legacy"
     CONCEPT |o--o{ EVENT : "evidence for"
     CONCEPT ||--o{ MISCONCEPTION : "wrong belief about"
     SESSION ||--o{ PART_CONCEPT : "part rests on"
@@ -298,10 +302,10 @@ erDiagram
     LEDGER }o--o{ EVENT : "label rests on"
 
     CONCEPT {
-        text id PK "slug, unique per workspace"
-        text workspace "git root"
+        text id PK "slug, unique globally"
         text label
         json aliases
+        text domain "short topic/domain tag, never raw paths"
         text created_by "map | extractor | user"
     }
     PREREQUISITE {
@@ -309,16 +313,26 @@ erDiagram
         text needs PK
         text source
     }
+    WORKSPACE_CONCEPT {
+        text workspace PK "git root"
+        text concept_id PK
+    }
+    CONCEPT_ID_MAP {
+        text workspace PK "git root"
+        text legacy_id PK
+        text concept_id FK
+        int max_event_id "pre-migration event ceiling"
+    }
     PART_CONCEPT {
         text part "in the session's state, not a table"
         text concept "1-4 core per part"
     }
     EVENT {
         int id PK
-        text workspace "git root"
+        text workspace "git root (provenance)"
         text session_id
         text concept "soft key: a concept id, or sources"
-        text kind "claim touched misconception_shown pass fail misconception_resolved delegated review_ok review_missed told read searched retracted step"
+        text kind "claim touched misconception_shown pass fail misconception_resolved delegated review_ok review_missed told read searched retracted step revisit"
         text ref "candidate, misconception, secret, retracted event, part, path or query"
         json detail
         int at "unix seconds"
@@ -363,7 +377,7 @@ erDiagram
     }
 ```
 
-The workspace is a key (the git root) that concepts, prerequisites, events and the ledger carry, not a table. A part's core concepts are a list on the part in the session's state, checked to hold 1–4. A misconception's open or resolved status is folded from its events, not stored. Source events (`read`, `searched`) go under the pseudo-concept `sources`, which is never a concept row. `outcomes` (§8) and `critic_events` tables also exist and are not drawn.
+`concepts` and `prerequisites` are user-wide (global) in the local SQLite store; `workspace_concepts` records which concepts each workspace uses. The workspace (the enclosing git root, else `cwd`) is a provenance key carried by `events`, `workspace_concepts`, `misconceptions` and the `ledger`, not a table. `events` is strictly append-only (enforced by triggers): when migrating legacy per-workspace concepts, exact `(id, normalized label)` matches merge into one global concept and colliding ids with different labels are disambiguated (`-2`, `-3`, …) and recorded in `concept_id_map(workspace, legacy_id, concept_id, max_event_id)` so pre-migration `events` rows (`e.id <= max_event_id`) resolve transparently without mutating `events` or misattributing post-migration events. A part's core concepts are a list on the part in the session's state, checked to hold 1–4. A misconception's open or resolved status is folded globally from its events, not stored. Source events (`read`, `searched`) go under the pseudo-concept `sources`, which is never a concept row. `outcomes` (§8) and `critic_events` tables also exist and are not drawn.
 
 ## A5. The understanding model's rules
 
@@ -383,7 +397,7 @@ stateDiagram-v2
     shaky --> shown: pass and no open misconception
     shown --> solid: 2nd pass, one flawed, no open misconception
     shown --> shaky: fail or review_missed
-    solid --> shown: aged, no pass or review_ok in 30 days
+    solid --> shown: aged, no pass or review_ok anywhere in 30 days
     shown --> solid: aged solid, then any pass or review_ok (even with an open misconception)
     solid --> shaky: fail or review_missed
     note right of claimed: a claim never becomes evidence
@@ -392,6 +406,13 @@ stateDiagram-v2
 ```
 
 Ageing makes a state depend on time as well as events: states are computed as of a `now`, and a ledger label stores the `now` it used, so it can be recomputed. `/why` stores nothing: it shows the states as of the moment you ask.
+
+Cross-workspace and cross-session rules:
+
+- **Two-tier evidence (local vs. `prior`):** A concept's local state (`state`, `passes`, `fails`, `last_evidence`, `event_ids`) is folded strictly from events in the current workspace. Same-workspace `shown`/`solid` advances immediately to the next open step. When the current workspace has no local evidence, `shown` or `solid` in another workspace surfaces as `prior` (`shown elsewhere` or `solid elsewhere`): Pathfinder skips wide intro re-teaching and opens directly at an applied/transfer step (`narrow` width) for this workspace. If active `solid elsewhere` holds immediately before a local `pass` (with no open misconceptions and local state not `shaky`), that single local pass promotes the concept directly to local `solid`.
+- **Append-only `/revisit`:** Appending a local `revisit` event suppresses `prior` and 1-pass fast promotion in the current workspace until newer elsewhere evidence arrives, without mutating `events`.
+- **Global misconceptions and 30-day recency:** Open misconceptions travel and resolve globally across workspaces (aiming T1 and blocking `solid` everywhere until resolved by passing a flawed candidate embodying them). The 30-day `AGE_SECS` recency clock is also global: any `pass` or `review_ok` in any workspace refreshes it, while 30 days of inactivity everywhere cools both local `solid` to `shown` and `solid elsewhere` to `shown elsewhere`.
+- **Same-workspace `touched`/`step` carryover:** Across sessions in the same workspace, prior `step` events rotate past the last shown angle on a concept with no local `pass` yet, and a concise digest of recent same-workspace `touched` notes is passed to the Tutor so it builds on earlier thinking. Neither `touched` nor `step` is evidence, so the A5 evidence bar never lowers.
 
 *A part's status, from its 1–4 core concepts:*
 
@@ -423,7 +444,7 @@ flowchart LR
 
 All three are computed by the harness, never by a model. Gaps are raised once per map, a concept another open part covers is skipped, no gap part is proposed while a map change waits, and a quick check skips gaps.
 
-Concept matching: lexical and semantic candidates (slug, label, aliases and local embedding similarity, up to 20), then a decision choice "same as which, or new?"; same at p ≥ 0.7. Misconceptions from your log open only when a decision predicate "does this message state that belief?" reaches p ≥ 0.8; they aim the next candidate (T1) and block promotion to `solid`, but do not demote `shown` or `solid` until a verdict fails.
+Concept matching runs against the global `concepts` store: lexical and semantic candidates (slug, label, aliases and local embedding similarity, up to 20), then a decision choice "same as which, or new?" that includes each candidate's short `domain` tag so homonyms across domains (such as physics `field` vs. struct `field`) do not falsely merge; same at p ≥ 0.7. Misconceptions from your log open only when a decision predicate "does this message state that belief?" reaches p ≥ 0.8; they aim the next candidate (T1) and block promotion to `solid`, but do not demote `shown` or `solid` until a verdict fails.
 
 ## A6. Secrets and the gate
 
@@ -488,7 +509,7 @@ sequenceDiagram
     Note over O: tag at p ≥ 0.6, untagged if none<br/>or "something else" ≥ 0.5
     O->>LM: states of tagged concepts, now
     LM-->>O: states + event ids
-    Note over O: reviewable if all shown or solid,<br/>claimed if remaining are only claimed,<br/>else delegated (untagged and /delegate count as delegated)
+    Note over O: reviewable if all locally shown or solid,<br/>claimed if remaining are only claimed,<br/>else delegated (prior elsewhere, untagged and /delegate never count as reviewable)
     O->>L: change entry: hunk, path-scoped line hashes, concepts, rationale, label, evidence + its now, hash chain
     Note over O,L: the verdict and objections come later as a review entry pointing at it (append-only).<br/>The agent writes first and the record follows. If the snapshot or diff fails, nothing is recorded.<br/>Outside a git repo no snapshot is taken, so nothing is recorded (A3).
 ```
@@ -506,7 +527,7 @@ flowchart LR
     V & RU & CL & DL & NP & DC --> R["per file and total<br/>/coverage · pathfinder coverage --export<br/>.pathfinder/coverage.json + chain head"]
 ```
 
-Each non-trivial added line is hashed with its file path and its nearest non-blank neighbours above and below (a path-scoped 3-line trimmed window), and deletion-only hunks are recorded as ledger entries and counted beside the buckets. Blank lines, trivial syntax-only lines (such as lone braces or delimiters) and lines whose text was already anywhere in the file before the agent ran (the snapshot, uncommitted work included) are left out; later reformatting that breaks a hash fails closed to `not from Pathfinder`, never falsely vouching. When `git-ai` notes (`refs/notes/ai`) are present, coverage pairs with them so external AI edits are not conflated with human code, and test/command results are reported beside understanding coverage without merging the two (§14). The Agent's tools refuse to write under `.pathfinder/` or the session database. This hunk/git pipeline is the provenance backend for code; non-code work (§1) records provenance at the part and artifact level.
+Each non-trivial added line is hashed with its file path and its nearest non-blank neighbours above and below (a path-scoped 3-line trimmed window), and deletion-only hunks are recorded as ledger entries and counted beside the buckets. `reviewable` and `vouched` require local (same-workspace) evidence: cross-workspace `prior` (`shown elsewhere` / `solid elsewhere`) never vouches for agent work until verified locally. Blank lines, trivial syntax-only lines (such as lone braces or delimiters) and lines whose text was already anywhere in the file before the agent ran (the snapshot, uncommitted work included) are left out; later reformatting that breaks a hash fails closed to `not from Pathfinder`, never falsely vouching. When `git-ai` notes (`refs/notes/ai`) are present, coverage pairs with them so external AI edits are not conflated with human code, and test/command results are reported beside understanding coverage without merging the two (§14). The Agent's tools refuse to write under `.pathfinder/` or the session database. This hunk/git pipeline is the provenance backend for code; non-code work (§1) records provenance at the part and artifact level.
 
 ## A8. Checked review
 
