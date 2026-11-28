@@ -980,12 +980,52 @@ fn mask_history(session: &Session, reviews: &[usize]) -> String {
 }
 
 fn format_turns(turns: &[crate::domain::TurnRecord]) -> String {
+    const MAX_TURN_CHARS: usize = 4000;
+    const MAX_SOURCES: usize = 8;
+
     if turns.is_empty() {
         return "(none)".to_string();
     }
     turns
         .iter()
-        .map(|t| format!("{}: {}", t.role, t.content))
+        .map(|t| {
+            let content = if t.content.chars().count() > MAX_TURN_CHARS {
+                let kept: String = t.content.chars().take(MAX_TURN_CHARS).collect();
+                format!("{kept}…")
+            } else {
+                t.content.clone()
+            };
+            let sources = if t.role == "assistant" && t.content != REVIEW_HIDDEN {
+                let mut seen = Vec::new();
+                for s in &t.steps {
+                    if let crate::domain::Step::Tool {
+                        title,
+                        ok: Some(true),
+                        ..
+                    } = s
+                        && (title.starts_with("Read ")
+                            || title.starts_with("View ")
+                            || title.starts_with("Grep ")
+                            || title.starts_with("List ")
+                            || title.starts_with("Glob "))
+                        && !seen.contains(title)
+                    {
+                        seen.push(title.clone());
+                        if seen.len() >= MAX_SOURCES {
+                            break;
+                        }
+                    }
+                }
+                if seen.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [sources: {}]", seen.join(", "))
+                }
+            } else {
+                String::new()
+            };
+            format!("{}{sources}: {content}", t.role)
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -1184,6 +1224,61 @@ fn turn_step(
             SessionMode::Working => Step::Log,
             SessionMode::Done => Step::Chat,
         },
+    }
+}
+
+#[cfg(test)]
+mod format_tests {
+    use super::*;
+    use crate::domain::{Step, TurnRecord};
+
+    #[test]
+    fn format_turns_includes_read_sources_and_respects_hidden_reviews() {
+        let turns = vec![
+            TurnRecord {
+                role: "user".into(),
+                content: "Explain slide 24".into(),
+                steps: vec![],
+            },
+            TurnRecord {
+                role: "assistant".into(),
+                content: "You noted the boundary condition.".into(),
+                steps: vec![
+                    Step::Tool {
+                        id: "1".into(),
+                        title: "Read FUB_Folien1.pdf (page 24)".into(),
+                        ok: Some(true),
+                        detail: String::new(),
+                    },
+                    Step::Tool {
+                        id: "2".into(),
+                        title: "Read FUB_Folien1.pdf (page 24)".into(),
+                        ok: Some(true),
+                        detail: String::new(),
+                    },
+                    Step::Tool {
+                        id: "3".into(),
+                        title: "Read missing.pdf".into(),
+                        ok: Some(false),
+                        detail: String::new(),
+                    },
+                ],
+            },
+            TurnRecord {
+                role: "assistant".into(),
+                content: REVIEW_HIDDEN.into(),
+                steps: vec![Step::Tool {
+                    id: "4".into(),
+                    title: "Read secret.rs".into(),
+                    ok: Some(true),
+                    detail: String::new(),
+                }],
+            },
+        ];
+        let out = format_turns(&turns);
+        assert!(out.contains("assistant [sources: Read FUB_Folien1.pdf (page 24)]: You noted"));
+        assert!(!out.contains("missing.pdf"));
+        assert!(!out.contains("secret.rs"));
     }
 }
 

@@ -202,8 +202,9 @@ fn cap(s: String) -> String {
 /// for deadlines and exams, the access level for what it may try.
 fn environment(req: &EngineRequest) -> String {
     // In-process, with the OS time zone: Windows has no `date` program.
-    let date = jiff::fmt::strtime::format("%Y-%m-%d (%A), %H:%M %Z", &jiff::ZonedDateTime::now())
-        .unwrap_or_default();
+    // Omit HH:MM so the system prompt prefix stays cacheable across turns.
+    let date =
+        jiff::fmt::strtime::format("%Y-%m-%d (%A)", &jiff::ZonedDateTime::now()).unwrap_or_default();
     let access = match req.tools {
         ToolAccess::None => "none: answer from what you are given",
         ToolAccess::ReadOnly => "read-only: you can read and search, not change anything",
@@ -256,18 +257,35 @@ fn cache_key(req: &EngineRequest) -> String {
     format!("pathfinder-{:016x}", h.finish())
 }
 
-/// Clears old tool results once they add up past `PRUNE_ABOVE`, keeping
-/// the last `KEEP_RECENT` steps. Calls stay paired with their results.
-fn prune(messages: &mut [Message]) {
-    let size = |m: &Message| match m {
+fn message_size(m: &Message) -> usize {
+    match m {
+        Message::User(t) => t.len(),
+        Message::UserWith(t, files) => {
+            t.len() + files.iter().map(|f| f.data.len()).sum::<usize>()
+        }
+        Message::Assistant(parts) => parts
+            .iter()
+            .map(|p| match p {
+                Part::Text(t) => t.len(),
+                Part::ToolCall(c) => c.name.len() + c.args.to_string().len(),
+                Part::Opaque(_) => 0,
+            })
+            .sum(),
         Message::ToolResults(rs) => rs
             .iter()
             .map(|r| r.content.len() + r.images.iter().map(|i| i.data.len()).sum::<usize>())
             .sum(),
-        _ => 0,
-    };
-    if messages.iter().map(size).sum::<usize>() <= PRUNE_ABOVE {
-        return;
+    }
+}
+
+/// Clears old tool results oldest-first once context adds up past
+/// `PRUNE_ABOVE`, keeping the last `KEEP_RECENT` tool-result steps and
+/// stopping as soon as total size is back under budget. Returns the message
+/// indices whose results were cleared.
+fn prune(messages: &mut [Message]) -> Vec<usize> {
+    let mut total: usize = messages.iter().map(message_size).sum();
+    if total <= PRUNE_ABOVE {
+        return Vec::new();
     }
     let steps: Vec<usize> = messages
         .iter()
@@ -275,25 +293,103 @@ fn prune(messages: &mut [Message]) {
         .filter(|(_, m)| matches!(m, Message::ToolResults(_)))
         .map(|(i, _)| i)
         .collect();
-    for &i in steps.iter().rev().skip(KEEP_RECENT) {
+    let mut cleared = Vec::new();
+    let eligible = steps.len().saturating_sub(KEEP_RECENT);
+    for &i in &steps[..eligible] {
+        if total <= PRUNE_ABOVE {
+            break;
+        }
         if let Message::ToolResults(rs) = &mut messages[i] {
+            let mut any = false;
             for r in rs {
                 if r.content.len() > 400 || !r.images.is_empty() {
-                    r.content =
-                        "[output cleared to save room; run the tool again if you need it]".into();
+                    let before = r.content.len()
+                        + r.images.iter().map(|img| img.data.len()).sum::<usize>();
+                    let replacement =
+                        "[output cleared to save room; re-read only if you still need it]";
+                    r.content = replacement.into();
                     r.images.clear();
+                    total = total.saturating_sub(before) + replacement.len();
+                    any = true;
                 }
+            }
+            if any {
+                cleared.push(i);
             }
         }
     }
+    cleared
+}
+
+/// Canonical JSON serialization (sorted keys) with normalized `read`/`view`
+/// arguments (`path` trimmed, single-page `"24-24"` collapsed to `"24"`).
+fn canonical_call_key(call: &crate::llm::ToolCall) -> String {
+    fn write_canonical(v: &serde_json::Value, out: &mut String) {
+        match v {
+            serde_json::Value::Object(map) => {
+                out.push('{');
+                let mut keys: Vec<&String> = map.keys().collect();
+                keys.sort();
+                for (i, k) in keys.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    out.push_str(&serde_json::to_string(k).unwrap_or_default());
+                    out.push(':');
+                    write_canonical(&map[*k], out);
+                }
+                out.push('}');
+            }
+            serde_json::Value::Array(arr) => {
+                out.push('[');
+                for (i, item) in arr.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    write_canonical(item, out);
+                }
+                out.push(']');
+            }
+            other => {
+                out.push_str(&other.to_string());
+            }
+        }
+    }
+
+    let mut args = call.args.clone();
+    if matches!(call.name.as_str(), "read" | "view")
+        && let Some(obj) = args.as_object_mut()
+    {
+        if let Some(p) = obj.get("path").and_then(serde_json::Value::as_str) {
+            let trimmed = p.trim();
+            let norm = trimmed.strip_prefix("./").unwrap_or(trimmed);
+            obj.insert("path".into(), serde_json::Value::String(norm.to_string()));
+        }
+        if let Some(pages) = obj.get("pages").and_then(serde_json::Value::as_str) {
+            let trimmed = pages.trim();
+            let norm = if let Some((a, b)) = trimmed.split_once('-') {
+                let (a, b) = (a.trim(), b.trim());
+                if !a.is_empty() && a == b {
+                    a.to_string()
+                } else {
+                    format!("{a}-{b}")
+                }
+            } else {
+                trimmed.to_string()
+            };
+            obj.insert("pages".into(), serde_json::Value::String(norm));
+        }
+    }
+    let mut out = format!("{}:", call.name);
+    write_canonical(&args, &mut out);
+    out
 }
 
 /// A tool call's fingerprint with its result, to notice repetition.
 fn fingerprint(call: &crate::llm::ToolCall, result: &ToolResult) -> u64 {
     use std::hash::{DefaultHasher, Hash, Hasher};
     let mut h = DefaultHasher::new();
-    call.name.hash(&mut h);
-    call.args.to_string().hash(&mut h);
+    canonical_call_key(call).hash(&mut h);
     result.content.hash(&mut h);
     h.finish()
 }
@@ -361,7 +457,10 @@ impl ApiEngine {
                 cache_key: Some(cache_key(req)),
             };
             let steps = max_steps(req);
-            let mut seen: Vec<u64> = Vec::new();
+            let mut seen_prints: std::collections::HashMap<u64, usize> =
+                std::collections::HashMap::new();
+            let mut active_reads: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
             let mut nudged = false;
             let mut fixes = 0;
 
@@ -423,10 +522,14 @@ impl ApiEngine {
                     return Ok(text);
                 }
 
-                // Reads run together; edits and commands run in order, since
-                // they depend on each other. A run of reads between them
-                // still goes at once.
-                let mut results = Vec::new();
+                // Reads run together (deduplicating identical reads that are
+                // already in context or repeated in the same step); edits and
+                // commands run in order and invalidate active read tracking.
+                let mut results: Vec<Option<ToolResult>> = vec![None; calls.len()];
+                let mut batch_reads: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                let mut repeats: usize = 0;
+                let mut executed_read: Vec<bool> = vec![false; calls.len()];
                 let mut i = 0;
                 while i < calls.len() {
                     if read_only_tool(&calls[i].name) || req.tools != ToolAccess::Full {
@@ -436,33 +539,91 @@ impl ApiEngine {
                         {
                             j += 1;
                         }
-                        results.extend(
-                            join_all(
-                                calls[i..j]
-                                    .iter()
-                                    .map(|c| run_call(c, &run, &root, req, &sink)),
-                            )
-                            .await,
-                        );
+                        let mut to_run: Vec<usize> = Vec::new();
+                        for idx in i..j {
+                            let c = &calls[idx];
+                            if read_only_tool(&c.name) {
+                                let key = canonical_call_key(c);
+                                let in_context = active_reads.contains_key(&key);
+                                if in_context || !batch_reads.insert(key.clone()) {
+                                    let count = seen_prints
+                                        .entry(fingerprint(c, &ToolResult {
+                                            call_id: String::new(),
+                                            content: key.clone(),
+                                            is_error: false,
+                                            images: Vec::new(),
+                                        }))
+                                        .and_modify(|n| *n += 1)
+                                        .or_insert(1);
+                                    repeats = repeats.max(*count);
+                                    let why = if in_context {
+                                        "already read in this conversation and still in context above"
+                                    } else {
+                                        "already requested in this step"
+                                    };
+                                    results[idx] = Some(ToolResult {
+                                        call_id: c.id.clone(),
+                                        content: format!(
+                                            "({why}; use that result instead of calling `{}` again with the same arguments.)",
+                                            c.name
+                                        ),
+                                        is_error: false,
+                                        images: Vec::new(),
+                                    });
+                                    continue;
+                                }
+                            }
+                            executed_read[idx] = read_only_tool(&c.name);
+                            to_run.push(idx);
+                        }
+                        let ran = join_all(
+                            to_run
+                                .iter()
+                                .map(|&idx| run_call(&calls[idx], &run, &root, req, &sink)),
+                        )
+                        .await;
+                        for (idx, res) in to_run.into_iter().zip(ran) {
+                            results[idx] = Some(res);
+                        }
                         i = j;
                     } else {
-                        results.push(run_call(&calls[i], &run, &root, req, &sink).await);
+                        let res = run_call(&calls[i], &run, &root, req, &sink).await;
+                        active_reads.clear();
+                        batch_reads.clear();
+                        results[i] = Some(res);
                         i += 1;
                     }
                 }
+                let mut results: Vec<ToolResult> =
+                    results.into_iter().map(|r| r.expect("all calls resolved")).collect();
 
-                // The same call with the same result again: say so, and stop
-                // the tools if it keeps happening.
-                let mut repeats = 0;
-                for (call, result) in calls.iter().zip(results.iter_mut()) {
-                    let print = fingerprint(call, result);
-                    let before = seen.iter().rev().take(12).filter(|p| **p == print).count();
-                    seen.push(print);
-                    if before >= 2 {
-                        repeats = repeats.max(before);
-                        result.content.push_str(
-                            "\n\n(You have made this exact call with this exact result before. Use what you have, or try something different.)",
-                        );
+                // Record successful reads in `active_reads` and flag repeated
+                // identical calls immediately on the second occurrence.
+                let results_msg_idx = request.messages.len();
+                for (idx, (call, result)) in calls.iter().zip(results.iter_mut()).enumerate() {
+                    if executed_read[idx] {
+                        if !result.is_error {
+                            active_reads.insert(canonical_call_key(call), results_msg_idx);
+                        }
+                        let print = fingerprint(call, result);
+                        let before = seen_prints.get(&print).copied().unwrap_or(0);
+                        seen_prints.insert(print, before + 1);
+                        if before >= 1 {
+                            repeats = repeats.max(before);
+                            result.content.push_str(
+                                "\n\n(You have made this exact call with this exact result before. Use what you have, or try something different.)",
+                            );
+                        }
+                    } else if !read_only_tool(&call.name) {
+                        let print = fingerprint(call, result);
+                        let before = seen_prints.get(&print).copied().unwrap_or(0);
+                        seen_prints.insert(print, before + 1);
+                        if before >= 1 {
+                            repeats = repeats.max(before);
+                            result.content.push_str(
+                                "\n\n(You have made this exact call with this exact result before. Use what you have, or try something different.)",
+                            );
+                        }
                     }
                 }
                 if let Some(last) = results.last_mut() {
@@ -473,13 +634,16 @@ impl ApiEngine {
                     }
                 }
                 request.messages.push(Message::ToolResults(results));
-                if repeats >= 4 {
+                if repeats >= 2 {
                     request.allow_tools = false;
                     request.messages.push(Message::User(
                         "You are repeating the same tool calls. Stop using tools and answer now with what you have, in the requested format.".into(),
                     ));
                 }
-                prune(&mut request.messages);
+                let cleared = prune(&mut request.messages);
+                if !cleared.is_empty() {
+                    active_reads.retain(|_, idx| !cleared.contains(idx));
+                }
             }
             bail!("the model kept going past its step budget")
         }
@@ -1252,8 +1416,6 @@ mod tests {
             ls(),
             ls(),
             ls(),
-            ls(),
-            ls(),
             Ok(vec![Part::Text("done".into())]),
         ]);
         let mut req = request(ws.clone(), ToolAccess::Full);
@@ -1265,13 +1427,92 @@ mod tests {
             panic!()
         };
         assert!(first[0].is_error && first[0].content.contains("weren't valid JSON"));
-        // The third identical `ls` is flagged; the fifth stops the tools.
-        let Message::ToolResults(third) = &seen[4].messages[8] else {
+        // The second identical `ls` is deduplicated; the third stops the tools.
+        let Message::ToolResults(second) = &seen[3].messages[6] else {
             panic!()
         };
-        assert!(third[0].content.contains("exact call"));
-        assert!(!seen[6].allow_tools);
+        assert!(second[0].content.contains("already read"));
+        assert!(!seen[4].allow_tools);
         fs::remove_dir_all(ws).unwrap();
+    }
+
+    #[tokio::test]
+    async fn duplicate_reads_in_one_step_are_deduplicated() {
+        let ws = workspace();
+        let (engine, llm) = scripted(vec![
+            Ok(vec![
+                call("1", "read", json!({"path": "Cargo.toml"})),
+                call("2", "read", json!({"path": "./Cargo.toml"})),
+                call("3", "read", json!({"path": "Cargo.toml"})),
+                call("4", "read", json!({"path": "Cargo.toml"})),
+            ]),
+            Ok(vec![Part::Text("done".into())]),
+        ]);
+        let (sink, log) = recorder();
+        let out = engine
+            .run_text(&request(ws.clone(), ToolAccess::ReadOnly), sink)
+            .await
+            .unwrap();
+        assert_eq!(out, "done");
+        // Only the first `read` actually ran.
+        let starts = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|l| l.starts_with("start "))
+            .count();
+        assert_eq!(starts, 1);
+        let seen = llm.seen.lock().unwrap();
+        let Message::ToolResults(results) = &seen[1].messages[2] else {
+            panic!()
+        };
+        assert_eq!(results.len(), 4);
+        assert!(results[0].content.contains("name = \"demo\""));
+        assert!(results[1].content.contains("already requested in this step"));
+        assert!(results[2].content.contains("already requested in this step"));
+        assert!(results[3].content.contains("already requested in this step"));
+        assert!(!seen[1].allow_tools);
+        fs::remove_dir_all(ws).unwrap();
+    }
+
+    #[tokio::test]
+    async fn edit_invalidates_active_reads_so_file_can_be_reread() {
+        let ws = workspace();
+        let (engine, llm) = scripted(vec![
+            Ok(vec![call("1", "read", json!({"path": "Cargo.toml"}))]),
+            Ok(vec![call(
+                "2",
+                "edit",
+                json!({"path": "Cargo.toml", "old_string": "demo", "new_string": "updated"}),
+            )]),
+            Ok(vec![call("3", "read", json!({"path": "Cargo.toml"}))]),
+            Ok(vec![Part::Text("done".into())]),
+        ]);
+        let mut req = request(ws.clone(), ToolAccess::Full);
+        req.ctx.host = Some(Arc::new(FakeHost(Permission::Once)));
+        let out = engine.run_text(&req, recorder().0).await.unwrap();
+        assert_eq!(out, "done");
+        let seen = llm.seen.lock().unwrap();
+        let Message::ToolResults(reread) = &seen[3].messages[6] else {
+            panic!()
+        };
+        assert!(reread[0].content.contains("name = \"updated\""));
+        fs::remove_dir_all(ws).unwrap();
+    }
+
+    #[test]
+    fn canonical_call_key_normalizes_args_and_pages() {
+        let a = ToolCall {
+            id: "1".into(),
+            name: "read".into(),
+            args: json!({"pages": "24-24", "path": "./FUB_Folien1.pdf"}),
+        };
+        let b = ToolCall {
+            id: "2".into(),
+            name: "read".into(),
+            args: json!({"path": "FUB_Folien1.pdf", "pages": " 24 "}),
+        };
+        assert_eq!(canonical_call_key(&a), canonical_call_key(&b));
     }
 
     #[tokio::test]
@@ -1383,7 +1624,8 @@ mod tests {
         let req = request(std::env::temp_dir(), ToolAccess::ReadOnly);
         let env = environment(&req);
         let today = env.lines().find_map(|l| l.strip_prefix("Today: ")).unwrap();
-        assert!(today.len() >= "2026-01-01 (Monday), 00:00".len(), "{today}");
+        assert!(today.len() >= "2026-01-01 (Monday)".len(), "{today}");
+        assert!(!today.contains(':'), "date should stay stable across minutes: {today}");
     }
 
     #[tokio::test]
