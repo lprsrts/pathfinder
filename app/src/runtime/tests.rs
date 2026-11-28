@@ -5423,17 +5423,19 @@ async fn homonym_safe_concept_resolution_uses_domain_tags() {
     assert_eq!(rust_field_id, "field-2");
 
     // Decision prompt included both domains so the decider can distinguish homonyms.
-    let qs = decider.seen_questions.lock().unwrap();
-    assert_eq!(qs.len(), 1);
-    assert!(qs[0].instructions.contains("rust-structs"), "{:?}", qs[0]);
-    assert!(
-        qs[0]
-            .options
-            .iter()
-            .any(|(id, desc)| id == "field" && desc.contains("[domain: electromagnetism]")),
-        "{:?}",
-        qs[0].options
-    );
+    {
+        let qs = decider.seen_questions.lock().unwrap();
+        assert_eq!(qs.len(), 1);
+        assert!(qs[0].instructions.contains("rust-structs"), "{:?}", qs[0]);
+        assert!(
+            qs[0]
+                .options
+                .iter()
+                .any(|(id, desc)| id == "field" && desc.contains("[domain: electromagnetism]")),
+            "{:?}",
+            qs[0].options
+        );
+    }
 
     // Domain is persisted and `field-2` has NO prior from physics `field`.
     let all = store.all_concepts().unwrap();
@@ -5442,8 +5444,30 @@ async fn homonym_safe_concept_resolution_uses_domain_tags() {
     let views = rt.concept_views(&sb, &["field-2".to_string()]).unwrap();
     assert!(views.get("field-2").is_none_or(|v| v.prior.is_none()));
 
+    // Regression: a third workspace proposing `{id: "field", label: "Field", domain: "rust-structs"}`
+    // must reuse `field-2` rather than short-circuiting on physics `field` and creating `field-3`.
+    let dir_c = std::env::temp_dir().join(format!("pf-hom-c-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir_c).unwrap();
+    let sc = rt.create_session("sc".into(), dir_c.clone()).unwrap();
+    let resolved_c = rt
+        .resolve_concepts(
+            &sc,
+            &[crate::domain::ProposedConcept {
+                id: "field".into(),
+                label: "Field".into(),
+                domain: "rust-structs".into(),
+                needs: vec![],
+            }],
+            "map",
+        )
+        .await
+        .unwrap();
+    assert_eq!(resolved_c.get("field").map(String::as_str), Some("field-2"));
+    assert_eq!(store.all_concepts().unwrap().len(), 2);
+
     let _ = std::fs::remove_dir_all(&dir_a);
     let _ = std::fs::remove_dir_all(&dir_b);
+    let _ = std::fs::remove_dir_all(&dir_c);
 }
 
 #[tokio::test]

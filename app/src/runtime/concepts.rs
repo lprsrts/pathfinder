@@ -1437,10 +1437,17 @@ fn compatible_match<'a>(
     domain: &str,
     concepts: &'a [Concept],
 ) -> Option<&'a Concept> {
-    exact_match(id, concepts)
-        .or_else(|| exact_match(label, concepts))
-        .or_else(|| understanding::same_named(label, concepts))
+    let compatible: Vec<Concept> = concepts
+        .iter()
         .filter(|c| !domains_conflict(domain, &c.domain))
+        .cloned()
+        .collect();
+    let matched_id = exact_match(id, &compatible)
+        .or_else(|| exact_match(label, &compatible))
+        .or_else(|| understanding::same_named(label, &compatible))?
+        .id
+        .clone();
+    concepts.iter().find(|c| c.id == matched_id)
 }
 
 fn query_words(text: &str) -> HashSet<String> {
