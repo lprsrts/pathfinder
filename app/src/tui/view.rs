@@ -3376,10 +3376,11 @@ mod tests {
         app.cmd_sel = 1;
 
         let (screen, _) = render_to_string(&mut app, 100, 30);
-        assert!(screen.contains("(2/3)"), "{screen}");
+        assert!(screen.contains("(2/4)"), "{screen}");
+        assert!(screen.contains("  revisit"), "{screen}");
+        assert!(screen.contains("→ replan"), "{screen}");
+        assert!(screen.contains("  reject"), "{screen}");
         assert!(screen.contains("  resume"), "{screen}");
-        assert!(screen.contains("→ reject"), "{screen}");
-        assert!(screen.contains("  replan"), "{screen}");
         assert!(screen.contains("Ctrl+O opens"), "{screen}");
     }
 
