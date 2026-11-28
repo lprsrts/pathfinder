@@ -203,8 +203,8 @@ fn cap(s: String) -> String {
 fn environment(req: &EngineRequest) -> String {
     // In-process, with the OS time zone: Windows has no `date` program.
     // Omit HH:MM so the system prompt prefix stays cacheable across turns.
-    let date =
-        jiff::fmt::strtime::format("%Y-%m-%d (%A)", &jiff::ZonedDateTime::now()).unwrap_or_default();
+    let date = jiff::fmt::strtime::format("%Y-%m-%d (%A)", &jiff::ZonedDateTime::now())
+        .unwrap_or_default();
     let access = match req.tools {
         ToolAccess::None => "none: answer from what you are given",
         ToolAccess::ReadOnly => "read-only: you can read and search, not change anything",
@@ -260,9 +260,7 @@ fn cache_key(req: &EngineRequest) -> String {
 fn message_size(m: &Message) -> usize {
     match m {
         Message::User(t) => t.len(),
-        Message::UserWith(t, files) => {
-            t.len() + files.iter().map(|f| f.data.len()).sum::<usize>()
-        }
+        Message::UserWith(t, files) => t.len() + files.iter().map(|f| f.data.len()).sum::<usize>(),
         Message::Assistant(parts) => parts
             .iter()
             .map(|p| match p {
@@ -303,8 +301,8 @@ fn prune(messages: &mut [Message]) -> Vec<usize> {
             let mut any = false;
             for r in rs {
                 if r.content.len() > 400 || !r.images.is_empty() {
-                    let before = r.content.len()
-                        + r.images.iter().map(|img| img.data.len()).sum::<usize>();
+                    let before =
+                        r.content.len() + r.images.iter().map(|img| img.data.len()).sum::<usize>();
                     let replacement =
                         "[output cleared to save room; re-read only if you still need it]";
                     r.content = replacement.into();
@@ -547,12 +545,15 @@ impl ApiEngine {
                                 let in_context = active_reads.contains_key(&key);
                                 if in_context || !batch_reads.insert(key.clone()) {
                                     let count = seen_prints
-                                        .entry(fingerprint(c, &ToolResult {
-                                            call_id: String::new(),
-                                            content: key.clone(),
-                                            is_error: false,
-                                            images: Vec::new(),
-                                        }))
+                                        .entry(fingerprint(
+                                            c,
+                                            &ToolResult {
+                                                call_id: String::new(),
+                                                content: key.clone(),
+                                                is_error: false,
+                                                images: Vec::new(),
+                                            },
+                                        ))
                                         .and_modify(|n| *n += 1)
                                         .or_insert(1);
                                     repeats = repeats.max(*count);
@@ -595,8 +596,10 @@ impl ApiEngine {
                         i += 1;
                     }
                 }
-                let mut results: Vec<ToolResult> =
-                    results.into_iter().map(|r| r.expect("all calls resolved")).collect();
+                let mut results: Vec<ToolResult> = results
+                    .into_iter()
+                    .map(|r| r.expect("all calls resolved"))
+                    .collect();
 
                 // Record successful reads in `active_reads` and flag repeated
                 // identical calls immediately on the second occurrence.
@@ -1469,9 +1472,21 @@ mod tests {
         };
         assert_eq!(results.len(), 4);
         assert!(results[0].content.contains("name = \"demo\""));
-        assert!(results[1].content.contains("already requested in this step"));
-        assert!(results[2].content.contains("already requested in this step"));
-        assert!(results[3].content.contains("already requested in this step"));
+        assert!(
+            results[1]
+                .content
+                .contains("already requested in this step")
+        );
+        assert!(
+            results[2]
+                .content
+                .contains("already requested in this step")
+        );
+        assert!(
+            results[3]
+                .content
+                .contains("already requested in this step")
+        );
         assert!(!seen[1].allow_tools);
         fs::remove_dir_all(ws).unwrap();
     }
@@ -1653,7 +1668,10 @@ mod tests {
         let env = environment(&req);
         let today = env.lines().find_map(|l| l.strip_prefix("Today: ")).unwrap();
         assert!(today.len() >= "2026-01-01 (Monday)".len(), "{today}");
-        assert!(!today.contains(':'), "date should stay stable across minutes: {today}");
+        assert!(
+            !today.contains(':'),
+            "date should stay stable across minutes: {today}"
+        );
     }
 
     #[tokio::test]

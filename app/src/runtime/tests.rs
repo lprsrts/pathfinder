@@ -5118,9 +5118,9 @@ async fn answering_a_specific_next_question_never_loops_silently_to_logged_and_s
     let (rt, _) = with_script(rt, vec![says("log", 0.9), says("log", 0.9)]);
     let entered = turn(&rt, "goal").await;
     assert!(
-        entered
-            .reply
-            .contains("What role does “Dispatch by name” play in this part? Put it in your own words."),
+        entered.reply.contains(
+            "What role does “Dispatch by name” play in this part? Put it in your own words."
+        ),
         "{}",
         entered.reply
     );
@@ -5136,7 +5136,11 @@ async fn answering_a_specific_next_question_never_loops_silently_to_logged_and_s
     // User answers that specific question directly; even with empty model
     // ack/missing/question, the harness must explain why it didn't advance
     // and must not repeat the verbatim StepWidePurpose prompt.
-    turn(&rt, "It looks up the name in the table and calls the handler").await;
+    turn(
+        &rt,
+        "It looks up the name in the table and calls the handler",
+    )
+    .await;
     let reply = session(&rt).history.last().unwrap().content.clone();
     assert!(
         reply.contains("still open: **Dispatch by name**"),
@@ -5173,7 +5177,9 @@ async fn log_reply_missing_field_explains_what_is_still_unaddressed() {
     turn(&rt, "The router keeps a table").await;
     let reply = session(&rt).history.last().unwrap().content.clone();
     assert!(
-        reply.contains("You haven't explained what happens when a name is missing from the table yet."),
+        reply.contains(
+            "You haven't explained what happens when a name is missing from the table yet."
+        ),
         "{reply}"
     );
 }

@@ -433,7 +433,11 @@ impl Parser<'_> {
             }
             "end" => {
                 self.raw_arg();
-                self.closers.pop().map(|(close, _)| close).unwrap_or_default().to_string()
+                self.closers
+                    .pop()
+                    .map(|(close, _)| close)
+                    .unwrap_or_default()
+                    .to_string()
             }
             "displaystyle" | "textstyle" | "scriptstyle" | "limits" | "nolimits" | "nonumber"
             | "notag" => {
@@ -487,9 +491,9 @@ fn environment(name: &str) -> Option<(&'static str, &'static str)> {
         "cases" | "dcases" => ("{ ", ""),
         "rcases" => ("", " }"),
         "matrix" | "smallmatrix" | "aligned" | "align" | "align*" | "alignat" | "alignat*"
-        | "alignedat" | "equation" | "equation*" | "gather" | "gather*" | "gathered"
-        | "split" | "array" | "eqnarray" | "eqnarray*" | "multline" | "multline*"
-        | "flalign" | "flalign*" => ("", ""),
+        | "alignedat" | "equation" | "equation*" | "gather" | "gather*" | "gathered" | "split"
+        | "array" | "eqnarray" | "eqnarray*" | "multline" | "multline*" | "flalign"
+        | "flalign*" => ("", ""),
         _ => return None,
     })
 }
@@ -694,7 +698,8 @@ fn one_term(x: &str) -> bool {
         while i < n && (c[i].is_ascii_digit() || c[i] == '.') {
             i += 1;
         }
-    } else if c[0].is_whitespace() || "+-−±∓·×÷/=<>≤≥≠≈,;∣|)]⟩_^".contains(c[0]) {
+    } else if c[0].is_whitespace() || "+-−±∓·×÷/=<>≤≥≠≈,;∣|)]⟩_^".contains(c[0])
+    {
         return false;
     } else {
         let letter = c[0].is_alphabetic();
@@ -1045,10 +1050,22 @@ mod tests {
     #[test]
     fn environments_keep_their_brackets() {
         let m = r"a & b \\ c & d";
-        assert_eq!(convert(&format!(r"\begin{{pmatrix}} {m} \end{{pmatrix}}")), "(a b; c d)");
-        assert_eq!(convert(&format!(r"\begin{{bmatrix}} {m} \end{{bmatrix}}")), "[a b; c d]");
-        assert_eq!(convert(&format!(r"\begin{{vmatrix}} {m} \end{{vmatrix}}")), "| a b; c d |");
-        assert_eq!(convert(&format!(r"\begin{{Vmatrix}} {m} \end{{Vmatrix}}")), "‖ a b; c d ‖");
+        assert_eq!(
+            convert(&format!(r"\begin{{pmatrix}} {m} \end{{pmatrix}}")),
+            "(a b; c d)"
+        );
+        assert_eq!(
+            convert(&format!(r"\begin{{bmatrix}} {m} \end{{bmatrix}}")),
+            "[a b; c d]"
+        );
+        assert_eq!(
+            convert(&format!(r"\begin{{vmatrix}} {m} \end{{vmatrix}}")),
+            "| a b; c d |"
+        );
+        assert_eq!(
+            convert(&format!(r"\begin{{Vmatrix}} {m} \end{{Vmatrix}}")),
+            "‖ a b; c d ‖"
+        );
         assert_eq!(
             convert(r"f(x) = \begin{cases} 1 & x > 0 \\ 0 & x \le 0 \end{cases}"),
             "f(x) = {1, x > 0; 0, x ≤ 0"
@@ -1061,9 +1078,15 @@ mod tests {
 
     #[test]
     fn escapes_and_shell_variables_stay_as_written() {
-        assert_eq!(prose("copy it to $HOME/$USER now"), "copy it to $HOME/$USER now");
+        assert_eq!(
+            prose("copy it to $HOME/$USER now"),
+            "copy it to $HOME/$USER now"
+        );
         assert_eq!(prose("set $PATH:$HOME_DIR/bin"), "set $PATH:$HOME_DIR/bin");
-        assert_eq!(prose(r"See \[1\] and `\(code\)`."), r"See [1] and `\(code\)`.");
+        assert_eq!(
+            prose(r"See \[1\] and `\(code\)`."),
+            r"See [1] and `\(code\)`."
+        );
         assert_eq!(prose(r"see \(note\) here"), "see (note) here");
         assert_eq!(prose(r"so \(x\) is free"), "so x is free");
         assert_eq!(prose("$x$ and $f(x)$"), "x and f(x)");

@@ -1195,7 +1195,13 @@ pub fn wrap_hanging(spans: &[Span<'static>], width: u16, hang: usize) -> Vec<Lin
 
         for ch in span.content.chars() {
             if ch == ' ' && !word.trim().is_empty() {
-                flush(&mut word, &mut current, &mut used, &mut lines, &mut cur_meta);
+                flush(
+                    &mut word,
+                    &mut current,
+                    &mut used,
+                    &mut lines,
+                    &mut cur_meta,
+                );
             }
             let ch_w = ch.width().unwrap_or(0);
             if used + word.width() + ch_w > width {
@@ -1203,19 +1209,37 @@ pub fn wrap_hanging(spans: &[Span<'static>], width: u16, hang: usize) -> Vec<Lin
                     // Try moving `word` to a fresh continuation line before cutting it.
                     let trimmed = word.trim_start().to_string();
                     let had_space = trimmed.len() < word.len() || (ch == ' ' && trimmed.is_empty());
-                    push_wrap(&mut current, &mut used, &mut lines, &mut cur_meta, had_space);
+                    push_wrap(
+                        &mut current,
+                        &mut used,
+                        &mut lines,
+                        &mut cur_meta,
+                        had_space,
+                    );
                     word = trimmed;
                     if ch == ' ' && word.is_empty() {
                         continue;
                     }
                     if used + word.width() + ch_w > width && !word.is_empty() {
                         current.push(Span::styled(std::mem::take(&mut word), span.style));
-                        push_wrap(&mut current, &mut used, &mut lines, &mut cur_meta, ch == ' ');
+                        push_wrap(
+                            &mut current,
+                            &mut used,
+                            &mut lines,
+                            &mut cur_meta,
+                            ch == ' ',
+                        );
                     }
                 } else if !word.is_empty() {
                     // Already at `hang`; cut the overlong word right before `ch`.
                     current.push(Span::styled(std::mem::take(&mut word), span.style));
-                    push_wrap(&mut current, &mut used, &mut lines, &mut cur_meta, ch == ' ');
+                    push_wrap(
+                        &mut current,
+                        &mut used,
+                        &mut lines,
+                        &mut cur_meta,
+                        ch == ' ',
+                    );
                     if ch == ' ' {
                         continue;
                     }
@@ -1223,7 +1247,13 @@ pub fn wrap_hanging(spans: &[Span<'static>], width: u16, hang: usize) -> Vec<Lin
             }
             word.push(ch);
         }
-        flush(&mut word, &mut current, &mut used, &mut lines, &mut cur_meta);
+        flush(
+            &mut word,
+            &mut current,
+            &mut used,
+            &mut lines,
+            &mut cur_meta,
+        );
     }
     lines.push(Line::from(current));
     log_meta(cur_meta);
@@ -1932,6 +1962,9 @@ mod tests {
             Style::default(),
         ))
         .join("\n");
-        assert!(text.contains("See [1] and copy it to $HOME/$USER now."), "{text}");
+        assert!(
+            text.contains("See [1] and copy it to $HOME/$USER now."),
+            "{text}"
+        );
     }
 }

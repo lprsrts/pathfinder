@@ -375,7 +375,10 @@ pub fn all_resolved(lang: Option<&str>, map: &crate::domain::Map) -> String {
     let full = line(lang, Line::AllResolved);
     let base = full.trim_end_matches(['.', '。', '।', '۔']);
     // The language's own colon, list comma and full stop.
-    let end = full.chars().last().filter(|c| ['.', '。', '।', '۔'].contains(c));
+    let end = full
+        .chars()
+        .last()
+        .filter(|c| ['.', '。', '।', '۔'].contains(c));
     let arabic = full.chars().any(|c| ('\u{600}'..='\u{6FF}').contains(&c));
     let (colon, comma, stop) = match end {
         Some('。') => ("：", "、", '。'),
@@ -385,7 +388,10 @@ pub fn all_resolved(lang: Option<&str>, map: &crate::domain::Map) -> String {
     };
     let count = |f: fn(PartStatus) -> bool| map.parts.iter().filter(|p| f(p.status)).count();
     let kinds = [
-        (count(PartStatus::counts_as_understood), PartStatus::Understood),
+        (
+            count(PartStatus::counts_as_understood),
+            PartStatus::Understood,
+        ),
         (count(|s| s == PartStatus::Known), PartStatus::Known),
         (count(|s| s == PartStatus::Delegated), PartStatus::Delegated),
     ];
@@ -451,7 +457,10 @@ mod tests {
         // Each language keeps its own punctuation.
         let ja = all_resolved(Some("ja"), &map);
         assert!(ja.starts_with("すべてのパートが解決しました：2 "), "{ja}");
-        assert!(ja.ends_with('。') && ja.contains('、') && !ja.contains(": "), "{ja}");
+        assert!(
+            ja.ends_with('。') && ja.contains('、') && !ja.contains(": "),
+            "{ja}"
+        );
         let hi = all_resolved(Some("hi"), &map);
         assert!(hi.ends_with('।') && !hi.ends_with('.'), "{hi}");
         let ur = all_resolved(Some("ur"), &map);

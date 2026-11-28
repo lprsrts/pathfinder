@@ -1624,12 +1624,14 @@ impl App {
                             self.new_below = false;
                         }
                     }
-                    let clamped_col = mouse
-                        .column
-                        .clamp(self.conv_area.x + 1, self.conv_area.x + self.conv_area.width - 2);
-                    let clamped_row = mouse
-                        .row
-                        .clamp(self.conv_area.y, self.conv_area.y + self.conv_area.height - 1);
+                    let clamped_col = mouse.column.clamp(
+                        self.conv_area.x + 1,
+                        self.conv_area.x + self.conv_area.width - 2,
+                    );
+                    let clamped_row = mouse.row.clamp(
+                        self.conv_area.y,
+                        self.conv_area.y + self.conv_area.height - 1,
+                    );
                     if let Some(pos) = self.mouse_to_text_pos(clamped_col, clamped_row) {
                         sel.head = pos;
                         self.text_sel = Some(sel);
@@ -1746,7 +1748,9 @@ impl App {
                 self.reveal_selected = true;
             }
             KeyCode::Tab => {}
-            KeyCode::Char('y') if !ctrl && !alt && self.input.is_empty() && self.has_text_selection() => {
+            KeyCode::Char('y')
+                if !ctrl && !alt && self.input.is_empty() && self.has_text_selection() =>
+            {
                 self.copy_text_selection();
             }
             KeyCode::Char('c') if ctrl => {
@@ -2348,48 +2352,54 @@ impl App {
     }
 
     fn entry_fingerprint(entry: &Entry) -> u64 {
-    match entry {
-        Entry::User(s) | Entry::Text(s) | Entry::Thought(s) | Entry::Note(s) => s.len() as u64,
-        Entry::Tool {
-            title, ok, detail, ..
-        } => {
-            let status = match ok {
-                None => 1,
-                Some(false) => 2,
-                Some(true) => 3,
-            };
-            (title.len() as u64)
-                .wrapping_mul(131)
-                .wrapping_add(detail.len() as u64)
-                .wrapping_mul(7)
-                .wrapping_add(status)
+        match entry {
+            Entry::User(s) | Entry::Text(s) | Entry::Thought(s) | Entry::Note(s) => s.len() as u64,
+            Entry::Tool {
+                title, ok, detail, ..
+            } => {
+                let status = match ok {
+                    None => 1,
+                    Some(false) => 2,
+                    Some(true) => 3,
+                };
+                (title.len() as u64)
+                    .wrapping_mul(131)
+                    .wrapping_add(detail.len() as u64)
+                    .wrapping_mul(7)
+                    .wrapping_add(status)
+            }
+            Entry::Source { body, .. } => body.len() as u64,
+            Entry::Search { hits, total, .. } => (hits.len() as u64)
+                .wrapping_mul(31)
+                .wrapping_add(*total as u64),
+            Entry::Info(rows) => rows.len() as u64,
         }
-        Entry::Source { body, .. } => body.len() as u64,
-        Entry::Search { hits, total, .. } => (hits.len() as u64).wrapping_mul(31).wrapping_add(*total as u64),
-        Entry::Info(rows) => rows.len() as u64,
     }
-}
 
-    fn slice_line_cols(line: &ratatui::text::Line<'_>, from_col: u16, to_col: Option<u16>) -> String {
-    use unicode_width::UnicodeWidthChar as _;
-    let mut out = String::new();
-    let mut col: u16 = 0;
-    for span in &line.spans {
-        for ch in span.content.chars() {
-            let w = ch.width().unwrap_or(0) as u16;
-            if let Some(end) = to_col
-                && col > end
-            {
-                return out;
+    fn slice_line_cols(
+        line: &ratatui::text::Line<'_>,
+        from_col: u16,
+        to_col: Option<u16>,
+    ) -> String {
+        use unicode_width::UnicodeWidthChar as _;
+        let mut out = String::new();
+        let mut col: u16 = 0;
+        for span in &line.spans {
+            for ch in span.content.chars() {
+                let w = ch.width().unwrap_or(0) as u16;
+                if let Some(end) = to_col
+                    && col > end
+                {
+                    return out;
+                }
+                if col >= from_col {
+                    out.push(ch);
+                }
+                col = col.saturating_add(w);
             }
-            if col >= from_col {
-                out.push(ch);
-            }
-            col = col.saturating_add(w);
         }
+        out
     }
-    out
-}
 
     fn line_start(&self) -> usize {
         self.input[..self.cursor].rfind('\n').map_or(0, |i| i + 1)

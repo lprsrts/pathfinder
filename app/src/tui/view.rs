@@ -972,7 +972,13 @@ fn conversation(f: &mut Frame, app: &mut App, area: Rect) {
     let text_sel = app.text_sel.filter(|s| !s.is_empty());
     let (visible, line_info): (Vec<Line<'static>>, Vec<(u16, u16)>) = {
         let cache = app.cached_transcript(area.width);
-        let vis: Vec<Line<'static>> = cache.lines.iter().skip(start).take(height).cloned().collect();
+        let vis: Vec<Line<'static>> = cache
+            .lines
+            .iter()
+            .skip(start)
+            .take(height)
+            .cloned()
+            .collect();
         let info: Vec<(u16, u16)> = (0..vis.len())
             .map(|row| {
                 let idx = start + row;
@@ -3848,7 +3854,10 @@ mod tests {
         // A part in review was understood before it was handed off.
         app.session.map.parts[0].status = PartStatus::InReview;
         let text = line_text(&rule_line(&app, 170, false));
-        assert!(text.contains("Understood 1/2 » The verdict prompt"), "{text}");
+        assert!(
+            text.contains("Understood 1/2 » The verdict prompt"),
+            "{text}"
+        );
         app.session.map.parts[0].status = PartStatus::Understood;
         // A LaTeX title reads as Unicode on the rule, as in the panel.
         app.session.map.parts[1].title = r"The weight \(w_{ij}\)".into();
@@ -4331,11 +4340,16 @@ mod tests {
 
         // Multiple reads of the same file show the read count and any failed reads.
         app.entries.clear();
-        app.entries.push(tool("t1", "Read FUB_Folien1.pdf (page 1)", false));
-        app.entries.push(tool("t2", "Read FUB_Folien1.pdf (page 24)", true));
-        app.entries.push(tool("t3", "Read FUB_Folien1.pdf (pages 39-41)", true));
-        app.entries.push(tool("t4", "Read FUB_Folien1.pdf (page 24)", true));
-        app.entries.push(tool("t5", "Read FUB_Folien1.pdf (page 19)", true));
+        app.entries
+            .push(tool("t1", "Read FUB_Folien1.pdf (page 1)", false));
+        app.entries
+            .push(tool("t2", "Read FUB_Folien1.pdf (page 24)", true));
+        app.entries
+            .push(tool("t3", "Read FUB_Folien1.pdf (pages 39-41)", true));
+        app.entries
+            .push(tool("t4", "Read FUB_Folien1.pdf (page 24)", true));
+        app.entries
+            .push(tool("t5", "Read FUB_Folien1.pdf (page 19)", true));
         app.entries.push(tool("t6", "Grep `foo`", true));
         app.entries.push(tool("t7", "Grep `bar`", true));
         let line = texts(&group_line(&app, &[0, 1, 2, 3, 4, 5, 6], 200)).join(" ");
@@ -4637,14 +4651,18 @@ mod tests {
         let buf = term.backend().buffer();
         let y = app.conv_area.y;
         // Prefix `• ` (cols 0..2 relative to conv_area.x + 1) is NOT highlighted.
-        assert!(!buf[(app.conv_area.x + 1, y)]
-            .style()
-            .add_modifier
-            .contains(Modifier::REVERSED));
+        assert!(
+            !buf[(app.conv_area.x + 1, y)]
+                .style()
+                .add_modifier
+                .contains(Modifier::REVERSED)
+        );
         // Content `Hello` (cols 2..=6) IS highlighted.
-        assert!(buf[(app.conv_area.x + 1 + 2, y)]
-            .style()
-            .add_modifier
-            .contains(Modifier::REVERSED));
+        assert!(
+            buf[(app.conv_area.x + 1 + 2, y)]
+                .style()
+                .add_modifier
+                .contains(Modifier::REVERSED)
+        );
     }
 }

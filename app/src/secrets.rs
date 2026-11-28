@@ -239,7 +239,10 @@ mod tests {
             r"Uses \(\mu_i + \sigma_i^2\) instead of \(\mu_i + \sigma_i\)",
             0,
         );
-        assert!(precheck_hit(&s, "Hint: it uses μᵢ + σᵢ² instead of μᵢ + σᵢ."));
+        assert!(precheck_hit(
+            &s,
+            "Hint: it uses μᵢ + σᵢ² instead of μᵢ + σᵢ."
+        ));
         // Math the candidate already shows is still fine to repeat.
         let s = Secret::candidate_key(
             r"It returns \(\mu_a + \mu_b\) over \(\sigma_a + \sigma_b\) here.",
@@ -247,6 +250,9 @@ mod tests {
             "It returns μₐ + μ_b over σₐ + σ_b here, which is wrong.",
             0,
         );
-        assert!(!precheck_hit(&s, "The candidate returns μₐ + μ_b over σₐ + σ_b here, hmm."));
+        assert!(!precheck_hit(
+            &s,
+            "The candidate returns μₐ + μ_b over σₐ + σ_b here, hmm."
+        ));
     }
 }
