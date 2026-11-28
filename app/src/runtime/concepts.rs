@@ -237,12 +237,13 @@ impl Runtime {
                         .into_iter()
                         .filter(|a| a != id)
                         .collect();
-                    self.store.upsert_concept(
+                    self.store.upsert_workspace_concept(
                         &ws,
                         &Concept {
                             id: id.clone(),
                             label: String::new(),
                             aliases,
+                            domain: String::new(),
                             created_by: created_by.into(),
                         },
                     )?;
@@ -263,12 +264,13 @@ impl Runtime {
                             .unwrap();
                     }
                     taken.insert(id.clone());
-                    self.store.upsert_concept(
+                    self.store.upsert_workspace_concept(
                         &ws,
                         &Concept {
                             id: id.clone(),
                             label,
                             aliases: vec![],
+                            domain: String::new(),
                             created_by: created_by.into(),
                         },
                     )?;
@@ -282,7 +284,7 @@ impl Runtime {
             for need in &p.needs {
                 let need = out.get(need).cloned().unwrap_or_else(|| slugify(need));
                 if taken.contains(&need) || existing.iter().any(|c| c.id == need) {
-                    self.store.add_prerequisite(&ws, id, &need, created_by)?;
+                    self.store.add_prerequisite(id, &need, created_by)?;
                 }
             }
         }
@@ -614,8 +616,7 @@ impl Runtime {
         }
         let labels = self.labels(session);
         let label = |id: &str| labels.get(id).cloned().unwrap_or_else(|| id.to_string());
-        let ws = Self::workspace(session);
-        let prerequisites = self.store.prerequisites(&ws).unwrap_or_default();
+        let prerequisites = self.store.prerequisites().unwrap_or_default();
         // Everything reachable, so gaps can see the states underneath.
         let mut wanted: Vec<String> = part.concepts.clone();
         for needs in prerequisites.values() {
@@ -749,7 +750,7 @@ impl Runtime {
         let lang = session.language.clone();
         let lang = lang.as_deref();
         let ws = Self::workspace(session);
-        let prerequisites = self.store.prerequisites(&ws).unwrap_or_default();
+        let prerequisites = self.store.prerequisites().unwrap_or_default();
         // The part's concepts, and one level of what they build on.
         let mut ids: Vec<String> = part.concepts.clone();
         for c in &part.concepts {
@@ -960,7 +961,7 @@ impl Runtime {
                 crate::domain::mermaid_text(&name),
             ));
         }
-        for (concept, needs) in self.store.prerequisites(&ws).unwrap_or_default() {
+        for (concept, needs) in self.store.prerequisites().unwrap_or_default() {
             for n in needs {
                 if shown_ids.contains(concept.as_str()) && shown_ids.contains(n.as_str()) {
                     out.push_str(&format!(

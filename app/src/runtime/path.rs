@@ -87,6 +87,7 @@ impl Runtime {
                 id: target.clone(),
                 label: target.replace('-', " "),
                 aliases: vec![],
+                domain: String::new(),
                 created_by: "map".into(),
             });
         // Avoid repeating the exact same fixed `Next:` question verbatim

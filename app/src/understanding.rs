@@ -57,6 +57,9 @@ pub struct Concept {
     pub label: String,
     #[serde(default)]
     pub aliases: Vec<String>,
+    /// Short topic/domain tag (e.g. `"electromagnetism"`, `"rust-async"`), never raw paths.
+    #[serde(default)]
+    pub domain: String,
     /// `map`, `extractor` or `user`.
     pub created_by: String,
 }
@@ -89,6 +92,9 @@ pub enum EventKind {
     /// `detail` `{"kind": "wide-example", "steered": bool}`. Activity, never
     /// evidence.
     Step,
+    /// Explicit opt-out in this workspace: don't assume prior knowledge from
+    /// other workspaces for this concept. Append-only, never evidence.
+    Revisit,
 }
 
 impl EventKind {
@@ -109,6 +115,7 @@ impl EventKind {
             Self::Searched => "searched",
             Self::Retracted => "retracted",
             Self::Step => "step",
+            Self::Revisit => "revisit",
         }
     }
 
@@ -129,6 +136,7 @@ impl EventKind {
             "searched" => Self::Searched,
             "retracted" => Self::Retracted,
             "step" => Self::Step,
+            "revisit" => Self::Revisit,
             _ => return None,
         })
     }
@@ -137,6 +145,7 @@ impl EventKind {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Event {
     pub id: i64,
+    pub workspace: String,
     pub concept: String,
     pub kind: EventKind,
     /// A candidate, misconception, ledger entry or message id.
@@ -213,22 +222,44 @@ impl ConceptState {
     }
 }
 
+/// Cross-workspace prior understanding when the current workspace has no local
+/// evidence (`!state.has_evidence()`). Never counts as local evidence or A7
+/// `vouched` provenance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PriorState {
+    /// Shown (passed at least once, or cooled from solid after `AGE_SECS` of
+    /// global inactivity) in another workspace.
+    ShownElsewhere { workspace: String },
+    /// Solid in another workspace and fresh within `AGE_SECS` globally.
+    SolidElsewhere { workspace: String },
+}
+
 /// One concept's state as of `now`, with what it rests on.
+///
+/// `state`, `passes`, `fails`, `last_evidence`, and `event_ids` strictly
+/// reflect the current (local) workspace so A7 ledger/coverage invariants never
+/// conflate cross-workspace `prior` knowledge with local evidence.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConceptView {
     pub state: ConceptState,
     pub passes: usize,
     pub fails: usize,
-    /// The newest pass or `review_ok`.
+    /// The newest local pass or `review_ok`.
     pub last_evidence: Option<i64>,
-    /// Open misconception ids, oldest first.
+    /// Open misconception ids, oldest first (global when computed via
+    /// [`concept_view_in_workspace`]).
     pub open_misconceptions: Vec<String>,
-    /// The events the state rests on.
+    /// The local events the state rests on.
     pub event_ids: Vec<i64>,
     pub now: i64,
+    /// Cross-workspace prior understanding when `!state.has_evidence()`,
+    /// suppressed if a local [`EventKind::Revisit`] occurred after the latest
+    /// elsewhere evidence.
+    pub prior: Option<PriorState>,
 }
 
-/// A5: folds one concept's events (in id order) into its state as of `now`.
+/// A5: folds one concept's single-workspace events (in id order) into its state
+/// as of `now`.
 pub fn concept_view(events: &[Event], now: i64) -> ConceptView {
     use ConceptState::*;
     let mut state = Unknown;
@@ -294,27 +325,254 @@ pub fn concept_view(events: &[Event], now: i64) -> ConceptView {
         open_misconceptions: open,
         event_ids: ids,
         now,
+        prior: None,
     }
 }
 
-/// The ids `retracted` events point at that are claims (§15). A
-/// retraction aimed at any other kind is ignored: undo only lowers the
-/// record.
+#[derive(Default)]
+struct WorkspaceFold {
+    state: Option<ConceptState>,
+    passes: usize,
+    fails: usize,
+    flawed_passes: usize,
+    last_evidence: Option<i64>,
+    last_evidence_id: Option<i64>,
+    event_ids: Vec<i64>,
+}
+
+impl WorkspaceFold {
+    fn state(&self) -> ConceptState {
+        self.state.unwrap_or(ConceptState::Unknown)
+    }
+}
+
+fn active_prior(
+    workspaces: &HashMap<&str, WorkspaceFold>,
+    current_workspace: &str,
+    global_last_evidence: Option<i64>,
+    latest_elsewhere_evidence_id: Option<i64>,
+    local_last_revisit_id: Option<i64>,
+    at: i64,
+) -> Option<PriorState> {
+    if let Some(rev_id) = local_last_revisit_id
+        && latest_elsewhere_evidence_id.is_none_or(|ev_id| rev_id > ev_id)
+    {
+        return None;
+    }
+    let global_fresh = global_last_evidence.is_some_and(|t| at - t <= AGE_SECS);
+    // Pick the strongest prior: SolidElsewhere > ShownElsewhere, then newest
+    // evidence timestamp/id, then lexicographically smallest workspace for
+    // determinism.
+    let mut best: Option<(bool, i64, i64, &str)> = None;
+    for (&ws, fold) in workspaces {
+        if ws == current_workspace {
+            continue;
+        }
+        let is_solid = match fold.state() {
+            ConceptState::Solid => global_fresh,
+            ConceptState::Shown => false,
+            _ => continue,
+        };
+        let ev_at = fold.last_evidence.unwrap_or(i64::MIN);
+        let ev_id = fold.last_evidence_id.unwrap_or(i64::MIN);
+        let better = match best {
+            None => true,
+            Some((b_solid, b_at, b_id, b_ws)) => {
+                (is_solid, ev_at, ev_id) > (b_solid, b_at, b_id)
+                    || ((is_solid, ev_at, ev_id) == (b_solid, b_at, b_id) && ws < b_ws)
+            }
+        };
+        if better {
+            best = Some((is_solid, ev_at, ev_id, ws));
+        }
+    }
+    best.map(|(is_solid, _, _, ws)| {
+        if is_solid {
+            PriorState::SolidElsewhere {
+                workspace: ws.to_string(),
+            }
+        } else {
+            PriorState::ShownElsewhere {
+                workspace: ws.to_string(),
+            }
+        }
+    })
+}
+
+/// Folds one concept's global events (across all workspaces) into its view for
+/// `current_workspace` as of `now`:
+/// - Local state (`state`, `passes`, `fails`, `last_evidence`, `event_ids`)
+///   comes strictly from `current_workspace` events (preserving A7 `vouched`
+///   safety).
+/// - Open misconceptions travel and resolve globally across workspaces.
+/// - Any `Pass` or `ReviewOk` in any workspace refreshes the 30-day `AGE_SECS`
+///   recency clock for both local `Solid` and `PriorState::SolidElsewhere`.
+/// - When `!state.has_evidence()`, `prior` surfaces `SolidElsewhere` or
+///   `ShownElsewhere` from other workspaces unless a local `Revisit` occurred
+///   after the latest elsewhere evidence.
+/// - 1-pass fast promotion: if active `SolidElsewhere` holds immediately before
+///   a local `Pass` (with no open misconceptions and local state not `Shaky`),
+///   that single local `Pass` promotes local state directly to `Solid`.
+pub fn concept_view_in_workspace(
+    events: &[Event],
+    current_workspace: &str,
+    now: i64,
+) -> ConceptView {
+    use ConceptState::*;
+    let mut sorted: Vec<&Event> = events.iter().collect();
+    sorted.sort_by_key(|e| e.id);
+
+    let withdrawn = retracted_claims(events);
+    let mut workspaces: HashMap<&str, WorkspaceFold> = HashMap::new();
+    let mut open: Vec<String> = Vec::new();
+    let mut global_last_evidence: Option<i64> = None;
+    let mut latest_elsewhere_evidence_id: Option<i64> = None;
+    let mut local_last_revisit_id: Option<i64> = None;
+
+    for e in sorted {
+        if e.kind == EventKind::Claim && withdrawn.contains(&e.id) {
+            continue;
+        }
+        match e.kind {
+            EventKind::MisconceptionShown => {
+                if let Some(m) = &e.reference
+                    && !open.contains(m)
+                {
+                    open.push(m.clone());
+                }
+            }
+            EventKind::MisconceptionResolved => {
+                if let Some(m) = &e.reference {
+                    open.retain(|o| o != m);
+                }
+            }
+            EventKind::Revisit if e.workspace == current_workspace => {
+                local_last_revisit_id = Some(e.id);
+            }
+            _ => {}
+        }
+
+        let solid_elsewhere_before_pass =
+            if e.kind == EventKind::Pass && e.workspace == current_workspace {
+                matches!(
+                    active_prior(
+                        &workspaces,
+                        current_workspace,
+                        global_last_evidence,
+                        latest_elsewhere_evidence_id,
+                        local_last_revisit_id,
+                        e.at,
+                    ),
+                    Some(PriorState::SolidElsewhere { .. })
+                )
+            } else {
+                false
+            };
+
+        let fold = workspaces.entry(e.workspace.as_str()).or_default();
+        let before = fold.state();
+        let mut state = before;
+        match e.kind {
+            EventKind::Claim if state == Unknown => state = Claimed,
+            EventKind::Delegated if state == Unknown => state = Delegated,
+            EventKind::Pass => {
+                fold.passes += 1;
+                if e.detail["flawed"].as_bool() == Some(true) {
+                    fold.flawed_passes += 1;
+                }
+                fold.last_evidence = Some(fold.last_evidence.map_or(e.at, |p| p.max(e.at)));
+                fold.last_evidence_id = Some(e.id);
+                global_last_evidence = Some(global_last_evidence.map_or(e.at, |p| p.max(e.at)));
+                if e.workspace != current_workspace {
+                    latest_elsewhere_evidence_id = Some(e.id);
+                }
+                state = match state {
+                    Unknown | Claimed | Delegated => {
+                        if solid_elsewhere_before_pass && open.is_empty() {
+                            Solid
+                        } else {
+                            Shown
+                        }
+                    }
+                    Shaky if open.is_empty() => Shown,
+                    Shaky => Shaky,
+                    Shown if fold.passes >= 2 && fold.flawed_passes >= 1 && open.is_empty() => {
+                        Solid
+                    }
+                    other => other,
+                };
+            }
+            EventKind::Fail => {
+                fold.fails += 1;
+                state = Shaky;
+            }
+            EventKind::ReviewMissed if matches!(state, Shown | Solid) => state = Shaky,
+            EventKind::ReviewOk => {
+                fold.last_evidence = Some(fold.last_evidence.map_or(e.at, |p| p.max(e.at)));
+                fold.last_evidence_id = Some(e.id);
+                global_last_evidence = Some(global_last_evidence.map_or(e.at, |p| p.max(e.at)));
+                if e.workspace != current_workspace {
+                    latest_elsewhere_evidence_id = Some(e.id);
+                }
+            }
+            _ => {}
+        }
+        fold.state = Some(state);
+        if state != before || matches!(e.kind, EventKind::Pass | EventKind::ReviewOk) {
+            fold.event_ids.push(e.id);
+        }
+    }
+
+    let local = workspaces.get(current_workspace);
+    let mut local_state = local.map(WorkspaceFold::state).unwrap_or(Unknown);
+    if local_state == Solid && global_last_evidence.is_none_or(|t| now - t > AGE_SECS) {
+        local_state = Shown;
+    }
+    let prior = if !local_state.has_evidence() {
+        active_prior(
+            &workspaces,
+            current_workspace,
+            global_last_evidence,
+            latest_elsewhere_evidence_id,
+            local_last_revisit_id,
+            now,
+        )
+    } else {
+        None
+    };
+
+    ConceptView {
+        state: local_state,
+        passes: local.map(|f| f.passes).unwrap_or(0),
+        fails: local.map(|f| f.fails).unwrap_or(0),
+        last_evidence: local.and_then(|f| f.last_evidence),
+        open_misconceptions: open,
+        event_ids: local.map(|f| f.event_ids.clone()).unwrap_or_default(),
+        now,
+        prior,
+    }
+}
+
+/// The ids `retracted` events point at that are claims (§15) in the same
+/// workspace. A retraction aimed at any other kind is ignored: undo only
+/// lowers the record.
 pub fn retracted_claims(events: &[Event]) -> HashSet<i64> {
-    let claims: HashSet<i64> = events
+    let claims: HashMap<i64, &str> = events
         .iter()
         .filter(|e| e.kind == EventKind::Claim)
-        .map(|e| e.id)
+        .map(|e| (e.id, e.workspace.as_str()))
         .collect();
     events
         .iter()
         .filter(|e| e.kind == EventKind::Retracted)
-        .filter_map(|e| e.reference.as_deref()?.parse::<i64>().ok())
-        .filter(|id| claims.contains(id))
+        .filter_map(|e| {
+            let id = e.reference.as_deref()?.parse::<i64>().ok()?;
+            (claims.get(&id) == Some(&e.workspace.as_str())).then_some(id)
+        })
         .collect()
 }
 
-/// Views for every concept in `events`, grouped by concept.
+/// Views for every concept in `events`, grouped by concept (single-workspace).
 pub fn views(events: &[Event], now: i64) -> HashMap<String, ConceptView> {
     let mut by: HashMap<String, Vec<Event>> = HashMap::new();
     for e in events {
@@ -324,6 +582,25 @@ pub fn views(events: &[Event], now: i64) -> HashMap<String, ConceptView> {
         .map(|(c, mut es)| {
             es.sort_by_key(|e| e.id);
             (c, concept_view(&es, now))
+        })
+        .collect()
+}
+
+/// Views for every concept in `events` (across all workspaces) evaluated in
+/// `current_workspace` as of `now`.
+pub fn views_in_workspace(
+    events: &[Event],
+    current_workspace: &str,
+    now: i64,
+) -> HashMap<String, ConceptView> {
+    let mut by: HashMap<String, Vec<Event>> = HashMap::new();
+    for e in events {
+        by.entry(e.concept.clone()).or_default().push(e.clone());
+    }
+    by.into_iter()
+        .map(|(c, mut es)| {
+            es.sort_by_key(|e| e.id);
+            (c, concept_view_in_workspace(&es, current_workspace, now))
         })
         .collect()
 }
@@ -846,11 +1123,38 @@ mod tests {
     fn ev(id: i64, kind: EventKind) -> Event {
         Event {
             id,
+            workspace: "/w".into(),
             concept: "c".into(),
             kind,
             reference: None,
             detail: Value::Null,
             at: 1000 + id,
+        }
+    }
+
+    fn ev_in(ws: &str, id: i64, kind: EventKind, at: i64) -> Event {
+        Event {
+            id,
+            workspace: ws.into(),
+            concept: "c".into(),
+            kind,
+            reference: None,
+            detail: Value::Null,
+            at,
+        }
+    }
+
+    fn pass_in(ws: &str, id: i64, flawed: bool, at: i64) -> Event {
+        Event {
+            detail: json!({"flawed": flawed}),
+            ..ev_in(ws, id, EventKind::Pass, at)
+        }
+    }
+
+    fn misc_in(ws: &str, id: i64, kind: EventKind, m: &str, at: i64) -> Event {
+        Event {
+            reference: Some(m.into()),
+            ..ev_in(ws, id, kind, at)
         }
     }
 
@@ -1009,12 +1313,14 @@ mod tests {
                 id: "d-separation".into(),
                 label: "d-separation".into(),
                 aliases: vec!["d-sep".into()],
+                domain: String::new(),
                 created_by: "map".into(),
             },
             Concept {
                 id: "colliders".into(),
                 label: "Colliders in a DAG".into(),
                 aliases: vec![],
+                domain: String::new(),
                 created_by: "map".into(),
             },
         ];
@@ -1273,5 +1579,242 @@ mod tests {
             Some("narrow-example")
         );
         assert_eq!(StepKind::parse("tall-example"), None);
+    }
+
+    #[test]
+    fn prior_state_surfaces_elsewhere_evidence_without_affecting_local_has_evidence() {
+        // /w1 is Solid; /w2 has no local events.
+        let events = [
+            pass_in("/w1", 1, false, 1000),
+            pass_in("/w1", 2, true, 1001),
+        ];
+        let v_w2 = concept_view_in_workspace(&events, "/w2", 2000);
+        // A7 safety: local state is Unknown and has_evidence() is false.
+        assert_eq!(v_w2.state, ConceptState::Unknown);
+        assert!(!v_w2.state.has_evidence());
+        assert_eq!(v_w2.passes, 0);
+        assert!(v_w2.event_ids.is_empty());
+        assert_eq!(
+            v_w2.prior,
+            Some(PriorState::SolidElsewhere {
+                workspace: "/w1".into()
+            })
+        );
+
+        // /w1 only Shown -> ShownElsewhere in /w2.
+        let shown_only = [pass_in("/w1", 1, false, 1000)];
+        let v_shown = concept_view_in_workspace(&shown_only, "/w2", 2000);
+        assert_eq!(v_shown.state, ConceptState::Unknown);
+        assert_eq!(
+            v_shown.prior,
+            Some(PriorState::ShownElsewhere {
+                workspace: "/w1".into()
+            })
+        );
+
+        // SolidElsewhere beats ShownElsewhere when multiple workspaces have evidence.
+        let mixed = [
+            pass_in("/w1", 1, false, 1000),
+            pass_in("/w3", 2, false, 1001),
+            pass_in("/w3", 3, true, 1002),
+        ];
+        assert_eq!(
+            concept_view_in_workspace(&mixed, "/w2", 2000).prior,
+            Some(PriorState::SolidElsewhere {
+                workspace: "/w3".into()
+            })
+        );
+
+        // If /w1 becomes Shaky, it no longer supplies a prior.
+        let failed = [
+            pass_in("/w1", 1, false, 1000),
+            pass_in("/w1", 2, true, 1001),
+            ev_in("/w1", 3, EventKind::Fail, 1002),
+        ];
+        assert_eq!(concept_view_in_workspace(&failed, "/w2", 2000).prior, None);
+    }
+
+    #[test]
+    fn one_pass_fast_promotion_requires_active_solid_elsewhere_and_clean_record() {
+        // Active SolidElsewhere in /w1 + 1 non-flawed local Pass in /w2 -> Solid!
+        let promoted = [
+            pass_in("/w1", 1, false, 1000),
+            pass_in("/w1", 2, true, 1001),
+            pass_in("/w2", 3, false, 1500),
+        ];
+        let v = concept_view_in_workspace(&promoted, "/w2", 2000);
+        assert_eq!(v.state, ConceptState::Solid);
+        assert!(v.state.has_evidence());
+        assert_eq!(v.passes, 1);
+        assert_eq!(v.event_ids, vec![3]);
+        assert_eq!(v.prior, None);
+
+        // ShownElsewhere is NOT enough for 1-pass fast promotion.
+        let from_shown = [
+            pass_in("/w1", 1, false, 1000),
+            pass_in("/w2", 2, false, 1500),
+        ];
+        assert_eq!(
+            concept_view_in_workspace(&from_shown, "/w2", 2000).state,
+            ConceptState::Shown
+        );
+
+        // Cooled SolidElsewhere (> AGE_SECS before local Pass) does NOT fast-promote.
+        let cooled = [
+            pass_in("/w1", 1, false, 1000),
+            pass_in("/w1", 2, true, 1001),
+            pass_in("/w2", 3, false, 1001 + AGE_SECS + 10),
+        ];
+        assert_eq!(
+            concept_view_in_workspace(&cooled, "/w2", 1001 + AGE_SECS + 20).state,
+            ConceptState::Shown
+        );
+
+        // Open global misconception blocks 1-pass fast promotion.
+        let blocked = [
+            pass_in("/w1", 1, false, 1000),
+            pass_in("/w1", 2, true, 1001),
+            misc_in("/w1", 3, EventKind::MisconceptionShown, "m1", 1100),
+            pass_in("/w2", 4, false, 1500),
+        ];
+        let vb = concept_view_in_workspace(&blocked, "/w2", 2000);
+        assert_eq!(vb.state, ConceptState::Shown);
+        assert_eq!(vb.open_misconceptions, vec!["m1"]);
+
+        // Local Fail (Shaky) followed by 1 Pass recovers to Shown, not Solid.
+        let shaky_first = [
+            pass_in("/w1", 1, false, 1000),
+            pass_in("/w1", 2, true, 1001),
+            ev_in("/w2", 3, EventKind::Fail, 1200),
+            pass_in("/w2", 4, false, 1500),
+        ];
+        assert_eq!(
+            concept_view_in_workspace(&shaky_first, "/w2", 2000).state,
+            ConceptState::Shown
+        );
+    }
+
+    #[test]
+    fn global_misconceptions_travel_and_resolve_across_workspaces() {
+        let events = [
+            ev_in("/w2", 1, EventKind::Fail, 1000),
+            misc_in("/w1", 2, EventKind::MisconceptionShown, "m-global", 1001),
+            pass_in("/w2", 3, false, 1002),
+        ];
+        let v = concept_view_in_workspace(&events, "/w2", 2000);
+        // Misconception from /w1 travels to /w2 and blocks Shaky -> Shown recovery.
+        assert_eq!(v.state, ConceptState::Shaky);
+        assert_eq!(v.open_misconceptions, vec!["m-global"]);
+
+        // Resolving in /w3 clears it globally and unblocks /w2.
+        let resolved = [
+            events[0].clone(),
+            events[1].clone(),
+            events[2].clone(),
+            misc_in("/w3", 4, EventKind::MisconceptionResolved, "m-global", 1003),
+            pass_in("/w2", 5, false, 1004),
+        ];
+        let vr = concept_view_in_workspace(&resolved, "/w2", 2000);
+        assert_eq!(vr.state, ConceptState::Shown);
+        assert!(vr.open_misconceptions.is_empty());
+    }
+
+    #[test]
+    fn global_recency_and_30_day_ageing_apply_across_all_workspaces() {
+        // SolidElsewhere cools to ShownElsewhere after AGE_SECS of global inactivity.
+        let elsewhere = [
+            pass_in("/w1", 1, false, 1000),
+            pass_in("/w1", 2, true, 1001),
+        ];
+        assert_eq!(
+            concept_view_in_workspace(&elsewhere, "/w2", 1001 + AGE_SECS).prior,
+            Some(PriorState::SolidElsewhere {
+                workspace: "/w1".into()
+            })
+        );
+        assert_eq!(
+            concept_view_in_workspace(&elsewhere, "/w2", 1001 + AGE_SECS + 1).prior,
+            Some(PriorState::ShownElsewhere {
+                workspace: "/w1".into()
+            })
+        );
+
+        // ReviewOk in /w3 refreshes the global 30-day clock for both local Solid and SolidElsewhere.
+        let refreshed = [
+            pass_in("/w1", 1, false, 1000),
+            pass_in("/w1", 2, true, 1001),
+            ev_in("/w3", 3, EventKind::ReviewOk, 1001 + AGE_SECS - 10),
+        ];
+        let after_30d = 1001 + AGE_SECS + 5;
+        assert_eq!(
+            concept_view_in_workspace(&refreshed, "/w1", after_30d).state,
+            ConceptState::Solid
+        );
+        assert_eq!(
+            concept_view_in_workspace(&refreshed, "/w2", after_30d).prior,
+            Some(PriorState::SolidElsewhere {
+                workspace: "/w1".into()
+            })
+        );
+    }
+
+    #[test]
+    fn revisit_suppresses_prior_and_fast_promotion_until_newer_elsewhere_evidence() {
+        assert_eq!(EventKind::parse("revisit"), Some(EventKind::Revisit));
+        assert_eq!(EventKind::Revisit.as_str(), "revisit");
+
+        // Revisit in /w2 after /w1's Solid suppresses prior.
+        let revisited = [
+            pass_in("/w1", 1, false, 1000),
+            pass_in("/w1", 2, true, 1001),
+            ev_in("/w2", 3, EventKind::Revisit, 1002),
+        ];
+        let v = concept_view_in_workspace(&revisited, "/w2", 2000);
+        assert_eq!(v.state, ConceptState::Unknown);
+        assert_eq!(v.prior, None);
+
+        // And suppresses 1-pass fast promotion in /w2.
+        let after_revisit_pass = [
+            revisited[0].clone(),
+            revisited[1].clone(),
+            revisited[2].clone(),
+            pass_in("/w2", 4, false, 1003),
+        ];
+        assert_eq!(
+            concept_view_in_workspace(&after_revisit_pass, "/w2", 2000).state,
+            ConceptState::Shown
+        );
+
+        // Newer elsewhere evidence after Revisit re-activates SolidElsewhere.
+        let newer_elsewhere = [
+            revisited[0].clone(),
+            revisited[1].clone(),
+            revisited[2].clone(),
+            ev_in("/w1", 4, EventKind::ReviewOk, 1004),
+        ];
+        assert_eq!(
+            concept_view_in_workspace(&newer_elsewhere, "/w2", 2000).prior,
+            Some(PriorState::SolidElsewhere {
+                workspace: "/w1".into()
+            })
+        );
+
+        // Revisit never drops existing local evidence.
+        let local_shown = [
+            pass_in("/w2", 1, false, 1000),
+            ev_in("/w2", 2, EventKind::Revisit, 1001),
+        ];
+        assert_eq!(
+            concept_view_in_workspace(&local_shown, "/w2", 2000).state,
+            ConceptState::Shown
+        );
+    }
+
+    #[test]
+    fn concept_domain_defaults_when_missing_in_json() {
+        let c: Concept =
+            serde_json::from_str(r#"{"id":"fft","label":"FFT","aliases":[],"created_by":"map"}"#)
+                .unwrap();
+        assert_eq!(c.domain, "");
     }
 }

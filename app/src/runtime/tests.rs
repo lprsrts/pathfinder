@@ -862,12 +862,13 @@ async fn a_question_is_answered_without_a_task() {
     let session = rt.load_session("s").unwrap().unwrap();
     let ws = crate::understanding::workspace_key(&session.cwd);
     rt.store
-        .upsert_concept(
+        .upsert_workspace_concept(
             &ws,
             &crate::understanding::Concept {
                 id: "phasors".into(),
                 label: "Phasors".into(),
                 aliases: vec![],
+                domain: String::new(),
                 created_by: "map".into(),
             },
         )
@@ -4676,12 +4677,13 @@ async fn a_check_passed_in_another_thread_of_the_folder_counts_here() {
     let chat = session(&rt);
     let ws = crate::understanding::workspace_key(&chat.cwd);
     rt.store
-        .upsert_concept(
+        .upsert_workspace_concept(
             &ws,
             &crate::understanding::Concept {
                 id: "l2-distance".into(),
                 label: "L2 distance between Gaussian mixtures".into(),
                 aliases: vec![],
+                domain: String::new(),
                 created_by: "map".into(),
             },
         )

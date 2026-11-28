@@ -689,9 +689,10 @@ fn own_concept(store: &crate::store::Store, workspace: &str, label: &str) -> Opt
         id: id.clone(),
         label: label.to_string(),
         aliases: Vec::new(),
+        domain: String::new(),
         created_by: "user".into(),
     };
-    store.upsert_concept(workspace, &concept).ok()?;
+    store.upsert_workspace_concept(workspace, &concept).ok()?;
     Some(id)
 }
 

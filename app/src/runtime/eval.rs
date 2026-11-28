@@ -226,12 +226,13 @@ impl Runtime {
             self.create_session(format!("eval-{}", uuid::Uuid::new_v4().simple()), dir)?;
         let ws = workspace_key(&session.cwd);
         for c in &part.concepts {
-            self.store.upsert_concept(
+            self.store.upsert_workspace_concept(
                 &ws,
                 &Concept {
                     id: c.id.clone(),
                     label: c.label.clone(),
                     aliases: vec![],
+                    domain: String::new(),
                     created_by: "map".into(),
                 },
             )?;
