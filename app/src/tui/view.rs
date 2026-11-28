@@ -373,7 +373,7 @@ fn tool_groups(app: &App) -> Vec<(usize, Vec<usize>)> {
         while k < app.entries.len() {
             match &app.entries[k] {
                 e if is_exploring(e) => members.push(k),
-                Entry::Thought(_) if !app.show_thoughts => {}
+                Entry::Thought(t) if !app.show_thoughts || t.trim().is_empty() => {}
                 Entry::Text(t) if t.trim().is_empty() => {}
                 _ => break,
             }
@@ -388,12 +388,12 @@ fn tool_groups(app: &App) -> Vec<(usize, Vec<usize>)> {
 }
 
 /// One line for a run of reads and searches: "Read 3 files, 2 searches".
-/// A probe that failed (a wrong path, a bad pattern) is the agent's own
-/// business: it read why and went on, so the line counts only what worked.
-/// When nothing in the run worked, it says so, and Tab→Enter shows why.
+/// Repeats on the same file show the read count (e.g. "Read 1 file (4×)"),
+/// and failed lookups are noted alongside what worked. When nothing in the
+/// run worked, it says so, and Tab→Enter shows why.
 fn group_line(app: &App, members: &[usize], width: u16) -> Vec<Line<'static>> {
     let mut files = std::collections::BTreeSet::new();
-    let (mut searches, mut lists, mut failed) = (0, 0, 0);
+    let (mut reads, mut searches, mut lists, mut failed) = (0usize, 0usize, 0usize, 0usize);
     let mut running = None;
     for &i in members {
         let Entry::Tool { title, ok, .. } = &app.entries[i] else {
@@ -411,6 +411,7 @@ fn group_line(app: &App, members: &[usize], width: u16) -> Vec<Line<'static>> {
             .strip_prefix("Read ")
             .or_else(|| title.strip_prefix("View "))
         {
+            reads += 1;
             files.insert(rest.split(" (").next().unwrap_or(rest).to_string());
         } else if title.starts_with("List") {
             lists += 1;
@@ -421,8 +422,13 @@ fn group_line(app: &App, members: &[usize], width: u16) -> Vec<Line<'static>> {
     let plural =
         |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
     let mut parts = Vec::new();
-    if !files.is_empty() {
-        parts.push(format!("read {}", plural(files.len(), "file", "files")));
+    if reads > 0 {
+        let count = plural(files.len(), "file", "files");
+        if reads > files.len() {
+            parts.push(format!("read {count} ({reads}×)"));
+        } else {
+            parts.push(format!("read {count}"));
+        }
     }
     if searches > 0 {
         parts.push(plural(searches, "search", "searches"));
@@ -431,6 +437,9 @@ fn group_line(app: &App, members: &[usize], width: u16) -> Vec<Line<'static>> {
         parts.push(format!("listed {}", plural(lists, "folder", "folders")));
     }
     let none_worked = parts.is_empty();
+    if !none_worked && failed > 0 {
+        parts.push(format!("{failed} failed"));
+    }
     let mut text = if none_worked {
         format!(
             "{} didn't work (a wrong path or pattern)",
@@ -469,8 +478,18 @@ pub type ItemSpan = (usize, std::ops::Range<usize>);
 /// The conversation's lines at `width`, oldest first, and which lines each
 /// selectable item takes.
 pub fn transcript(app: &App, width: u16) -> (Vec<Line<'static>>, Vec<ItemSpan>) {
+    let (lines, items, _) = transcript_with_meta(app, width);
+    (lines, items)
+}
+
+/// Like [`transcript`], plus per-line wrap/gutter metadata for selection.
+pub fn transcript_with_meta(
+    app: &App,
+    width: u16,
+) -> (Vec<Line<'static>>, Vec<ItemSpan>, Vec<super::LineMeta>) {
     let body = width.saturating_sub(2);
     let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut meta: Vec<super::LineMeta> = Vec::new();
     let mut prev: Option<&Entry> = None;
     let mut items: Vec<ItemSpan> = Vec::new();
     // Reads and searches in a row collapse to one line; Ctrl+G shows each.
@@ -485,6 +504,19 @@ pub fn transcript(app: &App, width: u16) -> (Vec<Line<'static>>, Vec<ItemSpan>) 
             group_at.insert(first, members);
         }
     }
+    let push_wrapped = |lines: &mut Vec<Line<'static>>,
+                        meta: &mut Vec<super::LineMeta>,
+                        (ls, ws): (Vec<Line<'static>>, Vec<markdown::WrapMeta>),
+                        prefix_cols: u16| {
+        for (l, w) in ls.into_iter().zip(ws) {
+            meta.push(super::LineMeta {
+                soft_wrap: w.soft_wrap,
+                soft_space: w.soft_space,
+                prefix_cols,
+            });
+            lines.push(l);
+        }
+    };
     for (index, entry) in app.entries.iter().enumerate() {
         if folded.contains(&index) {
             continue;
@@ -499,6 +531,7 @@ pub fn transcript(app: &App, width: u16) -> (Vec<Line<'static>>, Vec<ItemSpan>) 
         };
         if prev.is_some() && !together && !hidden_thought {
             lines.push(Line::default());
+            meta.push(super::LineMeta::default());
         }
         let item_start = lines.len();
         match entry {
@@ -511,23 +544,33 @@ pub fn transcript(app: &App, width: u16) -> (Vec<Line<'static>>, Vec<ItemSpan>) 
                         Span::styled(if i == 0 { "› " } else { "  " }, you),
                         Span::styled(l.to_string(), Style::default().add_modifier(Modifier::BOLD)),
                     ];
-                    lines.extend(markdown::wrap_hanging(&spans, width, 2));
+                    push_wrapped(
+                        &mut lines,
+                        &mut meta,
+                        markdown::wrap_hanging_meta(&spans, width, 2),
+                        2,
+                    );
                 }
             }
             Entry::Text(text) => {
                 // Blank lines at the edges come from streaming, not the reply.
                 let text = text.trim_matches('\n');
                 let plain = !app.mouse_capture;
-                for (i, mut l) in markdown::render_as(text, body, Style::default(), plain)
-                    .into_iter()
-                    .enumerate()
-                {
+                let (rendered, wraps) =
+                    markdown::render_as_meta(text, body, Style::default(), plain);
+                for (i, (mut l, w)) in rendered.into_iter().zip(wraps).enumerate() {
+                    let inner_prefix = inner_gutter_cols(&l, 0);
                     let lead = if i == 0 {
                         Span::styled("• ", Style::default().fg(Color::Magenta))
                     } else {
                         Span::raw("  ")
                     };
                     l.spans.insert(0, lead);
+                    meta.push(super::LineMeta {
+                        soft_wrap: w.soft_wrap,
+                        soft_space: w.soft_space,
+                        prefix_cols: 2 + inner_prefix,
+                    });
                     lines.push(l);
                 }
             }
@@ -535,16 +578,29 @@ pub fn transcript(app: &App, width: u16) -> (Vec<Line<'static>>, Vec<ItemSpan>) 
                 if app.show_thoughts {
                     let style = dim().add_modifier(Modifier::ITALIC);
                     for l in text.lines().filter(|l| !l.trim().is_empty()) {
-                        lines.extend(markdown::wrap_hanging(
-                            &[Span::styled(format!("∴ {l}"), style)],
-                            width,
+                        push_wrapped(
+                            &mut lines,
+                            &mut meta,
+                            markdown::wrap_hanging_meta(
+                                &[Span::styled(format!("∴ {l}"), style)],
+                                width,
+                                2,
+                            ),
                             2,
-                        ));
+                        );
                     }
                 }
             }
             Entry::Tool { .. } if group_at.contains_key(&index) => {
-                lines.extend(group_line(app, &group_at[&index], width));
+                let gl = group_line(app, &group_at[&index], width);
+                for (gi, l) in gl.into_iter().enumerate() {
+                    meta.push(super::LineMeta {
+                        soft_wrap: gi > 0,
+                        soft_space: gi > 0,
+                        prefix_cols: 2,
+                    });
+                    lines.push(l);
+                }
             }
             Entry::Tool {
                 title, ok, detail, ..
@@ -554,14 +610,19 @@ pub fn transcript(app: &App, width: u16) -> (Vec<Line<'static>>, Vec<ItemSpan>) 
                     Some(false) => ("✗", Color::Red),
                     None => ("●", Color::Cyan),
                 };
-                lines.extend(markdown::wrap_hanging(
-                    &[
-                        Span::styled(format!("{mark} "), Style::default().fg(color)),
-                        Span::styled(title.clone(), dim()),
-                    ],
-                    width,
+                push_wrapped(
+                    &mut lines,
+                    &mut meta,
+                    markdown::wrap_hanging_meta(
+                        &[
+                            Span::styled(format!("{mark} "), Style::default().fg(color)),
+                            Span::styled(title.clone(), dim()),
+                        ],
+                        width,
+                        2,
+                    ),
                     2,
-                ));
+                );
                 let out: Vec<&str> = detail.lines().collect();
                 // Never hide a single line behind "+1 line".
                 let shown = if out.len() <= TOOL_LINES + 1 || app.expanded.contains(&index) {
@@ -571,47 +632,109 @@ pub fn transcript(app: &App, width: u16) -> (Vec<Line<'static>>, Vec<ItemSpan>) 
                 };
                 for (i, d) in out.iter().take(shown).enumerate() {
                     let lead = if i == 0 { "  └ " } else { "    " };
-                    lines.extend(markdown::wrap_hanging(
-                        &[Span::styled(format!("{lead}{d}"), dim())],
-                        width,
+                    push_wrapped(
+                        &mut lines,
+                        &mut meta,
+                        markdown::wrap_hanging_meta(
+                            &[Span::styled(format!("{lead}{d}"), dim())],
+                            width,
+                            4,
+                        ),
                         4,
-                    ));
+                    );
                 }
                 if out.len() > shown {
-                    lines.extend(markdown::wrap_hanging(
-                        &[Span::styled(
-                            format!(
-                                "    … +{} lines (Tab→Enter expands · y copies)",
-                                out.len() - shown
-                            ),
-                            dim(),
-                        )],
-                        width,
+                    push_wrapped(
+                        &mut lines,
+                        &mut meta,
+                        markdown::wrap_hanging_meta(
+                            &[Span::styled(
+                                format!(
+                                    "    … +{} lines (Tab→Enter expands · y copies)",
+                                    out.len() - shown
+                                ),
+                                dim(),
+                            )],
+                            width,
+                            4,
+                        ),
                         4,
-                    ));
+                    );
                 }
             }
-            Entry::Note(text) => lines.extend(note_lines(text, width)),
+            Entry::Note(text) => {
+                let nl = note_lines(text, width);
+                for l in nl {
+                    meta.push(super::LineMeta {
+                        soft_wrap: false,
+                        soft_space: false,
+                        prefix_cols: 2,
+                    });
+                    lines.push(l);
+                }
+            }
             Entry::Source { title, range, body } => {
-                lines.extend(source_block_as(
-                    title,
-                    range,
-                    body,
-                    width,
-                    !app.mouse_capture,
-                ));
+                let sl = source_block_as(title, range, body, width, !app.mouse_capture);
+                for (si, l) in sl.into_iter().enumerate() {
+                    let inner_prefix = if si == 0 { 0 } else { inner_gutter_cols(&l, 1) };
+                    meta.push(super::LineMeta {
+                        soft_wrap: false,
+                        soft_space: false,
+                        prefix_cols: if si == 0 { 2 } else { 2 + inner_prefix },
+                    });
+                    lines.push(l);
+                }
             }
             Entry::Search { query, hits, total } => {
-                lines.extend(search_block(query, hits, *total, width));
+                let sl = search_block(query, hits, *total, width);
+                for l in sl {
+                    meta.push(super::LineMeta {
+                        soft_wrap: false,
+                        soft_space: false,
+                        prefix_cols: 2,
+                    });
+                    lines.push(l);
+                }
             }
-            Entry::Info(rows) => lines.extend(info_block(rows, width)),
+            Entry::Info(rows) => {
+                let il = info_block(rows, width);
+                for l in il {
+                    meta.push(super::LineMeta {
+                        soft_wrap: false,
+                        soft_space: false,
+                        prefix_cols: 2,
+                    });
+                    lines.push(l);
+                }
+            }
         }
         if !hidden_thought {
             prev = Some(entry);
             items.push((index, item_start..lines.len()));
         }
     }
-    (lines, items)
+    (lines, items, meta)
+}
+
+/// Width of a `│ ` bar or numbered-block gutter at `span_idx` of a markdown line.
+fn inner_gutter_cols(line: &Line<'_>, span_idx: usize) -> u16 {
+    let Some(first) = line.spans.get(span_idx) else {
+        return 0;
+    };
+    let s = first.content.as_ref();
+    if s == "│ " {
+        return 2;
+    }
+    if s.ends_with("┆  ") {
+        return s.width() as u16;
+    }
+    // Numbered source gutter: spaces + digits + 2 spaces (e.g. "   12  ").
+    let trimmed = s.trim_start_matches(' ');
+    let digits = trimmed.bytes().take_while(u8::is_ascii_digit).count();
+    if digits > 0 && trimmed[digits..] == *"  " {
+        return s.width() as u16;
+    }
+    0
 }
 
 /// A local note: a dim `·` lead, the text in the default colour (inline
@@ -781,34 +904,55 @@ fn conversation(f: &mut Frame, app: &mut App, area: Rect) {
         width: area.width.saturating_sub(2),
         ..area
     };
-    let (mut lines, items) = transcript(app, area.width);
-    if app.entries.is_empty() {
-        // Placed as if the menu's rows were the conversation's, so opening
-        // the menu covers the card's lower part instead of moving it.
-        lines = empty_card(app, area.width, area.height + app.menu_rows);
-        lines.truncate(area.height as usize);
-    }
-    let total = lines.len();
+    let height = area.height as usize;
+    let empty = app.entries.is_empty();
+    let (total, selected, items_vec) = if empty {
+        let mut lines = empty_card(app, area.width, area.height + app.menu_rows);
+        lines.truncate(height);
+        let total = lines.len();
+        app.last_total = total;
+        app.last_start = 0;
+        app.scroll = 0;
+        app.visual_scroll = 0.0;
+        app.new_below = false;
+        app.items.clear();
+        f.render_widget(Paragraph::new(lines), area);
+        return;
+    } else {
+        let sel_idx = app.selected;
+        let cache = app.cached_transcript(area.width);
+        let total = cache.lines.len();
+        let selected = sel_idx.and_then(|sel| {
+            cache
+                .items
+                .iter()
+                .find(|(i, _)| *i == sel)
+                .map(|(_, r)| r.clone())
+        });
+        let items_vec: Vec<usize> = cache.items.iter().map(|(i, _)| *i).collect();
+        (total, selected, items_vec)
+    };
     // Scrolled up: keep the view where it is while new lines arrive.
     if app.scroll > 0 && total > app.last_total {
-        app.scroll += total - app.last_total;
+        let delta = total - app.last_total;
+        app.scroll += delta;
+        app.visual_scroll += delta as f64;
         app.new_below = true;
     }
     if app.scroll == 0 {
         app.new_below = false;
     }
     app.last_total = total;
-    let height = area.height as usize;
     let max_scroll = total.saturating_sub(height);
     app.scroll = app.scroll.min(max_scroll);
-    let mut start = max_scroll - app.scroll;
+    app.visual_scroll = app.visual_scroll.clamp(0.0, max_scroll as f64);
+    let active_scroll = if app.smooth_scroll {
+        (app.visual_scroll.round() as usize).min(max_scroll)
+    } else {
+        app.scroll
+    };
+    let mut start = max_scroll - active_scroll;
     // The selected item, brought into view after a move.
-    let selected = app.selected.and_then(|sel| {
-        items
-            .iter()
-            .find(|(i, _)| *i == sel)
-            .map(|(_, r)| r.clone())
-    });
     if let Some(r) = &selected
         && app.reveal_selected
     {
@@ -820,11 +964,61 @@ fn conversation(f: &mut Frame, app: &mut App, area: Rect) {
         }
         start = start.min(max_scroll);
         app.scroll = max_scroll - start;
+        app.visual_scroll = app.scroll as f64;
         app.reveal_selected = false;
     }
-    app.items = items.iter().map(|(i, _)| *i).collect();
-    let visible: Vec<Line> = lines.into_iter().skip(start).take(height).collect();
+    app.last_start = start;
+    app.items = items_vec;
+    let text_sel = app.text_sel.filter(|s| !s.is_empty());
+    let (visible, line_info): (Vec<Line<'static>>, Vec<(u16, u16)>) = {
+        let cache = app.cached_transcript(area.width);
+        let vis: Vec<Line<'static>> = cache.lines.iter().skip(start).take(height).cloned().collect();
+        let info: Vec<(u16, u16)> = (0..vis.len())
+            .map(|row| {
+                let idx = start + row;
+                let w = vis[row]
+                    .spans
+                    .iter()
+                    .map(|s| s.content.width())
+                    .sum::<usize>() as u16;
+                let prefix = cache.meta.get(idx).map_or(0, |m| m.prefix_cols);
+                (w, prefix)
+            })
+            .collect();
+        (vis, info)
+    };
     f.render_widget(Paragraph::new(visible), area);
+    // Highlight active mouse text selection, excluding leading gutters/prefixes.
+    if let Some(sel) = text_sel {
+        let (start_pos, end_pos) = sel.ordered();
+        let buf = f.buffer_mut();
+        for (row, (line_w, prefix)) in line_info.iter().enumerate() {
+            let line_idx = start + row;
+            if line_idx < start_pos.line || line_idx > end_pos.line {
+                continue;
+            }
+            let max_x = area.width.saturating_sub(1);
+            let from_col = if line_idx == start_pos.line {
+                start_pos.col.max(*prefix)
+            } else {
+                *prefix
+            };
+            let to_col = if line_idx == end_pos.line {
+                end_pos.col.min(max_x)
+            } else {
+                line_w.saturating_sub(1).min(max_x)
+            };
+            if from_col > to_col || *line_w <= *prefix {
+                continue;
+            }
+            let y = area.y + row as u16;
+            for dx in from_col..=to_col {
+                let cell = &mut buf[(area.x + dx, y)];
+                let style = cell.style().add_modifier(Modifier::REVERSED);
+                cell.set_style(style);
+            }
+        }
+    }
     // A bar in the margin beside the selected item.
     if let Some(r) = selected {
         let bar = Style::default().fg(Color::Cyan);
@@ -4130,10 +4324,25 @@ mod tests {
         app.entries.push(tool("t5", "Read paper.pdf (p.29)", false));
         let line = texts(&group_line(&app, &[0, 1, 2, 3, 4], 200)).join(" ");
         assert!(
-            line.starts_with("✓ 1 search, listed 1 folder · Tab→Enter expands"),
+            line.starts_with("✓ 1 search, listed 1 folder, 3 failed · Tab→Enter expands"),
             "{line}"
         );
-        assert!(!line.contains("failed") && !line.contains("read"), "{line}");
+        assert!(!line.contains("read"), "{line}");
+
+        // Multiple reads of the same file show the read count and any failed reads.
+        app.entries.clear();
+        app.entries.push(tool("t1", "Read FUB_Folien1.pdf (page 1)", false));
+        app.entries.push(tool("t2", "Read FUB_Folien1.pdf (page 24)", true));
+        app.entries.push(tool("t3", "Read FUB_Folien1.pdf (pages 39-41)", true));
+        app.entries.push(tool("t4", "Read FUB_Folien1.pdf (page 24)", true));
+        app.entries.push(tool("t5", "Read FUB_Folien1.pdf (page 19)", true));
+        app.entries.push(tool("t6", "Grep `foo`", true));
+        app.entries.push(tool("t7", "Grep `bar`", true));
+        let line = texts(&group_line(&app, &[0, 1, 2, 3, 4, 5, 6], 200)).join(" ");
+        assert!(
+            line.starts_with("✓ Read 1 file (4×), 2 searches, 1 failed · Tab→Enter expands"),
+            "{line}"
+        );
 
         // Nothing worked: it says so in plain words, and where to see why.
         app.entries.clear();
@@ -4388,5 +4597,54 @@ mod tests {
             "{plain:?}"
         );
         assert!(plain.iter().any(|l| l.ends_with("quoted")));
+    }
+
+    #[test]
+    fn consecutive_pdf_reads_collapse_with_count_even_with_empty_thoughts() {
+        let mut app = test_app();
+        app.show_thoughts = true;
+        let read = |id: &str, pages: &str| Entry::Tool {
+            id: id.into(),
+            title: format!("Read FUB_Folien1.pdf ({pages})"),
+            ok: Some(true),
+            detail: String::new(),
+        };
+        app.entries.push(read("r1", "page 24"));
+        app.entries.push(Entry::Thought("   \n  ".into()));
+        app.entries.push(read("r2", "pages 39-41"));
+        app.entries.push(read("r3", "page 24"));
+        app.entries.push(read("r4", "page 24"));
+        app.entries.push(read("r5", "page 24"));
+        app.entries.push(read("r6", "page 19"));
+        let (lines, _) = transcript(&app, 100);
+        let all = texts(&lines);
+        assert_eq!(all.len(), 1, "expected 1 collapsed group line, got {all:?}");
+        assert!(all[0].starts_with("✓ Read 1 file (6×)"), "{all:?}");
+    }
+
+    #[test]
+    fn text_selection_highlights_cells_with_reversed_modifier() {
+        let mut app = test_app();
+        app.entries.push(Entry::Text("Hello world".into()));
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 10)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        app.text_sel = Some(crate::tui::TextSelection {
+            anchor: crate::tui::TextPos { line: 0, col: 0 },
+            head: crate::tui::TextPos { line: 0, col: 6 },
+            dragging: false,
+        });
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer();
+        let y = app.conv_area.y;
+        // Prefix `• ` (cols 0..2 relative to conv_area.x + 1) is NOT highlighted.
+        assert!(!buf[(app.conv_area.x + 1, y)]
+            .style()
+            .add_modifier
+            .contains(Modifier::REVERSED));
+        // Content `Hello` (cols 2..=6) IS highlighted.
+        assert!(buf[(app.conv_area.x + 1 + 2, y)]
+            .style()
+            .add_modifier
+            .contains(Modifier::REVERSED));
     }
 }

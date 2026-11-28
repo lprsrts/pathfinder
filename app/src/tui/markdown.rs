@@ -14,9 +14,27 @@ pub fn render(text: &str, width: u16, base: Style) -> Vec<Line<'static>> {
     render_lines(&raw, width, base)
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WrapMeta {
+    /// True when this visual row is a soft-wrapped continuation of the previous row.
+    pub soft_wrap: bool,
+    /// True when a space was elided at the wrap boundary (prose word wrap), so
+    /// rejoining the two rows should insert a space.
+    pub soft_space: bool,
+}
+
 thread_local! {
     /// Rendering for terminal text selection: no bars or frames to copy.
     static PLAIN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static WRAP_LOG: std::cell::RefCell<Option<Vec<WrapMeta>>> = const { std::cell::RefCell::new(None) };
+}
+
+fn log_meta(meta: WrapMeta) {
+    WRAP_LOG.with(|log| {
+        if let Some(v) = log.borrow_mut().as_mut() {
+            v.push(meta);
+        }
+    });
 }
 
 /// As [`render`], or with `plain` without the `│ ` bars and frames of
@@ -26,6 +44,39 @@ pub fn render_as(text: &str, width: u16, base: Style, plain: bool) -> Vec<Line<'
     let out = render(text, width, base);
     PLAIN.with(|p| p.set(was));
     out
+}
+
+/// As [`render_as`], plus per-line soft-wrap metadata for text selection copy.
+pub fn render_as_meta(
+    text: &str,
+    width: u16,
+    base: Style,
+    plain: bool,
+) -> (Vec<Line<'static>>, Vec<WrapMeta>) {
+    let prev = WRAP_LOG.with(|log| log.borrow_mut().replace(Vec::new()));
+    let lines = render_as(text, width, base, plain);
+    let mut metas = WRAP_LOG
+        .with(|log| log.borrow_mut().take())
+        .unwrap_or_default();
+    WRAP_LOG.with(|log| *log.borrow_mut() = prev);
+    metas.resize(lines.len(), WrapMeta::default());
+    (lines, metas)
+}
+
+/// As [`wrap_hanging`], plus per-line soft-wrap metadata.
+pub fn wrap_hanging_meta(
+    spans: &[Span<'static>],
+    width: u16,
+    hang: usize,
+) -> (Vec<Line<'static>>, Vec<WrapMeta>) {
+    let prev = WRAP_LOG.with(|log| log.borrow_mut().replace(Vec::new()));
+    let lines = wrap_hanging(spans, width, hang);
+    let mut metas = WRAP_LOG
+        .with(|log| log.borrow_mut().take())
+        .unwrap_or_default();
+    WRAP_LOG.with(|log| *log.borrow_mut() = prev);
+    metas.resize(lines.len(), WrapMeta::default());
+    (lines, metas)
 }
 
 fn plain() -> bool {
@@ -141,6 +192,7 @@ fn render_lines(raw: &[&str], width: u16, base: Style) -> Vec<Line<'static>> {
                 "─".repeat(rule_w),
                 base.add_modifier(Modifier::DIM),
             )));
+            log_meta(WrapMeta::default());
             i += 1;
             continue;
         }
@@ -175,6 +227,7 @@ fn render_lines(raw: &[&str], width: u16, base: Style) -> Vec<Line<'static>> {
                 trimmed.to_string(),
                 base.add_modifier(Modifier::DIM),
             )));
+            log_meta(WrapMeta::default());
             i += 1;
             continue;
         }
@@ -236,10 +289,17 @@ fn render_code_block(
             let mut rest = expanded.as_str();
             if rest.is_empty() {
                 out.push(Line::default());
+                log_meta(WrapMeta::default());
             }
+            let mut first = true;
             while !rest.is_empty() {
                 let (head, tail) = split_row(rest, total_w, false);
                 out.push(Line::from(Span::styled(head.to_string(), base)));
+                log_meta(WrapMeta {
+                    soft_wrap: !first,
+                    soft_space: false,
+                });
+                first = false;
                 rest = tail;
             }
         }
@@ -254,26 +314,35 @@ fn render_code_block(
             Span::styled("┌─ ", border),
             Span::styled(shown_lang, lang_style),
         ]));
+        log_meta(WrapMeta::default());
     }
     let content_w = total_w.saturating_sub(2).max(1);
     for raw_line in block {
         let expanded = raw_line.replace('\t', "    ");
         if expanded.is_empty() {
             out.push(Line::from(Span::styled("│ ", border)));
+            log_meta(WrapMeta::default());
             continue;
         }
         // Every character is kept (indent included): rows rejoin to the line.
         let mut rest = expanded.as_str();
+        let mut first = true;
         while !rest.is_empty() {
             let (head, tail) = split_row(rest, content_w, false);
             out.push(Line::from(vec![
                 Span::styled("│ ", border),
                 Span::styled(head.to_string(), base),
             ]));
+            log_meta(WrapMeta {
+                soft_wrap: !first,
+                soft_space: false,
+            });
+            first = false;
             rest = tail;
         }
     }
     out.push(Line::from(Span::styled("└─", border)));
+    log_meta(WrapMeta::default());
 }
 
 /// Where a row of `text` ends at `avail` columns: all of it when it fits;
@@ -362,10 +431,17 @@ fn render_numbered_block(
             let mut rest = fitted.as_ref();
             if rest.is_empty() {
                 out.push(Line::default());
+                log_meta(WrapMeta::default());
             }
+            let mut first = true;
             while !rest.is_empty() {
                 let (head, tail) = split_row(rest, total_w, prose);
                 out.push(Line::from(Span::styled(head.to_string(), base)));
+                log_meta(WrapMeta {
+                    soft_wrap: !first,
+                    soft_space: false,
+                });
+                first = false;
                 rest = tail;
             }
         }
@@ -388,9 +464,15 @@ fn render_numbered_block(
         if code_w < 8 {
             // Too narrow for a gutter: the line as it is, cut to fit.
             let mut rest = expanded.as_str();
+            let mut first = true;
             while !rest.is_empty() {
                 let (head, tail) = split_row(rest, total_w, prose);
                 out.push(Line::from(Span::styled(head.to_string(), base)));
+                log_meta(WrapMeta {
+                    soft_wrap: !first,
+                    soft_space: false,
+                });
+                first = false;
                 rest = tail;
             }
             continue;
@@ -400,6 +482,7 @@ fn render_numbered_block(
             Span::styled(gutter.to_string(), gutter_style),
             Span::styled(head.to_string(), base),
         ]));
+        log_meta(WrapMeta::default());
         if rest.is_empty() {
             continue;
         }
@@ -416,6 +499,10 @@ fn render_numbered_block(
                 Span::styled(cont.clone(), gutter_style),
                 Span::styled(format!("{}{head}", " ".repeat(indent)), base),
             ]));
+            log_meta(WrapMeta {
+                soft_wrap: true,
+                soft_space: !trimmed.starts_with(rest) || head.ends_with(' '),
+            });
             rest = tail;
         }
     }
@@ -506,6 +593,7 @@ fn render_blockquote(
                 Span::styled(prefix.clone(), bar_style),
                 Span::styled(text, base),
             ]));
+            log_meta(WrapMeta::default());
         }
         return;
     }
@@ -515,6 +603,7 @@ fn render_blockquote(
     VERBATIM.with(|v| v.set(was));
     if inner.is_empty() {
         out.push(Line::from(Span::styled(prefix, bar_style)));
+        log_meta(WrapMeta::default());
     } else {
         for mut l in inner {
             l.spans.insert(0, Span::styled(prefix.clone(), bar_style));
@@ -697,14 +786,17 @@ fn render_table(rows_raw: &[&str], width: u16, base: Style, out: &mut Vec<Line<'
                 truncate_to_width(&line, total_width),
                 dim,
             )));
+            log_meta(WrapMeta::default());
             continue;
         };
 
+        let saved_log = WRAP_LOG.with(|l| l.borrow_mut().take());
         let wrapped: Vec<Vec<Line<'static>>> = cells
             .into_iter()
             .enumerate()
             .map(|(c, spans)| wrap(&spans, col_w[c] as u16))
             .collect();
+        WRAP_LOG.with(|l| *l.borrow_mut() = saved_log);
         let row_h = wrapped.iter().map(Vec::len).max().unwrap_or(1);
 
         for sub in 0..row_h {
@@ -734,6 +826,7 @@ fn render_table(rows_raw: &[&str], width: u16, base: Style, out: &mut Vec<Line<'
                 }
             }
             out.push(Line::from(line_spans));
+            log_meta(WrapMeta::default());
         }
     }
 }
@@ -1054,15 +1147,24 @@ pub fn wrap_hanging(spans: &[Span<'static>], width: u16, hang: usize) -> Vec<Lin
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut current: Vec<Span<'static>> = Vec::new();
     let mut used = 0usize;
+    let mut cur_meta = WrapMeta::default();
 
-    let push_wrap =
-        |current: &mut Vec<Span<'static>>, used: &mut usize, lines: &mut Vec<Line<'static>>| {
-            lines.push(Line::from(std::mem::take(current)));
-            if hang > 0 {
-                current.push(Span::raw(" ".repeat(hang)));
-            }
-            *used = hang;
+    let push_wrap = |current: &mut Vec<Span<'static>>,
+                     used: &mut usize,
+                     lines: &mut Vec<Line<'static>>,
+                     cur_meta: &mut WrapMeta,
+                     next_space: bool| {
+        lines.push(Line::from(std::mem::take(current)));
+        log_meta(*cur_meta);
+        *cur_meta = WrapMeta {
+            soft_wrap: true,
+            soft_space: next_space,
         };
+        if hang > 0 {
+            current.push(Span::raw(" ".repeat(hang)));
+        }
+        *used = hang;
+    };
 
     for span in spans {
         // Words with the spaces before them, so spacing survives wrapping.
@@ -1070,14 +1172,16 @@ pub fn wrap_hanging(spans: &[Span<'static>], width: u16, hang: usize) -> Vec<Lin
         let flush = |word: &mut String,
                      current: &mut Vec<Span<'static>>,
                      used: &mut usize,
-                     lines: &mut Vec<Line<'static>>| {
+                     lines: &mut Vec<Line<'static>>,
+                     cur_meta: &mut WrapMeta| {
             if word.is_empty() {
                 return;
             }
             let w = word.width();
             if *used + w > width && *used > hang {
-                push_wrap(current, used, lines);
                 let trimmed = word.trim_start().to_string();
+                let had_space = trimmed.len() < word.len();
+                push_wrap(current, used, lines, cur_meta, had_space);
                 if !trimmed.is_empty() {
                     *used += trimmed.width();
                     current.push(Span::styled(trimmed, span.style));
@@ -1091,25 +1195,27 @@ pub fn wrap_hanging(spans: &[Span<'static>], width: u16, hang: usize) -> Vec<Lin
 
         for ch in span.content.chars() {
             if ch == ' ' && !word.trim().is_empty() {
-                flush(&mut word, &mut current, &mut used, &mut lines);
+                flush(&mut word, &mut current, &mut used, &mut lines, &mut cur_meta);
             }
             let ch_w = ch.width().unwrap_or(0);
             if used + word.width() + ch_w > width {
                 if used > hang {
                     // Try moving `word` to a fresh continuation line before cutting it.
-                    push_wrap(&mut current, &mut used, &mut lines);
-                    word = word.trim_start().to_string();
+                    let trimmed = word.trim_start().to_string();
+                    let had_space = trimmed.len() < word.len() || (ch == ' ' && trimmed.is_empty());
+                    push_wrap(&mut current, &mut used, &mut lines, &mut cur_meta, had_space);
+                    word = trimmed;
                     if ch == ' ' && word.is_empty() {
                         continue;
                     }
                     if used + word.width() + ch_w > width && !word.is_empty() {
                         current.push(Span::styled(std::mem::take(&mut word), span.style));
-                        push_wrap(&mut current, &mut used, &mut lines);
+                        push_wrap(&mut current, &mut used, &mut lines, &mut cur_meta, ch == ' ');
                     }
                 } else if !word.is_empty() {
                     // Already at `hang`; cut the overlong word right before `ch`.
                     current.push(Span::styled(std::mem::take(&mut word), span.style));
-                    push_wrap(&mut current, &mut used, &mut lines);
+                    push_wrap(&mut current, &mut used, &mut lines, &mut cur_meta, ch == ' ');
                     if ch == ' ' {
                         continue;
                     }
@@ -1117,9 +1223,10 @@ pub fn wrap_hanging(spans: &[Span<'static>], width: u16, hang: usize) -> Vec<Lin
             }
             word.push(ch);
         }
-        flush(&mut word, &mut current, &mut used, &mut lines);
+        flush(&mut word, &mut current, &mut used, &mut lines, &mut cur_meta);
     }
     lines.push(Line::from(current));
+    log_meta(cur_meta);
     lines
 }
 

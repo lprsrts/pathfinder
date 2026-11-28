@@ -312,6 +312,58 @@ pub const SETTINGS: [(&str, &str); 8] = [
     (crate::options::CHECKS, "Review checks"),
 ];
 
+/// A position in the rendered conversation transcript: (line index, content column).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TextPos {
+    pub line: usize,
+    pub col: u16,
+}
+
+/// Active mouse drag text selection in the conversation pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TextSelection {
+    pub anchor: TextPos,
+    pub head: TextPos,
+    pub dragging: bool,
+}
+
+impl TextSelection {
+    pub fn ordered(self) -> (TextPos, TextPos) {
+        if (self.anchor.line, self.anchor.col) <= (self.head.line, self.head.col) {
+            (self.anchor, self.head)
+        } else {
+            (self.head, self.anchor)
+        }
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.anchor == self.head
+    }
+}
+
+/// Per-line layout metadata for selection highlighting and clean copy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LineMeta {
+    pub soft_wrap: bool,
+    pub soft_space: bool,
+    pub prefix_cols: u16,
+}
+
+/// Cached rendered transcript so scrolling and ticks don't re-wrap every frame.
+pub struct CachedTranscript {
+    pub width: u16,
+    pub entries_len: usize,
+    pub last_fp: u64,
+    pub show_thoughts: bool,
+    pub show_tools: bool,
+    pub mouse_capture: bool,
+    pub expanded_fp: u64,
+    pub lines: Vec<ratatui::text::Line<'static>>,
+    pub items: Vec<view::ItemSpan>,
+    pub meta: Vec<LineMeta>,
+}
+
+/// Lines scrolled up from the bottom; 0 follows new output.
 pub struct App {
     pub rt: Arc<Runtime>,
     pub cwd: PathBuf,
@@ -324,6 +376,16 @@ pub struct App {
     pub running: Option<CancellationToken>,
     /// Lines scrolled up from the bottom; 0 follows new output.
     pub scroll: usize,
+    /// Smooth visual scroll offset (in lines from bottom) used during animation.
+    pub visual_scroll: f64,
+    /// When true, `visual_scroll` eases toward `scroll` across frames.
+    pub smooth_scroll: bool,
+    /// First visible transcript line index from the last draw.
+    pub last_start: usize,
+    /// Mouse drag text selection in the conversation pane.
+    pub text_sel: Option<TextSelection>,
+    /// Cached transcript lines + metadata.
+    pub transcript_cache: Option<CachedTranscript>,
     pub show_thoughts: bool,
     /// Every tool line, instead of runs of reads and searches as one line.
     pub show_tools: bool,
@@ -443,6 +505,11 @@ impl App {
             attachments: Vec::new(),
             running: None,
             scroll: 0,
+            visual_scroll: 0.0,
+            smooth_scroll: false,
+            last_start: 0,
+            text_sel: None,
+            transcript_cache: None,
             show_thoughts: false,
             show_tools: false,
             selected: None,
@@ -827,59 +894,73 @@ pub async fn run(
     {
         KEYBOARD_ENHANCED.store(true, Ordering::SeqCst);
     }
+    app.smooth_scroll = true;
     let mut events = EventStream::new();
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(120));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut scroll_ticker = tokio::time::interval(std::time::Duration::from_millis(16));
+    scroll_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut paste_until: Option<std::time::Instant> = None;
     let result: Result<()> = async {
         loop {
             terminal.draw(|f| view::draw(f, &mut app))?;
             tokio::select! {
-                ev = events.next() => match ev {
-                    // A Windows console never reports a paste: take the keys
-                    // already waiting with this one and see if they're one.
-                    Some(Ok(first @ Event::Key(_))) if cfg!(windows) => {
-                        let mut batch = vec![first];
-                        loop {
-                            // Polled with this task's waker, so the stream
-                            // still wakes the loop when it runs dry.
-                            let next = std::future::poll_fn(|cx| {
-                                std::task::Poll::Ready(events.poll_next_unpin(cx))
-                            })
-                            .await;
-                            match next {
-                                std::task::Poll::Ready(Some(Ok(ev))) => batch.push(ev),
-                                std::task::Poll::Ready(Some(Err(e))) => return Err(e.into()),
-                                _ => break,
-                            }
+                ev = events.next() => {
+                    let mut batch = match ev {
+                        Some(Ok(ev)) => vec![ev],
+                        Some(Err(e)) => return Err(e.into()),
+                        None => break,
+                    };
+                    // Drain queued terminal events (trackpad/wheel bursts, key
+                    // repeats, Windows paste bursts) before redrawing so scrolling
+                    // and typing never lag behind the event stream.
+                    while batch.len() < 64 {
+                        let next = std::future::poll_fn(|cx| {
+                            std::task::Poll::Ready(events.poll_next_unpin(cx))
+                        })
+                        .await;
+                        match next {
+                            std::task::Poll::Ready(Some(Ok(ev))) => batch.push(ev),
+                            std::task::Poll::Ready(Some(Err(e))) => return Err(e.into()),
+                            _ => break,
                         }
+                    }
+                    let handled_paste = if cfg!(windows)
+                        && batch.iter().any(|e| matches!(e, Event::Key(_)))
+                    {
                         let now = std::time::Instant::now();
                         let continuing = paste_until.is_some_and(|t| now < t);
                         if let Some(text) = paste_burst(&batch, continuing) {
                             app.on_paste(&text);
                             paste_until = Some(now + PASTE_GAP);
+                            true
                         } else {
                             paste_until = None;
-                            for ev in batch {
-                                match ev {
-                                    Event::Key(key) if key.kind != KeyEventKind::Release => {
-                                        app.on_key(key)
-                                    }
-                                    Event::Paste(text) => app.on_paste(&text),
-                                    Event::Mouse(mouse) => app.on_mouse(mouse),
-                                    _ => {}
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    if !handled_paste {
+                        for ev in batch {
+                            match ev {
+                                Event::Key(key) if key.kind != KeyEventKind::Release => {
+                                    app.on_key(key)
                                 }
+                                Event::Paste(text) => app.on_paste(&text),
+                                Event::Mouse(mouse) => app.on_mouse(mouse),
+                                _ => {}
+                            }
+                            if app.quit {
+                                break;
                             }
                         }
                     }
-                    Some(Ok(Event::Key(key))) if key.kind != KeyEventKind::Release => app.on_key(key),
-                    Some(Ok(Event::Paste(text))) => app.on_paste(&text),
-                    Some(Ok(Event::Mouse(mouse))) => app.on_mouse(mouse),
-                    Some(Ok(_)) => {}
-                    Some(Err(e)) => return Err(e.into()),
-                    None => break,
-                },
+                }
                 Some(ev) = rx.recv() => app.on_event(ev),
+                _ = scroll_ticker.tick(), if app.is_scroll_animating() => {
+                    app.step_scroll_anim();
+                }
                 _ = ticker.tick(), if app.running.is_some() || !app.status.is_empty() => {
                     app.on_tick(std::time::Instant::now());
                 }
@@ -1339,6 +1420,8 @@ impl App {
 
     fn toggle_mouse_capture(&mut self) {
         self.mouse_capture = !self.mouse_capture;
+        self.text_sel = None;
+        self.transcript_cache = None;
         if std::io::stdout().is_terminal() {
             if self.mouse_capture {
                 let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
@@ -1512,12 +1595,58 @@ impl App {
                     }
                 }
             }
-            MouseEventKind::Down(MouseButton::Left)
-                if self.modal.is_none()
-                    && self.selected.is_some()
-                    && !rect_contains(self.conv_area, mouse.column, mouse.row) =>
-            {
-                self.selected = None;
+            MouseEventKind::Down(MouseButton::Left) if self.modal.is_none() => {
+                if rect_contains(self.conv_area, mouse.column, mouse.row) {
+                    self.selected = None;
+                    if let Some(pos) = self.mouse_to_text_pos(mouse.column, mouse.row) {
+                        self.text_sel = Some(TextSelection {
+                            anchor: pos,
+                            head: pos,
+                            dragging: true,
+                        });
+                    }
+                } else {
+                    self.selected = None;
+                    self.text_sel = None;
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.modal.is_none() => {
+                if let Some(mut sel) = self.text_sel
+                    && sel.dragging
+                    && self.conv_area.height > 0
+                    && self.conv_area.width > 2
+                {
+                    if mouse.row < self.conv_area.y {
+                        self.scroll = self.scroll.saturating_add(1);
+                    } else if mouse.row >= self.conv_area.y + self.conv_area.height {
+                        self.scroll = self.scroll.saturating_sub(1);
+                        if self.scroll == 0 {
+                            self.new_below = false;
+                        }
+                    }
+                    let clamped_col = mouse
+                        .column
+                        .clamp(self.conv_area.x + 1, self.conv_area.x + self.conv_area.width - 2);
+                    let clamped_row = mouse
+                        .row
+                        .clamp(self.conv_area.y, self.conv_area.y + self.conv_area.height - 1);
+                    if let Some(pos) = self.mouse_to_text_pos(clamped_col, clamped_row) {
+                        sel.head = pos;
+                        self.text_sel = Some(sel);
+                    }
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) if self.modal.is_none() => {
+                if let Some(mut sel) = self.text_sel
+                    && sel.dragging
+                {
+                    sel.dragging = false;
+                    if sel.is_empty() {
+                        self.text_sel = None;
+                    } else {
+                        self.text_sel = Some(sel);
+                    }
+                }
             }
             _ => {}
         }
@@ -1549,6 +1678,7 @@ impl App {
             KeyCode::F(2) => self.toggle_mouse_capture(),
             KeyCode::Up if ctrl && !self.items.is_empty() => {
                 used(Feature::Navigate);
+                self.text_sel = None;
                 self.selected = self.items.last().copied();
                 self.reveal_selected = true;
             }
@@ -1611,14 +1741,24 @@ impl App {
             }
             KeyCode::Tab if self.input.is_empty() && !self.items.is_empty() => {
                 used(Feature::Navigate);
+                self.text_sel = None;
                 self.selected = self.items.last().copied();
                 self.reveal_selected = true;
             }
             KeyCode::Tab => {}
-            KeyCode::Char('c') if ctrl => match &self.running {
-                Some(cancel) => cancel.cancel(),
-                None => self.quit = true,
-            },
+            KeyCode::Char('y') if !ctrl && !alt && self.input.is_empty() && self.has_text_selection() => {
+                self.copy_text_selection();
+            }
+            KeyCode::Char('c') if ctrl => {
+                if self.has_text_selection() {
+                    self.copy_text_selection();
+                } else {
+                    match &self.running {
+                        Some(cancel) => cancel.cancel(),
+                        None => self.quit = true,
+                    }
+                }
+            }
             // With nothing typed: half a page down; at the bottom a second
             // ^D in a row quits, so paging down never ends the session.
             KeyCode::Char('d') if ctrl => {
@@ -1675,6 +1815,7 @@ impl App {
             }
             // Esc closes what is open, then stops a running reply. It never
             // clears the draft (Ctrl+U does).
+            KeyCode::Esc if self.text_sel.is_some() => self.text_sel = None,
             KeyCode::Esc if self.side_overlay => self.side_overlay = false,
             KeyCode::Esc if self.palette_open() || !self.path_menu().is_empty() => {
                 self.palette_dismissed = Some(self.input.clone());
@@ -2063,6 +2204,192 @@ impl App {
             _ => self.entry_text(index),
         }
     }
+
+    pub fn is_scroll_animating(&self) -> bool {
+        self.smooth_scroll && (self.visual_scroll - self.scroll as f64).abs() >= 0.5
+    }
+
+    pub fn step_scroll_anim(&mut self) {
+        let target = self.scroll as f64;
+        let diff = target - self.visual_scroll;
+        if diff.abs() < 0.5 {
+            self.visual_scroll = target;
+            return;
+        }
+        let mut step = diff * 0.45;
+        if step.abs() < 1.0 {
+            step = step.signum();
+        }
+        self.visual_scroll += step;
+        if (target - self.visual_scroll).abs() < 0.5 {
+            self.visual_scroll = target;
+        }
+    }
+
+    pub fn has_text_selection(&self) -> bool {
+        self.text_sel.is_some_and(|s| !s.is_empty())
+    }
+
+    fn copy_text_selection(&mut self) {
+        let text = self.selected_text();
+        if text.is_empty() {
+            self.text_sel = None;
+            return;
+        }
+        used(Feature::Copy);
+        self.status = match copy_to_clipboard(&text) {
+            Ok(()) => format!("Copied {} characters.", text.chars().count()),
+            Err(e) => format!("Couldn't copy: {e}"),
+        };
+        self.text_sel = None;
+    }
+
+    fn mouse_to_text_pos(&self, col: u16, row: u16) -> Option<TextPos> {
+        if self.conv_area.width <= 2 || self.conv_area.height == 0 || self.last_total == 0 {
+            return None;
+        }
+        let rel_row = row.saturating_sub(self.conv_area.y) as usize;
+        let line = (self.last_start + rel_row).min(self.last_total.saturating_sub(1));
+        let max_col = self.conv_area.width.saturating_sub(3);
+        let content_col = col.saturating_sub(self.conv_area.x + 1).min(max_col);
+        Some(TextPos {
+            line,
+            col: content_col,
+        })
+    }
+
+    pub fn selected_text(&self) -> String {
+        let Some(sel) = self.text_sel.filter(|s| !s.is_empty()) else {
+            return String::new();
+        };
+        let (start_pos, end_pos) = sel.ordered();
+        let width = self.conv_area.width.saturating_sub(2).max(1);
+        let owned;
+        let (lines, meta): (&[ratatui::text::Line<'static>], &[LineMeta]) =
+            match &self.transcript_cache {
+                Some(c) if c.width == width => (&c.lines, &c.meta),
+                _ => {
+                    owned = view::transcript_with_meta(self, width);
+                    (&owned.0, &owned.2)
+                }
+            };
+        if lines.is_empty() {
+            return String::new();
+        }
+        let last_line = end_pos.line.min(lines.len() - 1);
+        let mut out = String::new();
+        for idx in start_pos.line..=last_line {
+            let prefix = meta.get(idx).map_or(0, |m| m.prefix_cols);
+            let from_col = if idx == start_pos.line {
+                start_pos.col.max(prefix)
+            } else {
+                prefix
+            };
+            let to_col = if idx == end_pos.line {
+                Some(end_pos.col)
+            } else {
+                None
+            };
+            let piece = if to_col.is_some_and(|t| t < from_col) {
+                String::new()
+            } else {
+                Self::slice_line_cols(&lines[idx], from_col, to_col)
+            };
+            if idx == start_pos.line {
+                out.push_str(&piece);
+            } else if meta.get(idx).is_some_and(|m| m.soft_wrap) {
+                if meta[idx].soft_space && !out.ends_with(' ') && !piece.is_empty() {
+                    out.push(' ');
+                }
+                out.push_str(&piece);
+            } else {
+                out.push('\n');
+                out.push_str(&piece);
+            }
+        }
+        out
+    }
+
+    pub fn cached_transcript(&mut self, width: u16) -> &CachedTranscript {
+        let entries_len = self.entries.len();
+        let last_fp = self.entries.last().map_or(0, Self::entry_fingerprint);
+        let expanded_fp = {
+            let mut h = self.expanded.len() as u64;
+            for &i in &self.expanded {
+                h = h.wrapping_mul(31).wrapping_add(i as u64 + 1);
+            }
+            h
+        };
+        let valid = self.transcript_cache.as_ref().is_some_and(|c| {
+            c.width == width
+                && c.entries_len == entries_len
+                && c.last_fp == last_fp
+                && c.show_thoughts == self.show_thoughts
+                && c.show_tools == self.show_tools
+                && c.mouse_capture == self.mouse_capture
+                && c.expanded_fp == expanded_fp
+        });
+        if !valid {
+            let (lines, items, meta) = view::transcript_with_meta(self, width);
+            self.transcript_cache = Some(CachedTranscript {
+                width,
+                entries_len,
+                last_fp,
+                show_thoughts: self.show_thoughts,
+                show_tools: self.show_tools,
+                mouse_capture: self.mouse_capture,
+                expanded_fp,
+                lines,
+                items,
+                meta,
+            });
+        }
+        self.transcript_cache.as_ref().unwrap()
+    }
+
+    fn entry_fingerprint(entry: &Entry) -> u64 {
+    match entry {
+        Entry::User(s) | Entry::Text(s) | Entry::Thought(s) | Entry::Note(s) => s.len() as u64,
+        Entry::Tool {
+            title, ok, detail, ..
+        } => {
+            let status = match ok {
+                None => 1,
+                Some(false) => 2,
+                Some(true) => 3,
+            };
+            (title.len() as u64)
+                .wrapping_mul(131)
+                .wrapping_add(detail.len() as u64)
+                .wrapping_mul(7)
+                .wrapping_add(status)
+        }
+        Entry::Source { body, .. } => body.len() as u64,
+        Entry::Search { hits, total, .. } => (hits.len() as u64).wrapping_mul(31).wrapping_add(*total as u64),
+        Entry::Info(rows) => rows.len() as u64,
+    }
+}
+
+    fn slice_line_cols(line: &ratatui::text::Line<'_>, from_col: u16, to_col: Option<u16>) -> String {
+    use unicode_width::UnicodeWidthChar as _;
+    let mut out = String::new();
+    let mut col: u16 = 0;
+    for span in &line.spans {
+        for ch in span.content.chars() {
+            let w = ch.width().unwrap_or(0) as u16;
+            if let Some(end) = to_col
+                && col > end
+            {
+                return out;
+            }
+            if col >= from_col {
+                out.push(ch);
+            }
+            col = col.saturating_add(w);
+        }
+    }
+    out
+}
 
     fn line_start(&self) -> usize {
         self.input[..self.cursor].rfind('\n').map_or(0, |i| i + 1)
@@ -2507,11 +2834,13 @@ impl App {
             AppEvent::Stream(StreamEvent::ToolUpdate { id, content }) => {
                 if let Some(Entry::Tool { detail, .. }) = self.tool_mut(&id) {
                     *detail = content.summary();
+                    self.transcript_cache = None;
                 }
             }
             AppEvent::Stream(StreamEvent::ToolEnd { id, ok: done }) => {
                 if let Some(Entry::Tool { ok, .. }) = self.tool_mut(&id) {
                     *ok = Some(done);
+                    self.transcript_cache = None;
                 }
             }
             AppEvent::Ask {
@@ -5743,5 +6072,101 @@ mod tests {
         assert!(!app.side_overlay);
         app.on_key(key(KeyCode::F(2)));
         assert!(view::docks(&app, 140));
+    }
+
+    #[test]
+    fn smooth_scroll_animation_converges_to_target() {
+        let (mut app, _rx, _store) = test_app();
+        app.smooth_scroll = true;
+        app.conv_area = Rect::new(0, 0, 80, 20);
+        app.on_key(key(KeyCode::PageUp));
+        assert_eq!(app.scroll, 18);
+        assert!(app.is_scroll_animating());
+        let mut steps = 0;
+        while app.is_scroll_animating() && steps < 50 {
+            app.step_scroll_anim();
+            steps += 1;
+        }
+        assert!(!app.is_scroll_animating());
+        assert!((app.visual_scroll - 18.0).abs() < 0.01);
+        assert!((2..30).contains(&steps), "steps={steps}");
+    }
+
+    #[test]
+    fn mouse_drag_selection_strips_gutters_rejoins_wraps_and_handles_esc_ctrl_c() {
+        let (mut app, _rx, _store) = test_app();
+        app.entries.push(Entry::Text(
+            "The quick brown fox jumps over the lazy dog in the yard.".into(),
+        ));
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 12)).unwrap();
+        term.draw(|f| view::draw(f, &mut app)).unwrap();
+        let start_row = app.conv_area.y;
+        let x0 = app.conv_area.x + 1;
+        // Drag from col 0 of line 0 across the soft-wrapped line 1.
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: x0,
+            row: start_row,
+            modifiers: KeyModifiers::NONE,
+        });
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: x0 + 20,
+            row: start_row + 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: x0 + 20,
+            row: start_row + 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(app.has_text_selection());
+        let copied = app.selected_text();
+        assert!(
+            !copied.contains('•') && !copied.contains('\n'),
+            "expected prefix stripped & soft-wrap rejoined: {copied:?}"
+        );
+        assert!(copied.starts_with("The quick brown fox"), "{copied:?}");
+
+        // Esc clears selection without quitting.
+        app.on_key(key(KeyCode::Esc));
+        assert!(!app.has_text_selection());
+        assert!(!app.quit);
+    }
+
+    #[test]
+    fn mouse_drag_selection_on_source_strips_line_number_gutter() {
+        let (mut app, _rx, _store) = test_app();
+        app.entries.push(Entry::Source {
+            title: "src/main.rs".into(),
+            range: "lines 1–2 of 2".into(),
+            body: "```rust numbered\n   1  fn hello() {\n   2      println!(\"hi\");\n```".into(),
+        });
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 14)).unwrap();
+        term.draw(|f| view::draw(f, &mut app)).unwrap();
+        // Line 0 is header `▤ src/main.rs ...`, line 1 is `     1  fn hello() {`, line 2 is `     2      println!("hi");`.
+        let x0 = app.conv_area.x + 1;
+        let y1 = app.conv_area.y + 1;
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: x0,
+            row: y1,
+            modifiers: KeyModifiers::NONE,
+        });
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: x0 + 30,
+            row: y1 + 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: x0 + 30,
+            row: y1 + 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        let copied = app.selected_text();
+        assert_eq!(copied, "fn hello() {\n    println!(\"hi\");");
     }
 }
